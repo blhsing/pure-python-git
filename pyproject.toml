@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pythongit"
 version = "0.1.0"
-description = "Pure-Python reimplementation of git. Drop-in replacement that exposes both `pygit` and `git` console scripts."
+description = "Pure-Python reimplementation of git. Installs `pygit`; opt in to a drop-in `git` shim via `pygit install-git-shim`."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "pythongit" }]
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 keywords = ["git", "vcs", "version-control", "scm"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -33,13 +33,17 @@ Homepage = "https://github.com/example/pythongit"
 Repository = "https://github.com/example/pythongit"
 
 [project.scripts]
-# Primary CLI name.
+# The only auto-installed entry point. The `git` drop-in is opt-in via
+# `pygit install-git-shim` (see README), so installing pythongit never
+# shadows a system `git` by accident.
 pygit = "pythongit.cli:main"
-# Drop-in name. When this package is installed in an environment without a
-# real `git` binary on PATH, calling `git ...` invokes pythongit instead.
-git = "pythongit.cli:main"
 
 [project.optional-dependencies]
+# Opt in to the drop-in `git` command via `pip install pythongit[git]`. This
+# pulls in pythongit-git-shim, whose only role is to register a `git`
+# console-script that calls pythongit.cli:main. Uninstall
+# `pythongit-git-shim` to remove the shim without uninstalling pythongit.
+git = ["pythongit-git-shim==0.1.0"]
 test = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

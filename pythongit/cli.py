@@ -883,6 +883,97 @@ def cmd_help(argv: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Opt-in `git` drop-in installer.
+#
+# We do NOT declare a `git` console-script in pyproject.toml because that
+# would silently shadow the system's real git binary on every install. Users
+# opt in by running `pygit install-git-shim`, which copies the existing
+# `pygit` launcher to a sibling `git` file (or .exe on Windows). Reversed by
+# `pygit uninstall-git-shim`.
+
+
+def _scripts_dir() -> Path:
+    """Where pip placed pygit's console-script launcher."""
+    import sysconfig
+    return Path(sysconfig.get_path("scripts"))
+
+
+def _shim_paths() -> tuple[Path, Path]:
+    """Return (existing pygit launcher, target git launcher path)."""
+    d = _scripts_dir()
+    if os.name == "nt":
+        return d / "pygit.exe", d / "git.exe"
+    return d / "pygit", d / "git"
+
+
+def cmd_install_git_shim(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="pygit install-git-shim",
+        description="Install a `git` console-script alongside `pygit` so "
+                    "the command `git` invokes pythongit. By default this "
+                    "refuses to overwrite an existing `git` on PATH; pass "
+                    "--force to install anyway.",
+    )
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing git file in the scripts dir")
+    ap.add_argument("--dir", default=None,
+                    help="install into this directory instead of pygit's scripts dir")
+    args = ap.parse_args(argv)
+    import shutil as _sh
+    if args.dir:
+        d = Path(args.dir)
+        src = (d / "pygit.exe") if os.name == "nt" else (d / "pygit")
+        dst = (d / "git.exe") if os.name == "nt" else (d / "git")
+    else:
+        src, dst = _shim_paths()
+    if not src.exists():
+        _err(f"pygit launcher not found at {src}. Is pythongit installed?")
+        return 1
+    if dst.exists() and not args.force:
+        _err(f"refusing to overwrite existing {dst} (use --force).")
+        return 1
+    # Resolve PATH conflict: warn if a different `git` is earlier on PATH.
+    other = _sh.which("git")
+    if other and Path(other).resolve() != dst.resolve():
+        _err(f"warning: a different `git` is already first on PATH: {other}")
+        _err(f"         after this install, `git` will still resolve to that "
+             f"unless you put {dst.parent} earlier on PATH.")
+    _sh.copy2(src, dst)
+    # On Unix make sure it's executable
+    if os.name != "nt":
+        st = dst.stat()
+        os.chmod(dst, st.st_mode | 0o111)
+    _print(f"Installed git shim at {dst}")
+    return 0
+
+
+def cmd_uninstall_git_shim(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="pygit uninstall-git-shim")
+    ap.add_argument("--dir", default=None)
+    args = ap.parse_args(argv)
+    if args.dir:
+        d = Path(args.dir)
+        dst = (d / "git.exe") if os.name == "nt" else (d / "git")
+    else:
+        _, dst = _shim_paths()
+    if not dst.exists():
+        _print(f"no git shim found at {dst}")
+        return 0
+    # Sanity check: only remove a file that looks like our shim. We compare
+    # against pygit's launcher; if the file at `dst` doesn't share size and
+    # the same first bytes, refuse.
+    src = (Path(args.dir) / ("pygit.exe" if os.name == "nt" else "pygit")) if args.dir else _shim_paths()[0]
+    if src.exists():
+        if dst.stat().st_size != src.stat().st_size or dst.read_bytes()[:64] != src.read_bytes()[:64]:
+            _err(f"refusing to remove {dst}: it does not look like a pythongit shim. "
+                 f"Delete it manually if you're sure.")
+            return 1
+    dst.unlink()
+    _print(f"Removed git shim at {dst}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # stubs that record they are not yet implemented (Phase 2)
 
 
@@ -943,6 +1034,8 @@ _COMMANDS = {
     "fsck": cmd_fsck,
     "gc": cmd_gc,
     "help": cmd_help,
+    "install-git-shim": cmd_install_git_shim,
+    "uninstall-git-shim": cmd_uninstall_git_shim,
 }
 
 for _n in _PHASE2:

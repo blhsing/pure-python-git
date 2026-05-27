@@ -54,23 +54,49 @@ implements.
 pip install pythongit
 ```
 
-This installs **two console scripts**:
+By default this installs **one console script**: `pygit`. The system `git`
+binary on your PATH is **not** shadowed unless you explicitly opt in.
 
-| Script  | Purpose                                                   |
-|---------|-----------------------------------------------------------|
-| `pygit` | Unambiguous name; always invokes pythongit                |
-| `git`   | Drop-in name; shadows real `git` only if it comes earlier on PATH |
+### Opt-in `git` drop-in
 
-If a real `git` binary is already on PATH and earlier than the venv's `Scripts/`
-or `bin/` directory, your shell will resolve `git` to the real one. To force
-the pythongit version, either use `pygit`, put the venv earlier on PATH, or run
-`python -m pythongit ...`.
+The `git` command name is **not** installed by default. You can opt in two ways:
 
-You can also run from a checkout without installing:
+**1. The standard extras syntax — recommended:**
+
+```bash
+pip install "pythongit[git]"
+```
+
+This pulls in the tiny companion package `pythongit-git-shim`, which exists
+only to register a `git` console-script. Uninstall it with
+`pip uninstall pythongit-git-shim` to remove the `git` command without
+touching the rest of pythongit.
+
+**2. After-the-fact, without reinstalling:**
+
+```bash
+pygit install-git-shim
+```
+
+This copies `pygit` to a sibling `git` (or `git.exe` on Windows) in the same
+scripts directory. Reverse with `pygit uninstall-git-shim`. Useful when you
+already have pythongit installed and don't want to touch the pip metadata.
+
+Whichever way you choose, whether `git` resolves to pythongit depends on PATH
+order — both commands warn if a different `git` is earlier on PATH.
+
+You can also run pythongit from a checkout without installing:
 
 ```bash
 python -m pythongit <command> [args...]
 ```
+
+### Why is the `git` name opt-in?
+
+Silently shadowing `git` on every install is a footgun: scripts that shell
+out to `git` start invoking pythongit instead the next time you
+`pip install pythongit` into a venv, without warning. Making it opt-in turns
+it into a deliberate choice you make per-environment.
 
 ## Tutorial
 

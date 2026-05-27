@@ -3,6 +3,9 @@ build/
 dist/
 *.egg-info/
 *.egg
+pythongit-git-shim/build/
+pythongit-git-shim/dist/
+pythongit-git-shim/*.egg-info/
 
 # Python
 __pycache__/

@@ -74,17 +74,50 @@ jobs:
           pygit --version
           pygit help | head -5
 
-      - name: Verify `git` drop-in entry point resolves to pythongit
+      - name: Verify `git` is NOT installed by default
         shell: bash
         run: |
-          # In the venv used by setup-python, our `git` shim lives in the
-          # Scripts/bin dir. We invoke by absolute path so the system git on
-          # PATH doesn't shadow it.
+          scripts_dir=$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))")
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            "$(python -c 'import sys, os; print(os.path.join(os.path.dirname(sys.executable), "Scripts", "git.exe"))')" --version
+            [ ! -f "$scripts_dir/git.exe" ] || (echo "unexpected git.exe in $scripts_dir"; exit 1)
           else
-            "$(python -c 'import sys, os; print(os.path.join(os.path.dirname(sys.executable), "git"))')" --version
+            [ ! -f "$scripts_dir/git" ] || (echo "unexpected git in $scripts_dir"; exit 1)
           fi
+
+      - name: Verify opt-in via `pygit install-git-shim`
+        shell: bash
+        run: |
+          pygit install-git-shim
+          scripts_dir=$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))")
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            shim="$scripts_dir/git.exe"
+          else
+            shim="$scripts_dir/git"
+          fi
+          "$shim" --version | grep -q "pygit version"
+          "$shim" help | grep -q "init"
+          pygit uninstall-git-shim
+          [ ! -f "$shim" ] || (echo "uninstall left $shim behind"; exit 1)
+
+      - name: Verify opt-in via `pip install "pythongit[git]"` extra
+        shell: bash
+        run: |
+          # Install the sibling shim package from this repo, then re-install
+          # pythongit with the [git] extra. The extra references
+          # pythongit-git-shim, which should now resolve locally.
+          python -m pip install ./pythongit-git-shim
+          scripts_dir=$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))")
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            shim="$scripts_dir/git.exe"
+          else
+            shim="$scripts_dir/git"
+          fi
+          [ -f "$shim" ] || (echo "git shim not installed by the shim wheel"; exit 1)
+          "$shim" --version | grep -q "pygit version"
+          # Clean up so the test step (which does not want this extra installed)
+          # ends back in the default state.
+          python -m pip uninstall -y pythongit-git-shim
+          [ ! -f "$shim" ] || (echo "pip uninstall left $shim behind"; exit 1)
 
   build:
     name: build wheel + sdist
@@ -100,18 +133,41 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Build
+      - name: Build pythongit (main package)
         run: python -m build
 
-      - name: twine check
+      - name: Build pythongit-git-shim (companion package)
+        run: python -m build pythongit-git-shim --outdir dist
+
+      - name: twine check both distributions
         run: python -m twine check dist/*
 
-      - name: Smoke-install the built wheel
+      - name: Smoke-install — default (no `git` shim)
         run: |
           python -m venv /tmp/install-venv
-          /tmp/install-venv/bin/pip install dist/*.whl
+          /tmp/install-venv/bin/pip install dist/pythongit-*.whl
           /tmp/install-venv/bin/pygit --version
-          /tmp/install-venv/bin/git --version
+          # `git` must NOT be installed by default.
+          [ ! -f /tmp/install-venv/bin/git ] || (echo "unexpected git in /tmp/install-venv/bin"; exit 1)
+
+      - name: Smoke-install — `pythongit[git]` extra
+        run: |
+          python -m venv /tmp/install-extra-venv
+          # Install both wheels so the extra resolves against local artifacts.
+          /tmp/install-extra-venv/bin/pip install dist/pythongit_git_shim-*.whl dist/pythongit-*.whl
+          /tmp/install-extra-venv/bin/pygit --version
+          /tmp/install-extra-venv/bin/git --version | grep -q "pygit version"
+          /tmp/install-extra-venv/bin/pip uninstall -y pythongit-git-shim
+          [ ! -f /tmp/install-extra-venv/bin/git ] || (echo "uninstall failed"; exit 1)
+
+      - name: Smoke-install — `pygit install-git-shim` post-install path
+        run: |
+          python -m venv /tmp/install-postvenv
+          /tmp/install-postvenv/bin/pip install dist/pythongit-*.whl
+          /tmp/install-postvenv/bin/pygit install-git-shim
+          /tmp/install-postvenv/bin/git --version | grep -q "pygit version"
+          /tmp/install-postvenv/bin/pygit uninstall-git-shim
+          [ ! -f /tmp/install-postvenv/bin/git ] || (echo "uninstall failed"; exit 1)
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
