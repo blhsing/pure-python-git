@@ -80,6 +80,9 @@ def test_install_warns_about_path_shadowing(tmp_path, capsys, monkeypatch):
     elsewhere.mkdir()
     real_git = elsewhere / _name("git")
     real_git.write_bytes(b"# pretend real git\n")
+    # shutil.which() on Unix only finds executable files.
+    if os.name != "nt":
+        real_git.chmod(real_git.stat().st_mode | 0o111)
     monkeypatch.setenv("PATH", str(elsewhere) + os.pathsep + str(tmp_path))
     rc = cli_run("install-git-shim", "--dir", str(tmp_path))
     assert rc == 0
