@@ -51,7 +51,7 @@ implements.
 ## Install
 
 ```bash
-pip install pythongit
+pip install pure-python-git
 ```
 
 By default this installs **one console script**: `pygit`. The system `git`
@@ -64,12 +64,12 @@ The `git` command name is **not** installed by default. You can opt in two ways:
 **1. The standard extras syntax — recommended:**
 
 ```bash
-pip install "pythongit[git]"
+pip install "pure-python-git[git]"
 ```
 
-This pulls in the tiny companion package `pythongit-git-shim`, which exists
+This pulls in the tiny companion package `pure-python-git-shim`, which exists
 only to register a `git` console-script. Uninstall it with
-`pip uninstall pythongit-git-shim` to remove the `git` command without
+`pip uninstall pure-python-git-shim` to remove the `git` command without
 touching the rest of pythongit.
 
 **2. After-the-fact, without reinstalling:**
@@ -95,8 +95,8 @@ python -m pythongit <command> [args...]
 
 Silently shadowing `git` on every install is a footgun: scripts that shell
 out to `git` start invoking pythongit instead the next time you
-`pip install pythongit` into a venv, without warning. Making it opt-in turns
-it into a deliberate choice you make per-environment.
+`pip install pure-python-git` into a venv, without warning. Making it opt-in
+turns it into a deliberate choice you make per-environment.
 
 ## Tutorial
 

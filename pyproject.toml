@@ -3,12 +3,12 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pythongit"
+name = "pure-python-git"
 version = "0.1.0"
-description = "Pure-Python reimplementation of git. Installs `pygit`; opt in to a drop-in `git` shim via `pygit install-git-shim`."
+description = "Pure-Python reimplementation of git. Installs `pygit`; opt in to a drop-in `git` shim via `pip install pure-python-git[git]` or `pygit install-git-shim`."
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{ name = "pythongit" }]
+authors = [{ name = "pure-python-git contributors" }]
 license = { file = "LICENSE" }
 keywords = ["git", "vcs", "version-control", "scm"]
 classifiers = [
@@ -29,8 +29,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/pythongit"
-Repository = "https://github.com/example/pythongit"
+Homepage = "https://github.com/blhsing/pythongit"
+Repository = "https://github.com/blhsing/pythongit"
+Issues = "https://github.com/blhsing/pythongit/issues"
+"Source — companion `git` shim" = "https://github.com/blhsing/pythongit/tree/main/pure-python-git-shim"
 
 [project.scripts]
 # The only auto-installed entry point. The `git` drop-in is opt-in via
@@ -39,11 +41,11 @@ Repository = "https://github.com/example/pythongit"
 pygit = "pythongit.cli:main"
 
 [project.optional-dependencies]
-# Opt in to the drop-in `git` command via `pip install pythongit[git]`. This
-# pulls in pythongit-git-shim, whose only role is to register a `git`
-# console-script that calls pythongit.cli:main. Uninstall
-# `pythongit-git-shim` to remove the shim without uninstalling pythongit.
-git = ["pythongit-git-shim==0.1.0"]
+# Opt in to the drop-in `git` command via `pip install pure-python-git[git]`.
+# This pulls in `pure-python-git-shim`, whose only role is to register a `git`
+# console-script that calls pythongit.cli:main. Uninstall the shim with pip
+# to remove the shim without uninstalling the main package.
+git = ["pure-python-git-shim==0.1.0"]
 test = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

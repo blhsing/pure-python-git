@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pure-python-git-shim"
+version = "0.1.0"
+description = "Drop-in `git` console-script that delegates to pure-python-git. Install via `pip install pure-python-git[git]`."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "pure-python-git contributors" }]
+license = { file = "LICENSE" }
+dependencies = ["pure-python-git==0.1.0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/blhsing/pythongit"
+Repository = "https://github.com/blhsing/pythongit"
+"Main package" = "https://pypi.org/project/pure-python-git/"
+
+[project.scripts]
+# Sole purpose of this package: register a `git` console-script that calls
+# pure-python-git's CLI dispatcher. Anyone who doesn't want `git` shadowed
+# should not install this package.
+git = "pythongit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pure_python_git_shim*"]
