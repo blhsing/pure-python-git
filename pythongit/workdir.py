@@ -1,0 +1,284 @@
+"""Working directory operations: add, rm, status, write-tree, read-tree, checkout."""
+from __future__ import annotations
+
+import os
+import stat as st_mod
+from pathlib import Path
+from typing import Iterable, Optional
+
+from . import objects as objs
+from . import refs as refs_mod
+from .index import (
+    EXE_MODE, REG_MODE, SYM_MODE,
+    Index, IndexEntry, read_index, stat_to_entry, write_index,
+)
+from .repo import Repository
+
+
+# ---------------------------------------------------------------------------
+# helpers
+
+
+def _rel(repo: Repository, path: Path) -> str:
+    return str(path.resolve().relative_to(repo.path)).replace(os.sep, "/")
+
+
+def _norm(p: str) -> str:
+    return p.replace(os.sep, "/")
+
+
+def _ignored(rel: str) -> bool:
+    parts = rel.split("/")
+    return ".git" in parts
+
+
+def iter_worktree(repo: Repository) -> list[str]:
+    out: list[str] = []
+    base = repo.path
+    for root, dirs, files in os.walk(base):
+        rel_root = _norm(os.path.relpath(root, base))
+        if rel_root == ".":
+            rel_root = ""
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for f in files:
+            rel = f if not rel_root else f"{rel_root}/{f}"
+            if not _ignored(rel):
+                out.append(rel)
+    return sorted(out)
+
+
+def _mode_for(path: Path) -> int:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return REG_MODE
+    if st_mod.S_ISLNK(st.st_mode):
+        return SYM_MODE
+    if st.st_mode & 0o111:
+        return EXE_MODE
+    return REG_MODE
+
+
+def _blob_data(path: Path) -> bytes:
+    st = path.lstat()
+    if st_mod.S_ISLNK(st.st_mode):
+        return os.readlink(path).encode("utf-8")
+    return path.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# add / rm
+
+
+def add_paths(repo: Repository, paths: Iterable[str]) -> None:
+    idx = read_index(repo)
+    to_add: list[str] = []
+    for p in paths:
+        ap = (repo.path / p).resolve()
+        if ap.is_dir():
+            for root, dirs, files in os.walk(ap):
+                dirs[:] = [d for d in dirs if d != ".git"]
+                for f in files:
+                    rel = _norm(os.path.relpath(os.path.join(root, f), repo.path))
+                    if not _ignored(rel):
+                        to_add.append(rel)
+        else:
+            to_add.append(_norm(os.path.relpath(ap, repo.path)))
+    for rel in sorted(set(to_add)):
+        full = repo.path / rel
+        if not full.exists() and not full.is_symlink():
+            idx.remove(rel)
+            continue
+        data = _blob_data(full)
+        sha = objs.write_object(repo, "blob", data)
+        st = full.lstat()
+        entry = stat_to_entry(rel, st, sha, _mode_for(full))
+        # clear conflict stages (1/2/3) on add — resolution
+        idx.remove(rel, stage=1)
+        idx.remove(rel, stage=2)
+        idx.remove(rel, stage=3)
+        idx.upsert(entry)
+    write_index(repo, idx)
+
+
+def rm_paths(repo: Repository, paths: Iterable[str], *, cached: bool = False) -> None:
+    idx = read_index(repo)
+    for p in paths:
+        rel = _norm(p)
+        idx.remove(rel)
+        if not cached:
+            f = repo.path / rel
+            if f.exists() or f.is_symlink():
+                f.unlink()
+    write_index(repo, idx)
+
+
+# ---------------------------------------------------------------------------
+# status / diff target lists
+
+
+def status(repo: Repository) -> dict[str, list[str]]:
+    """Return groups: staged_new, staged_mod, staged_del, mod, untracked."""
+    idx = read_index(repo)
+    by_path = idx.by_path()
+
+    head_tree = _head_tree_map(repo)
+
+    staged_new, staged_mod, staged_del = [], [], []
+    for path, entry in by_path.items():
+        if path not in head_tree:
+            staged_new.append(path)
+        elif head_tree[path] != entry.sha:
+            staged_mod.append(path)
+    for path in head_tree:
+        if path not in by_path:
+            staged_del.append(path)
+
+    modified, untracked = [], []
+    seen = set(by_path)
+    for rel in iter_worktree(repo):
+        full = repo.path / rel
+        if rel in by_path:
+            data = _blob_data(full)
+            sha, _ = objs.hash_bytes("blob", data)
+            if sha != by_path[rel].sha:
+                modified.append(rel)
+        else:
+            untracked.append(rel)
+        seen.discard(rel)
+    missing = sorted(seen)
+
+    return {
+        "staged_new": sorted(staged_new),
+        "staged_mod": sorted(staged_mod),
+        "staged_del": sorted(staged_del),
+        "modified": sorted(modified),
+        "missing": missing,
+        "untracked": sorted(untracked),
+    }
+
+
+def _head_tree_map(repo: Repository) -> dict[str, str]:
+    _, head_sha = refs_mod.read_head(repo)
+    if not head_sha:
+        return {}
+    try:
+        t, data = objs.read_object(repo, head_sha)
+    except KeyError:
+        return {}
+    if t != "commit":
+        return {}
+    commit = objs.parse_commit(data)
+    return flatten_tree(repo, commit.tree)
+
+
+def flatten_tree(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str, str]:
+    out: dict[str, str] = {}
+    t, data = objs.read_object(repo, tree_sha)
+    if t != "tree":
+        return out
+    for e in objs.parse_tree(data):
+        path = f"{prefix}{e.name}"
+        if e.is_dir():
+            out.update(flatten_tree(repo, e.sha, prefix=path + "/"))
+        elif e.is_gitlink():
+            # gitlinks don't have blob contents in this repo; skip
+            continue
+        else:
+            out[path] = e.sha
+    return out
+
+
+def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str, str]:
+    """Like flatten_tree but only returns gitlink entries (path -> commit sha)."""
+    out: dict[str, str] = {}
+    t, data = objs.read_object(repo, tree_sha)
+    if t != "tree":
+        return out
+    for e in objs.parse_tree(data):
+        path = f"{prefix}{e.name}"
+        if e.is_dir():
+            out.update(flatten_gitlinks(repo, e.sha, prefix=path + "/"))
+        elif e.is_gitlink():
+            out[path] = e.sha
+    return out
+
+
+# ---------------------------------------------------------------------------
+# tree <-> index
+
+
+def write_tree(repo: Repository) -> str:
+    """Build trees from the current index, returning the root tree sha.
+
+    Refuses to run while conflict stages are present in the index — fail
+    early instead of building a tree from a half-resolved state.
+    """
+    idx = read_index(repo)
+    if idx.has_conflicts():
+        raise RuntimeError(
+            "cannot write-tree: index has unresolved conflicts at "
+            + ", ".join(idx.conflicted_paths())
+        )
+    # only stage-0 entries
+    root: dict = {}
+    for e in idx.entries:
+        if e.stage != 0:
+            continue
+        parts = e.path.split("/")
+        cur = root
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+            if not isinstance(cur, dict):
+                raise ValueError(f"path conflict at {part}")
+        cur[parts[-1]] = e
+
+    def emit(node: dict) -> str:
+        entries: list[objs.TreeEntry] = []
+        for name, val in node.items():
+            if isinstance(val, dict):
+                sub_sha = emit(val)
+                entries.append(objs.TreeEntry("40000", name, sub_sha))
+            else:
+                entries.append(objs.TreeEntry(val.mode_str().lstrip("0") or "0", name, val.sha))
+        data = objs.encode_tree(entries)
+        return objs.write_object(repo, "tree", data)
+
+    return emit(root)
+
+
+def read_tree(repo: Repository, tree_sha: str) -> None:
+    """Replace the index with the contents of the given tree (no worktree update)."""
+    idx = Index()
+    flat = flatten_tree(repo, tree_sha)
+    for path, sha in sorted(flat.items()):
+        idx.entries.append(IndexEntry(mode=REG_MODE, sha=sha, path=path))
+    write_index(repo, idx)
+
+
+def checkout_tree(repo: Repository, tree_sha: str) -> None:
+    """Materialize the tree to the worktree and rewrite the index."""
+    target = flatten_tree(repo, tree_sha)
+    cur_idx = read_index(repo).by_path()
+
+    # remove files present in current index but not in target
+    for path in cur_idx:
+        if path not in target:
+            f = repo.path / path
+            if f.exists() or f.is_symlink():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    new_idx = Index()
+    for path, sha in sorted(target.items()):
+        t, data = objs.read_object(repo, sha)
+        if t != "blob":
+            continue
+        full = repo.path / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(data)
+        st = full.lstat()
+        new_idx.entries.append(stat_to_entry(path, st, sha, REG_MODE))
+    write_index(repo, new_idx)

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pythongit"
+version = "0.1.0"
+description = "Pure-Python reimplementation of git. Drop-in replacement that exposes both `pygit` and `git` console scripts."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "pythongit" }]
+license = { text = "MIT" }
+keywords = ["git", "vcs", "version-control", "scm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/pythongit"
+Repository = "https://github.com/example/pythongit"
+
+[project.scripts]
+# Primary CLI name.
+pygit = "pythongit.cli:main"
+# Drop-in name. When this package is installed in an environment without a
+# real `git` binary on PATH, calling `git ...` invokes pythongit instead.
+git = "pythongit.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["pythongit*"]
+
+[tool.setuptools.package-data]
+pythongit = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "unit_*.py"]
