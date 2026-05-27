@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pure-Python reimplementation of git. Installs `pygit`; opt in to a drop-in `git` shim via `pip install pure-python-git[git]` or `pygit install-git-shim`."
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{ name = "pure-python-git contributors" }]
+authors = [{ name = "Ben Hsing", email = "blhsing@gmail.com" }]
 license = { file = "LICENSE" }
 keywords = ["git", "vcs", "version-control", "scm"]
 classifiers = [
@@ -29,10 +29,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/blhsing/pythongit"
-Repository = "https://github.com/blhsing/pythongit"
-Issues = "https://github.com/blhsing/pythongit/issues"
-"Source — companion `git` shim" = "https://github.com/blhsing/pythongit/tree/main/pure-python-git-shim"
+Homepage = "https://github.com/blhsing/pure-python-git"
+Repository = "https://github.com/blhsing/pure-python-git"
+Issues = "https://github.com/blhsing/pure-python-git/issues"
+"Source — companion `git` shim" = "https://github.com/blhsing/pure-python-git/tree/main/pure-python-git-shim"
 
 [project.scripts]
 # The only auto-installed entry point. The `git` drop-in is opt-in via

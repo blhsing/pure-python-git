@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Drop-in `git` console-script that delegates to pure-python-git. Install via `pip install pure-python-git[git]`."
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{ name = "pure-python-git contributors" }]
+authors = [{ name = "Ben Hsing", email = "blhsing@gmail.com" }]
 license = { file = "LICENSE" }
 dependencies = ["pure-python-git==0.1.0"]
 classifiers = [
@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/blhsing/pythongit"
-Repository = "https://github.com/blhsing/pythongit"
+Homepage = "https://github.com/blhsing/pure-python-git"
+Repository = "https://github.com/blhsing/pure-python-git"
 "Main package" = "https://pypi.org/project/pure-python-git/"
 
 [project.scripts]

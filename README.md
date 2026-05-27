@@ -1,14 +1,15 @@
-# pythongit
+# pure-python-git
 
-[![CI](https://github.com/blhsing/pythongit/actions/workflows/ci.yml/badge.svg)](https://github.com/blhsing/pythongit/actions/workflows/ci.yml)
+[![CI](https://github.com/blhsing/pure-python-git/actions/workflows/ci.yml/badge.svg)](https://github.com/blhsing/pure-python-git/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pure-python-git.svg)](https://pypi.org/project/pure-python-git/)
 
 A pure-Python reimplementation of `git`. No external runtime dependencies — just
 the Python standard library. All 141 of git's built-in subcommands are
 implemented, the on-disk format is byte-for-byte compatible with real `git`,
-and the package installs both `pygit` and a drop-in `git` console script.
+and the package optionally installs a drop-in `git` console script.
 
 ```text
-pythongit/                  (repo root)
+pure-python-git/             (repo root)
 ├── pyproject.toml
 ├── README.md                this file
 ├── pythongit/               importable package — at repo root
@@ -32,6 +33,7 @@ pythongit/                  (repo root)
 │   ├── ignore.py            .gitignore engine
 │   ├── rerere.py            reuse recorded resolution
 │   └── bridges.py           daemon / http-backend / SMTP / Tk / shell-out
+├── pure-python-git-shim/    companion distribution (opt-in `git` shim)
 └── tests/                   pytest + script-style integration tests
 ```
 
