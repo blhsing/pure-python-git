@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full matrix on Linux; latest Python only on macOS and Windows to
+        # keep run time reasonable while still catching platform regressions.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.9"
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Show git version (used by interop tests)
+        shell: bash
+        run: git --version
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Configure global git identity (some tests shell out to real git)
+        shell: bash
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Run pytest
+        run: python -m pytest -v --color=yes
+
+      - name: Verify `pygit` entry point works
+        shell: bash
+        run: |
+          pygit --version
+          pygit help | head -5
+
+      - name: Verify `git` drop-in entry point resolves to pythongit
+        shell: bash
+        run: |
+          # In the venv used by setup-python, our `git` shim lives in the
+          # Scripts/bin dir. We invoke by absolute path so the system git on
+          # PATH doesn't shadow it.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            "$(python -c 'import sys, os; print(os.path.join(os.path.dirname(sys.executable), "Scripts", "git.exe"))')" --version
+          else
+            "$(python -c 'import sys, os; print(os.path.join(os.path.dirname(sys.executable), "git"))')" --version
+          fi
+
+  build:
+    name: build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Build
+        run: python -m build
+
+      - name: twine check
+        run: python -m twine check dist/*
+
+      - name: Smoke-install the built wheel
+        run: |
+          python -m venv /tmp/install-venv
+          /tmp/install-venv/bin/pip install dist/*.whl
+          /tmp/install-venv/bin/pygit --version
+          /tmp/install-venv/bin/git --version
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  lint:
+    name: syntax + import sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Bytecode-compile every module
+        run: python -m compileall -q pythongit tests
+
+      - name: Import smoke test
+        run: |
+          python -c "
+          from pythongit import cli
+          from pythongit.cli import _COMMANDS
+          assert len(_COMMANDS) >= 150, f'expected >=150 commands, got {len(_COMMANDS)}'
+          print(f'OK: {len(_COMMANDS)} commands registered')
+          "

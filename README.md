@@ -1,5 +1,7 @@
 # pythongit
 
+[![CI](https://github.com/blhsing/pythongit/actions/workflows/ci.yml/badge.svg)](https://github.com/blhsing/pythongit/actions/workflows/ci.yml)
+
 A pure-Python reimplementation of `git`. No external runtime dependencies — just
 the Python standard library. All 141 of git's built-in subcommands are
 implemented, the on-disk format is byte-for-byte compatible with real `git`,
