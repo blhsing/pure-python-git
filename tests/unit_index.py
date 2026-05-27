@@ -84,16 +84,18 @@ def test_upsert_replaces_same_path_same_stage():
 
 def test_real_git_reads_our_index_file(tmprepo):
     """Real git ls-files should read pythongit's index correctly."""
-    import shutil, subprocess
-    if not shutil.which("git"):
-        return  # skip silently if git not installed
+    import subprocess
+    from conftest import real_git
+    gitbin = real_git()
+    if not gitbin:
+        return  # skip silently if real git not installed
     repo, _ = tmprepo
     from pythongit import objects as objs
     blob_sha = objs.write_object(repo, "blob", b"hi\n")
     idx = Index()
     idx.entries.append(IndexEntry(mode=REG_MODE, sha=blob_sha, path="hi.txt"))
     write_index(repo, idx)
-    r = subprocess.run(["git", "ls-files", "--stage"], cwd=repo.path,
+    r = subprocess.run([gitbin, "ls-files", "--stage"], cwd=repo.path,
                        capture_output=True, text=True)
     assert r.returncode == 0
     assert "hi.txt" in r.stdout

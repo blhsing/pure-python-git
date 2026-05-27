@@ -16,6 +16,15 @@ sys.path.insert(0, str(ROOT))
 from pythongit import cli  # noqa: E402
 
 
+def _git():
+    from conftest import real_git
+    return real_git()
+
+
+def git_available() -> bool:
+    return _git() is not None
+
+
 def run(*args: str) -> int:
     return cli.main(list(args))
 
@@ -55,8 +64,8 @@ def main() -> int:
         check(rc == 0, "verify-pack")
 
         # real git can read our pack
-        if shutil.which("git"):
-            r = subprocess.run(["git", "verify-pack", "-v", str(packs[0])], cwd=tmp,
+        if git_available():
+            r = subprocess.run([_git(), "verify-pack", "-v", str(packs[0])], cwd=tmp,
                                capture_output=True, text=True)
             check(r.returncode == 0, f"real git verify-pack passes (stderr={r.stderr.strip()[:120]})")
 

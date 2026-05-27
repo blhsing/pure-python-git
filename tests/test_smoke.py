@@ -25,7 +25,13 @@ def run(*args: str) -> int:
 
 
 def git_available() -> bool:
-    return shutil.which("git") is not None
+    from conftest import real_git
+    return real_git() is not None
+
+
+def _git():
+    from conftest import real_git
+    return real_git()
 
 
 def main() -> int:
@@ -65,13 +71,13 @@ def main() -> int:
 
         # write-tree round-trip via real git, if available
         if git_available():
-            r = subprocess.run(["git", "log", "--oneline"], cwd=tmp, capture_output=True, text=True)
+            r = subprocess.run([_git(), "log", "--oneline"], cwd=tmp, capture_output=True, text=True)
             check(r.returncode == 0 and r.stdout.strip() != "", f"git log reads our commit: {r.stdout.strip()!r}")
 
-            r = subprocess.run(["git", "fsck", "--no-dangling"], cwd=tmp, capture_output=True, text=True)
+            r = subprocess.run([_git(), "fsck", "--no-dangling"], cwd=tmp, capture_output=True, text=True)
             check(r.returncode == 0, f"git fsck passes (stderr={r.stderr.strip()!r})")
 
-            r = subprocess.run(["git", "cat-file", "-p", "HEAD^{tree}"], cwd=tmp, capture_output=True, text=True)
+            r = subprocess.run([_git(), "cat-file", "-p", "HEAD^{tree}"], cwd=tmp, capture_output=True, text=True)
             ok = r.returncode == 0 and "hello.txt" in r.stdout
             check(ok, f"git can read tree (rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
 
@@ -90,7 +96,7 @@ def main() -> int:
         run("commit", "-m", "feature commit")
 
         if git_available():
-            r = subprocess.run(["git", "log", "--all", "--oneline"], cwd=tmp, capture_output=True, text=True)
+            r = subprocess.run([_git(), "log", "--all", "--oneline"], cwd=tmp, capture_output=True, text=True)
             lines = [l for l in r.stdout.splitlines() if l.strip()]
             check(len(lines) == 3,
                   f"git sees 3 commits across branches (got {len(lines)}; rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")

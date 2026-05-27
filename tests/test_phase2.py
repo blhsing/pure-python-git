@@ -14,6 +14,15 @@ sys.path.insert(0, str(ROOT))
 from pythongit import cli  # noqa: E402
 
 
+def _git():
+    from conftest import real_git
+    return real_git()
+
+
+def git_available() -> bool:
+    return _git() is not None
+
+
 def run(*args: str) -> int:
     return cli.main(list(args))
 
@@ -73,16 +82,16 @@ def main() -> int:
         run("branch", "cp")
         run("checkout", "cp")
         # reset cp to C3
-        c3 = subprocess.run(["git", "rev-parse", "HEAD^1"], cwd=tmp, capture_output=True, text=True).stdout.strip() if shutil.which("git") else None
+        c3 = subprocess.run([_git(), "rev-parse", "HEAD^1"], cwd=tmp, capture_output=True, text=True).stdout.strip() if git_available() else None
         if c3:
             run("reset", "--hard", c3)
-            feat_tip = subprocess.run(["git", "rev-parse", "feat"], cwd=tmp, capture_output=True, text=True).stdout.strip()
+            feat_tip = subprocess.run([_git(), "rev-parse", "feat"], cwd=tmp, capture_output=True, text=True).stdout.strip()
             rc = run("cherry-pick", feat_tip)
             check(rc == 0, "cherry-pick clean")
 
         # revert
         rc = run("log", "--oneline", "-n", "1")
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp, capture_output=True, text=True).stdout.strip() if shutil.which("git") else None
+        head = subprocess.run([_git(), "rev-parse", "HEAD"], cwd=tmp, capture_output=True, text=True).stdout.strip() if git_available() else None
         if head:
             rc = run("revert", head)
             check(rc == 0, "revert HEAD succeeds")

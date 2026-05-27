@@ -182,15 +182,17 @@ def test_pack_objects_and_unpack(tmprepo):
 
 
 def test_commit_graph_binary_passes_real_git(tmprepo):
-    import shutil, subprocess
-    if not shutil.which("git"):
+    import subprocess
+    from conftest import real_git
+    gitbin = real_git()
+    if not gitbin:
         return
     from tests.conftest import commit_one
     repo, _ = tmprepo
     for i in range(5):
         commit_one(repo, "a", f"v{i}\n", f"c{i}")
     assert cli_run("commit-graph", "write") == 0
-    r = subprocess.run(["git", "commit-graph", "verify"], cwd=repo.path,
+    r = subprocess.run([gitbin, "commit-graph", "verify"], cwd=repo.path,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 

@@ -71,8 +71,10 @@ def test_build_pack_then_read_back(tmprepo):
 
 
 def test_real_git_verifies_our_pack(tmprepo):
-    import shutil, subprocess, hashlib
-    if not shutil.which("git"):
+    import subprocess, hashlib
+    from conftest import real_git
+    gitbin = real_git()
+    if not gitbin:
         return
     repo, _ = tmprepo
     from pythongit import objects as objs
@@ -93,7 +95,7 @@ def test_real_git_verifies_our_pack(tmprepo):
     i.write_bytes(idx_bytes)
     # Git verify-pack must succeed — output format varies across git versions
     # so we only assert on the exit code, not on the summary text.
-    r = subprocess.run(["git", "verify-pack", "-v", str(p)], capture_output=True, text=True)
+    r = subprocess.run([gitbin, "verify-pack", "-v", str(p)], capture_output=True, text=True)
     assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
     # Every blob sha we wrote must appear in the verify output.
     for sha in blobs:
