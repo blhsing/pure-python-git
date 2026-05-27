@@ -72,7 +72,8 @@ def main() -> int:
             check(r.returncode == 0, f"git fsck passes (stderr={r.stderr.strip()!r})")
 
             r = subprocess.run(["git", "cat-file", "-p", "HEAD^{tree}"], cwd=tmp, capture_output=True, text=True)
-            check(r.returncode == 0 and "hello.txt" in r.stdout, "git can read tree")
+            ok = r.returncode == 0 and "hello.txt" in r.stdout
+            check(ok, f"git can read tree (rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
 
         # second commit + diff
         (tmp / "hello.txt").write_text("hello world\nsecond line\n")
@@ -91,7 +92,8 @@ def main() -> int:
         if git_available():
             r = subprocess.run(["git", "log", "--all", "--oneline"], cwd=tmp, capture_output=True, text=True)
             lines = [l for l in r.stdout.splitlines() if l.strip()]
-            check(len(lines) == 3, f"git sees 3 commits across branches (got {len(lines)})")
+            check(len(lines) == 3,
+                  f"git sees 3 commits across branches (got {len(lines)}; rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
 
         # ls-files
         run("checkout", "main")
