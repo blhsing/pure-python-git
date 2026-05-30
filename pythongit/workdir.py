@@ -5,7 +5,7 @@ import os
 import stat as st_mod
 from collections import OrderedDict
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 from . import objects as objs
 from . import refs as refs_mod
@@ -233,6 +233,76 @@ def flatten_tree(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str,
     return out
 
 
+def iter_tree_files(repo: Repository, tree_sha: str, prefix: str = "") -> Iterator[tuple[str, str, str]]:
+    """Yield ``(path, mode, sha)`` for blobs in a tree without materializing it."""
+    stack = [(prefix, tree_sha)]
+    while stack:
+        cur_prefix, cur_tree = stack.pop()
+        dirs: list[tuple[str, str]] = []
+        for e in _tree_entries(repo, cur_tree):
+            path = f"{cur_prefix}{e.name}"
+            if e.is_dir():
+                dirs.append((path + "/", e.sha))
+            elif e.is_gitlink():
+                continue
+            else:
+                yield path, e.mode, e.sha
+        for item in reversed(dirs):
+            stack.append(item)
+
+
+def _iter_subtree_changes(
+    repo: Repository,
+    tree_sha: str,
+    prefix: str,
+    *,
+    old: bool,
+) -> Iterator[tuple[str, Optional[objs.TreeEntry], Optional[objs.TreeEntry]]]:
+    for path, mode, sha in iter_tree_files(repo, tree_sha, prefix):
+        entry = objs.TreeEntry(mode, path.rsplit("/", 1)[-1], sha)
+        if old:
+            yield path, entry, None
+        else:
+            yield path, None, entry
+
+
+def iter_tree_changes(
+    repo: Repository,
+    a_tree: Optional[str],
+    b_tree: Optional[str],
+    prefix: str = "",
+) -> Iterator[tuple[str, Optional[objs.TreeEntry], Optional[objs.TreeEntry]]]:
+    """Yield changed blob paths between two trees, skipping identical subtrees."""
+    if a_tree == b_tree:
+        return
+    a_entries = {e.name: e for e in _tree_entries(repo, a_tree)} if a_tree else {}
+    b_entries = {e.name: e for e in _tree_entries(repo, b_tree)} if b_tree else {}
+    for name in sorted(set(a_entries) | set(b_entries)):
+        a = a_entries.get(name)
+        b = b_entries.get(name)
+        path = f"{prefix}{name}"
+        if a is not None and b is not None and a.sha == b.sha and a.mode == b.mode:
+            continue
+        if a is not None and a.is_gitlink():
+            a = None
+        if b is not None and b.is_gitlink():
+            b = None
+        if a is None and b is None:
+            continue
+        if a is not None and b is not None and a.is_dir() and b.is_dir():
+            yield from iter_tree_changes(repo, a.sha, b.sha, path + "/")
+        elif a is not None and a.is_dir():
+            yield from _iter_subtree_changes(repo, a.sha, path + "/", old=True)
+            if b is not None:
+                yield path, None, b
+        elif b is not None and b.is_dir():
+            if a is not None:
+                yield path, a, None
+            yield from _iter_subtree_changes(repo, b.sha, path + "/", old=False)
+        else:
+            yield path, a, b
+
+
 def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str, str]:
     """Like flatten_tree but only returns gitlink entries (path -> commit sha)."""
     out: dict[str, str] = {}
@@ -294,20 +364,19 @@ def write_tree(repo: Repository) -> str:
 def read_tree(repo: Repository, tree_sha: str) -> None:
     """Replace the index with the contents of the given tree (no worktree update)."""
     idx = Index()
-    flat = flatten_tree(repo, tree_sha)
-    for path, sha in sorted(flat.items()):
+    for path, _mode, sha in iter_tree_files(repo, tree_sha):
         idx.entries.append(IndexEntry(mode=REG_MODE, sha=sha, path=path))
     write_index(repo, idx)
 
 
 def checkout_tree(repo: Repository, tree_sha: str) -> None:
     """Materialize the tree to the worktree and rewrite the index."""
-    target = flatten_tree(repo, tree_sha)
+    target_paths = {path for path, _mode, _sha in iter_tree_files(repo, tree_sha)}
     cur_idx = read_index(repo).by_path()
 
     # remove files present in current index but not in target
     for path in cur_idx:
-        if path not in target:
+        if path not in target_paths:
             f = repo.path / path
             if f.exists() or f.is_symlink():
                 try:
@@ -316,7 +385,7 @@ def checkout_tree(repo: Repository, tree_sha: str) -> None:
                     pass
 
     new_idx = Index()
-    for path, sha in sorted(target.items()):
+    for path, _mode, sha in iter_tree_files(repo, tree_sha):
         t, data = objs.read_object(repo, sha)
         if t != "blob":
             continue

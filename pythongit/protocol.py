@@ -9,6 +9,11 @@ Sequence:
 """
 from __future__ import annotations
 
+import http.client
+import os
+from pathlib import Path
+import tempfile
+import urllib.parse
 import urllib.request
 from typing import Iterator
 
@@ -41,6 +46,23 @@ def _iter_pkt(buf: bytes) -> Iterator[bytes]:
         pos += n
 
 
+def _iter_pkt_stream(source) -> Iterator[bytes]:
+    while True:
+        hdr = source.read(4)
+        if not hdr:
+            return
+        if len(hdr) < 4:
+            raise RuntimeError("truncated pkt-line header")
+        n = int(hdr.decode(), 16)
+        if n == 0:
+            yield b""
+            continue
+        payload = source.read(n - 4)
+        if len(payload) != n - 4:
+            raise RuntimeError("truncated pkt-line payload")
+        yield payload
+
+
 def _get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "pythongit/0.1"})
     with urllib.request.urlopen(req) as r:
@@ -60,6 +82,62 @@ def _post(url: str, body: bytes, content_type: str, accept: str) -> bytes:
     )
     with urllib.request.urlopen(req) as r:
         return r.read()
+
+
+def _post_stream(url: str, body: bytes, content_type: str, accept: str):
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": "pythongit/0.1",
+            "Content-Type": content_type,
+            "Accept": accept,
+        },
+    )
+    return urllib.request.urlopen(req)
+
+
+def _post_with_pack_file(
+    url: str,
+    prefix: bytes,
+    pack_path: Path,
+    content_type: str,
+    accept: str,
+) -> bytes:
+    parsed = urllib.parse.urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    host = parsed.hostname or ""
+    if parsed.port:
+        host_header = f"{host}:{parsed.port}"
+    else:
+        host_header = host
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    pack_size = pack_path.stat().st_size
+    conn = conn_cls(host, parsed.port)
+    try:
+        conn.putrequest("POST", target)
+        conn.putheader("Host", host_header)
+        conn.putheader("User-Agent", "pythongit/0.1")
+        conn.putheader("Content-Type", content_type)
+        conn.putheader("Accept", accept)
+        conn.putheader("Content-Length", str(len(prefix) + pack_size))
+        conn.endheaders()
+        if prefix:
+            conn.send(prefix)
+        with pack_path.open("rb") as fh:
+            while True:
+                chunk = fh.read(256 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"HTTP {resp.status}: {data.decode(errors='replace')}")
+        return data
+    finally:
+        conn.close()
 
 
 def discover_refs(base_url: str) -> dict[str, str]:
@@ -91,8 +169,7 @@ def discover_refs(base_url: str) -> dict[str, str]:
     return refs
 
 
-def fetch_pack(base_url: str, wants: list[str], haves: list[str] | None = None) -> bytes:
-    """Negotiate a fetch, return raw pack bytes. Single round, no multi_ack."""
+def _fetch_pack_request_body(wants: list[str], haves: list[str] | None = None) -> bytes:
     caps = "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=pythongit/0.1"
     if any(len(w) == 64 for w in wants):
         caps += " object-format=sha256"
@@ -106,30 +183,50 @@ def fetch_pack(base_url: str, wants: list[str], haves: list[str] | None = None) 
     for h in (haves or []):
         body += _pkt_line(f"have {h}\n".encode())
     body += _pkt_line(b"done\n")
+    return bytes(body)
+
+
+def fetch_pack_to_file(base_url: str, wants: list[str], pack_path: Path, haves: list[str] | None = None) -> int:
+    """Negotiate a fetch and stream side-band channel 1 into ``pack_path``."""
+    body = _fetch_pack_request_body(wants, haves)
     url = base_url.rstrip("/") + "/git-upload-pack"
-    resp = _post(
+    written = 0
+    with _post_stream(
         url,
-        bytes(body),
+        body,
         "application/x-git-upload-pack-request",
         "application/x-git-upload-pack-result",
-    )
-    # Parse side-band: each pkt-line starts with a 1-byte channel after the length.
-    pack = bytearray()
-    for pkt in _iter_pkt(resp):
-        if not pkt:
-            continue
-        if pkt.startswith(b"NAK") or pkt.startswith(b"ACK"):
-            continue
-        ch = pkt[0]
-        data = pkt[1:]
-        if ch == 1:
-            pack += data
-        elif ch == 2:
-            # progress; ignore
+    ) as resp:
+        with Path(pack_path).open("wb") as out:
+            for pkt in _iter_pkt_stream(resp):
+                if not pkt:
+                    continue
+                if pkt.startswith(b"NAK") or pkt.startswith(b"ACK"):
+                    continue
+                ch = pkt[0]
+                data = pkt[1:]
+                if ch == 1:
+                    out.write(data)
+                    written += len(data)
+                elif ch == 2:
+                    pass
+                elif ch == 3:
+                    raise RuntimeError("remote error: " + data.decode(errors="replace"))
+    return written
+
+
+def fetch_pack(base_url: str, wants: list[str], haves: list[str] | None = None) -> bytes:
+    """Negotiate a fetch, return raw pack bytes. Single round, no multi_ack."""
+    with tempfile.NamedTemporaryFile(prefix="pygit-fetch-", suffix=".pack", delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        fetch_pack_to_file(base_url, wants, Path(tmp_name), haves=haves)
+        return Path(tmp_name).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
             pass
-        elif ch == 3:
-            raise RuntimeError("remote error: " + data.decode(errors="replace"))
-    return bytes(pack)
 
 
 def clone(url: str, target_dir: str, object_format: str | None = None) -> Repository:
@@ -145,13 +242,28 @@ def clone(url: str, target_dir: str, object_format: str | None = None) -> Reposi
     target_format = object_format or source_format
     repo = Repository.init(target_dir, object_format=target_format)
     wants = sorted(set(remote_refs.values()))
-    raw = fetch_pack(url, wants)
     unpack_repo = repo
     tmp_dir = None
+    tmp_pack = None
     if target_format != source_format:
         tmp_dir = tempfile.mkdtemp(prefix="pygit-translate-")
         unpack_repo = Repository.init(tmp_dir, object_format=source_format)
-    pack_mod.unpack_pack(unpack_repo, raw)
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pygit-fetch-", suffix=".pack", delete=False) as tmp:
+            tmp_pack = tmp.name
+        fetch_pack_to_file(url, wants, Path(tmp_pack))
+        pack_mod.install_pack_file(unpack_repo, Path(tmp_pack))
+        tmp_pack = None
+    finally:
+        if tmp_pack:
+            try:
+                os.unlink(tmp_pack)
+            except OSError:
+                pass
+            try:
+                os.unlink(str(Path(tmp_pack).with_suffix(".idx")))
+            except OSError:
+                pass
 
     # set up refs and HEAD
     for name, sha in remote_refs.items():
@@ -227,8 +339,23 @@ def fetch(repo: Repository, remote: str = "origin") -> dict[str, str]:
     wants = sorted(set(remote_refs.values()) - set(haves))
     updated: dict[str, str] = {}
     if wants:
-        raw = fetch_pack(url, wants, haves=haves)
-        pack_mod.unpack_pack(repo, raw)
+        tmp_pack = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="pygit-fetch-", suffix=".pack", delete=False) as tmp:
+                tmp_pack = tmp.name
+            fetch_pack_to_file(url, wants, Path(tmp_pack), haves=haves)
+            pack_mod.install_pack_file(repo, Path(tmp_pack))
+            tmp_pack = None
+        finally:
+            if tmp_pack:
+                try:
+                    os.unlink(tmp_pack)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(str(Path(tmp_pack).with_suffix(".idx")))
+                except OSError:
+                    pass
     for name, sha in remote_refs.items():
         if not name.startswith("refs/heads/"):
             continue
@@ -369,15 +496,26 @@ def push(repo: Repository, remote: str = "origin", refspecs: list[str] | None = 
             if o not in seen:
                 seen.add(o)
                 objects.append(o)
-    pack = _build_pack(repo, objects)
-    body = bytes(commands) + pack
     url_post = url.rstrip("/") + "/git-receive-pack"
-    resp = _post(
-        url_post,
-        body,
-        "application/x-git-receive-pack-request",
-        "application/x-git-receive-pack-result",
-    )
+    from . import pack as pack_mod
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pygit-push-", suffix=".pack", delete=False) as tmp:
+            tmp_name = tmp.name
+        pack_mod.write_pack_stream(repo, objects, Path(tmp_name))
+        resp = _post_with_pack_file(
+            url_post,
+            bytes(commands),
+            Path(tmp_name),
+            "application/x-git-receive-pack-request",
+            "application/x-git-receive-pack-result",
+        )
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     results: dict[str, str] = {}
     for pkt in _iter_pkt(resp):
         if not pkt:

@@ -40,6 +40,12 @@ def write_object(repo: Repository, obj_type: str, data: bytes) -> str:
         tmp = p.with_suffix(".tmp")
         tmp.write_bytes(zlib.compress(full))
         os.replace(tmp, p)
+        try:
+            from . import loose as _loose
+
+            _loose.clear_cache(repo)
+        except Exception:
+            pass
     return sha
 
 

@@ -155,12 +155,13 @@ def rev_parse(repo: Repository, name: str) -> Optional[str]:
     if _is_sha(low, repo.hex_len):
         return low
     if 4 <= len(low) <= repo.hex_len and all(c in "0123456789abcdef" for c in low):
-        # search loose objects
-        obj_root = repo.gitdir / "objects" / low[:2]
-        if obj_root.is_dir():
-            matches = [low[:2] + f.name for f in obj_root.iterdir() if f.name.startswith(low[2:])]
-            if len(matches) == 1:
-                return matches[0]
+        # search loose objects through the persistent loose-object cache
+        from . import loose as _loose
+        loose_match = _loose.resolve_short(repo, low)
+        if loose_match is None:
+            return None
+        if loose_match:
+            return loose_match
         # search packs
         from . import pack as _pack
         m = _pack.resolve_short(repo, low)

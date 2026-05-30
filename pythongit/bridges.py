@@ -18,12 +18,13 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from . import objects as objs
 from . import pack as pack_mod
@@ -201,6 +202,12 @@ def _pkt(b: bytes) -> bytes:
     return f"{len(b) + 4:04x}".encode() + b
 
 
+def _pkt_chunks(channel: bytes, data: bytes, limit: int = 65500):
+    max_payload = limit - len(channel)
+    for i in range(0, len(data), max_payload):
+        yield _pkt(channel + data[i : i + max_payload])
+
+
 def _read_pkt(sock: socket.socket) -> Optional[bytes]:
     hdr = b""
     while len(hdr) < 4:
@@ -284,13 +291,11 @@ def daemon_serve(base_path: str, host: str = "127.0.0.1", port: int = 9418) -> i
                         if o not in seen_shas:
                             shas.append(o)
                             seen_shas.add(o)
-                pack_bytes, _ = pack_mod.build_pack(repo, shas)
-                # chunk side-band channel 1
-                i = 0
-                while i < len(pack_bytes):
-                    chunk = pack_bytes[i : i + 65500]
-                    self.request.sendall(_pkt(b"\x01" + chunk))
-                    i += 65500
+                def send_pack_data(data: bytes) -> None:
+                    for pkt in _pkt_chunks(b"\x01", data):
+                        self.request.sendall(pkt)
+
+                pack_mod.write_pack_stream_to(repo, shas, send_pack_data, collect_entries=False)
                 self.request.sendall(b"0000")
 
         def _receive_pack(self, repo: Repository):
@@ -324,17 +329,25 @@ def daemon_serve(base_path: str, host: str = "127.0.0.1", port: int = 9418) -> i
                 if len(parts) >= 3:
                     updates.append((parts[0], parts[1], parts[2]))
             # read pack from remaining stream
-            pack_buf = b""
-            while True:
-                chunk = self.request.recv(65536)
-                if not chunk:
-                    break
-                pack_buf += chunk
-            if pack_buf:
+            tmp_pack = None
+            pack_size = 0
+            with tempfile.NamedTemporaryFile(prefix="pygit-receive-", suffix=".pack", delete=False) as tmp:
+                tmp_pack = tmp.name
+                while True:
+                    chunk = self.request.recv(65536)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    pack_size += len(chunk)
+            if pack_size:
                 try:
-                    pack_mod.unpack_pack(repo, pack_buf)
+                    pack_mod.install_pack_file(repo, Path(tmp_pack))
+                    tmp_pack = None
                 except Exception:
                     pass
+            if tmp_pack:
+                Path(tmp_pack).unlink(missing_ok=True)
+                Path(tmp_pack).with_suffix(".idx").unlink(missing_ok=True)
             self.request.sendall(_pkt(b"unpack ok\n"))
             for old, new, ref in updates:
                 try:
@@ -372,6 +385,181 @@ def http_fetch(url: str, sha: str, repo: Repository) -> int:
 # ---------------------------------------------------------------------------
 # http-backend — CGI-style handler producing smart HTTP responses.
 # We expose a thin in-process function used by instaweb.
+
+
+def _repo_from_smart_http_path(path: str, base: Path):
+    for ep in ("/info/refs", "/git-upload-pack", "/git-receive-pack"):
+        if ep in path:
+            repo_path = path.split(ep)[0].lstrip("/")
+            break
+    else:
+        return None
+    try:
+        return Repository.discover(str(base / repo_path))
+    except Exception:
+        return None
+
+
+def _parse_upload_pack_wants(body: bytes) -> list[str]:
+    wants = []
+    i = 0
+    while i < len(body):
+        n = int(body[i : i + 4].decode(), 16)
+        i += 4
+        if n == 0:
+            continue
+        line = body[i : i + n - 4].decode("utf-8", errors="replace").rstrip("\n")
+        i += n - 4
+        if line.startswith("want "):
+            wants.append(line[5:].split()[0])
+    return wants
+
+
+def _objects_for_wants(repo: Repository, wants: list[str]) -> list[str]:
+    from .protocol import _collect_objects
+
+    shas: list[str] = []
+    seen_shas: set[str] = set()
+    for w in wants:
+        for obj in _collect_objects(repo, w, set()):
+            if obj not in seen_shas:
+                shas.append(obj)
+                seen_shas.add(obj)
+    return shas
+
+
+def _upload_pack_response_iter(repo: Repository, shas: list[str]) -> Iterable[bytes]:
+    import tempfile
+
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pygit-upload-", suffix=".pack", delete=False) as tmp:
+            tmp_name = tmp.name
+        pack_mod.write_pack_stream(repo, shas, Path(tmp_name))
+        yield _pkt(b"NAK\n")
+        with open(tmp_name, "rb") as fh:
+            while True:
+                chunk = fh.read(65500 - 1)
+                if not chunk:
+                    break
+                yield _pkt(b"\x01" + chunk)
+        yield b"0000"
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _receive_pack_report(repo: Repository, updates: list[tuple[str, str, str]], pack_path: Optional[Path]) -> bytes:
+    if pack_path is not None:
+        try:
+            pack_mod.install_pack_file(repo, pack_path)
+            pack_path = None
+        except Exception:
+            pass
+    if pack_path is not None:
+        pack_path.unlink(missing_ok=True)
+        pack_path.with_suffix(".idx").unlink(missing_ok=True)
+    out = bytearray()
+    out += _pkt(b"unpack ok\n")
+    for old, new, ref in updates:
+        try:
+            refs_mod.update_ref(repo, ref, new)
+            out += _pkt(f"ok {ref}\n".encode())
+        except Exception as e:
+            out += _pkt(f"ng {ref} {e}\n".encode())
+    out += b"0000"
+    return bytes(out)
+
+
+def _receive_pack_body(repo: Repository, body: bytes) -> bytes:
+    i = 0
+    updates = []
+    while i < len(body):
+        n = int(body[i : i + 4].decode(), 16)
+        i += 4
+        if n == 0:
+            break
+        line = body[i : i + n - 4].decode("utf-8", errors="replace").rstrip("\n")
+        i += n - 4
+        line = line.split("\0", 1)[0]
+        parts = line.split(" ")
+        if len(parts) >= 3:
+            updates.append((parts[0], parts[1], parts[2]))
+    pack_path = None
+    if i < len(body):
+        with tempfile.NamedTemporaryFile(prefix="pygit-receive-", suffix=".pack", delete=False) as tmp:
+            tmp.write(body[i:])
+            pack_path = Path(tmp.name)
+    return _receive_pack_report(repo, updates, pack_path)
+
+
+def http_backend_receive_pack_stream(path: str, source, length: int, base: Path) -> tuple[int, dict[str, str], bytes]:
+    clean_path = path.split("?", 1)[0]
+    repo = _repo_from_smart_http_path(clean_path, base)
+    if repo is None:
+        return 404, {"Content-Type": "text/plain"}, b"no such repo\n"
+    updates: list[tuple[str, str, str]] = []
+    remaining = length
+    while remaining > 0:
+        hdr = source.read(4)
+        remaining -= len(hdr)
+        if len(hdr) < 4:
+            break
+        n = int(hdr.decode(), 16)
+        if n == 0:
+            break
+        payload = source.read(n - 4)
+        remaining -= len(payload)
+        if len(payload) != n - 4:
+            break
+        line = payload.decode("utf-8", errors="replace").rstrip("\n").split("\0", 1)[0]
+        parts = line.split(" ")
+        if len(parts) >= 3:
+            updates.append((parts[0], parts[1], parts[2]))
+    pack_path = None
+    if remaining > 0:
+        with tempfile.NamedTemporaryFile(prefix="pygit-receive-", suffix=".pack", delete=False) as tmp:
+            pack_path = Path(tmp.name)
+            while remaining > 0:
+                chunk = source.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                remaining -= len(chunk)
+    return (
+        200,
+        {"Content-Type": "application/x-git-receive-pack-result"},
+        _receive_pack_report(repo, updates, pack_path),
+    )
+
+
+def http_backend_stream(method: str, path: str, body: bytes, base: Path) -> tuple[int, dict[str, str], Iterable[bytes]]:
+    """Streaming variant of ``http_backend`` for large upload-pack responses."""
+    clean_path = path.split("?", 1)[0]
+    if clean_path.endswith("/git-upload-pack"):
+        repo = _repo_from_smart_http_path(clean_path, base)
+        if repo is None:
+            return 404, {"Content-Type": "text/plain"}, [b"no such repo\n"]
+        shas = _objects_for_wants(repo, _parse_upload_pack_wants(body))
+        return (
+            200,
+            {"Content-Type": "application/x-git-upload-pack-result"},
+            _upload_pack_response_iter(repo, shas),
+        )
+    if clean_path.endswith("/git-receive-pack"):
+        repo = _repo_from_smart_http_path(clean_path, base)
+        if repo is None:
+            return 404, {"Content-Type": "text/plain"}, [b"no such repo\n"]
+        return (
+            200,
+            {"Content-Type": "application/x-git-receive-pack-result"},
+            [_receive_pack_body(repo, body)],
+        )
+    status, headers, out = http_backend(method, path, body, base)
+    return status, headers, [out]
 
 
 def http_backend(method: str, path: str, body: bytes, base: Path) -> tuple[int, dict[str, str], bytes]:
@@ -429,66 +617,11 @@ def http_backend(method: str, path: str, body: bytes, base: Path) -> tuple[int, 
         return 200, {"Content-Type": f"application/x-{service}-advertisement"}, bytes(out)
     if path.endswith("/git-upload-pack"):
         # parse wants + done
-        wants = []
-        i = 0
-        while i < len(body):
-            n = int(body[i : i + 4].decode(), 16)
-            i += 4
-            if n == 0:
-                continue
-            line = body[i : i + n - 4].decode("utf-8", errors="replace").rstrip("\n")
-            i += n - 4
-            if line.startswith("want "):
-                wants.append(line[5:].split()[0])
-        from .protocol import _collect_objects
-        shas: list[str] = []
-        seen_shas: set[str] = set()
-        for w in wants:
-            for o in _collect_objects(repo, w, set()):
-                if o not in seen_shas:
-                    shas.append(o)
-                    seen_shas.add(o)
-        pack_bytes, _ = pack_mod.build_pack(repo, shas)
-        out = bytearray()
-        out += _pkt(b"NAK\n")
-        k = 0
-        while k < len(pack_bytes):
-            chunk = pack_bytes[k : k + 65500]
-            out += _pkt(b"\x01" + chunk)
-            k += 65500
-        out += b"0000"
+        shas = _objects_for_wants(repo, _parse_upload_pack_wants(body))
+        out = b"".join(_upload_pack_response_iter(repo, shas))
         return 200, {"Content-Type": "application/x-git-upload-pack-result"}, bytes(out)
     if path.endswith("/git-receive-pack"):
-        # commands then pack
-        i = 0
-        updates = []
-        while i < len(body):
-            n = int(body[i : i + 4].decode(), 16)
-            i += 4
-            if n == 0:
-                break
-            line = body[i : i + n - 4].decode("utf-8", errors="replace").rstrip("\n")
-            i += n - 4
-            line = line.split("\0", 1)[0]
-            parts = line.split(" ")
-            if len(parts) >= 3:
-                updates.append((parts[0], parts[1], parts[2]))
-        pack_buf = body[i:]
-        if pack_buf:
-            try:
-                pack_mod.unpack_pack(repo, pack_buf)
-            except Exception:
-                pass
-        out = bytearray()
-        out += _pkt(b"unpack ok\n")
-        for old, new, ref in updates:
-            try:
-                refs_mod.update_ref(repo, ref, new)
-                out += _pkt(f"ok {ref}\n".encode())
-            except Exception as e:
-                out += _pkt(f"ng {ref} {e}\n".encode())
-        out += b"0000"
-        return 200, {"Content-Type": "application/x-git-receive-pack-result"}, bytes(out)
+        return 200, {"Content-Type": "application/x-git-receive-pack-result"}, _receive_pack_body(repo, body)
     return 404, {"Content-Type": "text/plain"}, b"not found\n"
 
 
@@ -512,6 +645,15 @@ def instaweb(repo: Repository, port: int = 1234) -> int:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_stream(self, status, headers, chunks: Iterable[bytes]):
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            for chunk in chunks:
+                if chunk:
+                    self.wfile.write(chunk)
 
         def do_GET(self):
             if "/info/refs" in self.path or self.path.endswith("/git-upload-pack"):
@@ -544,9 +686,13 @@ def instaweb(repo: Repository, port: int = 1234) -> int:
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
+            if self.path.split("?", 1)[0].endswith("/git-receive-pack"):
+                status, hdrs, body = http_backend_receive_pack_stream(self.path, self.rfile, length, base)
+                self._send(status, hdrs, body)
+                return
             body = self.rfile.read(length) if length else b""
-            status, hdrs, out = http_backend("POST", self.path, body, base)
-            self._send(status, hdrs, out)
+            status, hdrs, chunks = http_backend_stream("POST", self.path, body, base)
+            self._send_stream(status, hdrs, chunks)
 
     print(f"instaweb listening on http://127.0.0.1:{port}/")
     with HTTPServer(("127.0.0.1", port), Handler) as srv:

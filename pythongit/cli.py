@@ -557,12 +557,9 @@ def cmd_show(argv: list[str]) -> int:
 
 
 def _print_tree_diff(repo: Repository, a_tree: str, b_tree: str) -> None:
-    a = workdir.flatten_tree(repo, a_tree)
-    b = workdir.flatten_tree(repo, b_tree)
-    paths = sorted(set(a) | set(b))
-    for p in paths:
-        a_sha = a.get(p)
-        b_sha = b.get(p)
+    for p, a_entry, b_entry in workdir.iter_tree_changes(repo, a_tree, b_tree):
+        a_sha = a_entry.sha if a_entry else None
+        b_sha = b_entry.sha if b_entry else None
         if a_sha == b_sha:
             continue
         a_text = ""
@@ -1391,12 +1388,10 @@ def cmd_format_patch(argv: list[str]) -> int:
         parent_tree = ""
         if c.parents:
             parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-        a_map = workdir.flatten_tree(repo, parent_tree) if parent_tree else {}
-        b_map = workdir.flatten_tree(repo, c.tree)
         diff_text = []
-        for p in sorted(set(a_map) | set(b_map)):
-            a_sha = a_map.get(p)
-            b_sha = b_map.get(p)
+        for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree or None, c.tree):
+            a_sha = a_entry.sha if a_entry else None
+            b_sha = b_entry.sha if b_entry else None
             if a_sha == b_sha:
                 continue
             at = bt = ""
@@ -1740,12 +1735,11 @@ def cmd_archive(argv: list[str]) -> int:
         return 128
     t, data = objs.read_object(repo, sha)
     tree = objs.parse_commit(data).tree if t == "commit" else sha
-    files = workdir.flatten_tree(repo, tree)
     import io
     if args.format == "tar":
         import tarfile
         with tarfile.open(args.output, "w") as tf:
-            for path, bsha in sorted(files.items()):
+            for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
                 _, blob = objs.read_object(repo, bsha)
                 ti = tarfile.TarInfo(name=path)
                 ti.size = len(blob)
@@ -1753,7 +1747,7 @@ def cmd_archive(argv: list[str]) -> int:
     else:
         import zipfile
         with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path, bsha in sorted(files.items()):
+            for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
                 _, blob = objs.read_object(repo, bsha)
                 zf.writestr(path, blob)
     return 0
@@ -1779,7 +1773,8 @@ def cmd_bundle(argv: list[str]) -> int:
         for sha, name in tips:
             header += f"{sha} {name}\n".encode()
         header += b"\n"
-        from .protocol import _build_pack, _collect_objects
+        from . import pack as _pack_mod
+        from .protocol import _collect_objects
         objs_list: list[str] = []
         seen: set[str] = set()
         for sha, _ in tips:
@@ -1787,8 +1782,9 @@ def cmd_bundle(argv: list[str]) -> int:
                 if o not in seen:
                     seen.add(o)
                     objs_list.append(o)
-        pack = _build_pack(repo, objs_list)
-        Path(args.file).write_bytes(bytes(header) + pack)
+        with Path(args.file).open("wb") as fh:
+            fh.write(bytes(header))
+            _pack_mod.write_pack_stream_to(repo, objs_list, fh.write, collect_entries=False)
         _print(f"Wrote bundle {args.file}")
         return 0
     if args.action == "verify":
@@ -1913,14 +1909,9 @@ _register_phase3()
 
 
 def _iter_loose_shas(repo: Repository):
-    obj_root = repo.gitdir / "objects"
-    if obj_root.is_dir():
-        for d in obj_root.iterdir():
-            if not d.is_dir() or len(d.name) != 2:
-                continue
-            for f in d.iterdir():
-                if f.is_file():
-                    yield d.name + f.name
+    from . import loose
+
+    yield from loose.iter_shas(repo)
 
 
 def _loose_shas(repo: Repository) -> list[str]:
@@ -1928,22 +1919,9 @@ def _loose_shas(repo: Repository) -> list[str]:
 
 
 def _loose_count_and_size(repo: Repository) -> tuple[int, int]:
-    obj_root = repo.gitdir / "objects"
-    count = 0
-    size = 0
-    if obj_root.is_dir():
-        for d in obj_root.iterdir():
-            if not d.is_dir() or len(d.name) != 2:
-                continue
-            for f in d.iterdir():
-                if not f.is_file():
-                    continue
-                count += 1
-                try:
-                    size += f.stat().st_size
-                except OSError:
-                    pass
-    return count, size
+    from . import loose
+
+    return loose.count_and_size(repo)
 
 
 def _ref_tips(repo: Repository) -> set[str]:
@@ -2008,9 +1986,6 @@ def _reachable(repo: Repository) -> set[str]:
     return seen
 
 
-_STREAM_PACK_OBJECT_LIMIT = 50000
-
-
 def _write_pack_files(
     repo: Repository,
     shas: list[str],
@@ -2021,23 +1996,14 @@ def _write_pack_files(
     pack_dir = repo.gitdir / "objects" / "pack"
     pack_dir.mkdir(parents=True, exist_ok=True)
     _p.clear_pack_cache(repo)
-    if len(shas) >= _STREAM_PACK_OBJECT_LIMIT:
-        tmp = pack_dir / f".tmp-{base}-{os.getpid()}-{time.time_ns()}.pack"
-        try:
-            pack_sha, entries = _p.write_pack_stream(repo, shas, tmp)
-            idx_bytes = _p.write_idx_v2_from_checksum(bytes.fromhex(pack_sha), entries, repo.object_format())
-            pack_path = pack_dir / f"{base}-{pack_sha}.pack"
-            os.replace(tmp, pack_path)
-            (pack_dir / f"{base}-{pack_sha}.idx").write_bytes(idx_bytes)
-            return pack_sha, pack_path, entries
-        finally:
-            tmp.unlink(missing_ok=True)
-
-    pack_bytes, entries = _p.build_pack(repo, shas)
-    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
-    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
-    pack_path = pack_dir / f"{base}-{pack_sha}.pack"
-    pack_path.write_bytes(pack_bytes)
+    tmp = pack_dir / f".tmp-{base}-{os.getpid()}-{time.time_ns()}.pack"
+    try:
+        pack_sha, entries = _p.write_pack_stream(repo, shas, tmp)
+        idx_bytes = _p.write_idx_v2_from_checksum(bytes.fromhex(pack_sha), entries, repo.object_format())
+        pack_path = pack_dir / f"{base}-{pack_sha}.pack"
+        os.replace(tmp, pack_path)
+    finally:
+        tmp.unlink(missing_ok=True)
     (pack_dir / f"{base}-{pack_sha}.idx").write_bytes(idx_bytes)
     return pack_sha, pack_path, entries
 
@@ -2059,8 +2025,7 @@ def cmd_pack_objects(argv: list[str]) -> int:
     else:
         shas = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
     if args.stdout:
-        pack_bytes, _entries = _p.build_pack(repo, shas)
-        sys.stdout.buffer.write(pack_bytes)
+        _p.write_pack_stream_to(repo, shas, sys.stdout.buffer.write, collect_entries=False)
         return 0
     pack_sha, pack_path, entries = _write_pack_files(repo, shas, args.base)
     if args.all and not args.no_write_bitmap_index:
@@ -2074,8 +2039,7 @@ def cmd_unpack_objects(argv: list[str]) -> int:
     ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
-    data = sys.stdin.buffer.read()
-    n = _p.unpack_pack(repo, data)
+    n = _p.unpack_pack_stream(repo, sys.stdin.buffer)
     _print(f"Unpacked {n} objects")
     return 0
 
@@ -2086,55 +2050,11 @@ def cmd_index_pack(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
-    import struct, zlib, binascii
-    raw = Path(args.packfile).read_bytes()
-    if raw[:4] != b"PACK":
-        _err("not a pack")
+    try:
+        pack_sha, _entries = _p.index_pack_file(repo, Path(args.packfile))
+    except Exception as exc:
+        _err(str(exc))
         return 1
-    _, count = struct.unpack(">II", raw[4:12])
-    pos = 12
-    by_offset: dict[int, tuple[str, bytes]] = {}
-    entries: list[tuple[str, int, int]] = []
-    for _ in range(count):
-        start = pos
-        obj_type, _sz, p = _p._read_var_size(raw, pos)
-        pos = p
-        if obj_type in (_p.OBJ_COMMIT, _p.OBJ_TREE, _p.OBJ_BLOB, _p.OBJ_TAG):
-            d = zlib.decompressobj()
-            payload = d.decompress(raw[pos:])
-            consumed = len(raw) - pos - len(d.unused_data)
-            t = _p._TYPE_NAME[obj_type]
-        elif obj_type == _p.OBJ_OFS_DELTA:
-            neg, p2 = _p._read_offset(raw, pos)
-            pos = p2
-            base_off = start - neg
-            d = zlib.decompressobj()
-            delta = d.decompress(raw[pos:])
-            consumed = len(raw) - pos - len(d.unused_data)
-            base = by_offset[base_off]
-            payload = _p.apply_delta(base[1], delta)
-            t = base[0]
-        elif obj_type == _p.OBJ_REF_DELTA:
-            base_sha = raw[pos : pos + repo.hash_len].hex()
-            pos += repo.hash_len
-            d = zlib.decompressobj()
-            delta = d.decompress(raw[pos:])
-            consumed = len(raw) - pos - len(d.unused_data)
-            t, base_data = objs.read_object(repo, base_sha)
-            payload = _p.apply_delta(base_data, delta)
-        else:
-            _err(f"unknown obj type {obj_type}")
-            return 1
-        pos += consumed
-        end = pos
-        sha, _ = objs.hash_bytes(t, payload, repo)
-        by_offset[start] = (t, payload)
-        crc = binascii.crc32(raw[start:end])
-        entries.append((sha, start, crc))
-    idx = _p.write_idx_v2(raw, entries, repo.object_format())
-    idx_path = Path(args.packfile).with_suffix(".idx")
-    idx_path.write_bytes(idx)
-    pack_sha = repo.hash_hex(raw[:-repo.hash_len])
     _print(pack_sha)
     return 0
 
@@ -2335,7 +2255,7 @@ def cmd_notes(argv: list[str]) -> int:
     notes_map: dict[str, str] = {}
     if notes_tree_sha:
         nc = objs.parse_commit(objs.read_object(repo, notes_tree_sha)[1])
-        notes_map = workdir.flatten_tree(repo, nc.tree)
+        notes_map = {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, nc.tree)}
 
     if action == "list":
         for path, blob_sha in sorted(notes_map.items()):
@@ -2409,6 +2329,12 @@ def cmd_bisect(argv: list[str]) -> int:
         if not bads or not goods:
             _print("status: need at least one good and one bad")
             return 0
+        graph = _graph_for_repo(repo)
+
+        def commit_parents(sha: str) -> tuple[str, ...]:
+            info = _commit_tree_parents(repo, sha, graph)
+            return info[1] if info is not None else tuple()
+
         # candidates: ancestors of any bad, minus ancestors of any good and bads themselves
         anc_bad: set[str] = set()
         stack = list(bads)
@@ -2419,11 +2345,7 @@ def cmd_bisect(argv: list[str]) -> int:
                 continue
             seen.add(s)
             anc_bad.add(s)
-            try:
-                c = objs.parse_commit(objs.read_object(repo, s)[1])
-                stack.extend(c.parents)
-            except KeyError:
-                pass
+            stack.extend(commit_parents(s))
         for g in goods:
             seen2: set[str] = set()
             stack = [g]
@@ -2433,11 +2355,7 @@ def cmd_bisect(argv: list[str]) -> int:
                     continue
                 seen2.add(s)
                 anc_bad.discard(s)
-                try:
-                    c = objs.parse_commit(objs.read_object(repo, s)[1])
-                    stack.extend(c.parents)
-                except KeyError:
-                    pass
+                stack.extend(commit_parents(s))
         candidates = anc_bad - set(bads)
         if not candidates:
             _print(f"{bads[0]} is the first bad commit")
@@ -2446,11 +2364,7 @@ def cmd_bisect(argv: list[str]) -> int:
         # best = argmax(min(weight, n - weight)) — matches git/bisect.c best_bisection
         parents_map: dict[str, list[str]] = {}
         for c_sha in candidates:
-            try:
-                cc = objs.parse_commit(objs.read_object(repo, c_sha)[1])
-                parents_map[c_sha] = [p for p in cc.parents if p in candidates]
-            except KeyError:
-                parents_map[c_sha] = []
+            parents_map[c_sha] = [p for p in commit_parents(c_sha) if p in candidates]
         indegree = {c: 0 for c in candidates}
         for ps in parents_map.values():
             for p in ps:
@@ -2465,25 +2379,36 @@ def cmd_bisect(argv: list[str]) -> int:
                 if indegree[p] == 0:
                     queue.append(p)
 
-        positions = {c_sha: i for i, c_sha in enumerate(sorted(candidates))}
-        reachable: dict[str, int] = {}
-        for c_sha in reversed(topo):
-            r = 1 << positions[c_sha]
-            for p in parents_map.get(c_sha, []):
-                r |= reachable[p]
-            reachable[c_sha] = r
-
         n = len(candidates)
-        best = None
-        best_distance = -1
-        for c_sha in sorted(candidates):  # stable for ties
-            w = reachable.get(c_sha, 1 << positions[c_sha]).bit_count()
-            distance = min(w, n - w)
-            if distance > best_distance:
-                best_distance = distance
-                best = c_sha
-        if best is None:
-            best = next(iter(candidates))
+        exact_limit = 20000
+        if n > exact_limit:
+            def rank_key(sha: str) -> tuple[int, str]:
+                entry = graph.get(sha) if graph is not None else None
+                return (entry.generation if entry is not None else 0, sha)
+
+            ranked = sorted(candidates, key=rank_key) if graph is not None else list(reversed(topo))
+            best_index = len(ranked) // 2
+            best = ranked[best_index] if ranked else next(iter(candidates))
+            best_distance = min(best_index, max(0, n - best_index - 1))
+        else:
+            positions = {c_sha: i for i, c_sha in enumerate(sorted(candidates))}
+            reachable: dict[str, int] = {}
+            for c_sha in reversed(topo):
+                r = 1 << positions[c_sha]
+                for p in parents_map.get(c_sha, []):
+                    r |= reachable[p]
+                reachable[c_sha] = r
+
+            best = None
+            best_distance = -1
+            for c_sha in sorted(candidates):  # stable for ties
+                w = reachable.get(c_sha, 1 << positions[c_sha]).bit_count()
+                distance = min(w, n - w)
+                if distance > best_distance:
+                    best_distance = distance
+                    best = c_sha
+            if best is None:
+                best = next(iter(candidates))
         _print(f"Bisecting: {n // 2} revisions left to test after this (roughly {best_distance} steps)")
         _print(f"[{best}] candidate")
         t, d = objs.read_object(repo, best)
@@ -2554,7 +2479,7 @@ def cmd_worktree(argv: list[str]) -> int:
         (target_dir / ".git").write_text(f"gitdir: {wt_dir}\n", encoding="utf-8")
         t, data = objs.read_object(repo, sha)
         tree = objs.parse_commit(data).tree if t == "commit" else sha
-        for path, bsha in workdir.flatten_tree(repo, tree).items():
+        for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
             _, blob = objs.read_object(repo, bsha)
             full = target_dir / path
             full.parent.mkdir(parents=True, exist_ok=True)
@@ -2739,16 +2664,17 @@ def cmd_whatchanged(argv: list[str]) -> int:
         _print("")
         if c.parents:
             parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-            a = workdir.flatten_tree(repo, parent_tree)
-            b = workdir.flatten_tree(repo, c.tree)
-            for p in sorted(set(a) | set(b)):
-                if a.get(p) != b.get(p):
-                    if p not in a:
-                        _print(f":000000 100644 0000000 {b[p][:7]} A\t{p}")
-                    elif p not in b:
-                        _print(f":100644 000000 {a[p][:7]} 0000000 D\t{p}")
-                    else:
-                        _print(f":100644 100644 {a[p][:7]} {b[p][:7]} M\t{p}")
+            for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree, c.tree):
+                a_sha = a_entry.sha if a_entry else None
+                b_sha = b_entry.sha if b_entry else None
+                if a_sha == b_sha:
+                    continue
+                if a_sha is None and b_sha is not None:
+                    _print(f":000000 100644 0000000 {b_sha[:7]} A\t{p}")
+                elif b_sha is None and a_sha is not None:
+                    _print(f":100644 000000 {a_sha[:7]} 0000000 D\t{p}")
+                elif a_sha is not None and b_sha is not None:
+                    _print(f":100644 100644 {a_sha[:7]} {b_sha[:7]} M\t{p}")
             _print("")
         sha = c.parents[0] if c.parents else None
     return 0
@@ -3003,17 +2929,17 @@ def cmd_cherry(argv: list[str]) -> int:
             return hashlib.sha1(c.tree.encode()).hexdigest()
         parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
         from . import diff as _d
-        a = workdir.flatten_tree(repo, parent_tree)
-        b = workdir.flatten_tree(repo, c.tree)
         h = hashlib.sha1()
-        for p in sorted(set(a) | set(b)):
-            if a.get(p) == b.get(p):
+        for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree, c.tree):
+            a_sha = a_entry.sha if a_entry else None
+            b_sha = b_entry.sha if b_entry else None
+            if a_sha == b_sha:
                 continue
             at = bt = ""
-            if a.get(p):
-                at = objs.read_object(repo, a[p])[1].decode("utf-8", errors="replace")
-            if b.get(p):
-                bt = objs.read_object(repo, b[p])[1].decode("utf-8", errors="replace")
+            if a_sha:
+                at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
+            if b_sha:
+                bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
             h.update(_d.unified_diff(at, bt, p, p).encode("utf-8", errors="replace"))
         return h.hexdigest()
 
@@ -3215,7 +3141,7 @@ def cmd_fast_export(argv: list[str]) -> int:
     # emit blobs first
     for cs in order:
         c = objs.parse_commit(objs.read_object(repo, cs)[1])
-        for path, bsha in workdir.flatten_tree(repo, c.tree).items():
+        for _path, _mode, bsha in workdir.iter_tree_files(repo, c.tree):
             if bsha in blob_mark:
                 continue
             _, data = objs.read_object(repo, bsha)
@@ -3245,7 +3171,7 @@ def cmd_fast_export(argv: list[str]) -> int:
                 _print(f"merge :{commit_mark[p]}")
         # files: deleteall + M for each file
         _print("deleteall")
-        for path, bsha in sorted(workdir.flatten_tree(repo, c.tree).items()):
+        for path, _mode, bsha in workdir.iter_tree_files(repo, c.tree):
             _print(f"M 100644 :{blob_mark[bsha]} {path}")
         _print("")
         next_mark += 1
@@ -3350,8 +3276,7 @@ def cmd_fast_import(argv: list[str]) -> int:
             # build tree from files
             if parents and not deleted_all:
                 parent_tree = objs.parse_commit(objs.read_object(repo, parents[0])[1]).tree
-                inherited = workdir.flatten_tree(repo, parent_tree)
-                for p, s in inherited.items():
+                for p, mode, s in workdir.iter_tree_files(repo, parent_tree):
                     files.setdefault(p, ("100644", s))
             from .index import Index, IndexEntry, REG_MODE, write_index, read_index
             saved_idx = read_index(repo) if (repo.gitdir / "index").exists() else None
@@ -4036,35 +3961,39 @@ def cmd_diff_tree(argv: list[str]) -> int:
         b_tree = _resolve_to_tree(args.rev2)
     if not b_tree:
         return 128
-    a = workdir.flatten_tree(repo, a_tree) if a_tree else {}
-    b = workdir.flatten_tree(repo, b_tree)
-    for p in sorted(set(a) | set(b)):
-        if a.get(p) == b.get(p):
+    changes = list(workdir.iter_tree_changes(repo, a_tree, b_tree))
+    for p, a_entry, b_entry in changes:
+        a_sha = a_entry.sha if a_entry else None
+        b_sha = b_entry.sha if b_entry else None
+        a_mode = a_entry.mode if a_entry else "100644"
+        b_mode = b_entry.mode if b_entry else "100644"
+        if a_sha == b_sha and a_mode == b_mode:
             continue
         if args.name_only:
             _print(p)
         elif args.name_status:
-            if p not in a:
+            if a_sha is None:
                 _print(f"A\t{p}")
-            elif p not in b:
+            elif b_sha is None:
                 _print(f"D\t{p}")
             else:
                 _print(f"M\t{p}")
         else:
-            ln = _raw_diff_status("100644", "100644",
-                                  a.get(p, None), b.get(p, None), p)
+            ln = _raw_diff_status(a_mode, b_mode, a_sha, b_sha, p)
             if ln:
                 _print(ln)
     if args.patch:
         from . import diff as _d
-        for p in sorted(set(a) | set(b)):
-            if a.get(p) == b.get(p):
+        for p, a_entry, b_entry in changes:
+            a_sha = a_entry.sha if a_entry else None
+            b_sha = b_entry.sha if b_entry else None
+            if a_sha == b_sha:
                 continue
             at = bt = ""
-            if a.get(p):
-                at = objs.read_object(repo, a[p])[1].decode("utf-8", errors="replace")
-            if b.get(p):
-                bt = objs.read_object(repo, b[p])[1].decode("utf-8", errors="replace")
+            if a_sha:
+                at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
+            if b_sha:
+                bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
             out = _d.unified_diff(at, bt, f"a/{p}", f"b/{p}")
             if out:
                 _print(f"diff --git a/{p} b/{p}")
@@ -4111,7 +4040,7 @@ def cmd_diff_index(argv: list[str]) -> int:
     t, data = objs.read_object(repo, tsha)
     if t == "commit":
         tsha = objs.parse_commit(data).tree
-    tree_map = workdir.flatten_tree(repo, tsha)
+    tree_map = {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, tsha)}
     from .index import read_index
     idx = read_index(repo).by_path()
     for p in sorted(set(tree_map) | set(idx)):
@@ -4480,18 +4409,18 @@ def _patch_id_for_commit(repo: Repository, sha: str) -> str:
     parent_tree = ""
     if c.parents:
         parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-    a = workdir.flatten_tree(repo, parent_tree) if parent_tree else {}
-    b = workdir.flatten_tree(repo, c.tree)
     from . import diff as _d
     h = hashlib.sha1()
-    for p in sorted(set(a) | set(b)):
-        if a.get(p) == b.get(p):
+    for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree or None, c.tree):
+        a_sha = a_entry.sha if a_entry else None
+        b_sha = b_entry.sha if b_entry else None
+        if a_sha == b_sha:
             continue
         at = bt = ""
-        if a.get(p):
-            at = objs.read_object(repo, a[p])[1].decode("utf-8", errors="replace")
-        if b.get(p):
-            bt = objs.read_object(repo, b[p])[1].decode("utf-8", errors="replace")
+        if a_sha:
+            at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
+        if b_sha:
+            bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
         h.update(_d.unified_diff(at, bt, p, p).encode("utf-8", errors="replace"))
     return h.hexdigest()
 
@@ -4590,8 +4519,19 @@ def cmd_fetch_pack(argv: list[str]) -> int:
     wants = sorted({remote_refs[r] for r in wanted if r in remote_refs})
     if not wants:
         return 1
-    raw = protocol.fetch_pack(args.url, wants)
-    _p.unpack_pack(repo, raw)
+    import tempfile
+
+    tmp_pack = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pygit-fetch-pack-", suffix=".pack", delete=False) as tmp:
+            tmp_pack = tmp.name
+        protocol.fetch_pack_to_file(args.url, wants, Path(tmp_pack))
+        _p.install_pack_file(repo, Path(tmp_pack))
+        tmp_pack = None
+    finally:
+        if tmp_pack:
+            Path(tmp_pack).unlink(missing_ok=True)
+            Path(tmp_pack).with_suffix(".idx").unlink(missing_ok=True)
     for r in wanted:
         if r in remote_refs:
             _print(f"{remote_refs[r]} {r}")
@@ -4854,12 +4794,18 @@ def cmd_diff_pairs(argv: list[str]) -> int:
         if len(parts) < 2:
             continue
         a, b = parts[0], parts[1]
-        am = workdir.flatten_tree(repo, a)
-        bm = workdir.flatten_tree(repo, b)
-        for p in sorted(set(am) | set(bm)):
-            if am.get(p) == bm.get(p):
+        for p, a_entry, b_entry in workdir.iter_tree_changes(repo, a, b):
+            a_sha = a_entry.sha if a_entry else None
+            b_sha = b_entry.sha if b_entry else None
+            if a_sha == b_sha:
                 continue
-            ln = _raw_diff_status("100644", "100644", am.get(p), bm.get(p), p)
+            ln = _raw_diff_status(
+                a_entry.mode if a_entry else "100644",
+                b_entry.mode if b_entry else "100644",
+                a_sha,
+                b_sha,
+                p,
+            )
             if ln:
                 _print(ln)
     return 0

@@ -81,6 +81,82 @@ def test_build_pack_then_read_back(tmprepo):
         assert t == "blob"
 
 
+def test_streaming_pack_writer_keeps_bounded_delta_compression(tmprepo):
+    repo, _ = tmprepo
+    from pythongit import objects as objs
+    blobs = []
+    text = "base\n"
+    for i in range(12):
+        text += f"line {i}\n"
+        blobs.append(objs.write_object(repo, "blob", text.encode()))
+    pack_dir = repo.gitdir / "objects" / "pack"
+    pack_path = pack_dir / "pack-stream.pack"
+    _pack_sha, entries = pack.write_pack_stream(repo, blobs, pack_path, batch_size=4, window=4)
+    idx_bytes = pack.write_idx_v2_from_checksum(pack_path.read_bytes()[-repo.hash_len:], entries, repo.object_format())
+    pack_path.with_suffix(".idx").write_bytes(idx_bytes)
+
+    raw = pack_path.read_bytes()
+    assert any(pack._read_var_size(raw, off)[0] == pack.OBJ_OFS_DELTA for _sha, off, _crc in entries)
+    pk = pack.Pack(pack_path, repo.object_format())
+    try:
+        for sha in blobs:
+            assert pk.get(sha)[0] == "blob"
+    finally:
+        pk.close()
+
+
+def test_install_pack_file_indexes_incoming_pack_without_loose_unpack(tmprepo, tmp_path):
+    from pythongit import objects as objs
+    from pythongit.repo import Repository
+
+    src, _ = tmprepo
+    dest = Repository.init(tmp_path / "dest")
+    blobs = [objs.write_object(src, "blob", f"incoming {i}\n".encode()) for i in range(8)]
+    raw, _entries = pack.build_pack(src, blobs)
+    incoming = tmp_path / "incoming.pack"
+    incoming.write_bytes(raw)
+
+    pack_sha, pack_path, count = pack.install_pack_file(dest, incoming)
+
+    assert count == len(blobs)
+    assert pack_path.exists()
+    assert pack_path.with_suffix(".idx").exists()
+    assert pack_path.name == f"pack-{pack_sha}.pack"
+    for sha in blobs:
+        assert objs.read_object(dest, sha)[0] == "blob"
+        assert not (dest.gitdir / "objects" / sha[:2] / sha[2:]).exists()
+
+
+def test_install_pack_file_fixes_thin_ref_delta_pack(tmprepo, tmp_path):
+    import struct
+    import zlib
+    from pythongit import objects as objs
+
+    repo, _ = tmprepo
+    base_data = b"hello\n"
+    target_data = b"hello\nworld\n"
+    base_sha = objs.write_object(repo, "blob", base_data)
+    target_sha, _serialized = objs.hash_bytes("blob", target_data, repo)
+    delta = pack._compute_delta(base_data, target_data)
+    record = (
+        pack._encode_pack_object_header(pack.OBJ_REF_DELTA, len(delta))
+        + bytes.fromhex(base_sha)
+        + zlib.compress(delta)
+    )
+    body = b"PACK" + struct.pack(">II", 2, 1) + record
+    raw = body + repo.hash_bytes(body)
+    incoming = tmp_path / "thin.pack"
+    incoming.write_bytes(raw)
+
+    _pack_sha, _pack_path, count = pack.install_pack_file(repo, incoming)
+    (repo.gitdir / "objects" / base_sha[:2] / base_sha[2:]).unlink()
+    pack.clear_pack_cache(repo)
+
+    assert count == 2
+    assert objs.read_object(repo, base_sha) == ("blob", base_data)
+    assert objs.read_object(repo, target_sha) == ("blob", target_data)
+
+
 def test_real_git_verifies_our_pack(tmprepo):
     import subprocess, hashlib
     from conftest import real_git

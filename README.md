@@ -213,14 +213,20 @@ The reverse also holds: pythongit reads packs and indexes produced by real
 ### Object storage
 
 Loose objects under `.git/objects/<oid[:2]>/<oid[2:]>`, zlib-compressed. SHA-1
-and SHA-256 repositories are selected by `extensions.objectformat`. Pack objects
-live in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader mmaps pack files,
-binary-searches `.idx` tables, and handles both `REF_DELTA` (delta against a
-hex object-id base) and `OFS_DELTA` (delta against an earlier offset in the same
-pack). `pack.build_pack` also writes deltas: candidate bases come from a
-windowed search over recent same-type objects, accepted when the delta is at
-most half the raw size. Large CLI repacks stream non-delta pack records straight
-to disk instead of materializing the entire pack in Python memory.
+and SHA-256 repositories are selected by `extensions.objectformat`. Loose-object
+enumeration uses a persistent `.git/objects/info/pygit-loose-cache-v1` cache
+validated by fanout directory mtimes/sizes, so repeated `count-objects`,
+abbreviated-OID resolution, and pruning commands do not rewalk every loose
+object directory when nothing changed.
+
+Pack objects live in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader
+mmaps pack files, binary-searches `.idx` tables, and handles both `REF_DELTA`
+(delta against a hex object-id base) and `OFS_DELTA` (delta against an earlier
+offset in the same pack). Pack creation has two paths: `pack.build_pack` is the
+small in-memory builder used by tests and helper code, while CLI repacks,
+bundles, `pack-objects --stdout`, push requests, and upload-pack responses use
+a bounded-memory streaming writer that still emits OFS deltas against recent
+same-type bases.
 
 `pack-objects --all` and `repack` write pack `.bitmap` indexes for full
 reachable packs. `multi-pack-index write --bitmap` writes `RIDX`/`BTMP` chunks
@@ -274,8 +280,11 @@ post-image automatically.
 ### Bisect
 
 `bisect_step` follows git's `best_bisection`: for each candidate commit,
-compute `min(reachable_from_it, n - reachable_from_it)` and pick the maximum
-— i.e. the commit that splits the candidate DAG as evenly as possible.
+compute `min(reachable_from_it, n - reachable_from_it)` and pick the maximum;
+that is, the commit that splits the candidate DAG as evenly as possible. Parent
+lookups use the commit-graph when present. For very large candidate sets,
+`pygit` switches from exact transitive bitsets to a bounded-memory
+generation/topological median so bisect remains usable on large histories.
 
 ### Pack writer (delta compression)
 
@@ -283,7 +292,12 @@ compute `min(reachable_from_it, n - reachable_from_it)` and pick the maximum
 then sweeps the target looking for matches >= 4 bytes long. Matches become
 `COPY` ops; misses are accumulated into `INSERT` ops capped at 127 bytes each.
 The encoder is conservative: it accepts a delta only when it's at most 50% of
-raw size, keeping the chain length sensible.
+raw size, keeping the chain length sensible. The streaming writer processes
+bounded batches sorted by type/size and keeps only a small recent-base window,
+so large pack creation no longer requires all object contents or the final pack
+bytes in memory. Incoming fetch/receive packs are streamed to a temporary file,
+mmap-indexed from disk, and installed as pack/idx pairs; thin packs are fixed by
+appending missing bases before the final index is written.
 
 ### Binary commit-graph
 
@@ -312,14 +326,18 @@ work for commits that definitely did not touch the requested path.
 ### Smart HTTPS
 
 `protocol.discover_refs` calls `GET /info/refs?service=git-upload-pack`,
-strips the pkt-line framing, and returns the ref map. `protocol.fetch_pack`
-posts `want <sha>` lines + capability list and parses the side-band-encoded
-pack response. `protocol.push` does the receive-pack flow including building
-a non-thin pack of only-new objects and parsing `ok/ng` lines.
+strips the pkt-line framing, and returns the ref map. Fetch/clone stream the
+side-band-encoded pack response directly into the pack indexer instead of
+building one large response buffer. `protocol.push` does the receive-pack flow
+including streaming a non-thin pack of only-new objects from a temporary pack
+file and parsing `ok/ng` lines.
 
 The `daemon` command serves the same flow over a raw TCP socket (git:// at
-port 9418), implemented with `socketserver.ThreadingTCPServer`. `http-backend`
-is an in-process variant used by `instaweb`.
+port 9418), implemented with `socketserver.ThreadingTCPServer`. Upload-pack
+responses stream side-band pack chunks instead of assembling the full response
+body. `http-backend` is an in-process variant used by `instaweb`; the web server
+uses the streaming backend for upload-pack responses and receive-pack request
+bodies.
 
 ## Testing
 
@@ -328,16 +346,16 @@ pip install pythongit[test]
 pytest
 ```
 
-93 tests pass:
+99 tests pass:
 
 | File                    | Coverage |
 |-------------------------|----------|
 | `unit_objects.py`       | hash, encode/decode, signatures, gitlinks |
 | `unit_refs.py`          | symbolic refs, reflog, packed-refs, abbrev SHA |
 | `unit_index.py`         | DIRC v2 roundtrip, conflict stages, long paths |
-| `unit_pack.py`          | delta apply, idx v2, build_pack, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
+| `unit_pack.py`          | delta apply, idx v2, build_pack, inbound pack indexing, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
 | `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP unit-level |
-| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rerere replay, SHA-256 translation |
+| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 
 Tests that require the real `git` binary are silently skipped when it's not on
@@ -354,13 +372,13 @@ PATH, so the suite runs cleanly in containers without one.
 
 * Big repos: packed repositories now use mmap-backed pack reads, binary MIDX
   lookup, pack/MIDX bitmaps, commit-graph parent/tree lookup, changed-path
-  Bloom filters, and streaming on-disk repacks. The remaining scale-sensitive
-  cases are loose-object-heavy repositories without maintenance data, commands
-  that inherently inspect every path or blob, and smart-protocol paths that
-  still assemble response packs in memory.
-* The `bisect` heuristic computes exact candidate weights with iterative
-  bitsets. It avoids Python recursion, but very large candidate DAGs can still
-  spend noticeable CPU and memory on transitive reachability.
+  Bloom filters, cached loose-object enumeration, and bounded-memory streaming
+  pack generation/indexing. Tree-diff commands skip identical subtrees. The
+  remaining scale-sensitive cases are commands whose output inherently requires
+  inspecting every path or blob.
+* `bisect` computes exact candidate weights for ordinary ranges. Above a large
+  threshold it uses a bounded-memory generation/topological median, so the pick
+  may differ from C Git's exact best bisection on unusually large DAGs.
 * `fsmonitor` uses polling, not OS-level inotify/fsevent. Configurable
   interval; not free.
 * `send-email` uses `smtplib` with plain SMTP, STARTTLS/TLS, and SMTP-over-SSL.

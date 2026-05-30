@@ -18,14 +18,17 @@ Index format (.idx v2):
 from __future__ import annotations
 
 import bisect
+import binascii
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import mmap
 import os
 import struct
+import tempfile
 import zlib
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .repo import Repository
 
@@ -38,6 +41,7 @@ OBJ_OFS_DELTA = 6
 OBJ_REF_DELTA = 7
 
 _TYPE_NAME = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
+_TYPE_ID = {"commit": 1, "tree": 2, "blob": 3, "tag": 4}
 _BITMAP_TYPE_ORDER = ("commit", "tree", "blob", "tag")
 
 
@@ -177,20 +181,57 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
     return bytes(out)
 
 
-def _decompress_from(data, pos: int) -> bytes:
+def _decompress_from_with_consumed(data, pos: int, *, keep: bool = True) -> tuple[bytes, int]:
     decomp = zlib.decompressobj()
-    out = bytearray()
+    out = bytearray() if keep else None
     step = 64 * 1024
     cur = pos
     while True:
         chunk = data[cur : cur + step]
         if not chunk:
             raise zlib.error("truncated compressed stream")
-        out += decomp.decompress(chunk)
+        part = decomp.decompress(chunk)
+        if out is not None:
+            out += part
         if decomp.unused_data or decomp.eof:
+            consumed = (cur - pos) + len(chunk) - len(decomp.unused_data)
             break
         cur += len(chunk)
-    return bytes(out)
+    return (bytes(out) if out is not None else b""), consumed
+
+
+def _decompress_from(data, pos: int) -> bytes:
+    out, _consumed = _decompress_from_with_consumed(data, pos)
+    return out
+
+
+def _crc32_range(data, start: int, end: int) -> int:
+    crc = 0
+    cur = start
+    step = 1024 * 1024
+    while cur < end:
+        chunk = data[cur : min(end, cur + step)]
+        crc = binascii.crc32(chunk, crc)
+        cur += len(chunk)
+    return crc & 0xFFFFFFFF
+
+
+def _hash_range(repo: Repository, data, start: int, end: int) -> bytes:
+    h = repo.new_hash()
+    cur = start
+    step = 1024 * 1024
+    while cur < end:
+        chunk = data[cur : min(end, cur + step)]
+        h.update(chunk)
+        cur += len(chunk)
+    return h.digest()
+
+
+def _repo_from_pack_path(pack_path: Path) -> Repository:
+    gitdir = pack_path.parent.parent.parent
+    if gitdir.name == ".git":
+        return Repository(gitdir.parent, gitdir=gitdir)
+    return Repository(gitdir, gitdir=gitdir, bare=True)
 
 
 class Pack:
@@ -262,11 +303,11 @@ class Pack:
             delta = _decompress_from(data, pos)
             base = self.get(base_sha)
             if base is None:
-                # cross-pack lookup
-                from .objects import read_object  # local import to avoid cycle
                 base = read_object_via_loose_only(self.pack_path.parents[1].parent, base_sha)
                 if base is None:
-                    raise KeyError(base_sha)
+                    from .objects import read_object  # local import to avoid cycle
+
+                    base = read_object(_repo_from_pack_path(self.pack_path), base_sha)
             base_type, base_data = base
             return base_type, apply_delta(base_data, delta)
         raise ValueError(f"unknown object type {obj_type}")
@@ -701,59 +742,331 @@ def resolve_short(repo: Repository, prefix: str) -> Optional[str]:
 # pack -> loose unpacker (used by clone)
 
 
+@dataclass
+class _PackObjectMeta:
+    offset: int
+    obj_type: int
+    payload_pos: int
+    end: int
+    crc: int
+    base_offset: Optional[int] = None
+    base_sha: Optional[str] = None
+
+
+@dataclass
+class _PackIndexData:
+    count: int
+    checksum: bytes
+    entries: list[tuple[str, int, int]]
+    ref_bases: set[str]
+    object_shas: set[str]
+
+
+def _parse_pack_metadata(repo: Repository, data) -> tuple[int, bytes, dict[int, _PackObjectMeta], list[int], set[str]]:
+    if data[:4] != b"PACK":
+        raise ValueError("not a pack")
+    version, count = struct.unpack(">II", data[4:12])
+    if version != 2:
+        raise ValueError(f"unsupported pack version {version}")
+    trailer_pos = len(data) - repo.hash_len
+    if trailer_pos < 12:
+        raise ValueError("truncated pack")
+    expected = bytes(data[trailer_pos:])
+    actual = _hash_range(repo, data, 0, trailer_pos)
+    if actual != expected:
+        raise ValueError("pack checksum mismatch")
+
+    pos = 12
+    metas: dict[int, _PackObjectMeta] = {}
+    offsets: list[int] = []
+    ref_bases: set[str] = set()
+    for _i in range(count):
+        if pos >= trailer_pos:
+            raise ValueError("pack ended before declared object count")
+        start = pos
+        obj_type, _size, p = _read_var_size(data, pos)
+        pos = p
+        base_offset = None
+        base_sha = None
+        if obj_type in (OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG):
+            payload_pos = pos
+        elif obj_type == OBJ_OFS_DELTA:
+            neg, pos = _read_offset(data, pos)
+            base_offset = start - neg
+            payload_pos = pos
+        elif obj_type == OBJ_REF_DELTA:
+            base_sha = data[pos : pos + repo.hash_len].hex()
+            ref_bases.add(base_sha)
+            pos += repo.hash_len
+            payload_pos = pos
+        else:
+            raise ValueError(f"unknown pack object type {obj_type}")
+        _payload, consumed = _decompress_from_with_consumed(data, payload_pos, keep=False)
+        pos = payload_pos + consumed
+        if pos > trailer_pos:
+            raise ValueError("pack object extends past checksum trailer")
+        metas[start] = _PackObjectMeta(
+            offset=start,
+            obj_type=obj_type,
+            payload_pos=payload_pos,
+            end=pos,
+            crc=_crc32_range(data, start, pos),
+            base_offset=base_offset,
+            base_sha=base_sha,
+        )
+        offsets.append(start)
+    if pos != trailer_pos:
+        raise ValueError("pack has trailing bytes before checksum")
+    return count, expected, metas, offsets, ref_bases
+
+
+def _collect_pack_index_data(
+    repo: Repository,
+    data,
+    *,
+    on_object: Optional[Callable[[str, str, bytes], None]] = None,
+    cache_bytes_limit: int = 64 * 1024 * 1024,
+) -> _PackIndexData:
+    from . import objects as objs
+
+    count, checksum, metas, offsets, ref_bases = _parse_pack_metadata(repo, data)
+    sha_to_offset: dict[str, int] = {}
+    entries: list[tuple[str, int, int]] = []
+    object_shas: set[str] = set()
+    emitted: set[int] = set()
+    cache: OrderedDict[int, tuple[str, bytes]] = OrderedDict()
+    cache_bytes = 0
+
+    def cache_get(offset: int) -> Optional[tuple[str, bytes]]:
+        cached = cache.get(offset)
+        if cached is not None:
+            cache.move_to_end(offset)
+        return cached
+
+    def cache_put(offset: int, obj_type: str, payload: bytes) -> None:
+        nonlocal cache_bytes
+        if len(payload) > cache_bytes_limit:
+            return
+        old = cache.pop(offset, None)
+        if old is not None:
+            cache_bytes -= len(old[1])
+        cache[offset] = (obj_type, payload)
+        cache_bytes += len(payload)
+        while cache_bytes > cache_bytes_limit and cache:
+            _old_offset, (_old_type, old_payload) = cache.popitem(last=False)
+            cache_bytes -= len(old_payload)
+
+    def decode_at(offset: int, stack: tuple[int, ...] = ()) -> tuple[str, bytes]:
+        cached = cache_get(offset)
+        if cached is not None:
+            return cached
+        if offset in stack:
+            raise ValueError("cyclic delta chain")
+        meta = metas[offset]
+        if meta.obj_type in (OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG):
+            obj_type = _TYPE_NAME[meta.obj_type]
+            payload, _consumed = _decompress_from_with_consumed(data, meta.payload_pos)
+        elif meta.obj_type == OBJ_OFS_DELTA:
+            if meta.base_offset is None or meta.base_offset not in metas:
+                raise KeyError(f"missing OFS_DELTA base at {meta.base_offset}")
+            obj_type, base_payload = decode_at(meta.base_offset, stack + (offset,))
+            delta, _consumed = _decompress_from_with_consumed(data, meta.payload_pos)
+            payload = apply_delta(base_payload, delta)
+        elif meta.obj_type == OBJ_REF_DELTA:
+            if meta.base_sha is None:
+                raise KeyError("missing REF_DELTA base")
+            base_offset = sha_to_offset.get(meta.base_sha)
+            if base_offset is not None and base_offset != offset:
+                obj_type, base_payload = decode_at(base_offset, stack + (offset,))
+            else:
+                obj_type, base_payload = objs.read_object(repo, meta.base_sha)
+            delta, _consumed = _decompress_from_with_consumed(data, meta.payload_pos)
+            payload = apply_delta(base_payload, delta)
+        else:
+            raise ValueError(f"unknown pack object type {meta.obj_type}")
+        sha, _serialized = objs.hash_bytes(obj_type, payload, repo)
+        sha_to_offset.setdefault(sha, offset)
+        cache_put(offset, obj_type, payload)
+        return obj_type, payload
+
+    pending = list(offsets)
+    last_error: Optional[BaseException] = None
+    while pending:
+        next_pending: list[int] = []
+        progressed = False
+        for offset in pending:
+            try:
+                obj_type, payload = decode_at(offset)
+            except KeyError as exc:
+                last_error = exc
+                next_pending.append(offset)
+                continue
+            sha, _serialized = objs.hash_bytes(obj_type, payload, repo)
+            sha_to_offset.setdefault(sha, offset)
+            object_shas.add(sha)
+            entries.append((sha, offset, metas[offset].crc))
+            if on_object is not None and offset not in emitted:
+                on_object(sha, obj_type, payload)
+                emitted.add(offset)
+            progressed = True
+        if not progressed:
+            if last_error is not None:
+                raise last_error
+            raise ValueError("could not resolve pack deltas")
+        pending = next_pending
+    entries.sort(key=lambda item: item[1])
+    return _PackIndexData(count, checksum, entries, ref_bases, object_shas)
+
+
+def _append_thin_bases(repo: Repository, pack_path: Path, base_shas: list[str]) -> None:
+    from . import objects as objs
+
+    if not base_shas:
+        return
+    tmp_name = ""
+    with pack_path.open("rb") as src:
+        header = src.read(12)
+        if header[:4] != b"PACK":
+            raise ValueError("not a pack")
+        version, count = struct.unpack(">II", header[4:12])
+        src.seek(0, os.SEEK_END)
+        size = src.tell()
+        body_end = size - repo.hash_len
+        src.seek(12)
+        fd, tmp_name = tempfile.mkstemp(prefix=pack_path.name + ".", suffix=".tmp", dir=str(pack_path.parent))
+        try:
+            with os.fdopen(fd, "wb") as out:
+                h = repo.new_hash()
+
+                def write_hashed(chunk: bytes) -> None:
+                    out.write(chunk)
+                    h.update(chunk)
+
+                write_hashed(b"PACK" + struct.pack(">II", version, count + len(base_shas)))
+                remaining = body_end - 12
+                while remaining > 0:
+                    chunk = src.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("truncated pack while fixing thin pack")
+                    write_hashed(chunk)
+                    remaining -= len(chunk)
+                for sha in base_shas:
+                    obj_type, payload = objs.read_object(repo, sha)
+                    if obj_type not in _TYPE_ID:
+                        raise ValueError(f"unsupported thin-pack base type {obj_type}")
+                    write_hashed(_pack_plain_record(obj_type, payload))
+                out.write(h.digest())
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    os.replace(tmp_name, pack_path)
+
+
+def _pack_index_data_from_file(
+    repo: Repository,
+    pack_path: Path,
+    *,
+    on_object: Optional[Callable[[str, str, bytes], None]] = None,
+) -> _PackIndexData:
+    with pack_path.open("rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            return _collect_pack_index_data(repo, mm, on_object=on_object)
+
+
+def index_pack_file(repo: Repository, pack_path: Path) -> tuple[str, list[tuple[str, int, int]]]:
+    """Create a v2 ``.idx`` next to ``pack_path`` without loading the pack file."""
+    pack_path = Path(pack_path)
+    data = _pack_index_data_from_file(repo, pack_path)
+    idx = write_idx_v2_from_checksum(data.checksum, data.entries, repo.object_format())
+    pack_path.with_suffix(".idx").write_bytes(idx)
+    clear_pack_cache(repo)
+    return data.checksum.hex(), data.entries
+
+
+def install_pack_file(repo: Repository, pack_path: Path, *, fix_thin: bool = True) -> tuple[str, Path, int]:
+    """Index and install an incoming pack under ``objects/pack``.
+
+    Thin packs are made self-contained by appending the missing base objects as
+    plain records before the final index is written.
+    """
+    pack_path = Path(pack_path)
+    if fix_thin:
+        while True:
+            data = _pack_index_data_from_file(repo, pack_path)
+            missing_bases = sorted(data.ref_bases - data.object_shas)
+            if not missing_bases:
+                break
+            _append_thin_bases(repo, pack_path, missing_bases)
+    pack_sha, entries = index_pack_file(repo, pack_path)
+    pack_dir = repo.gitdir / "objects" / "pack"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    dest_pack = pack_dir / f"pack-{pack_sha}.pack"
+    dest_idx = pack_dir / f"pack-{pack_sha}.idx"
+    tmp_idx = pack_path.with_suffix(".idx")
+    if pack_path.resolve() != dest_pack.resolve():
+        if dest_pack.exists():
+            pack_path.unlink(missing_ok=True)
+        else:
+            os.replace(pack_path, dest_pack)
+    if tmp_idx.resolve() != dest_idx.resolve():
+        if dest_idx.exists():
+            tmp_idx.unlink(missing_ok=True)
+        else:
+            os.replace(tmp_idx, dest_idx)
+    clear_pack_cache(repo)
+    return pack_sha, dest_pack, len(entries)
+
+
+def unpack_pack_file(repo: Repository, pack_path: Path) -> int:
+    """Decompose a pack file into loose objects without reading the pack at once."""
+    from . import objects as objs
+
+    count = 0
+
+    def write_loose(_sha: str, obj_type: str, payload: bytes) -> None:
+        nonlocal count
+        objs.write_object(repo, obj_type, payload)
+        count += 1
+
+    _pack_index_data_from_file(repo, Path(pack_path), on_object=write_loose)
+    return count
+
+
+def unpack_pack_stream(repo: Repository, source) -> int:
+    """Read a pack stream from a file-like object and unpack it as loose objects."""
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pygit-unpack-", suffix=".pack", delete=False) as tmp:
+            tmp_name = tmp.name
+            while True:
+                chunk = source.read(256 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        return unpack_pack_file(repo, Path(tmp_name))
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def unpack_pack(repo: Repository, pack_bytes: bytes) -> int:
     """Decompose a pack into loose objects in the repo. Returns object count."""
     from . import objects as objs
 
-    if pack_bytes[:4] != b"PACK":
-        raise ValueError("not a pack")
-    _, count = struct.unpack(">II", pack_bytes[4:12])
-    pos = 12
+    count = 0
 
-    by_offset: dict[int, tuple[str, bytes]] = {}
-    by_sha: dict[str, tuple[str, bytes]] = {}
+    def write_loose(_sha: str, obj_type: str, payload: bytes) -> None:
+        nonlocal count
+        objs.write_object(repo, obj_type, payload)
+        count += 1
 
-    for _i in range(count):
-        start = pos
-        obj_type, _size, p = _read_var_size(pack_bytes, pos)
-        pos = p
-        if obj_type in (OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG):
-            decomp = zlib.decompressobj()
-            payload = decomp.decompress(pack_bytes[pos:])
-            consumed = len(pack_bytes) - pos - len(decomp.unused_data)
-            pos += consumed
-            t = _TYPE_NAME[obj_type]
-            by_offset[start] = (t, payload)
-            sha = objs.write_object(repo, t, payload)
-            by_sha[sha] = (t, payload)
-        elif obj_type == OBJ_OFS_DELTA:
-            neg, p2 = _read_offset(pack_bytes, pos)
-            pos = p2
-            base_off = start - neg
-            decomp = zlib.decompressobj()
-            delta = decomp.decompress(pack_bytes[pos:])
-            consumed = len(pack_bytes) - pos - len(decomp.unused_data)
-            pos += consumed
-            base = by_offset[base_off]
-            full = apply_delta(base[1], delta)
-            by_offset[start] = (base[0], full)
-            sha = objs.write_object(repo, base[0], full)
-            by_sha[sha] = (base[0], full)
-        elif obj_type == OBJ_REF_DELTA:
-            base_sha = pack_bytes[pos : pos + repo.hash_len].hex()
-            pos += repo.hash_len
-            decomp = zlib.decompressobj()
-            delta = decomp.decompress(pack_bytes[pos:])
-            consumed = len(pack_bytes) - pos - len(decomp.unused_data)
-            pos += consumed
-            base = by_sha.get(base_sha) or objs.read_object(repo, base_sha)
-            full = apply_delta(base[1], delta)
-            by_offset[start] = (base[0], full)
-            sha = objs.write_object(repo, base[0], full)
-            by_sha[sha] = (base[0], full)
-        else:
-            raise ValueError(f"unknown pack object type {obj_type}")
-
+    _collect_pack_index_data(repo, pack_bytes, on_object=write_loose)
     return count
 
 
@@ -827,42 +1140,146 @@ def _encode_pack_object_header(obj_type: int, size: int) -> bytes:
     return bytes(hdr)
 
 
-def write_pack_stream(
+def _encode_ofs_delta_offset(negative_offset: int) -> bytes:
+    ofs_buf = bytearray()
+    ofs_buf.append(negative_offset & 0x7F)
+    negative_offset >>= 7
+    while negative_offset:
+        negative_offset -= 1
+        ofs_buf.append(0x80 | (negative_offset & 0x7F))
+        negative_offset >>= 7
+    ofs_buf.reverse()
+    return bytes(ofs_buf)
+
+
+def _pack_plain_record(obj_type: str, data: bytes) -> bytes:
+    return _encode_pack_object_header(_TYPE_ID[obj_type], len(data)) + zlib.compress(data)
+
+
+def _pack_delta_record(offset: int, base_offset: int, delta: bytes) -> bytes:
+    return (
+        _encode_pack_object_header(OBJ_OFS_DELTA, len(delta))
+        + _encode_ofs_delta_offset(offset - base_offset)
+        + zlib.compress(delta)
+    )
+
+
+def write_pack_stream_to(
     repo: Repository,
     shas: list[str],
-    pack_path: Path,
+    write: Callable[[bytes], None],
+    *,
+    collect_entries: bool = True,
+    delta: bool = True,
+    batch_size: int = 4096,
+    batch_bytes: int = 64 * 1024 * 1024,
+    window: int = 8,
 ) -> tuple[str, list[tuple[str, int, int]]]:
-    """Write a non-delta pack without materializing the whole pack in memory."""
+    """Write a pack to an arbitrary sink with bounded memory.
+
+    Objects are processed in bounded batches, sorted by type and size inside
+    each batch, and delta-compressed against recently-written same-type bases.
+    Bases are capped by size and window count so large repositories do not
+    require the whole object set in memory.
+    """
     import binascii
 
     from . import objects as objs
 
-    type_id = {"commit": 1, "tree": 2, "blob": 3, "tag": 4}
-    pack_path = Path(pack_path)
-    pack_path.parent.mkdir(parents=True, exist_ok=True)
     entries: list[tuple[str, int, int]] = []
     hasher = repo.new_hash()
     offset = 0
+    base_windows: dict[str, list[tuple[int, bytes]]] = {name: [] for name in _TYPE_ID}
+    max_delta_size = 8 * 1024 * 1024
+    min_ratio = 0.5
 
-    with pack_path.open("wb") as fh:
-        def write(chunk: bytes) -> None:
-            nonlocal offset
-            fh.write(chunk)
-            hasher.update(chunk)
-            offset += len(chunk)
+    def write_hashed(chunk: bytes) -> None:
+        nonlocal offset
+        write(chunk)
+        hasher.update(chunk)
+        offset += len(chunk)
 
-        write(b"PACK" + struct.pack(">II", 2, len(shas)))
-        for sha in shas:
-            obj_type, data = objs.read_object(repo, sha)
-            if obj_type not in type_id:
+    def choose_delta(obj_type: str, data: bytes) -> Optional[tuple[int, bytes]]:
+        if not delta or not data or len(data) > max_delta_size:
+            return None
+        best: Optional[tuple[int, bytes]] = None
+        for base_offset, base_data in reversed(base_windows.get(obj_type, [])):
+            if not base_data or len(base_data) > max_delta_size:
+                continue
+            candidate = _compute_delta(base_data, data)
+            if len(candidate) <= min_ratio * len(data) and (
+                best is None or len(candidate) < len(best[1])
+            ):
+                best = (base_offset, candidate)
+        return best
+
+    def remember_base(obj_type: str, obj_offset: int, data: bytes) -> None:
+        if len(data) > max_delta_size:
+            return
+        bases = base_windows[obj_type]
+        bases.append((obj_offset, data))
+        if len(bases) > window:
+            del bases[: len(bases) - window]
+
+    def flush_batch(batch: list[tuple[str, str, bytes]]) -> None:
+        nonlocal offset
+        batch.sort(key=lambda item: (item[1], -len(item[2]), item[0]))
+        for sha, obj_type, data in batch:
+            if obj_type not in _TYPE_ID:
                 raise ValueError(f"unsupported object type {obj_type}")
             obj_offset = offset
-            record = _encode_pack_object_header(type_id[obj_type], len(data)) + zlib.compress(data)
-            write(record)
-            entries.append((sha, obj_offset, binascii.crc32(record) & 0xFFFFFFFF))
-        checksum = hasher.digest()
-        fh.write(checksum)
+            best = choose_delta(obj_type, data)
+            if best is None:
+                record = _pack_plain_record(obj_type, data)
+            else:
+                base_offset, delta_data = best
+                record = _pack_delta_record(obj_offset, base_offset, delta_data)
+            write_hashed(record)
+            if collect_entries:
+                entries.append((sha, obj_offset, binascii.crc32(record) & 0xFFFFFFFF))
+            remember_base(obj_type, obj_offset, data)
+
+    write_hashed(b"PACK" + struct.pack(">II", 2, len(shas)))
+    batch: list[tuple[str, str, bytes]] = []
+    current_bytes = 0
+    for sha in shas:
+        obj_type, data = objs.read_object(repo, sha)
+        batch.append((sha, obj_type, data))
+        current_bytes += len(data)
+        if len(batch) >= batch_size or current_bytes >= batch_bytes:
+            flush_batch(batch)
+            batch = []
+            current_bytes = 0
+    if batch:
+        flush_batch(batch)
+    checksum = hasher.digest()
+    write(checksum)
     return checksum.hex(), entries
+
+
+def write_pack_stream(
+    repo: Repository,
+    shas: list[str],
+    pack_path: Path,
+    *,
+    delta: bool = True,
+    batch_size: int = 4096,
+    batch_bytes: int = 64 * 1024 * 1024,
+    window: int = 8,
+) -> tuple[str, list[tuple[str, int, int]]]:
+    """Write a pack without materializing the whole pack in memory."""
+    pack_path = Path(pack_path)
+    pack_path.parent.mkdir(parents=True, exist_ok=True)
+    with pack_path.open("wb") as fh:
+        return write_pack_stream_to(
+            repo,
+            shas,
+            fh.write,
+            delta=delta,
+            batch_size=batch_size,
+            batch_bytes=batch_bytes,
+            window=window,
+        )
 
 
 @dataclass

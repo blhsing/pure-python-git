@@ -394,6 +394,65 @@ def test_rev_list_count_uses_bitmap_commit_filter(tmprepo, capsys):
     assert capsys.readouterr().out.strip() == "3"
 
 
+def test_loose_object_cache_backs_count_and_abbrev_resolution(tmprepo, monkeypatch):
+    from pythongit import loose
+
+    repo, _ = tmprepo
+    shas = [objs.write_object(repo, "blob", f"loose {i}\n".encode()) for i in range(20)]
+    count, size = loose.count_and_size(repo)
+    assert count >= 20
+    assert size > 0
+    assert (repo.gitdir / "objects" / "info" / "pygit-loose-cache-v1").exists()
+
+    loose.clear_cache(repo)
+
+    def fail_scan(_repo):
+        raise AssertionError("loose cache was not reused")
+
+    monkeypatch.setattr(loose, "_scan_entries", fail_scan)
+    assert loose.count_and_size(repo)[0] >= 20
+    assert refs.rev_parse(repo, shas[0][:8]) == shas[0]
+
+
+def test_http_backend_streams_upload_pack_response(tmprepo):
+    from tests.conftest import commit_one
+    from pythongit import bridges
+
+    repo, path = tmprepo
+    head = commit_one(repo, "a.txt", "one\n", "c1")
+
+    def pkt(payload: bytes) -> bytes:
+        return f"{len(payload) + 4:04x}".encode() + payload
+
+    body = pkt(f"want {head} side-band-64k\n".encode()) + b"0000" + pkt(b"done\n")
+    status, headers, chunks = bridges.http_backend_stream(
+        "POST",
+        f"/{path.name}/git-upload-pack",
+        body,
+        path.parent,
+    )
+    response = b"".join(chunks)
+    assert status == 200
+    assert headers["Content-Type"] == "application/x-git-upload-pack-result"
+    assert b"PACK" in response
+
+
+def test_diff_tree_uses_recursive_tree_changes(tmprepo, monkeypatch, capsys):
+    from tests.conftest import commit_one
+    from pythongit import workdir
+
+    repo, _ = tmprepo
+    c1 = commit_one(repo, "a.txt", "one\n", "c1")
+    c2 = commit_one(repo, "a.txt", "two\n", "c2")
+
+    def fail_flatten(*_args, **_kwargs):
+        raise AssertionError("diff-tree should not flatten whole trees")
+
+    monkeypatch.setattr(workdir, "flatten_tree", fail_flatten)
+    assert cli_run("diff-tree", "--name-status", c1, c2) == 0
+    assert "M\ta.txt" in capsys.readouterr().out
+
+
 def test_status_groups_correctly(tmprepo):
     from tests.conftest import commit_one
     from pythongit import workdir
