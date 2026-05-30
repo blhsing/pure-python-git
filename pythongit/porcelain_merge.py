@@ -41,20 +41,16 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
         workdir.checkout_tree(repo, tree)
         return other, []
 
-    # three-way merge
-    base_tree = objs.parse_commit(objs.read_object(repo, base)[1]).tree
-    head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
-    other_tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
-    from .sequencer import _apply_patch
-    new_tree, conflicts, conflict_idx = _apply_patch(
-        repo,
-        base_tree,
-        other_tree,
-        head_tree,
-        ort_base=base,
-        ort_ours="HEAD",
-        ort_theirs=other_rev,
-    )
+    # three-way merge — recursive ort (handles 1, 2+, or 0 merge bases via a
+    # virtual ancestor), matching `git merge`.
+    from . import ort as ort_mod
+    from .sequencer import _note_rerere_conflicts
+    ort_result = ort_mod.merge_commits(repo, "HEAD", other_rev)
+    new_tree = ort_result.tree
+    conflicts = ort_result.conflicts
+    conflict_idx = ort_result.conflict_index
+    if conflicts:
+        _note_rerere_conflicts(repo, new_tree, conflicts)
     workdir.checkout_tree(repo, new_tree)
     if conflicts:
         if conflict_idx is not None:

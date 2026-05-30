@@ -17,6 +17,7 @@ conservative resolution.
 """
 from __future__ import annotations
 
+import fnmatch
 import functools
 from dataclasses import dataclass, field
 from typing import Optional
@@ -49,6 +50,73 @@ def s_islnk(mode: int) -> bool:
     return (mode & S_IFMT) == S_IFLNK
 
 
+class MergeAttributes:
+    """Minimal .gitattributes evaluator for the ``merge`` and
+    ``conflict-marker-size`` attributes, mirroring git's per-path attribute
+    lookup for content merges."""
+
+    def __init__(self, rules: list):
+        # rules: list of (pattern, {attr_name: value}) in file order
+        self.rules = rules
+
+    @classmethod
+    def parse(cls, text: str) -> "MergeAttributes":
+        rules = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            pattern = parts[0]
+            attrs: dict = {}
+            for tok in parts[1:]:
+                if tok.startswith("-"):
+                    attrs[tok[1:]] = False
+                elif tok.startswith("!"):
+                    attrs[tok[1:]] = "unspecified"
+                elif "=" in tok:
+                    k, v = tok.split("=", 1)
+                    attrs[k] = v
+                else:
+                    attrs[tok] = True
+            rules.append((pattern, attrs))
+        return cls(rules)
+
+    def _lookup(self, path: str, attr: str):
+        value = None
+        for pattern, attrs in self.rules:
+            if attr in attrs and _attr_match(pattern, path):
+                value = attrs[attr]
+        return value
+
+    def driver(self, path: str) -> str:
+        v = self._lookup(path, "merge")
+        if v is False:
+            return "binary"          # -merge
+        if v in (None, True, "unspecified"):
+            return "text"
+        if v in ("text", "binary", "union"):
+            return v
+        return "text"                # custom/unknown driver -> built-in text
+
+    def marker_size(self, path: str) -> int:
+        v = self._lookup(path, "conflict-marker-size")
+        if isinstance(v, str) and v.isdigit():
+            n = int(v)
+            return n if n > 0 else xdiff.DEFAULT_CONFLICT_MARKER_SIZE
+        return xdiff.DEFAULT_CONFLICT_MARKER_SIZE
+
+
+def _attr_match(pattern: str, path: str) -> bool:
+    neg = False
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+        return fnmatch.fnmatch(path, pattern)
+    if "/" not in pattern:
+        return fnmatch.fnmatch(path.rsplit("/", 1)[-1], pattern)
+    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, "*/" + pattern)
+
+
 @dataclass
 class VersionInfo:
     mode: int = 0
@@ -75,7 +143,12 @@ class CI:
 
 
 class Opt:
-    def __init__(self, repo: Repository, ancestor: str, branch1: str, branch2: str):
+    def __init__(self, repo: Repository, ancestor: str, branch1: str, branch2: str,
+                 *, conflict_style: int = 0, variant: int = 0,
+                 xdl_flags: int = xdiff.XDF_HISTOGRAM_DIFF,
+                 attributes: Optional["MergeAttributes"] = None,
+                 rename_detection: bool = True, rename_limit: int = 7000,
+                 detect_directory_renames: int = 1):
         self.repo = repo
         self.ancestor = ancestor
         self.branch1 = branch1
@@ -85,10 +158,33 @@ class Opt:
         self.call_depth = 0
         self.null_oid = "0" * (repo.hash_len * 2)
         self._tree_cache: dict[str, dict] = {}
-        self.rename_limit = 7000
+        self.rename_limit = rename_limit
+        # merge configuration (parity-preserving defaults)
+        self.conflict_style = conflict_style       # 0 merge / 1 diff3 / 2 zdiff3
+        self.variant = variant                     # 0 / FAVOR_OURS / FAVOR_THEIRS
+        self.xdl_flags = xdl_flags                 # histogram (+ whitespace flags)
+        self.rename_detection = rename_detection
+        # 0 = false, 1 = conflict (default), 2 = true
+        self.detect_directory_renames = detect_directory_renames
+        self._attributes = attributes
+        self._submodule_cache: dict[str, Optional[Repository]] = {}
+        # rename-detection bookkeeping populated during collect_merge_info
+        self.relevant_sources: dict[int, set] = {1: set(), 2: set()}
+        self.dirs_removed_relevance: dict[int, dict] = {1: {}, 2: {}}
 
     def is_null(self, oid: str) -> bool:
         return oid == self.null_oid or set(oid) == {"0"}
+
+    def merge_driver(self, path: str) -> str:
+        """Resolve the built-in merge driver for a path: text/binary/union."""
+        if self._attributes is None:
+            return "text"
+        return self._attributes.driver(path)
+
+    def marker_size(self, path: str) -> int:
+        if self._attributes is None:
+            return xdiff.DEFAULT_CONFLICT_MARKER_SIZE
+        return self._attributes.marker_size(path)
 
 
 # ---------------------------------------------------------------------------
@@ -155,16 +251,33 @@ def _setup_resolved(opt: Opt, fullpath: str, dirpath: str, ver: tuple,
 
 
 def collect_merge_info(opt: Opt, base: Optional[str], s1: Optional[str],
-                       s2: Optional[str], dirpath: str = "") -> None:
+                       s2: Optional[str], dirpath: str = "",
+                       dir_rename_mask: int = 0) -> None:
     e0 = _tree_entries(opt, base)
     e1 = _tree_entries(opt, s1)
     e2 = _tree_entries(opt, s2)
     names_all = sorted(set(e0) | set(e1) | set(e2))
+
+    # Per-directory dir_rename_mask 0x07 flip: if a direct child is a file
+    # present only on the dir-having side (filemask == dir_rename_mask), the
+    # whole directory's rename-info is computed under directory-rename context.
+    if dir_rename_mask in (2, 4):
+        for name in names_all:
+            a0, a1, a2 = e0.get(name), e1.get(name), e2.get(name)
+            mask = (1 if a0 else 0) | (2 if a1 else 0) | (4 if a2 else 0)
+            dmask = ((2 if (a1 and a1[2]) else 0) | (1 if (a0 and a0[2]) else 0)
+                     | (4 if (a2 and a2[2]) else 0))
+            if (mask & ~dmask) == dir_rename_mask:
+                dir_rename_mask = 0x07
+                break
+
     for name in names_all:
-        _collect_one(opt, name, e0.get(name), e1.get(name), e2.get(name), dirpath)
+        _collect_one(opt, name, e0.get(name), e1.get(name), e2.get(name),
+                     dirpath, dir_rename_mask)
 
 
-def _collect_one(opt: Opt, name: str, a0, a1, a2, dirpath: str) -> None:
+def _collect_one(opt: Opt, name: str, a0, a1, a2, dirpath: str,
+                 dir_rename_mask: int) -> None:
     null = opt.null_oid
     # names[i] = (mode, oid); is_dir[i]
     names = []
@@ -219,6 +332,14 @@ def _collect_one(opt: Opt, name: str, a0, a1, a2, dirpath: str) -> None:
         _setup_resolved(opt, fullpath, dirpath, names[1], side1_null)
         return
 
+    # collect_rename_info: track removed directories + relevance + relevant
+    # rename sources, mirroring merge-ort.c:collect_rename_info().
+    child_dir_rename_mask = dir_rename_mask
+    if dir_rename_mask != 0x07 and dirmask in (3, 5):
+        child_dir_rename_mask = dirmask & ~1
+    _collect_rename_info(opt, fullpath, dirpath, match_mask, filemask, dirmask,
+                         dir_rename_mask)
+
     ci = _setup_conflict(opt, fullpath, dirpath, names, filemask, dirmask, df_conflict)
     ci.match_mask = match_mask
 
@@ -228,7 +349,37 @@ def _collect_one(opt: Opt, name: str, a0, a1, a2, dirpath: str) -> None:
         for i in range(3):
             if is_dir[i]:
                 child[i] = names[i][1]
-        collect_merge_info(opt, child[0], child[1], child[2], fullpath)
+        collect_merge_info(opt, child[0], child[1], child[2], fullpath,
+                           child_dir_rename_mask)
+
+
+def _collect_rename_info(opt: Opt, fullpath: str, dirpath: str, match_mask: int,
+                         filemask: int, dirmask: int, dir_rename_mask: int) -> None:
+    rel = opt.dirs_removed_relevance
+    # Record removed directories and their relevance.
+    if dirmask in (1, 3, 5):
+        sides = (0x07 - dirmask) // 2
+        relevance = (_RELEVANT_FOR_ANCESTOR if dir_rename_mask == 0x07
+                     else _NOT_RELEVANT)
+        if sides & 1 and rel[1].get(fullpath) != _RELEVANT_FOR_SELF:
+            rel[1][fullpath] = relevance
+        if sides & 2 and rel[2].get(fullpath) != _RELEVANT_FOR_SELF:
+            rel[2][fullpath] = relevance
+    # Upgrade a directory to RELEVANT_FOR_SELF when the dir-having side added a
+    # file directly in it.
+    if dir_rename_mask == 0x07 and filemask in (2, 4):
+        side = 3 - (filemask >> 1)
+        rel[side][dirpath] = _RELEVANT_FOR_SELF
+    # Record relevant rename sources (deletions).
+    if filemask in (0, 7):
+        return
+    for side in (1, 2):
+        side_mask = 1 << side
+        if (filemask & 1) and not (filemask & side_mask):
+            content_relevant = ((match_mask & filemask) == 0)
+            location_relevant = (dir_rename_mask == 0x07)
+            if content_relevant or location_relevant:
+                opt.relevant_sources[side].add(fullpath)
 
 
 # ---------------------------------------------------------------------------
@@ -246,18 +397,28 @@ def _read_blob(opt: Opt, oid: str) -> bytes:
 
 
 def _ll_merge(opt: Opt, orig: bytes, src1: bytes, src2: bytes, *,
-              name1: str, name2: str, ancestor_name: str,
-              marker_size: int) -> tuple[bytes, int]:
+              name1: str, name2: str, ancestor_name: str, marker_size: int,
+              virtual_ancestor: bool, variant: int, driver: str) -> tuple[bytes, int]:
     """Returns (result_bytes, status) where status 0=clean, 1=conflict,
-    2=binary conflict."""
-    if (diffcore.buffer_is_binary(orig) or diffcore.buffer_is_binary(src1)
-            or diffcore.buffer_is_binary(src2)):
-        # binary merge: default variant takes src1, reports binary conflict
+    2=binary conflict.  ``variant`` selects favor (0 normal / OURS / THEIRS /
+    UNION); ``driver`` is the resolved merge driver (text/binary/union)."""
+    if driver == "binary" or (
+            driver != "union"
+            and (diffcore.buffer_is_binary(orig) or diffcore.buffer_is_binary(src1)
+                 or diffcore.buffer_is_binary(src2))):
+        # binary merge: ancestor for virtual merges, else ours/theirs by variant
+        if virtual_ancestor:
+            return orig, 0
+        if variant == xdiff.XDL_MERGE_FAVOR_THEIRS:
+            return src2, 0
+        if variant == xdiff.XDL_MERGE_FAVOR_OURS:
+            return src1, 0
         return src1, 2
+    favor = xdiff.XDL_MERGE_FAVOR_UNION if driver == "union" else variant
     result, nconf = xdiff.xdl_merge(
         orig, src1, src2,
-        level=xdiff.XDL_MERGE_ZEALOUS, style=0, favor=0,
-        flags=xdiff.XDF_HISTOGRAM_DIFF, marker_size=marker_size,
+        level=xdiff.XDL_MERGE_ZEALOUS, style=opt.conflict_style, favor=favor,
+        flags=opt.xdl_flags, marker_size=marker_size,
         name1=name1, name2=name2, ancestor_name=ancestor_name)
     return result, (1 if nconf > 0 else 0)
 
@@ -274,13 +435,18 @@ def merge_3way(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
         name1 = f"{opt.branch1}:{pathnames[1]}"
         name2 = f"{opt.branch2}:{pathnames[2]}"
 
+    virtual_ancestor = opt.call_depth > 0
+    variant = 0 if virtual_ancestor else opt.variant
     two_way = (S_IFMT & o.mode) != (S_IFMT & a.mode)
     orig = b"" if two_way else _read_blob(opt, o.oid)
     src1 = _read_blob(opt, a.oid)
     src2 = _read_blob(opt, b.oid)
-    marker_size = xdiff.DEFAULT_CONFLICT_MARKER_SIZE + extra_marker_size
+    marker_size = opt.marker_size(path) + extra_marker_size
+    driver = opt.merge_driver(path)
     return _ll_merge(opt, orig, src1, src2, name1=name1, name2=name2,
-                     ancestor_name=base, marker_size=marker_size)
+                     ancestor_name=base, marker_size=marker_size,
+                     virtual_ancestor=virtual_ancestor, variant=variant,
+                     driver=driver)
 
 
 def handle_content_merge(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
@@ -307,21 +473,94 @@ def handle_content_merge(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
         result.oid = objs.write_object(opt.repo, "blob", merged)
         clean = clean & (1 if status == 0 else 0)
     elif s_isgitlink(a.mode):
-        # submodule merge: conservative — leave side1, mark conflict
-        # (full submodule fast-forward merge is not modelled)
-        if a.oid == b.oid:
-            result.oid = a.oid
-        else:
-            clean = 0
-            result.oid = a.oid
+        two_way = (S_IFMT & o.mode) != (S_IFMT & a.mode)
+        clean, result.oid = merge_submodule(
+            opt, pathnames[0], None if two_way else o.oid, a.oid, b.oid)
+        if opt.call_depth and two_way and not clean:
+            result.mode = o.mode
+            result.oid = o.oid
     elif s_islnk(a.mode):
-        clean = 0
-        result.oid = a.oid
+        if opt.call_depth:
+            clean = 0
+            result.mode = o.mode
+            result.oid = o.oid
+        else:
+            if opt.variant == xdiff.XDL_MERGE_FAVOR_THEIRS:
+                result.oid = b.oid
+            elif opt.variant == xdiff.XDL_MERGE_FAVOR_OURS:
+                result.oid = a.oid
+            else:
+                clean = 0
+                result.oid = a.oid
     else:
         clean = 0
         result.oid = a.oid
 
     return clean, result
+
+
+def merge_submodule(opt: Opt, path: str, o_oid: Optional[str], a_oid: str,
+                    b_oid: str) -> tuple[int, str]:
+    """Port of merge_submodule: fast-forward when one submodule commit
+    contains the other; otherwise leave a conflict. Requires the submodule's
+    object store to be available, matching git (which conflicts otherwise)."""
+    # fallback answer in case we fail
+    fallback = o_oid if (opt.call_depth and o_oid is not None) else a_oid
+
+    subrepo = _open_submodule(opt, path)
+    if subrepo is None:
+        return 0, fallback
+    if o_oid is None or opt.is_null(o_oid):
+        return 0, fallback
+    from . import merge as _merge
+
+    def present(sha):
+        return objs.object_exists(subrepo, sha)
+
+    if not (present(o_oid) and present(a_oid) and present(b_oid)):
+        return 0, fallback
+    # both changes must be forward from base
+    if not (_merge.is_ancestor(subrepo, o_oid, a_oid) and
+            _merge.is_ancestor(subrepo, o_oid, b_oid)):
+        return 0, fallback
+    # case 1: a contained in b or vice versa -> fast-forward
+    if _merge.is_ancestor(subrepo, a_oid, b_oid):
+        return 1, b_oid
+    if _merge.is_ancestor(subrepo, b_oid, a_oid):
+        return 1, a_oid
+    # case 2: a merge exists -> leave conflict (suggestion only)
+    return 0, fallback
+
+
+def _open_submodule(opt: Opt, path: str) -> Optional[Repository]:
+    """Locate and open a submodule's repository, or None if unavailable."""
+    cache = opt._submodule_cache
+    if path in cache:
+        return cache[path]
+    repo = opt.repo
+    candidates = [
+        repo.gitdir / "modules" / path,
+        repo.path / path / ".git",
+        repo.path / path,
+    ]
+    sub: Optional[Repository] = None
+    for cand in candidates:
+        try:
+            if cand.is_dir() and (cand / "objects").is_dir():
+                sub = Repository(cand.parent if cand.name == ".git" else cand)
+                break
+            if cand.is_file():
+                # gitlink file ".git" pointing to actual gitdir
+                text = cand.read_text(encoding="utf-8", errors="replace")
+                if text.startswith("gitdir:"):
+                    target = (cand.parent / text.split(":", 1)[1].strip()).resolve()
+                    if (target / "objects").is_dir():
+                        sub = Repository(target)
+                        break
+        except (OSError, ValueError):
+            continue
+    cache[path] = sub
+    return sub
 
 
 # ---------------------------------------------------------------------------
@@ -367,21 +606,6 @@ def _basename_of(path: str) -> str:
     return path[i + 1:] if i >= 0 else path
 
 
-def _all_dirs(tree_map: dict) -> set:
-    """All directory prefixes that contain at least one file in tree_map."""
-    dirs: set = set()
-    for path in tree_map:
-        d = _parent(path)
-        while d not in dirs:
-            dirs.add(d)
-            if d == "":
-                break
-            d = _parent(d)
-    dirs.discard("")  # toplevel "" is implicit; removed-dir detection excludes it
-    dirs.add("")
-    return dirs
-
-
 class _Pair:
     __slots__ = ("status", "one_path", "two_path")
 
@@ -391,7 +615,13 @@ class _Pair:
         self.two_path = two_path
 
 
-def _update_dir_rename_counts(counts: dict, removed_dirs: set,
+# relevance of a removed directory for directory-rename detection
+_NOT_RELEVANT = 0
+_RELEVANT_FOR_ANCESTOR = 1
+_RELEVANT_FOR_SELF = 2
+
+
+def _update_dir_rename_counts(counts: dict, removed_dirs: set, relevance: dict,
                               oldname: str, newname: str) -> None:
     old_dir = oldname
     new_dir = newname
@@ -403,12 +633,15 @@ def _update_dir_rename_counts(counts: dict, removed_dirs: set,
             break
         new_stripped = _basename_of(new_dir)
         new_dir = _parent(new_dir)
-        if not first:
-            if old_stripped != new_stripped:
-                break
-        d = counts.setdefault(old_dir, {})
-        d[new_dir] = d.get(new_dir, 0) + 1
+        if not first and old_stripped != new_stripped:
+            break
+        drd = relevance.get(old_dir, _NOT_RELEVANT)
+        if drd == _RELEVANT_FOR_SELF or first:
+            d = counts.setdefault(old_dir, {})
+            d[new_dir] = d.get(new_dir, 0) + 1
         first = False
+        if drd == _NOT_RELEVANT:
+            break
         if old_dir == "" or new_dir == "":
             break
 
@@ -578,8 +811,10 @@ def _apply_directory_rename_modifications(opt: Opt, pair: _Pair, new_path: str) 
                                              ci.stages[index].oid)
         ci = existing
 
-    # default detect_directory_renames is "conflict": mark as path conflict
-    ci.path_conflict = True
+    # detect_directory_renames "conflict" (default) marks a path conflict;
+    # "true" applies the rename silently (clean).
+    if opt.detect_directory_renames != 2:
+        ci.path_conflict = True
     pair.two_path = new_path
 
 
@@ -588,25 +823,29 @@ def detect_and_process_renames(opt: Opt, base: Optional[str], s1: Optional[str],
     base_map = _leaf_map(opt, base)
     side_maps = {1: _leaf_map(opt, s1), 2: _leaf_map(opt, s2)}
 
-    base_dirs = _all_dirs(base_map)
     removed_dirs = {}
     pairs = {1: [], 2: []}
     dir_rename_count = {1: {}, 2: {}}
     dir_renames = {1: {}, 2: {}}
     clean = 1
 
+    relevance = opt.dirs_removed_relevance
     for side in (1, 2):
         side_map = side_maps[side]
         rps = diffcore.detect_renames(opt.repo, base_map, side_map,
-                                      rename_limit=opt.rename_limit)
+                                      rename_limit=opt.rename_limit,
+                                      relevant_sources=opt.relevant_sources[side])
         renamed_dsts = {p.dst.path for p in rps}
-        # removed dirs on this side = dirs in base not in side
-        side_dirs = _all_dirs(side_map)
-        removed_dirs[side] = {d for d in base_dirs if d not in side_dirs and d != ""}
-        # build dir rename counts from file renames
+        # removed dirs on this side come from collect_merge_info (with relevance)
+        removed_dirs[side] = set(relevance[side])
+        # only renames with a relevant source feed directory-rename counting
+        # (exact renames of irrelevant sources still move the file, but must
+        # not imply a directory rename)
         for p in rps:
-            _update_dir_rename_counts(dir_rename_count[side], removed_dirs[side],
-                                      p.src.path, p.dst.path)
+            if p.src.path in opt.relevant_sources[side]:
+                _update_dir_rename_counts(dir_rename_count[side],
+                                          removed_dirs[side], relevance[side],
+                                          p.src.path, p.dst.path)
             pairs[side].append(_Pair("R", p.src.path, p.dst.path))
         # add pairs: files added on this side, not rename dests
         for path in sorted(side_map):
@@ -817,53 +1056,60 @@ def process_entry(opt: Opt, path: str, ci: CI, dm: "DirVersions") -> None:
                 ci.clean = True
             ci.result_oid = ci.stages[sidei].oid
     elif ci.filemask >= 6 and (S_IFMT & ci.stages[1].mode) != (S_IFMT & ci.stages[2].mode):
-        # two different types (file/submodule/symlink) on the two sides
-        o_mode = ci.stages[0].mode
-        a_mode = ci.stages[1].mode
-        b_mode = ci.stages[2].mode
-        rename_a = rename_b = 0
-        if s_isreg(a_mode):
-            rename_a = 1
-        elif s_isreg(b_mode):
-            rename_b = 1
+        # two different items (file/submodule/symlink) on the two sides
+        if opt.call_depth:
+            # virtual ancestor: just use the merge-base version
+            ci.clean = False
+            ci.result_oid = ci.stages[0].oid
+            ci.result_mode = ci.stages[0].mode
+            ci.is_null = (ci.result_mode == 0)
         else:
-            rename_a = rename_b = 1
-        a_path = _unique_path(opt, path, opt.branch1) if rename_a else None
-        b_path = _unique_path(opt, path, opt.branch2) if rename_b else None
+            o_mode = ci.stages[0].mode
+            a_mode = ci.stages[1].mode
+            b_mode = ci.stages[2].mode
+            rename_a = rename_b = 0
+            if s_isreg(a_mode):
+                rename_a = 1
+            elif s_isreg(b_mode):
+                rename_b = 1
+            else:
+                rename_a = rename_b = 1
+            a_path = _unique_path(opt, path, opt.branch1) if rename_a else None
+            b_path = _unique_path(opt, path, opt.branch2) if rename_b else None
 
-        ci.clean = False
-        new_ci = CI()
-        _copy_ci(new_ci, ci)
+            ci.clean = False
+            new_ci = CI()
+            _copy_ci(new_ci, ci)
 
-        new_ci.result_mode = ci.stages[2].mode
-        new_ci.result_oid = ci.stages[2].oid
-        new_ci.stages[1] = VersionInfo(0, opt.null_oid)
-        new_ci.filemask = 5
-        if (S_IFMT & b_mode) != (S_IFMT & o_mode):
-            new_ci.stages[0] = VersionInfo(0, opt.null_oid)
-            new_ci.filemask = 4
+            new_ci.result_mode = ci.stages[2].mode
+            new_ci.result_oid = ci.stages[2].oid
+            new_ci.stages[1] = VersionInfo(0, opt.null_oid)
+            new_ci.filemask = 5
+            if (S_IFMT & b_mode) != (S_IFMT & o_mode):
+                new_ci.stages[0] = VersionInfo(0, opt.null_oid)
+                new_ci.filemask = 4
 
-        ci.result_mode = ci.stages[1].mode
-        ci.result_oid = ci.stages[1].oid
-        ci.stages[2] = VersionInfo(0, opt.null_oid)
-        ci.filemask = 3
-        if (S_IFMT & a_mode) != (S_IFMT & o_mode):
-            ci.stages[0] = VersionInfo(0, opt.null_oid)
-            ci.filemask = 2
+            ci.result_mode = ci.stages[1].mode
+            ci.result_oid = ci.stages[1].oid
+            ci.stages[2] = VersionInfo(0, opt.null_oid)
+            ci.filemask = 3
+            if (S_IFMT & a_mode) != (S_IFMT & o_mode):
+                ci.stages[0] = VersionInfo(0, opt.null_oid)
+                ci.filemask = 2
 
-        if rename_a:
-            opt.paths[a_path] = ci
-        if not rename_b:
-            b_path = path
-        opt.paths[b_path] = new_ci
-        if rename_a and rename_b:
-            opt.paths.pop(path, None)
+            if rename_a:
+                opt.paths[a_path] = ci
+            if not rename_b:
+                b_path = path
+            opt.paths[b_path] = new_ci
+            if rename_a and rename_b:
+                opt.paths.pop(path, None)
 
-        new_ci.clean = False
-        opt.conflicted[b_path] = new_ci
-        record_entry_for_tree(dm, b_path, new_ci)
-        if a_path:
-            path = a_path
+            new_ci.clean = False
+            opt.conflicted[b_path] = new_ci
+            record_entry_for_tree(dm, b_path, new_ci)
+            if a_path:
+                path = a_path
     elif ci.filemask >= 6:
         # content merge (two-way or three-way)
         o = ci.stages[0]
@@ -881,7 +1127,7 @@ def process_entry(opt: Opt, path: str, ci: CI, dm: "DirVersions") -> None:
     elif ci.filemask in (3, 5):
         # modify/delete
         sidei = 2 if ci.filemask == 5 else 1
-        index = sidei
+        index = 0 if opt.call_depth else sidei
         ci.result_mode = ci.stages[index].mode
         ci.result_oid = ci.stages[index].oid
         ci.clean = False
@@ -1056,3 +1302,136 @@ def merge_incore_nonrecursive(opt: Opt, base: Optional[str], s1: Optional[str],
     tree = process_entries(opt)
     clean = clean and not opt.conflicted
     return tree, bool(clean)
+
+
+# ---------------------------------------------------------------------------
+# recursive merge (virtual merge base) — merge_ort_internal
+
+
+@dataclass
+class MergeConfig:
+    """Merge configuration carried through the recursion (mirrors the subset
+    of merge_options that affects results)."""
+    conflict_style: int = 0          # 0 merge / 1 diff3 / 2 zdiff3
+    variant: int = 0                 # 0 / FAVOR_OURS / FAVOR_THEIRS
+    xdl_flags: int = xdiff.XDF_HISTOGRAM_DIFF
+    attributes: Optional["MergeAttributes"] = None
+    rename_detection: bool = True
+    rename_limit: int = 7000
+    detect_directory_renames: int = 1
+
+
+def _commit_tree(repo: Repository, commit_sha: str) -> str:
+    t, data = objs.read_object(repo, commit_sha)
+    if t == "commit":
+        return objs.parse_commit(data).tree
+    if t == "tree":
+        return commit_sha
+    raise ValueError(f"{commit_sha} is not a commit or tree")
+
+
+def _commit_time(repo: Repository, commit_sha: str) -> int:
+    try:
+        t, data = objs.read_object(repo, commit_sha)
+        if t != "commit":
+            return 0
+        c = objs.parse_commit(data)
+        return int(c.committer.rsplit(" ", 2)[-2])
+    except (ValueError, IndexError, KeyError):
+        return 0
+
+
+def _empty_tree(repo: Repository) -> str:
+    sha, _ = objs.hash_bytes("tree", b"", repo)
+    objs.write_object(repo, "tree", b"")
+    return sha
+
+
+def _make_virtual_commit(repo: Repository, tree_sha: str, parents: list) -> str:
+    # keep committer date monotonically newer than parents so merge-base
+    # date heuristics behave; the sha is only used for ancestry computation.
+    when = 1
+    for p in parents:
+        when = max(when, _commit_time(repo, p) + 1)
+    sig = objs.format_signature("merge", "merge@ort", when=when)
+    c = objs.Commit(tree=tree_sha, parents=list(parents), author=sig,
+                    committer=sig, message="virtual merge base\n")
+    return objs.write_object(repo, "commit", c.encode())
+
+
+def _abbrev(repo: Repository, sha: str) -> str:
+    # git uses repo_find_unique_abbrev (>= 7 chars, extended on collision).
+    from . import loose as _loose
+    for n in range(7, repo.hex_len):
+        prefix = sha[:n]
+        try:
+            m = _loose.resolve_short(repo, prefix)
+        except Exception:
+            m = None
+        # resolve_short returns "" for ambiguous in this codebase; treat any
+        # ambiguity by extending. We only need uniqueness, so accept length 7
+        # unless we can detect ambiguity cheaply.
+        if m is None or m == sha:
+            return prefix
+        if m:
+            return prefix
+    return sha
+
+
+def _merge_ort_internal(repo: Repository, merge_bases: list, h1: str, h2: str,
+                        branch1: str, branch2: str, call_depth: int,
+                        cfg: MergeConfig) -> tuple[str, bool, Optional[Opt]]:
+    """Port of merge_ort_internal. merge_bases is a list of commit shas in the
+    order git uses (already reversed). Returns (tree, clean, opt) where opt is
+    only meaningful at call_depth 0 (for conflicted-stage extraction)."""
+    bases = list(merge_bases)
+    if not bases:
+        merged_tree = _empty_tree(repo)
+        merged_commit = _make_virtual_commit(repo, merged_tree, [])
+        ancestor_name = "empty tree"
+    elif len(bases) > 1:
+        merged_commit = bases.pop(0)
+        merged_tree = _commit_tree(repo, merged_commit)
+        ancestor_name = "merged common ancestors"
+    else:
+        merged_commit = bases.pop(0)
+        merged_tree = _commit_tree(repo, merged_commit)
+        ancestor_name = _abbrev(repo, merged_commit)
+
+    from . import merge as _merge
+    for nxt in bases:
+        prev = merged_commit
+        inner = list(reversed(_merge.merge_bases(repo, prev, nxt)))
+        inner_tree, _c, _o = _merge_ort_internal(
+            repo, inner, prev, nxt,
+            "Temporary merge branch 1", "Temporary merge branch 2",
+            call_depth + 1, cfg)
+        merged_commit = _make_virtual_commit(repo, inner_tree, [prev, nxt])
+        merged_tree = inner_tree
+
+    opt = Opt(repo, ancestor_name, branch1, branch2,
+              conflict_style=cfg.conflict_style, variant=cfg.variant,
+              xdl_flags=cfg.xdl_flags, attributes=cfg.attributes,
+              rename_detection=cfg.rename_detection,
+              rename_limit=cfg.rename_limit,
+              detect_directory_renames=cfg.detect_directory_renames)
+    opt.call_depth = call_depth
+    tree, clean = merge_incore_nonrecursive(
+        opt, merged_tree, _commit_tree(repo, h1), _commit_tree(repo, h2))
+    return tree, clean, opt
+
+
+def merge_recursive(repo: Repository, h1: str, h2: str, *, branch1: str,
+                    branch2: str, merge_bases: Optional[list] = None,
+                    cfg: Optional[MergeConfig] = None) -> tuple[str, bool, Opt]:
+    """Merge two commits using the recursive (virtual merge base) strategy,
+    matching `git merge-tree <h1> <h2>` (no --merge-base). Returns
+    (tree, clean, opt)."""
+    if cfg is None:
+        cfg = MergeConfig()
+    from . import merge as _merge
+    if merge_bases is None:
+        merge_bases = list(reversed(_merge.merge_bases(repo, h1, h2)))
+    tree, clean, opt = _merge_ort_internal(
+        repo, merge_bases, h1, h2, branch1, branch2, 0, cfg)
+    return tree, clean, opt

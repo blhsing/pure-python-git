@@ -212,12 +212,17 @@ def detect_renames(
     rename_limit: int = 7000,
     minimum_score: int = 0,
     rename_empty: bool = False,
+    relevant_sources: Optional[set] = None,
 ) -> list[RenamePair]:
     """Detect file renames between two trees represented as path->(mode, oid).
 
     Sources are paths present in base but absent in side (deletions);
     destinations are paths present in side but absent in base (additions).
     Returns the list of detected rename pairs.
+
+    ``relevant_sources`` (if given) limits inexact/basename rename detection to
+    those source paths (exact renames still consider all sources), mirroring
+    merge-ort's relevant_sources culling in diffcore_rename_extended.
     """
     if minimum_score == 0:
         minimum_score = DEFAULT_RENAME_SCORE
@@ -304,6 +309,8 @@ def detect_renames(
     for i in range(len(srcs)):
         if srcs[i].rename_used:
             continue
+        if relevant_sources is not None and srcs[i].path not in relevant_sources:
+            continue
         base = _basename(srcs[i].path)
         src_index = src_base.get(base, -1)
         if base in dst_base:
@@ -321,7 +328,9 @@ def detect_renames(
             record(dst_index, src_index, score)
 
     # --- inexact matrix (NxM similarity) ---
-    src_idx = remaining_srcs()
+    # cull sources not in relevant_sources (remove_unneeded_paths_from_src)
+    src_idx = [i for i in remaining_srcs()
+               if relevant_sources is None or srcs[i].path in relevant_sources]
     num_sources = len(src_idx)
     num_destinations = sum(1 for i in range(len(dsts)) if not dst_is_rename[i])
     if not num_sources or not num_destinations:

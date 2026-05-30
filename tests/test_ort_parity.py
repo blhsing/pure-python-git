@@ -200,6 +200,96 @@ def test_rename_delete(tmprepo):
            {})
 
 
+def _blob(d, content):
+    import subprocess
+    return subprocess.run([GIT, "-C", str(d), "hash-object", "-w", "--stdin"],
+                          input=content, capture_output=True).stdout.decode().strip()
+
+
+def _mktree(d, entries):
+    spec = "".join(f"{mode} blob {sha}\t{path}\n" for path, (mode, sha) in entries.items())
+    return _g(d, "mktree", input=spec.encode()).stdout.decode().strip()
+
+
+def _commit_tree(d, tree, parents):
+    args = ["commit-tree", tree]
+    for p in parents:
+        args += ["-p", p]
+    return _g(d, *args, input=b"m").stdout.decode().strip()
+
+
+def test_recursive_criss_cross(tmprepo):
+    """Two merge bases -> virtual ancestor; compare merge_commits with
+    `git merge-tree <a> <b>` (no --merge-base)."""
+    import subprocess
+    repo, d = tmprepo
+
+    def tr(files):
+        return _mktree(d, {p: ("100644", _blob(d, c)) for p, c in files.items()})
+
+    o = _commit_tree(d, tr({"f": b"base\n"}), [])
+    ca = _commit_tree(d, tr({"f": b"a\n"}), [o])
+    cb = _commit_tree(d, tr({"f": b"b\n"}), [o])
+    m1 = _commit_tree(d, tr({"f": b"m1\n"}), [ca, cb])
+    m2 = _commit_tree(d, tr({"f": b"m2\n"}), [cb, ca])
+
+    g = _g(d, "merge-tree", "--write-tree", "--no-messages", "-z", m1, m2)
+    parts = g.stdout.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    g_tree = parts[0].decode()
+    g_stages = []
+    for rec in parts[1:]:
+        if rec:
+            meta, _, path = rec.partition(b"\t")
+            ms, oid, ss = meta.decode().split()
+            g_stages.append((path.decode(), int(ss), int(ms, 8), oid))
+
+    res = ort.merge_commits(repo, m1, m2)
+    p_stages = sorted(
+        [(e.path, e.stage, e.mode, e.sha)
+         for e in (res.conflict_index.entries if res.conflict_index else [])
+         if e.stage], key=lambda t: (t[0], t[1]))
+    assert res.tree == g_tree
+    assert p_stages == sorted(g_stages, key=lambda t: (t[0], t[1]))
+
+
+def test_diff3_conflict_style(tmprepo):
+    import subprocess
+    repo, d = tmprepo
+    _g(d, "config", "merge.conflictstyle", "diff3")
+    base = _commit(d, {"f": b"a\nb\nc\n"})
+    s1 = _commit(d, {"f": b"X\nb\nc\n"})
+    s2 = _commit(d, {"f": b"Y\nb\nc\n"})
+    g_tree, g_stages = _git_merge_tree(d, base, s1, s2)
+    p_tree, p_stages = _py_merge_tree(repo, base, s1, s2)
+    assert p_tree == g_tree  # diff3 markers must match
+    assert p_stages == g_stages
+
+
+def test_union_merge_attribute(tmprepo):
+    # git merge-tree reads .gitattributes from the working tree (its attr_index
+    # stays empty without renormalize), so place it there for both engines.
+    repo, d = tmprepo
+    base = _commit(d, {"u.txt": b"x\ny\n"})
+    s1 = _commit(d, {"u.txt": b"x\ny\nOURS\n"})
+    s2 = _commit(d, {"u.txt": b"x\ny\nTHEIRS\n"})
+    (d / ".gitattributes").write_bytes(b"u.txt merge=union\n")
+    g_tree, g_stages = _git_merge_tree(d, base, s1, s2)
+    p_tree, p_stages = _py_merge_tree(repo, base, s1, s2)
+    assert p_tree == g_tree
+    assert p_tree != base  # sanity: a real union/merge happened
+    assert p_stages == g_stages
+
+
+def test_nested_directory_rename(tmprepo):
+    _check(tmprepo,
+           {"a/b/c/f1": b"1\n2\n3\n", "a/b/g": b"g\n"},
+           {"x/b/c/f1": b"1\n2\n3\n", "x/b/g": b"g\n"},
+           {"a/b/c/f1": b"1\n2\n3\n", "a/b/g": b"g\n",
+            "a/b/c/deep": b"d\n", "a/b/mid": b"m\n"})
+
+
 def test_type_change_file_symlink(tmprepo):
     # built via low-level cacheinfo so it works on Windows worktrees
     repo, d = tmprepo

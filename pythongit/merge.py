@@ -40,43 +40,92 @@ def _parents(repo: Repository, sha: str) -> list[str]:
     return objs.parse_commit(data).parents
 
 
+def _insert_by_date(lst: list, item: str, date: int) -> None:
+    """Insert into a date-descending list; equal dates keep insertion (FIFO),
+    mirroring commit_list_insert_by_date."""
+    i = 0
+    while i < len(lst) and lst[i][1] >= date:
+        i += 1
+    lst.insert(i, (item, date))
+
+
+def _paint_down_to_common(repo: Repository, one: str, twos: list[str]):
+    """Faithful port of commit-reach.c:paint_down_to_common (no commit-graph
+    generation numbers, so ordering is by commit date). Returns
+    (result_shas_in_date_order, flags)."""
+    flags: dict[str, int] = {one: PARENT1}
+    # min-heap on (-date, insertion_ctr) → pops newest first, FIFO for ties
+    heap: list[tuple[int, int, str]] = []
+    ctr = 0
+    heapq.heappush(heap, (-_commit_time(repo, one), ctr, one))
+    ctr += 1
+    for t in twos:
+        flags[t] = flags.get(t, 0) | PARENT2
+        heapq.heappush(heap, (-_commit_time(repo, t), ctr, t))
+        ctr += 1
+
+    result: list[tuple[str, int]] = []
+    while any(not (flags.get(s, 0) & STALE) for _, _, s in heap):
+        negd, _c, commit = heapq.heappop(heap)
+        f = flags.get(commit, 0) & (PARENT1 | PARENT2 | STALE)
+        if f == (PARENT1 | PARENT2):
+            if not (flags.get(commit, 0) & RESULT):
+                flags[commit] = flags.get(commit, 0) | RESULT
+                _insert_by_date(result, commit, -negd)
+            f |= STALE
+        for p in _parents(repo, commit):
+            pf = flags.get(p, 0)
+            if (pf & f) == f:
+                continue
+            flags[p] = pf | f
+            heapq.heappush(heap, (-_commit_time(repo, p), ctr, p))
+            ctr += 1
+    return [s for s, _ in result], flags
+
+
+def _remove_redundant(repo: Repository, array: list[str]) -> list[str]:
+    """Port of remove_redundant_no_gen: drop merge bases that are ancestors of
+    other merge bases, preserving order."""
+    cnt = len(array)
+    redundant = [False] * cnt
+    for i in range(cnt):
+        if redundant[i]:
+            continue
+        work = []
+        filled_index = []
+        for j in range(cnt):
+            if i == j or redundant[j]:
+                continue
+            filled_index.append(j)
+            work.append(array[j])
+        if not work:
+            continue
+        _res, flags = _paint_down_to_common(repo, array[i], work)
+        if flags.get(array[i], 0) & PARENT2:
+            redundant[i] = True
+        for k, wj in enumerate(work):
+            if flags.get(wj, 0) & PARENT1:
+                redundant[filled_index[k]] = True
+    return [array[i] for i in range(cnt) if not redundant[i]]
+
+
 def merge_bases(repo: Repository, a: str, b: str) -> list[str]:
+    """Return the merge bases of two commits, in git's order
+    (repo_get_merge_bases): date-descending with FIFO tie-breaking, redundant
+    bases removed."""
     if a == b:
         return [a]
-    flags: dict[str, int] = {a: PARENT1, b: PARENT2}
-    # max-heap by commit time via negative
-    pq: list[tuple[int, str]] = []
-    heapq.heappush(pq, (-_commit_time(repo, a), a))
-    heapq.heappush(pq, (-_commit_time(repo, b), b))
-    result: list[str] = []
-    while pq:
-        # check if any non-stale remain with both flags possible
-        if all((flags[s] & STALE) for _, s in pq):
-            break
-        _, sha = heapq.heappop(pq)
-        f = flags.get(sha, 0)
-        if (f & (PARENT1 | PARENT2)) == (PARENT1 | PARENT2):
-            if not (f & RESULT):
-                f |= RESULT
-                result.append(sha)
-            f |= STALE
-        flags[sha] = f
-        carry = f & (PARENT1 | PARENT2 | STALE)
-        for p in _parents(repo, sha):
-            pf = flags.get(p, 0)
-            if (pf & carry) == carry:
-                continue
-            flags[p] = pf | carry
-            heapq.heappush(pq, (-_commit_time(repo, p), p))
-    # filter out stale results
-    return [s for s in result if not (flags.get(s, 0) & STALE) or (flags.get(s, 0) & RESULT)]
+    res_shas, flags = _paint_down_to_common(repo, a, [b])
+    result = [s for s in res_shas if not (flags.get(s, 0) & STALE)]
+    if len(result) <= 1:
+        return result
+    return _remove_redundant(repo, result)
 
 
 def is_ancestor(repo: Repository, ancestor: str, descendant: str) -> bool:
     if ancestor == descendant:
         return True
-    bases = merge_bases(repo, ancestor, descendant)
-    return ancestor in bases
+    return ancestor in merge_bases(repo, ancestor, descendant)
 
 
 # ---------------------------------------------------------------------------

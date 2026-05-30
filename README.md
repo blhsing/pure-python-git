@@ -266,31 +266,38 @@ mechanism.
 
 ### Merge
 
-`merge.merge_bases` mirrors `commit-reach.c`'s `paint_down_to_common`: BFS
-from both tips with PARENT1/PARENT2 flags, marking double-flagged commits as
-results and pushing STALE to their ancestors.
+`merge.merge_bases` is a faithful port of `commit-reach.c`'s
+`paint_down_to_common`: a date-ordered priority walk with PARENT1/PARENT2/STALE
+flags and insertion-order tie-breaking, followed by `remove_redundant`, so the
+merge bases come back in the **same order** C Git returns them (which the
+recursive merge below depends on).
 
 High-level three-way merges run a pure-Python port of Git's own `ort` engine —
-no `git` binary and no fallback engine. The port lives in three modules and
+no `git` binary and no fallback engine. The port lives in four modules and
 reproduces `git merge-tree --write-tree` byte-for-byte (result tree oid,
 conflicted blobs with markers, and conflicted index stages):
 
 * `xdiff.py` — Git's xdiff library: record classification, the **histogram**
   diff that `ort` hardcodes for content merges (with the classic Myers
   algorithm as its documented fallback), change compaction, and the zealous
-  three-way `xdl_merge` that emits `<<<<<<<` / `=======` / `>>>>>>>` markers.
+  three-way `xdl_merge` that emits `<<<<<<<` / `=======` / `>>>>>>>` markers
+  (merge / diff3 / zdiff3 styles, configurable marker size).
 * `diffcore.py` — rename detection: the `diffcore-delta` spanhash similarity
   estimator plus exact, basename-driven, and inexact NxM matrix matching from
-  `diffcore-rename.c`.
+  `diffcore-rename.c`, with `relevant_sources` source-culling.
 * `mergeort.py` — the `merge-ort.c` tree engine: the recursive three-way tree
-  walk (`collect_merge_info`), file and **directory** rename detection and
-  resolution (`process_renames`), per-path resolution (`process_entry`), and
-  streamed result-tree assembly with conflicted index stages.
-
-`ort.py` is a thin adapter exposing `merge_tree(repo, merge_base, ours,
-theirs)`; the `merge_base`/`ours`/`theirs` arguments double as the
-conflict-marker labels, exactly as the corresponding `git merge-tree
---merge-base` arguments do.
+  walk (`collect_merge_info`, tracking `dir_rename_mask` and rename-source
+  relevance), file and **directory** rename detection/resolution
+  (`process_renames`, dir-rename counting with RELEVANT_FOR_SELF/ANCESTOR
+  gating), per-path resolution (`process_entry`, including the `call_depth`
+  virtual-ancestor behaviors), submodule fast-forward, `.gitattributes`
+  `merge`/`conflict-marker-size` handling, and streamed result-tree assembly.
+* `ort.py` — adapter exposing `merge_tree(repo, merge_base, ours, theirs)`
+  (explicit base, like `git merge-tree --merge-base`) and `merge_commits(repo,
+  ours, theirs)` (computes all merge bases and **recursively** merges them into
+  a virtual ancestor, like `git merge-tree <a> <b>`). The tree-ish arguments
+  double as conflict-marker labels, exactly as the matching `git merge-tree`
+  arguments do; `merge.conflictStyle` is honored.
 
 ### Rerere
 
@@ -405,13 +412,15 @@ randomized cases.
   remaining scale-sensitive cases are commands whose output inherently requires
   inspecting every path or blob.
 * The `ort` merge engine is a pure-Python reimplementation (no `git` binary,
-  no fallback) and is validated for byte-for-byte parity against
-  `git merge-tree --write-tree` across content merges, rename detection
-  (file and directory), and conflict presentation. It targets a single merge
-  base (as `git merge-tree --merge-base` provides); recursive merge of multiple
-  merge bases (a virtual ancestor) and full submodule fast-forward resolution
-  are not modelled, and `merge.conflictStyle`/whitespace merge drivers default
-  to Git's standard behavior.
+  no fallback), validated for byte-for-byte parity against
+  `git merge-tree --write-tree` across content merges, file and directory
+  renames, recursive merges (criss-cross histories with a virtual ancestor),
+  submodule fast-forwards, conflict styles (merge/diff3/zdiff3), `merge=union`
+  attributes, and conflict presentation. Two areas are not fully modelled:
+  custom external `.gitattributes` merge drivers (treated as the built-in text
+  driver), and a small number of pathological deeply-nested simultaneous
+  directory-rename cases where Git's `merge-ort` deferred two-pass traversal
+  computes rename-source relevance slightly differently.
 * `fsmonitor-daemon run` uses native filesystem notifications on Windows and
   Linux (`ReadDirectoryChangesW` / inotify). One-shot `fsmonitor` calls and
   unsupported platforms fall back to configurable polling.

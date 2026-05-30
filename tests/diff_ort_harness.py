@@ -23,15 +23,16 @@ def run(cwd, *args, **kw):
 
 def git_commit_tree(cwd, files: dict, parent_env=0):
     """Create a commit whose tree contains `files` (path->bytes), return sha.
-    Uses the index then commit-tree (no parents needed)."""
-    # write blobs and build index via update-index --add with --cacheinfo
+    Builds the index directly via update-index --cacheinfo (no worktree, so
+    file/dir path collisions across commits can't leak)."""
     run(cwd, "read-tree", "--empty")
+    args = ["update-index", "--add"]
     for path, content in files.items():
-        p = Path(cwd) / path
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(content)
+        sha = run(cwd, "hash-object", "-w", "--stdin",
+                  input=content).stdout.decode().strip()
+        args += ["--cacheinfo", f"100644,{sha},{path}"]
     if files:
-        run(cwd, "add", "-A")
+        run(cwd, *args)
     tree = run(cwd, "write-tree").stdout.decode().strip()
     c = run(cwd, "commit-tree", tree, input=b"x")
     return c.stdout.decode().strip(), tree
@@ -83,6 +84,18 @@ def mutate_files(rng, base_files, *, allow_rename=True):
             files[newp] = "\n".join(lines).encode()
             del files[p]
     return files
+
+
+def valid_tree(files: dict) -> bool:
+    """True if no path is an ancestor directory of another (a tree can't hold
+    both a file 'a/z' and a directory 'a/z/...')."""
+    keys = set(files)
+    for p in keys:
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            if "/".join(parts[:i]) in keys:
+                return False
+    return True
 
 
 def parse_merge_tree(out: bytes):
@@ -139,23 +152,37 @@ def main():
             run(d, "init", "-q")
             run(d, "config", "user.email", "a@b.c")
             run(d, "config", "user.name", "t")
-            if mode == "dirrename":
-                # base files concentrated in a couple of directories
+            if mode in ("dirrename", "deepdir"):
+                # base files concentrated in directories (nested for deepdir)
                 base_files = {}
-                for dd in ("d1", "d2"):
-                    for _ in range(rng.randint(1, 4)):
-                        base_files[f"{dd}/{rng.choice('abcde')}"] = rand_content(rng)
+                if mode == "deepdir":
+                    dirs = ["a/b", "a/c", "a/b/d", "e"]
+                else:
+                    dirs = ["d1", "d2"]
+                for dd in dirs:
+                    for _ in range(rng.randint(0, 3)):
+                        base_files[f"{dd}/{rng.choice('mnop')}"] = rand_content(rng)
+                if not base_files:
+                    base_files["a/b/x"] = rand_content(rng)
                 if rng.random() < 0.5:
                     base_files["top"] = rand_content(rng)
                 base, _bt = git_commit_tree(d, base_files)
-                # side1: rename a directory (and maybe small edits)
-                s1_files = rename_dir(rng, base_files, "d1",
-                                      rng.choice(["nd1", "moved", "d3/inner"]))
+                # side1: rename a directory subtree (and maybe small edits)
+                if mode == "deepdir":
+                    src, dst = rng.choice([("a", "x"), ("a/b", "a/z"),
+                                           ("a", "p/q"), ("a/b", "moved"),
+                                           ("a/b/d", "a/dd")])
+                else:
+                    src, dst = "d1", rng.choice(["nd1", "moved", "d3/inner"])
+                s1_files = rename_dir(rng, base_files, src, dst)
                 s1_files = mutate_files(rng, s1_files, allow_rename=False)
-                # side2: add files into the old directory + edits
+                # side2: add files into the old directory tree + edits
                 s2_files = dict(base_files)
-                for _ in range(rng.randint(1, 3)):
-                    s2_files[f"d1/{rng.choice('xyzw')}"] = rand_content(rng)
+                add_dirs = ([src, src + "/sub", "a/b", "a"] if mode == "deepdir"
+                            else ["d1"])
+                for _ in range(rng.randint(1, 4)):
+                    ad = rng.choice(add_dirs)
+                    s2_files[f"{ad}/{rng.choice('xyzw')}"] = rand_content(rng)
                 s2_files = mutate_files(rng, s2_files, allow_rename=False)
                 if rng.random() < 0.4:
                     s1_files, s2_files = s2_files, s1_files
@@ -170,6 +197,9 @@ def main():
                 base, _bt = git_commit_tree(d, base_files)
                 s1_files = mutate_files(rng, base_files)
                 s2_files = mutate_files(rng, base_files)
+            if not (valid_tree(base_files) and valid_tree(s1_files)
+                    and valid_tree(s2_files)):
+                continue
             s1, _ = git_commit_tree(d, s1_files)
             s2, _ = git_commit_tree(d, s2_files)
 
