@@ -94,6 +94,8 @@ def discover_refs(base_url: str) -> dict[str, str]:
 def fetch_pack(base_url: str, wants: list[str], haves: list[str] | None = None) -> bytes:
     """Negotiate a fetch, return raw pack bytes. Single round, no multi_ack."""
     caps = "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=pythongit/0.1"
+    if any(len(w) == 64 for w in wants):
+        caps += " object-format=sha256"
     body = bytearray()
     for i, w in enumerate(wants):
         line = f"want {w}"
@@ -130,30 +132,38 @@ def fetch_pack(base_url: str, wants: list[str], haves: list[str] | None = None) 
     return bytes(pack)
 
 
-def clone(url: str, target_dir: str) -> Repository:
+def clone(url: str, target_dir: str, object_format: str | None = None) -> Repository:
+    import shutil
+    import tempfile
     from . import pack as pack_mod
     from . import refs as refs_mod
 
-    repo = Repository.init(target_dir)
     remote_refs = discover_refs(url)
     if not remote_refs:
         raise RuntimeError("no refs from remote")
+    source_format = "sha256" if any(len(s) == 64 for s in remote_refs.values()) else "sha1"
+    target_format = object_format or source_format
+    repo = Repository.init(target_dir, object_format=target_format)
     wants = sorted(set(remote_refs.values()))
     raw = fetch_pack(url, wants)
-    pack_mod.unpack_pack(repo, raw)
+    unpack_repo = repo
+    tmp_dir = None
+    if target_format != source_format:
+        tmp_dir = tempfile.mkdtemp(prefix="pygit-translate-")
+        unpack_repo = Repository.init(tmp_dir, object_format=source_format)
+    pack_mod.unpack_pack(unpack_repo, raw)
 
     # set up refs and HEAD
-    head_target = remote_refs.get("HEAD")
     for name, sha in remote_refs.items():
         if name == "HEAD":
             continue
         if name.startswith("refs/heads/"):
             # mirror as remote tracking refs/remotes/origin/<branch>
             branch = name[len("refs/heads/") :]
-            refs_mod.update_ref(repo, f"refs/remotes/origin/{branch}", sha)
-            refs_mod.update_ref(repo, name, sha)
+            refs_mod.update_ref(unpack_repo, f"refs/remotes/origin/{branch}", sha)
+            refs_mod.update_ref(unpack_repo, name, sha)
         elif name.startswith("refs/tags/"):
-            refs_mod.update_ref(repo, name, sha)
+            refs_mod.update_ref(unpack_repo, name, sha)
 
     # pick a default branch
     chosen = None
@@ -167,7 +177,16 @@ def clone(url: str, target_dir: str) -> Repository:
                 chosen = n
                 break
     if chosen:
-        refs_mod.set_head(repo, chosen)
+        refs_mod.set_head(unpack_repo, chosen)
+
+    if unpack_repo is not repo:
+        try:
+            from . import translate
+            translate.translate_repository(unpack_repo, repo, checkout=True)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    elif chosen:
         # checkout
         from . import workdir
         sha = refs_mod.read_ref(repo, chosen)
@@ -254,7 +273,7 @@ def _collect_objects(repo: Repository, tip: str, stop_at: set[str]) -> list[str]
             stack.append(c.tree)
             stack.extend(c.parents)
         elif t == "tree":
-            for e in objs.parse_tree(data):
+            for e in objs.parse_tree(data, repo.hash_len):
                 stack.append(e.sha)
         elif t == "tag":
             # parse target line
@@ -297,6 +316,8 @@ def push(repo: Repository, remote: str = "origin", refspecs: list[str] | None = 
             return {}
 
     caps = "report-status side-band-64k agent=pythongit/0.1"
+    if repo.object_format() == "sha256":
+        caps += " object-format=sha256"
     commands = bytearray()
     new_shas: list[str] = []
     stop = set(remote_refs.values())
@@ -308,7 +329,7 @@ def push(repo: Repository, remote: str = "origin", refspecs: list[str] | None = 
         sha = refs_mod.rev_parse(repo, local) or refs_mod.read_ref(repo, local)
         if not sha:
             continue
-        old = remote_refs.get(remote_ref, "0" * 40)
+        old = remote_refs.get(remote_ref, repo.null_oid())
         if old == sha:
             continue
         line = f"{old} {sha} {remote_ref}"

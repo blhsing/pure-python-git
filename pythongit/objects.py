@@ -23,15 +23,17 @@ def _loose_path(repo: Repository, sha: str) -> Path:
     return repo.gitdir / "objects" / sha[:2] / sha[2:]
 
 
-def hash_bytes(obj_type: str, data: bytes) -> tuple[str, bytes]:
-    """Return (sha1, serialized) for a raw object payload."""
+def hash_bytes(obj_type: str, data: bytes, repo: Optional[Repository] = None) -> tuple[str, bytes]:
+    """Return (object id, serialized) for a raw object payload."""
     header = f"{obj_type} {len(data)}".encode() + b"\0"
     full = header + data
+    if repo is not None:
+        return repo.hash_hex(full), full
     return hashlib.sha1(full).hexdigest(), full
 
 
 def write_object(repo: Repository, obj_type: str, data: bytes) -> str:
-    sha, full = hash_bytes(obj_type, data)
+    sha, full = hash_bytes(obj_type, data, repo)
     p = _loose_path(repo, sha)
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +87,7 @@ class TreeEntry:
         return self.mode == "160000"
 
 
-def parse_tree(data: bytes) -> list[TreeEntry]:
+def parse_tree(data: bytes, hash_len: int = 20) -> list[TreeEntry]:
     entries: list[TreeEntry] = []
     i = 0
     while i < len(data):
@@ -93,9 +95,9 @@ def parse_tree(data: bytes) -> list[TreeEntry]:
         mode = data[i:sp].decode()
         nul = data.index(b"\0", sp)
         name = data[sp + 1 : nul].decode("utf-8", errors="replace")
-        sha = data[nul + 1 : nul + 21].hex()
+        sha = data[nul + 1 : nul + 1 + hash_len].hex()
         entries.append(TreeEntry(mode, name, sha))
-        i = nul + 21
+        i = nul + 1 + hash_len
     return entries
 
 

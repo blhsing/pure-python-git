@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import os
 from pathlib import Path
 from typing import Optional
@@ -44,7 +45,9 @@ class Repository:
     # ---- init ----------------------------------------------------------
 
     @classmethod
-    def init(cls, path: os.PathLike | str, *, bare: bool = False) -> "Repository":
+    def init(cls, path: os.PathLike | str, *, bare: bool = False, object_format: str = "sha1") -> "Repository":
+        if object_format not in ("sha1", "sha256"):
+            raise ValueError(f"unsupported object format {object_format}")
         path = Path(path).resolve()
         path.mkdir(parents=True, exist_ok=True)
         gitdir = path if bare else (path / ".git")
@@ -56,13 +59,15 @@ class Repository:
             head.write_text("ref: refs/heads/main\n", encoding="utf-8")
         cfg = gitdir / "config"
         if not cfg.exists():
-            cfg.write_text(
+            config = (
                 "[core]\n"
-                "\trepositoryformatversion = 0\n"
+                f"\trepositoryformatversion = {1 if object_format == 'sha256' else 0}\n"
                 "\tfilemode = false\n"
-                f"\tbare = {'true' if bare else 'false'}\n",
-                encoding="utf-8",
+                f"\tbare = {'true' if bare else 'false'}\n"
             )
+            if object_format != "sha1":
+                config += "[extensions]\n\tobjectformat = sha256\n"
+            cfg.write_text(config, encoding="utf-8")
         (gitdir / "description").write_text(
             "Unnamed repository; edit this file 'description' to name the repository.\n",
             encoding="utf-8",
@@ -77,6 +82,37 @@ class Repository:
         if cfg.exists():
             cp.read(cfg, encoding="utf-8")
         return cp
+
+    def object_format(self) -> str:
+        cp = self.config()
+        fmt = cp.get("extensions", "objectformat", fallback="sha1").lower()
+        if fmt not in ("sha1", "sha256"):
+            raise RepositoryError(f"unsupported object format: {fmt}")
+        return fmt
+
+    @property
+    def hash_len(self) -> int:
+        return 32 if self.object_format() == "sha256" else 20
+
+    @property
+    def hex_len(self) -> int:
+        return self.hash_len * 2
+
+    def null_oid(self) -> str:
+        return "0" * self.hex_len
+
+    def new_hash(self):
+        return hashlib.sha256() if self.object_format() == "sha256" else hashlib.sha1()
+
+    def hash_bytes(self, data: bytes) -> bytes:
+        h = self.new_hash()
+        h.update(data)
+        return h.digest()
+
+    def hash_hex(self, data: bytes) -> str:
+        h = self.new_hash()
+        h.update(data)
+        return h.hexdigest()
 
     def user(self) -> tuple[str, str]:
         cp = self.config()

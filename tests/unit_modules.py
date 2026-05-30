@@ -6,6 +6,7 @@ from pythongit import merge as merge_mod
 from pythongit import patch as patch_mod
 from pythongit import ignore as ignore_mod
 from pythongit import rerere as rerere_mod
+from pythongit import bridges as bridges_mod
 
 
 # --- diff -----------------------------------------------------------------
@@ -157,3 +158,73 @@ def test_rerere_replay_after_record(tmprepo):
 def test_rerere_replay_for_unseen_preimage(tmprepo):
     repo, _ = tmprepo
     assert rerere_mod.replay(repo, "no such conflict\n") is None
+
+
+# --- bridges ---------------------------------------------------------------
+
+
+def test_send_email_uses_smtp_ssl(tmp_path, monkeypatch):
+    import smtplib
+    calls = []
+
+    class FakeSMTPSSL:
+        def __init__(self, host, port, **kwargs):
+            calls.append(("connect_ssl", host, port, "context" in kwargs))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def login(self, user, password):
+            calls.append(("login", user, password))
+
+        def send_message(self, msg):
+            calls.append(("send", msg["To"], msg["Subject"]))
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSMTPSSL)
+    mbox = tmp_path / "patch.mbox"
+    mbox.write_text("From x\nSubject: test\nFrom: a@example.com\n\nbody\n", encoding="utf-8")
+
+    rc = bridges_mod.send_email(str(mbox), to=["b@example.com"],
+                                smtp_host="smtp.example.com", smtp_port=465,
+                                smtp_user="user", smtp_pass="pass",
+                                smtp_encryption="ssl")
+
+    assert rc == 0
+    assert calls[0] == ("connect_ssl", "smtp.example.com", 465, True)
+    assert ("login", "user", "pass") in calls
+    assert ("send", "b@example.com", "test") in calls
+
+
+def test_send_email_uses_explicit_starttls(tmp_path, monkeypatch):
+    import smtplib
+    calls = []
+
+    class FakeSMTP:
+        def __init__(self, host, port):
+            calls.append(("connect", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def starttls(self, **kwargs):
+            calls.append(("starttls", "context" in kwargs))
+
+        def send_message(self, msg):
+            calls.append(("send", msg["To"], msg["Subject"]))
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    mbox = tmp_path / "patch.mbox"
+    mbox.write_text("From x\nSubject: test\n\nbody\n", encoding="utf-8")
+
+    rc = bridges_mod.send_email(str(mbox), to=["b@example.com"],
+                                smtp_encryption="tls")
+
+    assert rc == 0
+    assert calls[:2] == [("connect", "localhost", 25), ("starttls", True)]
+    assert ("send", "b@example.com", "test") in calls

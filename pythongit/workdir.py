@@ -140,7 +140,7 @@ def status(repo: Repository) -> dict[str, list[str]]:
         full = repo.path / rel
         if rel in by_path:
             data = _blob_data(full)
-            sha, _ = objs.hash_bytes("blob", data)
+            sha, _ = objs.hash_bytes("blob", data, repo)
             if sha != by_path[rel].sha:
                 modified.append(rel)
         else:
@@ -177,7 +177,7 @@ def flatten_tree(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str,
     t, data = objs.read_object(repo, tree_sha)
     if t != "tree":
         return out
-    for e in objs.parse_tree(data):
+    for e in objs.parse_tree(data, repo.hash_len):
         path = f"{prefix}{e.name}"
         if e.is_dir():
             out.update(flatten_tree(repo, e.sha, prefix=path + "/"))
@@ -195,7 +195,7 @@ def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[
     t, data = objs.read_object(repo, tree_sha)
     if t != "tree":
         return out
-    for e in objs.parse_tree(data):
+    for e in objs.parse_tree(data, repo.hash_len):
         path = f"{prefix}{e.name}"
         if e.is_dir():
             out.update(flatten_gitlinks(repo, e.sha, prefix=path + "/"))

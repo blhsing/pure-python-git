@@ -4,6 +4,17 @@ from __future__ import annotations
 from pythongit import pack
 
 
+def _write_pack(repo, shas):
+    pack_bytes, entries = pack.build_pack(repo, shas)
+    idx_bytes = pack.write_idx_v2(pack_bytes, entries, repo.object_format())
+    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
+    pack_dir = repo.gitdir / "objects" / "pack"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    (pack_dir / f"pack-{pack_sha}.pack").write_bytes(pack_bytes)
+    (pack_dir / f"pack-{pack_sha}.idx").write_bytes(idx_bytes)
+    return pack_dir / f"pack-{pack_sha}.pack"
+
+
 def test_apply_delta_simple_copy_and_insert():
     base = b"hello world"
     # delta: src_size=11, dst_size=11, copy from base offset=0 len=5, insert "world"
@@ -127,3 +138,70 @@ def test_pack_var_size_roundtrip():
     t, sz, _ = pack._read_var_size(bytes(buf), 0)
     assert t == 3
     assert sz == 1000
+
+
+def test_multi_pack_index_binary_lookup(tmprepo):
+    repo, _ = tmprepo
+    from pythongit import objects as objs
+    blobs1 = [objs.write_object(repo, "blob", f"a{i}\n".encode()) for i in range(3)]
+    blobs2 = [objs.write_object(repo, "blob", f"b{i}\n".encode()) for i in range(3)]
+    _write_pack(repo, blobs1)
+    _write_pack(repo, blobs2)
+    pack_dir = repo.gitdir / "objects" / "pack"
+
+    data, pack_count, object_count = pack.write_midx(pack_dir)
+
+    assert data[:4] == b"MIDX"
+    assert pack_count == 2
+    assert object_count == 6
+    assert pack.verify_midx(pack_dir) == (2, 6)
+    midx = pack.read_midx(repo)
+    assert midx is not None
+    assert midx.get(blobs2[1]) == ("blob", b"b1\n")
+
+
+def test_real_git_verifies_our_multi_pack_index(tmprepo):
+    import subprocess
+    from conftest import real_git
+    gitbin = real_git()
+    if not gitbin:
+        return
+    repo, _ = tmprepo
+    from pythongit import objects as objs
+    blobs1 = [objs.write_object(repo, "blob", f"x{i}\n".encode()) for i in range(2)]
+    blobs2 = [objs.write_object(repo, "blob", f"y{i}\n".encode()) for i in range(2)]
+    _write_pack(repo, blobs1)
+    _write_pack(repo, blobs2)
+    pack.write_midx(repo.gitdir / "objects" / "pack")
+
+    r = subprocess.run([gitbin, "multi-pack-index", "verify"],
+                       cwd=repo.path, capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
+def test_sha256_pack_and_midx_interop(tmp_path):
+    import subprocess
+    from conftest import real_git
+    from pythongit import objects as objs
+    from pythongit.repo import Repository
+    gitbin = real_git()
+    if not gitbin:
+        return
+    repo = Repository.init(tmp_path, object_format="sha256")
+    blobs1 = [objs.write_object(repo, "blob", f"sx{i}\n".encode()) for i in range(2)]
+    blobs2 = [objs.write_object(repo, "blob", f"sy{i}\n".encode()) for i in range(2)]
+    p1 = _write_pack(repo, blobs1)
+    _write_pack(repo, blobs2)
+    pack_dir = repo.gitdir / "objects" / "pack"
+
+    r = subprocess.run([gitbin, "verify-pack", "-v", str(p1)],
+                       cwd=repo.path, capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+    data, packs, objects = pack.write_midx(pack_dir, repo.object_format())
+    assert data[5] == 2
+    assert packs == 2
+    assert objects == 4
+    assert pack.verify_midx(pack_dir) == (2, 4)
+    r = subprocess.run([gitbin, "-C", str(repo.path), "multi-pack-index", "verify"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"

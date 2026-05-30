@@ -45,9 +45,10 @@ def cmd_init(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit init")
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--bare", action="store_true")
+    ap.add_argument("--object-format", choices=["sha1", "sha256"], default="sha1")
     ap.add_argument("-b", "--initial-branch", default="main")
     args = ap.parse_args(argv)
-    repo = Repository.init(args.path, bare=args.bare)
+    repo = Repository.init(args.path, bare=args.bare, object_format=args.object_format)
     if args.initial_branch != "main":
         (repo.gitdir / "HEAD").write_text(f"ref: refs/heads/{args.initial_branch}\n", encoding="utf-8")
     _print(f"Initialized empty Git repository in {repo.gitdir}")
@@ -71,7 +72,11 @@ def cmd_hash_object(argv: list[str]) -> int:
         repo = _repo()
         sha = objs.write_object(repo, args.t, data)
     else:
-        sha, _ = objs.hash_bytes(args.t, data)
+        try:
+            repo = _repo()
+        except RepositoryError:
+            repo = None
+        sha, _ = objs.hash_bytes(args.t, data, repo)
     _print(sha)
     return 0
 
@@ -103,7 +108,7 @@ def cmd_cat_file(argv: list[str]) -> int:
         return 0
     elif args.pretty:
         if t == "tree":
-            for e in objs.parse_tree(data):
+            for e in objs.parse_tree(data, repo.hash_len):
                 obj_t = "tree" if e.is_dir() else "blob"
                 _print(f"{int(e.mode):06o} {obj_t} {e.sha}\t{e.name}")
         else:
@@ -131,7 +136,7 @@ def cmd_ls_tree(argv: list[str]) -> int:
 
     def walk(tsha: str, prefix: str = "") -> None:
         _t, td = objs.read_object(repo, tsha)
-        for e in objs.parse_tree(td):
+        for e in objs.parse_tree(td, repo.hash_len):
             obj_t = "tree" if e.is_dir() else "blob"
             path = prefix + e.name
             if args.r and obj_t == "tree":
@@ -510,7 +515,7 @@ def cmd_show(argv: list[str]) -> int:
             parent_tree = objs.parse_commit(pd).tree
             _print_tree_diff(repo, parent_tree, c.tree)
     elif t == "tree":
-        for e in objs.parse_tree(data):
+        for e in objs.parse_tree(data, repo.hash_len):
             obj_t = "tree" if e.is_dir() else "blob"
             _print(f"{int(e.mode):06o} {obj_t} {e.sha}\t{e.name}")
     else:
@@ -572,7 +577,7 @@ def cmd_diff(argv: list[str]) -> int:
             if not full.exists():
                 continue
             blob = full.read_bytes()
-            new_sha, _ = objs.hash_bytes("blob", blob)
+            new_sha, _ = objs.hash_bytes("blob", blob, repo)
             if new_sha == e.sha:
                 continue
             _, old_data = objs.read_object(repo, e.sha)
@@ -835,12 +840,19 @@ def cmd_ls_remote(argv: list[str]) -> int:
 
 def cmd_clone(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit clone")
+    ap.add_argument("--object-format", choices=["sha1", "sha256"], default=None)
     ap.add_argument("url")
     ap.add_argument("directory", nargs="?")
     args = ap.parse_args(argv)
-    from . import protocol
     target = args.directory or args.url.rstrip("/").split("/")[-1].removesuffix(".git")
-    protocol.clone(args.url, target)
+    src_path = args.url[7:] if args.url.startswith("file://") else args.url
+    if not args.url.startswith(("http://", "https://", "git://")) and Path(src_path).exists():
+        from . import translate
+        src = Repository.discover(src_path)
+        translate.convert_repository(src.path, target, args.object_format or src.object_format())
+    else:
+        from . import protocol
+        protocol.clone(args.url, target, object_format=args.object_format)
     _print(f"Cloned into {target}")
     return 0
 
@@ -848,7 +860,7 @@ def cmd_clone(argv: list[str]) -> int:
 def cmd_fsck(argv: list[str]) -> int:
     repo = _repo()
     # Walk loose objects + packs, verify hash matches content for loose.
-    import zlib, hashlib
+    import zlib
     obj_root = repo.gitdir / "objects"
     bad = 0
     if obj_root.is_dir():
@@ -859,7 +871,7 @@ def cmd_fsck(argv: list[str]) -> int:
                 sha = d.name + f.name
                 try:
                     raw = zlib.decompress(f.read_bytes())
-                    actual = hashlib.sha1(raw).hexdigest()
+                    actual = repo.hash_hex(raw)
                     if actual != sha:
                         _print(f"error: bad sha for {sha} (got {actual})")
                         bad += 1
@@ -1890,7 +1902,7 @@ def _reachable(repo: Repository) -> set[str]:
             stack.append(c.tree)
             stack.extend(c.parents)
         elif t == "tree":
-            for e in _o.parse_tree(data):
+            for e in _o.parse_tree(data, repo.hash_len):
                 stack.append(e.sha)
         elif t == "tag":
             for line in data.decode("utf-8", errors="replace").splitlines():
@@ -1913,9 +1925,8 @@ def cmd_pack_objects(argv: list[str]) -> int:
     else:
         shas = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
     pack_bytes, entries = _p.build_pack(repo, shas)
-    idx_bytes = _p.write_idx_v2(pack_bytes, entries)
-    import hashlib
-    pack_sha = hashlib.sha1(pack_bytes[:-20]).hexdigest()
+    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
+    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
     if args.stdout:
         sys.stdout.buffer.write(pack_bytes)
         return 0
@@ -1944,7 +1955,7 @@ def cmd_index_pack(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
-    import struct, zlib, binascii, hashlib
+    import struct, zlib, binascii
     raw = Path(args.packfile).read_bytes()
     if raw[:4] != b"PACK":
         _err("not a pack")
@@ -1973,8 +1984,8 @@ def cmd_index_pack(argv: list[str]) -> int:
             payload = _p.apply_delta(base[1], delta)
             t = base[0]
         elif obj_type == _p.OBJ_REF_DELTA:
-            base_sha = raw[pos : pos + 20].hex()
-            pos += 20
+            base_sha = raw[pos : pos + repo.hash_len].hex()
+            pos += repo.hash_len
             d = zlib.decompressobj()
             delta = d.decompress(raw[pos:])
             consumed = len(raw) - pos - len(d.unused_data)
@@ -1985,14 +1996,14 @@ def cmd_index_pack(argv: list[str]) -> int:
             return 1
         pos += consumed
         end = pos
-        sha, _ = objs.hash_bytes(t, payload)
+        sha, _ = objs.hash_bytes(t, payload, repo)
         by_offset[start] = (t, payload)
         crc = binascii.crc32(raw[start:end])
         entries.append((sha, start, crc))
-    idx = _p.write_idx_v2(raw, entries)
+    idx = _p.write_idx_v2(raw, entries, repo.object_format())
     idx_path = Path(args.packfile).with_suffix(".idx")
     idx_path.write_bytes(idx)
-    pack_sha = hashlib.sha1(raw[:-20]).hexdigest()
+    pack_sha = repo.hash_hex(raw[:-repo.hash_len])
     _print(pack_sha)
     return 0
 
@@ -2002,17 +2013,18 @@ def cmd_verify_pack(argv: list[str]) -> int:
     ap.add_argument("-v", action="store_true")
     ap.add_argument("packs", nargs="+")
     args = ap.parse_args(argv)
+    repo = _repo()
     from . import pack as _p
     rc = 0
     for p in args.packs:
         path = Path(p)
         if path.suffix == ".idx":
             path = path.with_suffix(".pack")
-        pk = _p.Pack(path)
+        pk = _p.Pack(path, repo.object_format())
         try:
             for sha in pk.shas:
                 t, data = pk.get(sha)  # type: ignore[misc]
-                actual, _ = objs.hash_bytes(t, data)
+                actual, _ = objs.hash_bytes(t, data, repo)
                 if actual != sha:
                     _err(f"error: bad object {sha}")
                     rc = 1
@@ -2060,11 +2072,10 @@ def cmd_repack(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
-    import hashlib
     shas = sorted(_reachable(repo))
     pack_bytes, entries = _p.build_pack(repo, shas)
-    idx_bytes = _p.write_idx_v2(pack_bytes, entries)
-    pack_sha = hashlib.sha1(pack_bytes[:-20]).hexdigest()
+    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
+    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
     pack_dir = repo.gitdir / "objects" / "pack"
     pack_dir.mkdir(parents=True, exist_ok=True)
     (pack_dir / f"pack-{pack_sha}.pack").write_bytes(pack_bytes)
@@ -2311,37 +2322,33 @@ def cmd_bisect(argv: list[str]) -> int:
                 parents_map[c_sha] = [p for p in cc.parents if p in candidates]
             except KeyError:
                 parents_map[c_sha] = []
-        # topological order
-        in_degree = {c: 0 for c in candidates}
-        for c_sha in candidates:
-            for p in parents_map[c_sha]:
-                in_degree[p] = in_degree.get(p, 0) + 1
-        # process from leaves (no candidates pointing at them as parent)
-        # weight: number of descendants in candidates including self
-        # Walk from roots-of-DAG (commits with no parents in candidates) upward.
-        # Easier: reverse parents to get children.
-        children_map: dict[str, list[str]] = {c: [] for c in candidates}
-        for c_sha, ps in parents_map.items():
+        indegree = {c: 0 for c in candidates}
+        for ps in parents_map.values():
             for p in ps:
-                children_map[p].append(c_sha)
-        # reachable_from[c] = set of candidates reachable from c via parent edges
-        from functools import lru_cache
-        memo: dict[str, set[str]] = {}
+                indegree[p] += 1
+        queue = sorted(c for c, deg in indegree.items() if deg == 0)
+        topo: list[str] = []
+        while queue:
+            c_sha = queue.pop()
+            topo.append(c_sha)
+            for p in parents_map.get(c_sha, []):
+                indegree[p] -= 1
+                if indegree[p] == 0:
+                    queue.append(p)
 
-        def reach(c: str) -> set[str]:
-            if c in memo:
-                return memo[c]
-            r = {c}
-            for p in parents_map.get(c, []):
-                r |= reach(p)
-            memo[c] = r
-            return r
+        positions = {c_sha: i for i, c_sha in enumerate(sorted(candidates))}
+        reachable: dict[str, int] = {}
+        for c_sha in reversed(topo):
+            r = 1 << positions[c_sha]
+            for p in parents_map.get(c_sha, []):
+                r |= reachable[p]
+            reachable[c_sha] = r
 
         n = len(candidates)
         best = None
         best_distance = -1
         for c_sha in sorted(candidates):  # stable for ties
-            w = len(reach(c_sha))
+            w = reachable.get(c_sha, 1 << positions[c_sha]).bit_count()
             distance = min(w, n - w)
             if distance > best_distance:
                 best_distance = distance
@@ -3302,7 +3309,7 @@ def cmd_verify_commit(argv: list[str]) -> int:
                 _err(f"error: {r} is not a commit")
                 rc = 1
                 continue
-            actual, _ = objs.hash_bytes("commit", data)
+            actual, _ = objs.hash_bytes("commit", data, repo)
             if actual != s:
                 _err(f"error: {r} sha mismatch")
                 rc = 1
@@ -3334,7 +3341,7 @@ def cmd_verify_tag(argv: list[str]) -> int:
                 _err(f"error: {r} is not an annotated tag")
                 rc = 1
                 continue
-            actual, _ = objs.hash_bytes("tag", data)
+            actual, _ = objs.hash_bytes("tag", data, repo)
             if actual != s:
                 _err(f"error: {r} sha mismatch")
                 rc = 1
@@ -3350,7 +3357,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
     """Binary commit-graph per Documentation/gitformat-commit-graph.adoc.
 
     Writes .git/objects/info/commit-graph with CGPH header + OIDF + OIDL +
-    CDAT + optional EDGE chunks, terminated by a SHA1 trailer of the
+    CDAT + optional EDGE chunks, terminated by the repository hash of the
     preceding bytes.
     """
     ap = argparse.ArgumentParser(prog="pygit commit-graph")
@@ -3365,7 +3372,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
     cg = info / "commit-graph"
 
     if args.action == "write":
-        import hashlib, struct
+        import struct
         reach = _reachable(repo)
         commits: dict[str, objs.Commit] = {}
         for sha in sorted(reach):
@@ -3379,7 +3386,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
         sha_to_pos = {s: i for i, s in enumerate(shas)}
         n = len(shas)
 
-        # Build CDAT entries (each H + 16 = 36 bytes for SHA-1)
+        # Build CDAT entries (each H + 16 bytes).
         # parent positions: 0x70000000 means "no parent"
         # parent2 = 0x80000000 | edge_index when more than 2 parents
         extra_edges = bytearray()
@@ -3447,10 +3454,10 @@ def cmd_commit_graph(argv: list[str]) -> int:
             cum += fanout[i]
             oidf += struct.pack(">I", cum)
 
-        # OIDL (N * 20)
+        # OIDL (N * H)
         oidl = b"".join(bytes.fromhex(s) for s in shas)
 
-        # Compose: header (8) + TOC + chunks + trailer (20)
+        # Compose: header (8) + TOC + chunks + trailer (H)
         chunks: list[tuple[bytes, bytes]] = [(b"OIDF", bytes(oidf)),
                                              (b"OIDL", oidl),
                                              (b"CDAT", bytes(cdat))]
@@ -3458,7 +3465,8 @@ def cmd_commit_graph(argv: list[str]) -> int:
             chunks.append((b"EDGE", bytes(extra_edges)))
 
         # 4 bytes signature + 1 ver + 1 hashver + 1 chunks + 1 base
-        header = b"CGPH" + bytes([1, 1, len(chunks), 0])
+        hash_version = 2 if repo.object_format() == "sha256" else 1
+        header = b"CGPH" + bytes([1, hash_version, len(chunks), 0])
         # TOC: (count + 1) * 12 bytes
         toc_size = (len(chunks) + 1) * 12
         # compute offsets for each chunk
@@ -3475,7 +3483,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
         toc += b"\x00\x00\x00\x00" + struct.pack(">Q", end_offset)
 
         body = header + bytes(toc) + b"".join(d for _, d in chunks)
-        trailer = hashlib.sha1(body).digest()
+        trailer = repo.hash_bytes(body)
         cg.write_bytes(body + trailer)
         _print(f"wrote commit-graph with {n} commits")
         return 0
@@ -3484,7 +3492,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
         if not cg.exists():
             _err("no commit-graph")
             return 1
-        import hashlib, struct
+        import struct
         raw = cg.read_bytes()
         if raw[:4] != b"CGPH":
             _err("bad signature")
@@ -3492,9 +3500,13 @@ def cmd_commit_graph(argv: list[str]) -> int:
         if raw[4] != 1:
             _err(f"unsupported version {raw[4]}")
             return 1
+        expected_hash_version = 2 if repo.object_format() == "sha256" else 1
+        if raw[5] != expected_hash_version:
+            _err(f"hash version mismatch: {raw[5]}")
+            return 1
         chunks_count = raw[6]
-        actual = hashlib.sha1(raw[:-20]).digest()
-        if actual != raw[-20:]:
+        actual = repo.hash_bytes(raw[:-repo.hash_len])
+        if actual != raw[-repo.hash_len:]:
             _err("trailer hash mismatch")
             return 1
         # parse TOC to find OIDL
@@ -3507,7 +3519,7 @@ def cmd_commit_graph(argv: list[str]) -> int:
             off = struct.unpack(">Q", entry[4:])[0]
             offsets.append((cid, off))
         for i, (cid, off) in enumerate(offsets):
-            nxt = offsets[i + 1][1] if i + 1 < len(offsets) else len(raw) - 20
+            nxt = offsets[i + 1][1] if i + 1 < len(offsets) else len(raw) - repo.hash_len
             if cid == b"OIDL":
                 oidl_off, oidl_end = off, nxt
             if cid == b"CDAT":
@@ -3517,8 +3529,8 @@ def cmd_commit_graph(argv: list[str]) -> int:
             return 1
         # check that all listed shas exist as commits
         sha_block = raw[oidl_off:oidl_end]
-        for i in range(0, len(sha_block), 20):
-            sha = sha_block[i : i + 20].hex()
+        for i in range(0, len(sha_block), repo.hash_len):
+            sha = sha_block[i : i + repo.hash_len].hex()
             try:
                 t, _ = objs.read_object(repo, sha)
                 if t != "commit":
@@ -3808,10 +3820,11 @@ _register_phase6()
 
 def _raw_diff_status(a_mode: str, b_mode: str, a_sha: Optional[str], b_sha: Optional[str], path: str) -> str:
     """Emit a 'raw diff' format line: ':MODE_A MODE_B SHA_A SHA_B STATUS\\tpath'."""
+    null_oid = "0" * max(len(a_sha or ""), len(b_sha or ""), 40)
     if a_sha is None:
-        return f":000000 {b_mode} {'0' * 40} {b_sha} A\t{path}"
+        return f":000000 {b_mode} {null_oid} {b_sha} A\t{path}"
     if b_sha is None:
-        return f":{a_mode} 000000 {a_sha} {'0' * 40} D\t{path}"
+        return f":{a_mode} 000000 {a_sha} {null_oid} D\t{path}"
     if a_sha == b_sha and a_mode == b_mode:
         return ""
     return f":{a_mode} {b_mode} {a_sha} {b_sha} M\t{path}"
@@ -3906,7 +3919,7 @@ def cmd_diff_files(argv: list[str]) -> int:
             _print(_raw_diff_status(e.mode_str(), "000000", e.sha, None, e.path) if not args.name_only else e.path)
             continue
         data = full.read_bytes()
-        sha, _ = objs.hash_bytes("blob", data)
+        sha, _ = objs.hash_bytes("blob", data, repo)
         if sha != e.sha:
             if args.name_only:
                 _print(e.path)
@@ -4082,11 +4095,19 @@ def cmd_check_mailmap(argv: list[str]) -> int:
 
 def cmd_show_index(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit show-index")
+    ap.add_argument("--object-format", choices=["sha1", "sha256"], default=None)
     ap.add_argument("idx", nargs="?", help="path to .idx; if omitted, reads stdin (raw idx)")
     args = ap.parse_args(argv)
+    if args.object_format:
+        hash_len = 32 if args.object_format == "sha256" else 20
+    else:
+        try:
+            hash_len = _repo().hash_len
+        except RepositoryError:
+            hash_len = 20
     from . import pack as _p
     if args.idx:
-        shas, offsets = _p._read_idx(Path(args.idx))
+        shas, offsets = _p._read_idx(Path(args.idx), hash_len)
     else:
         data = sys.stdin.buffer.read()
         # write to temp then read
@@ -4094,7 +4115,7 @@ def cmd_show_index(argv: list[str]) -> int:
         with tempfile.NamedTemporaryFile(suffix=".idx", delete=False) as f:
             f.write(data)
             tmp = f.name
-        shas, offsets = _p._read_idx(Path(tmp))
+        shas, offsets = _p._read_idx(Path(tmp), hash_len)
         os.unlink(tmp)
     paired = sorted(zip(offsets, shas))
     for off, sha in paired:
@@ -4450,6 +4471,8 @@ def cmd_upload_pack(argv: list[str]) -> int:
 
     head_sym, head_sha = refs_mod.read_head(repo)
     caps = b"side-band-64k ofs-delta agent=pythongit/0.1"
+    if repo.object_format() == "sha256":
+        caps += b" object-format=sha256"
     first = True
     for kind in ("refs/heads", "refs/tags", "refs/remotes"):
         root = repo.gitdir / kind
@@ -4481,6 +4504,8 @@ def cmd_receive_pack(argv: list[str]) -> int:
         return f"{len(b) + 4:04x}".encode() + b
 
     caps = b"report-status agent=pythongit/0.1"
+    if repo.object_format() == "sha256":
+        caps += b" object-format=sha256"
     first = True
     for kind in ("refs/heads", "refs/tags"):
         root = repo.gitdir / kind
@@ -4580,7 +4605,7 @@ def cmd_merge_ours(argv: list[str]) -> int:
 
 
 def cmd_multi_pack_index(argv: list[str]) -> int:
-    """Minimal MIDX: a text listing of pack files (real format is binary chunks)."""
+    """Write and verify Git's binary multi-pack-index format."""
     ap = argparse.ArgumentParser(prog="pygit multi-pack-index")
     sub = ap.add_subparsers(dest="action", required=True)
     sub.add_parser("write")
@@ -4590,18 +4615,21 @@ def cmd_multi_pack_index(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     pack_dir = repo.gitdir / "objects" / "pack"
-    midx_txt = pack_dir / "multi-pack-index.txt"
+    from . import pack as _p
     if args.action == "write":
-        pack_dir.mkdir(parents=True, exist_ok=True)
-        lines = [p.name for p in sorted(pack_dir.glob("pack-*.pack"))]
-        midx_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _print(f"wrote multi-pack-index with {len(lines)} packs")
+        _data, packs, objects = _p.write_midx(pack_dir, repo.object_format())
+        _print(f"wrote multi-pack-index with {packs} packs, {objects} objects")
         return 0
     if args.action == "verify":
-        if not midx_txt.exists():
+        if not (pack_dir / "multi-pack-index").exists():
             _err("no multi-pack-index")
             return 1
-        _print("ok")
+        try:
+            packs, objects = _p.verify_midx(pack_dir)
+        except (OSError, ValueError) as exc:
+            _err(f"multi-pack-index verify failed: {exc}")
+            return 1
+        _print(f"ok ({packs} packs, {objects} objects)")
         return 0
     if args.action in ("expire", "repack"):
         return 0
@@ -4799,6 +4827,18 @@ def cmd_backfill(argv: list[str]) -> int:
     return 0
 
 
+def cmd_convert_object_format(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="pygit convert-object-format")
+    ap.add_argument("--object-format", choices=["sha1", "sha256"], required=True)
+    ap.add_argument("source")
+    ap.add_argument("destination")
+    args = ap.parse_args(argv)
+    from . import translate
+    dst = translate.convert_repository(args.source, args.destination, args.object_format)
+    _print(f"Converted {args.source} to {args.object_format} repository at {dst.path}")
+    return 0
+
+
 def cmd_submodule_helper(argv: list[str]) -> int:
     """Internal: dispatch to a submodule subcommand."""
     return cmd_submodule(argv)
@@ -4843,6 +4883,7 @@ def _register_phase8() -> None:
     _COMMANDS["refs"] = cmd_refs
     _COMMANDS["replay"] = cmd_replay
     _COMMANDS["backfill"] = cmd_backfill
+    _COMMANDS["convert-object-format"] = cmd_convert_object_format
     _COMMANDS["submodule-helper"] = cmd_submodule_helper
     _COMMANDS["checkout-worker"] = cmd_checkout_worker
 
@@ -4857,11 +4898,19 @@ def _register_phase8() -> None:
         ap.add_argument("--smtp-server-port", type=int, default=25)
         ap.add_argument("--smtp-user", default=None)
         ap.add_argument("--smtp-pass", default=None)
+        ap.add_argument("--smtp-encryption", default=None,
+                        help="tls/starttls or ssl; anything else disables encryption")
+        ap.add_argument("--smtp-ssl", action="store_true",
+                        help="deprecated alias for --smtp-encryption ssl")
+        ap.add_argument("--smtp-ssl-cert-path", default=None)
         ap.add_argument("mbox")
         args = ap.parse_args(argv)
+        enc = "ssl" if args.smtp_ssl else args.smtp_encryption
         return bridges.send_email(args.mbox, to=args.to, from_addr=args.from_addr,
                                   smtp_host=args.smtp_server, smtp_port=args.smtp_server_port,
-                                  smtp_user=args.smtp_user, smtp_pass=args.smtp_pass)
+                                  smtp_user=args.smtp_user, smtp_pass=args.smtp_pass,
+                                  smtp_encryption=enc,
+                                  smtp_ssl_cert_path=args.smtp_ssl_cert_path)
 
     def _cmd_difftool(argv):
         ap = argparse.ArgumentParser(prog="pygit difftool")

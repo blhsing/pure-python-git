@@ -4,15 +4,14 @@ Layout:
   header: 'DIRC' + version(uint32) + count(uint32)
   entries:
     ctime_s, ctime_n, mtime_s, mtime_n, dev, ino, mode, uid, gid, size  (10 * uint32)
-    sha1(20)
+    object id (20 bytes for SHA-1, 32 bytes for SHA-256)
     flags(uint16)  -- low 12 bits = path length
     path (NUL terminated, padded so total entry length is multiple of 8)
   extensions ...
-  SHA1 trailer over the preceding bytes.
+  object-format hash trailer over the preceding bytes.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import struct
 from dataclasses import dataclass, field
@@ -118,9 +117,14 @@ def read_index(repo: Repository) -> Index:
     pos = 12
     for _ in range(count):
         start = pos
-        fields = struct.unpack(">10I20sH", raw[pos : pos + 62])
+        hash_len = repo.hash_len
+        head_len = 40 + hash_len + 2
+        fields = struct.unpack(
+            f">10I{hash_len}sH",
+            raw[pos : pos + head_len],
+        )
         (cts, ctn, mts, mtn, dev, ino, mode, uid, gid, size, sha_b, flags) = fields
-        pos += 62
+        pos += head_len
         name_len = flags & 0x0FFF
         if name_len < 0x0FFF:
             path = raw[pos : pos + name_len].decode("utf-8", errors="replace")
@@ -151,7 +155,7 @@ def write_index(repo: Repository, idx: Index) -> None:
         path_bytes = e.path.encode("utf-8")
         flags = (e.flags & 0xF000) | min(len(path_bytes), 0x0FFF)
         buf += struct.pack(
-            ">10I20sH",
+            f">10I{repo.hash_len}sH",
             e.ctime_s & 0xFFFFFFFF, e.ctime_n & 0xFFFFFFFF,
             e.mtime_s & 0xFFFFFFFF, e.mtime_n & 0xFFFFFFFF,
             e.dev & 0xFFFFFFFF, e.ino & 0xFFFFFFFF,
@@ -162,7 +166,7 @@ def write_index(repo: Repository, idx: Index) -> None:
         buf += path_bytes + b"\0"
         while (len(buf) - start) % 8 != 0:
             buf += b"\0"
-    buf += hashlib.sha1(buf).digest()
+    buf += repo.hash_bytes(buf)
     p = _index_path(repo)
     tmp = p.with_suffix(".tmp")
     tmp.write_bytes(bytes(buf))

@@ -15,8 +15,8 @@ from .repo import Repository
 SHA_LEN = 40
 
 
-def _is_sha(s: str) -> bool:
-    return len(s) == SHA_LEN and all(c in "0123456789abcdef" for c in s.lower())
+def _is_sha(s: str, hex_len: int = SHA_LEN) -> bool:
+    return len(s) == hex_len and all(c in "0123456789abcdef" for c in s.lower())
 
 
 def read_packed_refs(repo: Repository) -> dict[str, str]:
@@ -51,13 +51,13 @@ def read_ref(repo: Repository, name: str) -> Optional[str]:
         if txt.startswith("ref: "):
             cur = txt[5:].strip()
             continue
-        return txt if _is_sha(txt) else None
+        return txt if _is_sha(txt, repo.hex_len) else None
 
 
 def update_ref(repo: Repository, name: str, sha: str, *, message: str = "") -> None:
-    if not _is_sha(sha):
+    if not _is_sha(sha, repo.hex_len):
         raise ValueError(f"not a sha: {sha}")
-    old = read_ref(repo, name) or "0" * 40
+    old = read_ref(repo, name) or repo.null_oid()
     p = repo.gitdir / name
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -91,14 +91,14 @@ def read_head(repo: Repository) -> tuple[Optional[str], Optional[str]]:
     if txt.startswith("ref: "):
         ref = txt[5:].strip()
         return ref, read_ref(repo, ref)
-    return None, txt if _is_sha(txt) else None
+    return None, txt if _is_sha(txt, repo.hex_len) else None
 
 
 def set_head(repo: Repository, target: str) -> None:
     p = repo.gitdir / "HEAD"
     if target.startswith("refs/"):
         p.write_text(f"ref: {target}\n", encoding="utf-8")
-    elif _is_sha(target):
+    elif _is_sha(target, repo.hex_len):
         p.write_text(target + "\n", encoding="utf-8")
     else:
         # branch shorthand
@@ -152,9 +152,9 @@ def rev_parse(repo: Repository, name: str) -> Optional[str]:
             return sha
     # raw / abbreviated sha
     low = name.lower()
-    if _is_sha(low):
+    if _is_sha(low, repo.hex_len):
         return low
-    if 4 <= len(low) <= SHA_LEN and all(c in "0123456789abcdef" for c in low):
+    if 4 <= len(low) <= repo.hex_len and all(c in "0123456789abcdef" for c in low):
         # search loose objects
         obj_root = repo.gitdir / "objects" / low[:2]
         if obj_root.is_dir():

@@ -5,8 +5,9 @@
 
 A pure-Python reimplementation of `git`. No external runtime dependencies — just
 the Python standard library. All 141 of git's built-in subcommands are
-implemented, the on-disk format is byte-for-byte compatible with real `git`,
-and the package optionally installs a drop-in `git` console script.
+implemented, plus aliases and pythongit-specific helpers. The on-disk format is
+byte-for-byte compatible with real `git`, and the package optionally installs a
+drop-in `git` console script.
 
 ```text
 pure-python-git/             (repo root)
@@ -15,7 +16,7 @@ pure-python-git/             (repo root)
 ├── pythongit/               importable package — at repo root
 │   ├── __init__.py
 │   ├── __main__.py          `python -m pythongit ...`
-│   ├── cli.py               command dispatch (158 commands)
+│   ├── cli.py               command dispatch (161 commands)
 │   ├── repo.py              Repository discovery + config
 │   ├── objects.py           blob / tree / commit / tag encode/decode
 │   ├── refs.py              ref resolution, update, reflog hook
@@ -135,10 +136,17 @@ Cloning over HTTPS:
 pygit clone https://github.com/some/repo.git
 ```
 
+Cloning or converting across object formats:
+
+```bash
+pygit clone --object-format=sha256 ./sha1-repo ./sha256-copy
+pygit convert-object-format --object-format=sha1 ./sha256-copy ./sha1-copy
+```
+
 ## Supported commands
 
-All 141 git built-in subcommands plus aliases (158 entries in total). Selected
-highlights:
+All 141 git built-in subcommands plus aliases and pythongit-specific helpers
+(161 entries in total). Selected highlights:
 
 **Plumbing.** `hash-object`, `cat-file`, `ls-tree`, `write-tree`, `read-tree`,
 `commit-tree`, `mktree`, `mktag`, `update-ref`, `symbolic-ref`, `rev-parse`,
@@ -160,8 +168,8 @@ highlights:
 `submodule`, `sparse-checkout`, `request-pull`, `interpret-trailers`,
 `verify-commit`, `verify-tag`, `rerere`, `replace`, `gc`, `repack`, `prune`,
 `count-objects`, `fsck`, `pull`, `fetch`, `push`, `remote`, `ls-remote`,
-`config`, `refs`, `repo`, `diagnose`, `bugreport`, `last-modified`, `history`,
-`url-parse`, `maintenance`.
+`config`, `refs`, `convert-object-format`, `repo`, `diagnose`, `bugreport`,
+`last-modified`, `history`, `url-parse`, `maintenance`.
 
 **Bridges (orchestrate other binaries / protocols).** `send-email` (via
 `smtplib`), `daemon` (TCP git:// server), `instaweb`/`gitweb` (`http.server`-based
@@ -190,6 +198,7 @@ The test suite verifies this against the real `git` binary:
 | index v2 with stages | `git ls-files --stage` |
 | pack v2 + idx v2 (with deltas) | `git verify-pack -v` |
 | binary commit-graph file | `git commit-graph verify` |
+| SHA-1/SHA-256 object-format repos | `git fsck`, `git rev-parse --show-object-format` |
 | refs / packed-refs / reflog | `git log --all` |
 | smart HTTPS push payload | `git receive-pack` |
 
@@ -200,12 +209,18 @@ The reverse also holds: pythongit reads packs and indexes produced by real
 
 ### Object storage
 
-Loose objects under `.git/objects/<sha[:2]>/<sha[2:]>`, zlib-compressed. Pack
-objects in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader handles both
-`REF_DELTA` (delta against a hex sha base) and `OFS_DELTA` (delta against an
-earlier offset in the same pack). `pack.build_pack` also writes deltas:
+Loose objects under `.git/objects/<oid[:2]>/<oid[2:]>`, zlib-compressed. SHA-1
+and SHA-256 repositories are selected by `extensions.objectformat`. Pack objects
+live in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader handles both
+`REF_DELTA` (delta against a hex object-id base) and `OFS_DELTA` (delta against
+an earlier offset in the same pack). `pack.build_pack` also writes deltas:
 candidate bases come from a windowed search over recent same-type objects,
 accepted when the delta is at most half the raw size.
+
+`translate.ObjectTranslator` converts complete reachable object graphs between
+SHA-1 and SHA-256 by rehashing blobs and rewriting embedded object IDs in
+trees, commits, and annotated tags. `clone --object-format=...` uses this when
+the requested target format differs from the source format.
 
 ### Index
 
@@ -264,10 +279,10 @@ Implements the format from `gitformat-commit-graph.adoc`:
 HEADER  (8 bytes)   CGPH + ver(1) + hashver(1) + chunk_count + base_count
 TOC     ((C+1)*12)  per-chunk (id, offset_uint64) + terminator
 OIDF    (256*4)     fanout: cumulative counts indexed by first byte of OID
-OIDL    (N*20)      sorted SHA-1s
-CDAT    (N*36)      tree(20) + parent1_pos(4) + parent2_pos(4) + gen+time(8)
+OIDL    (N*H)       sorted object IDs
+CDAT    (N*(H+16))  tree(H) + parent1_pos(4) + parent2_pos(4) + gen+time(8)
 EDGE    (optional)  octopus extra parents
-TRAILER (20)        SHA-1 of all preceding bytes
+TRAILER (H)         repository hash of all preceding bytes
 ```
 
 Generation numbers count topological level (1 for roots). The on-disk file is
@@ -292,16 +307,16 @@ pip install pythongit[test]
 pytest
 ```
 
-74 tests pass:
+88 tests pass:
 
 | File                    | Coverage |
 |-------------------------|----------|
 | `unit_objects.py`       | hash, encode/decode, signatures, gitlinks |
 | `unit_refs.py`          | symbolic refs, reflog, packed-refs, abbrev SHA |
 | `unit_index.py`         | DIRC v2 roundtrip, conflict stages, long paths |
-| `unit_pack.py`          | delta apply, idx v2, build_pack, real-git interop |
-| `unit_modules.py`       | diff/merge/patch/ignore/rerere unit-level |
-| `unit_integration.py`   | end-to-end CLI flows incl. conflicts + rerere replay |
+| `unit_pack.py`          | delta apply, idx v2, build_pack, binary MIDX, SHA-256 interop |
+| `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP unit-level |
+| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rerere replay, SHA-256 translation |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 
 Tests that require the real `git` binary are silently skipped when it's not on
@@ -309,11 +324,9 @@ PATH, so the suite runs cleanly in containers without one.
 
 ## What's intentionally NOT implemented
 
-* SHA-256 object IDs. The format module is wired for SHA-1; SHA-256 would
-  need a few format changes (hash length = H byte, idx v3, longer OIDs).
-* Bitmap indexes, multi-pack-index in binary form, and bloom filters on the
-  commit-graph. The hot paths use linear scans instead — fine up to a few
-  thousand commits / a few hundred MB of packs.
+* Bitmap indexes and bloom filters on the commit-graph. Binary
+  multi-pack-index files are implemented for pack lookup, but MIDX bitmaps are
+  not.
 * `git filter-repo` (it's a separate Python tool anyway, not a git built-in).
 * The fancier merge strategies (`recursive`'s rename detection, `ort`'s
   three-way for trees). `pygit merge-recursive` aliases to the default
@@ -321,15 +334,17 @@ PATH, so the suite runs cleanly in containers without one.
 
 ## Limitations to know about
 
-* Big repos: scans walk every loose object on disk and every pack
-  sequentially. Fine for typical project sizes; not designed for the
+* Big repos: loose-object discovery and some reachability walks are still
+  straightforward scans. Pack object lookup can use `.idx` files and the
+  binary multi-pack-index, but this is still not designed for the
   linux-kernel-or-larger end of the spectrum.
-* The `bisect` heuristic computes weights with a Python recursion — for
-  multi-thousand-commit candidate sets this is slow.
+* The `bisect` heuristic computes exact candidate weights with iterative
+  bitsets. It avoids Python recursion, but very large candidate DAGs can still
+  spend noticeable CPU and memory on transitive reachability.
 * `fsmonitor` uses polling, not OS-level inotify/fsevent. Configurable
   interval; not free.
-* `send-email` only supports vanilla SMTP via `smtplib`. No SSL/TLS-only
-  authentication helpers (it does use `starttls()` when given a `--smtp-user`).
+* `send-email` uses `smtplib` with plain SMTP, STARTTLS/TLS, and SMTP-over-SSL.
+  It does not include provider-specific OAuth/keychain helpers.
 * `gitk` / `gui` need a working Tk install (`tkinter`).
 
 ## Contributing

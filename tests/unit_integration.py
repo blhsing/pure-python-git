@@ -26,6 +26,127 @@ def test_full_init_add_commit_log(tmprepo):
     assert refs.read_ref(repo, "refs/heads/main") == head
 
 
+def test_sha256_init_add_commit_local(tmp_path):
+    from pythongit.repo import Repository
+    from pythongit.index import read_index
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert cli_run("init", "--object-format=sha256", str(tmp_path)) == 0
+        repo = Repository.discover(tmp_path)
+        assert repo.object_format() == "sha256"
+        cli_run("config", "user.name", "t")
+        cli_run("config", "user.email", "t@example.com")
+        (tmp_path / "a.txt").write_text("hello\n")
+        assert cli_run("add", "a.txt") == 0
+        idx = read_index(repo)
+        assert len(idx.entries[0].sha) == 64
+        assert cli_run("commit", "-m", "sha256 commit") == 0
+        head = refs.rev_parse(repo, "HEAD")
+        assert head is not None and len(head) == 64
+        t, data = objs.read_object(repo, head)
+        assert t == "commit"
+        tree = objs.parse_commit(data).tree
+        assert len(tree) == 64
+        assert cli_run("commit-graph", "write", "--reachable") == 0
+        assert cli_run("commit-graph", "verify") == 0
+        assert cli_run("fsck") == 0
+        assert cli_run("status") == 0
+    finally:
+        os.chdir(cwd)
+
+
+def test_real_git_reads_pygit_sha256_repo(tmp_path):
+    from tests.conftest import real_git
+    gitbin = real_git()
+    if not gitbin:
+        return
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert cli_run("init", "--object-format=sha256", str(tmp_path)) == 0
+        cli_run("config", "user.name", "t")
+        cli_run("config", "user.email", "t@example.com")
+        (tmp_path / "a.txt").write_text("hello\n")
+        assert cli_run("add", "a.txt") == 0
+        assert cli_run("commit", "-m", "sha256 commit") == 0
+        assert cli_run("commit-graph", "write", "--reachable") == 0
+    finally:
+        os.chdir(cwd)
+    import subprocess
+    r = subprocess.run([gitbin, "-C", str(tmp_path), "fsck"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+    r = subprocess.run([gitbin, "-C", str(tmp_path), "rev-parse", "--show-object-format"],
+                       capture_output=True, text=True)
+    assert r.stdout.strip() == "sha256"
+    r = subprocess.run([gitbin, "-C", str(tmp_path), "commit-graph", "verify"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
+def test_cross_format_clone_and_roundtrip_translation(tmp_path):
+    from pythongit.repo import Repository
+    source = tmp_path / "source"
+    clone256 = tmp_path / "clone256"
+    back = tmp_path / "back"
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert cli_run("init", str(source)) == 0
+        os.chdir(source)
+        cli_run("config", "user.name", "t")
+        cli_run("config", "user.email", "t@example.com")
+        (source / "a.txt").write_text("one\n")
+        assert cli_run("add", "a.txt") == 0
+        assert cli_run("commit", "-m", "one") == 0
+        (source / "a.txt").write_text("one\ntwo\n")
+        assert cli_run("add", "a.txt") == 0
+        assert cli_run("commit", "-m", "two") == 0
+    finally:
+        os.chdir(cwd)
+
+    src_repo = Repository.discover(source)
+    original_head = refs.rev_parse(src_repo, "HEAD")
+    assert original_head is not None
+    tag_data = (
+        f"object {original_head}\n"
+        "type commit\n"
+        "tag ann\n"
+        "tagger t <t@example.com> 1 +0000\n\n"
+        "annotated\n"
+    ).encode()
+    tag_sha = objs.write_object(src_repo, "tag", tag_data)
+    refs.update_ref(src_repo, "refs/tags/ann", tag_sha)
+
+    assert cli_run("clone", "--object-format=sha256", str(source), str(clone256)) == 0
+    dst_repo = Repository.discover(clone256)
+    translated_head = refs.rev_parse(dst_repo, "HEAD")
+    translated_tag = refs.rev_parse(dst_repo, "ann")
+    assert dst_repo.object_format() == "sha256"
+    assert translated_head is not None and len(translated_head) == 64
+    assert translated_tag is not None and len(translated_tag) == 64
+    assert (clone256 / "a.txt").read_text() == "one\ntwo\n"
+    tag_type, translated_tag_data = objs.read_object(dst_repo, translated_tag)
+    assert tag_type == "tag"
+    assert f"object {translated_head}\n".encode() in translated_tag_data
+
+    assert cli_run("convert-object-format", "--object-format=sha1", str(clone256), str(back)) == 0
+    back_repo = Repository.discover(back)
+    assert back_repo.object_format() == "sha1"
+    assert refs.rev_parse(back_repo, "HEAD") == original_head
+    assert refs.rev_parse(back_repo, "ann") == tag_sha
+
+    from tests.conftest import real_git
+    gitbin = real_git()
+    if gitbin:
+        import subprocess
+        for path in (clone256, back):
+            r = subprocess.run([gitbin, "-C", str(path), "fsck"],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, f"{path}: stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
 def test_branch_checkout_switches(tmprepo):
     from tests.conftest import commit_one
     repo, _ = tmprepo

@@ -37,9 +37,24 @@ from .repo import Repository
 
 def send_email(mbox: str, *, to: list[str], from_addr: Optional[str] = None,
                smtp_host: str = "localhost", smtp_port: int = 25,
-               smtp_user: Optional[str] = None, smtp_pass: Optional[str] = None) -> int:
+               smtp_user: Optional[str] = None, smtp_pass: Optional[str] = None,
+               smtp_encryption: Optional[str] = None,
+               smtp_ssl_cert_path: Optional[str] = None) -> int:
     import smtplib
+    import ssl
     from email.message import EmailMessage
+    encryption = (smtp_encryption or "auto").lower()
+    if encryption == "tls":
+        encryption = "starttls"
+    context = None
+    if encryption in ("ssl", "starttls"):
+        context = ssl.create_default_context()
+        if smtp_ssl_cert_path:
+            path = Path(smtp_ssl_cert_path)
+            if path.is_dir():
+                context.load_verify_locations(capath=str(path))
+            else:
+                context.load_verify_locations(cafile=str(path))
     text = Path(mbox).read_text(encoding="utf-8", errors="replace")
     pieces: list[list[str]] = []
     cur: list[str] = []
@@ -51,9 +66,14 @@ def send_email(mbox: str, *, to: list[str], from_addr: Optional[str] = None,
             cur.append(line)
     if cur:
         pieces.append(cur)
-    with smtplib.SMTP(smtp_host, smtp_port) as s:
-        if smtp_user:
+    smtp_cls = smtplib.SMTP_SSL if encryption == "ssl" else smtplib.SMTP
+    kwargs = {"context": context} if encryption == "ssl" and context is not None else {}
+    with smtp_cls(smtp_host, smtp_port, **kwargs) as s:
+        if encryption == "starttls":
+            s.starttls(context=context)
+        elif encryption == "auto" and smtp_user:
             s.starttls()
+        if smtp_user:
             s.login(smtp_user, smtp_pass or "")
         for piece in pieces:
             try:
@@ -94,7 +114,7 @@ def run_difftool(repo: Repository, tool: Optional[str]) -> int:
         if not full.exists():
             continue
         data = full.read_bytes()
-        sha, _ = objs.hash_bytes("blob", data)
+        sha, _ = objs.hash_bytes("blob", data, repo)
         if sha == e.sha:
             continue
         # write a temp file for the staged version
@@ -228,6 +248,8 @@ def daemon_serve(base_path: str, host: str = "127.0.0.1", port: int = 9418) -> i
         def _upload_pack(self, repo: Repository):
             # list refs
             caps = b"side-band-64k ofs-delta agent=pythongit/0.1"
+            if repo.object_format() == "sha256":
+                caps += b" object-format=sha256"
             first = True
             for kind in ("refs/heads", "refs/tags"):
                 root = repo.gitdir / kind
@@ -272,6 +294,8 @@ def daemon_serve(base_path: str, host: str = "127.0.0.1", port: int = 9418) -> i
         def _receive_pack(self, repo: Repository):
             # advertise refs
             caps = b"report-status agent=pythongit/0.1"
+            if repo.object_format() == "sha256":
+                caps += b" object-format=sha256"
             first = True
             for kind in ("refs/heads", "refs/tags"):
                 root = repo.gitdir / kind
@@ -378,6 +402,8 @@ def http_backend(method: str, path: str, body: bytes, base: Path) -> tuple[int, 
         adv = f"# service={service}\n".encode()
         out += _pkt(adv) + b"0000"
         caps = b"side-band-64k ofs-delta agent=pythongit/0.1" if service == "git-upload-pack" else b"report-status agent=pythongit/0.1"
+        if repo.object_format() == "sha256":
+            caps += b" object-format=sha256"
         first = True
         any_refs = False
         for kind in ("refs/heads", "refs/tags"):
@@ -396,7 +422,7 @@ def http_backend(method: str, path: str, body: bytes, base: Path) -> tuple[int, 
                             out += _pkt(line + b"\n")
         if not any_refs:
             # advertise HEAD shim if there's nothing else
-            out += _pkt(b"0000000000000000000000000000000000000000 capabilities^{}\0" + caps + b"\n")
+            out += _pkt(repo.null_oid().encode() + b" capabilities^{}\0" + caps + b"\n")
         out += b"0000"
         return 200, {"Content-Type": f"application/x-{service}-advertisement"}, bytes(out)
     if path.endswith("/git-upload-pack"):
