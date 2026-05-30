@@ -28,7 +28,9 @@ pure-python-git/             (repo root)
 │   ├── sequencer.py         cherry-pick / revert / rebase
 │   ├── porcelain_merge.py   ff + 3-way merge entry point
 │   ├── patch.py             unified-diff parser + applier
-│   ├── pack.py              pack v2 + idx v2, REF_DELTA + OFS_DELTA, encoder
+│   ├── pack.py              pack v2 + idx v2, bitmaps, MIDX, streaming writer
+│   ├── commitgraph.py       cached commit-graph reader
+│   ├── bloom.py             changed-path Bloom filters
 │   ├── protocol.py          smart HTTPS clone / fetch / push
 │   ├── stash.py             refs/stash + reflog-backed stash
 │   ├── ignore.py            .gitignore engine
@@ -197,7 +199,8 @@ The test suite verifies this against the real `git` binary:
 | tree / commit objects | `git cat-file -p` |
 | index v2 with stages | `git ls-files --stage` |
 | pack v2 + idx v2 (with deltas) | `git verify-pack -v` |
-| binary commit-graph file | `git commit-graph verify` |
+| pack and MIDX bitmap indexes | `git rev-list --test-bitmap` |
+| binary commit-graph file with changed-path Bloom filters | `git commit-graph verify` |
 | SHA-1/SHA-256 object-format repos | `git fsck`, `git rev-parse --show-object-format` |
 | refs / packed-refs / reflog | `git log --all` |
 | smart HTTPS push payload | `git receive-pack` |
@@ -211,11 +214,22 @@ The reverse also holds: pythongit reads packs and indexes produced by real
 
 Loose objects under `.git/objects/<oid[:2]>/<oid[2:]>`, zlib-compressed. SHA-1
 and SHA-256 repositories are selected by `extensions.objectformat`. Pack objects
-live in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader handles both
-`REF_DELTA` (delta against a hex object-id base) and `OFS_DELTA` (delta against
-an earlier offset in the same pack). `pack.build_pack` also writes deltas:
-candidate bases come from a windowed search over recent same-type objects,
-accepted when the delta is at most half the raw size.
+live in `.git/objects/pack/pack-*.{pack,idx}`. The pack reader mmaps pack files,
+binary-searches `.idx` tables, and handles both `REF_DELTA` (delta against a
+hex object-id base) and `OFS_DELTA` (delta against an earlier offset in the same
+pack). `pack.build_pack` also writes deltas: candidate bases come from a
+windowed search over recent same-type objects, accepted when the delta is at
+most half the raw size. Large CLI repacks stream non-delta pack records straight
+to disk instead of materializing the entire pack in Python memory.
+
+`pack-objects --all` and `repack` write pack `.bitmap` indexes for full
+reachable packs. `multi-pack-index write --bitmap` writes `RIDX`/`BTMP` chunks
+plus the companion `multi-pack-index-<hash>.bitmap` file. Reachability queries,
+`rev-list --count`, pruning, and maintenance paths use pack/MIDX bitmaps when
+available. The bitmaps use Git's v1 `BITM` format and EWAH containers; the
+first implementation emits literal EWAH words rather than XOR-compressed
+chains, prioritizing compatibility and simple verification over minimum file
+size.
 
 `translate.ObjectTranslator` converts complete reachable object graphs between
 SHA-1 and SHA-256 by rehashing blobs and rewriting embedded object IDs in
@@ -282,11 +296,18 @@ OIDF    (256*4)     fanout: cumulative counts indexed by first byte of OID
 OIDL    (N*H)       sorted object IDs
 CDAT    (N*(H+16))  tree(H) + parent1_pos(4) + parent2_pos(4) + gen+time(8)
 EDGE    (optional)  octopus extra parents
+BIDX    (N*4)       cumulative byte offsets for changed-path Bloom filters
+BDAT    (optional)  Bloom settings + concatenated changed-path filters
 TRAILER (H)         repository hash of all preceding bytes
 ```
 
 Generation numbers count topological level (1 for roots). The on-disk file is
-verifiable by real `git commit-graph verify`.
+verifiable by real `git commit-graph verify`. `pygit` also reads and caches the
+commit-graph for parent/tree lookups during history walks. Changed-path Bloom
+filters use Git's default settings: hash version 1, seven hashes, and ten bits
+per changed path; parent directories are included so path-limited history can
+test both `dir` and `dir/file`. `blame` uses those filters to avoid tree/blob
+work for commits that definitely did not touch the requested path.
 
 ### Smart HTTPS
 
@@ -307,14 +328,14 @@ pip install pythongit[test]
 pytest
 ```
 
-88 tests pass:
+93 tests pass:
 
 | File                    | Coverage |
 |-------------------------|----------|
 | `unit_objects.py`       | hash, encode/decode, signatures, gitlinks |
 | `unit_refs.py`          | symbolic refs, reflog, packed-refs, abbrev SHA |
 | `unit_index.py`         | DIRC v2 roundtrip, conflict stages, long paths |
-| `unit_pack.py`          | delta apply, idx v2, build_pack, binary MIDX, SHA-256 interop |
+| `unit_pack.py`          | delta apply, idx v2, build_pack, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
 | `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP unit-level |
 | `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rerere replay, SHA-256 translation |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
@@ -324,9 +345,6 @@ PATH, so the suite runs cleanly in containers without one.
 
 ## What's intentionally NOT implemented
 
-* Bitmap indexes and bloom filters on the commit-graph. Binary
-  multi-pack-index files are implemented for pack lookup, but MIDX bitmaps are
-  not.
 * `git filter-repo` (it's a separate Python tool anyway, not a git built-in).
 * The fancier merge strategies (`recursive`'s rename detection, `ort`'s
   three-way for trees). `pygit merge-recursive` aliases to the default
@@ -334,10 +352,12 @@ PATH, so the suite runs cleanly in containers without one.
 
 ## Limitations to know about
 
-* Big repos: loose-object discovery and some reachability walks are still
-  straightforward scans. Pack object lookup can use `.idx` files and the
-  binary multi-pack-index, but this is still not designed for the
-  linux-kernel-or-larger end of the spectrum.
+* Big repos: packed repositories now use mmap-backed pack reads, binary MIDX
+  lookup, pack/MIDX bitmaps, commit-graph parent/tree lookup, changed-path
+  Bloom filters, and streaming on-disk repacks. The remaining scale-sensitive
+  cases are loose-object-heavy repositories without maintenance data, commands
+  that inherently inspect every path or blob, and smart-protocol paths that
+  still assemble response packs in memory.
 * The `bisect` heuristic computes exact candidate weights with iterative
   bitsets. It avoids Python recursion, but very large candidate DAGs can still
   spend noticeable CPU and memory on transitive reachability.

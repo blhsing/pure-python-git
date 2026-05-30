@@ -318,6 +318,82 @@ def test_commit_graph_binary_passes_real_git(tmprepo):
     assert r.returncode == 0, r.stderr
 
 
+def test_commit_graph_changed_path_bloom_filters(tmprepo):
+    import struct
+    import subprocess
+    from conftest import real_git
+    from tests.conftest import commit_one
+    from pythongit import bloom
+
+    repo, path = tmprepo
+    commit_one(repo, "a.txt", "one\n", "c1")
+    (path / "d").mkdir()
+    c2 = commit_one(repo, "d/b.txt", "two\n", "c2")
+    assert cli_run("commit-graph", "write", "--reachable", "--changed-paths") == 0
+    assert cli_run("commit-graph", "verify") == 0
+
+    raw = (repo.gitdir / "objects" / "info" / "commit-graph").read_bytes()
+    chunks: dict[bytes, bytes] = {}
+    entries: list[tuple[bytes, int]] = []
+    for i in range(raw[6] + 1):
+        pos = 8 + i * 12
+        entries.append((raw[pos:pos + 4], struct.unpack(">Q", raw[pos + 4:pos + 12])[0]))
+    for (cid, off), (_next_cid, nxt) in zip(entries, entries[1:]):
+        if cid != b"\0\0\0\0":
+            chunks[cid] = raw[off:nxt]
+    assert b"BIDX" in chunks and b"BDAT" in chunks
+    shas = [
+        chunks[b"OIDL"][i:i + repo.hash_len].hex()
+        for i in range(0, len(chunks[b"OIDL"]), repo.hash_len)
+    ]
+    filters = bloom.read_commit_graph_bloom_filters(chunks[b"BIDX"], chunks[b"BDAT"], len(shas))
+    changed_filter = filters[shas.index(c2)]
+    assert bloom.bloom_maybe_contains(changed_filter, "d")
+    assert bloom.bloom_maybe_contains(changed_filter, "d/b.txt")
+
+    gitbin = real_git()
+    if gitbin:
+        r = subprocess.run([gitbin, "commit-graph", "verify"], cwd=repo.path,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
+def test_commit_graph_reader_and_path_lookup_shortcuts(tmprepo, capsys):
+    from tests.conftest import commit_one
+    from pythongit import commitgraph
+
+    repo, path = tmprepo
+    c1 = commit_one(repo, "a.txt", "one\n", "c1")
+    (path / "d").mkdir()
+    c2 = commit_one(repo, "d/b.txt", "two\n", "c2")
+    commit_one(repo, "a.txt", "one\n", "c3 unchanged target")
+
+    assert cli_run("commit-graph", "write", "--changed-paths") == 0
+    capsys.readouterr()
+    graph = commitgraph.read_commit_graph(repo)
+    assert graph is not None
+    c2_entry = graph.get(c2)
+    assert c2_entry is not None
+    assert c2_entry.parents == (c1,)
+    assert graph.maybe_changed(c2, "d/b.txt")
+    assert not graph.maybe_changed(c2, "a.txt")
+
+    assert cli_run("last-modified", "d/b.txt") == 0
+    assert capsys.readouterr().out.strip() == c2
+
+
+def test_rev_list_count_uses_bitmap_commit_filter(tmprepo, capsys):
+    from tests.conftest import commit_one
+
+    repo, _ = tmprepo
+    for i in range(3):
+        commit_one(repo, "a.txt", f"{i}\n", f"c{i}")
+    assert cli_run("pack-objects", "pack", "--all") == 0
+    capsys.readouterr()
+    assert cli_run("rev-list", "--count", "HEAD") == 0
+    assert capsys.readouterr().out.strip() == "3"
+
+
 def test_status_groups_correctly(tmprepo):
     from tests.conftest import commit_one
     from pythongit import workdir

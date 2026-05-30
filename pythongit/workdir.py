@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import stat as st_mod
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -64,6 +65,49 @@ def _blob_data(path: Path) -> bytes:
     if st_mod.S_ISLNK(st.st_mode):
         return os.readlink(path).encode("utf-8")
     return path.read_bytes()
+
+
+_TREE_ENTRY_CACHE_MAX = 8192
+_TREE_ENTRY_CACHE: OrderedDict[tuple[Path, int, str], tuple[objs.TreeEntry, ...]] = OrderedDict()
+
+
+def _tree_entries(repo: Repository, tree_sha: str) -> tuple[objs.TreeEntry, ...]:
+    key = (repo.gitdir, repo.hash_len, tree_sha)
+    cached = _TREE_ENTRY_CACHE.get(key)
+    if cached is not None:
+        _TREE_ENTRY_CACHE.move_to_end(key)
+        return cached
+    obj_type, data = objs.read_object(repo, tree_sha)
+    if obj_type != "tree":
+        entries: tuple[objs.TreeEntry, ...] = tuple()
+    else:
+        entries = tuple(objs.parse_tree(data, repo.hash_len))
+    _TREE_ENTRY_CACHE[key] = entries
+    if len(_TREE_ENTRY_CACHE) > _TREE_ENTRY_CACHE_MAX:
+        _TREE_ENTRY_CACHE.popitem(last=False)
+    return entries
+
+
+def tree_path_entry(repo: Repository, tree_sha: str, path: str) -> Optional[objs.TreeEntry]:
+    """Return the tree entry at ``path`` without flattening the whole tree."""
+    parts = [p for p in path.replace("\\", "/").strip("/").split("/") if p and p != "."]
+    if not parts:
+        return None
+    cur_tree = tree_sha
+    for idx, part in enumerate(parts):
+        found = None
+        for entry in _tree_entries(repo, cur_tree):
+            if entry.name == part:
+                found = entry
+                break
+        if found is None:
+            return None
+        if idx == len(parts) - 1:
+            return found
+        if not found.is_dir():
+            return None
+        cur_tree = found.sha
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -174,33 +218,33 @@ def _head_tree_map(repo: Repository) -> dict[str, str]:
 
 def flatten_tree(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str, str]:
     out: dict[str, str] = {}
-    t, data = objs.read_object(repo, tree_sha)
-    if t != "tree":
-        return out
-    for e in objs.parse_tree(data, repo.hash_len):
-        path = f"{prefix}{e.name}"
-        if e.is_dir():
-            out.update(flatten_tree(repo, e.sha, prefix=path + "/"))
-        elif e.is_gitlink():
-            # gitlinks don't have blob contents in this repo; skip
-            continue
-        else:
-            out[path] = e.sha
+    stack = [(prefix, tree_sha)]
+    while stack:
+        cur_prefix, cur_tree = stack.pop()
+        for e in _tree_entries(repo, cur_tree):
+            path = f"{cur_prefix}{e.name}"
+            if e.is_dir():
+                stack.append((path + "/", e.sha))
+            elif e.is_gitlink():
+                # gitlinks don't have blob contents in this repo; skip
+                continue
+            else:
+                out[path] = e.sha
     return out
 
 
 def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[str, str]:
     """Like flatten_tree but only returns gitlink entries (path -> commit sha)."""
     out: dict[str, str] = {}
-    t, data = objs.read_object(repo, tree_sha)
-    if t != "tree":
-        return out
-    for e in objs.parse_tree(data, repo.hash_len):
-        path = f"{prefix}{e.name}"
-        if e.is_dir():
-            out.update(flatten_gitlinks(repo, e.sha, prefix=path + "/"))
-        elif e.is_gitlink():
-            out[path] = e.sha
+    stack = [(prefix, tree_sha)]
+    while stack:
+        cur_prefix, cur_tree = stack.pop()
+        for e in _tree_entries(repo, cur_tree):
+            path = f"{cur_prefix}{e.name}"
+            if e.is_dir():
+                stack.append((path + "/", e.sha))
+            elif e.is_gitlink():
+                out[path] = e.sha
     return out
 
 

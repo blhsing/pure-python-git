@@ -113,6 +113,32 @@ def test_real_git_verifies_our_pack(tmprepo):
         assert sha in r.stdout, f"sha {sha} missing from verify-pack output"
 
 
+def test_pack_bitmap_written_and_real_git_uses_it(tmprepo):
+    import subprocess
+    from conftest import real_git
+    from tests.conftest import commit_one
+    from pythongit import cli
+
+    repo, path = tmprepo
+    for i in range(4):
+        commit_one(repo, "a.txt", f"v{i}\n", f"c{i}")
+
+    assert cli.main(["pack-objects", "pack", "--all"]) == 0
+    pack_dir = repo.gitdir / "objects" / "pack"
+    bitmaps = list(pack_dir.glob("pack-*.bitmap"))
+    assert len(bitmaps) == 1
+    objects, commits = pack.verify_pack_bitmap(repo, bitmaps[0])
+    assert objects >= 4
+    assert commits == 4
+
+    gitbin = real_git()
+    if not gitbin:
+        return
+    r = subprocess.run([gitbin, "rev-list", "--test-bitmap", "HEAD"],
+                       cwd=path, capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
 def test_pack_var_size_roundtrip():
     """Variable-length size encoding used in pack headers."""
     # _read_var_size expects a tagged byte followed by continuation bytes.
@@ -176,6 +202,51 @@ def test_real_git_verifies_our_multi_pack_index(tmprepo):
 
     r = subprocess.run([gitbin, "multi-pack-index", "verify"],
                        cwd=repo.path, capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+
+
+def test_multi_pack_index_bitmap_interop(tmprepo):
+    import subprocess
+    from conftest import real_git
+    from tests.conftest import commit_one
+    from pythongit import cli as cli_mod
+    from pythongit import refs
+
+    repo, path = tmprepo
+    packed: set[str] = set()
+    for i in range(3):
+        commit_one(repo, f"f{i}.txt", f"v{i}\n", f"c{i}")
+        reachable = cli_mod._reachable(repo)
+        new_objects = sorted(reachable - packed)
+        assert new_objects
+        _write_pack(repo, new_objects)
+        packed.update(new_objects)
+
+    pack_dir = repo.gitdir / "objects" / "pack"
+    expected_reachable = cli_mod._reachable(repo)
+    assert cli_mod.main(["multi-pack-index", "write", "--bitmap"]) == 0
+    midx = pack.parse_midx(pack_dir / "multi-pack-index")
+    assert len(midx.pack_names) == 3
+    assert len(midx.shas) == len(packed)
+    assert midx.revindex is not None
+    assert midx.bitmapped_packs is not None
+    bitmaps = list(pack_dir.glob("multi-pack-index-*.bitmap"))
+    assert len(bitmaps) == 1
+    assert bitmaps[0].name == f"multi-pack-index-{midx.checksum.hex()}.bitmap"
+    assert pack.verify_midx(pack_dir) == (3, len(packed))
+    assert pack.verify_midx_bitmap(repo, pack_dir) == (len(packed), 3)
+    head = refs.rev_parse(repo, "HEAD")
+    assert head is not None
+    assert pack.reachable_from_bitmaps(repo, [head]) == expected_reachable
+
+    gitbin = real_git()
+    if not gitbin:
+        return
+    r = subprocess.run([gitbin, "multi-pack-index", "verify"],
+                       cwd=path, capture_output=True, text=True)
+    assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
+    r = subprocess.run([gitbin, "rev-list", "--test-bitmap", "HEAD"],
+                       cwd=path, capture_output=True, text=True)
     assert r.returncode == 0, f"stderr={r.stderr!r} stdout={r.stdout!r}"
 
 

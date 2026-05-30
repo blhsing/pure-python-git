@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,30 @@ def _print(s: str = "") -> None:
 
 def _err(s: str) -> None:
     sys.stderr.write(s + ("\n" if not s.endswith("\n") else ""))
+
+
+def _graph_for_repo(repo: Repository):
+    try:
+        from . import commitgraph
+
+        return commitgraph.read_commit_graph(repo)
+    except Exception:
+        return None
+
+
+def _commit_tree_parents(repo: Repository, sha: str, graph=None) -> Optional[tuple[str, tuple[str, ...]]]:
+    if graph is not None:
+        entry = graph.get(sha)
+        if entry is not None:
+            return entry.tree, entry.parents
+    try:
+        obj_type, data = objs.read_object(repo, sha)
+    except KeyError:
+        return None
+    if obj_type != "commit":
+        return None
+    commit = objs.parse_commit(data)
+    return commit.tree, tuple(commit.parents)
 
 
 # ---------------------------------------------------------------------------
@@ -279,23 +304,31 @@ def cmd_rev_list(argv: list[str]) -> int:
         sha = refs_mod.rev_parse(repo, r)
         if sha:
             starts.append(sha)
+    if args.count and args.max_count is None and starts:
+        try:
+            from . import pack as _p
+
+            bitmapped = _p.reachable_from_bitmaps(repo, starts, object_type="commit")
+            if bitmapped is not None:
+                _print(str(len(bitmapped)))
+                return 0
+        except Exception:
+            pass
+    graph = _graph_for_repo(repo)
     visited: set[str] = set()
     out: list[str] = []
-    stack = list(starts)
+    stack = deque(starts)
     while stack:
-        sha = stack.pop(0)
+        sha = stack.popleft()
         if sha in visited:
             continue
         visited.add(sha)
-        try:
-            t, data = objs.read_object(repo, sha)
-        except KeyError:
-            continue
-        if t != "commit":
+        info = _commit_tree_parents(repo, sha, graph)
+        if info is None:
             continue
         out.append(sha)
-        c = objs.parse_commit(data)
-        stack.extend(c.parents)
+        _tree, parents = info
+        stack.extend(parents)
         if args.max_count and len(out) >= args.max_count:
             break
     if args.count:
@@ -457,10 +490,10 @@ def cmd_log(argv: list[str]) -> int:
         _err("fatal: bad revision")
         return 128
     seen: set[str] = set()
-    cur = [sha]
+    cur = deque([sha])
     count = 0
     while cur:
-        s = cur.pop(0)
+        s = cur.popleft()
         if s in seen:
             continue
         seen.add(s)
@@ -1514,9 +1547,10 @@ def cmd_describe(argv: list[str]) -> int:
             pass
         tag_for[ts] = tag
     seen: set[str] = set()
-    queue = [(0, sha)]
+    graph = _graph_for_repo(repo)
+    queue = deque([(0, sha)])
     while queue:
-        depth, s = queue.pop(0)
+        depth, s = queue.popleft()
         if s in seen:
             continue
         seen.add(s)
@@ -1526,11 +1560,11 @@ def cmd_describe(argv: list[str]) -> int:
             else:
                 _print(f"{tag_for[s]}-{depth}-g{sha[:7]}")
             return 0
-        try:
-            c = objs.parse_commit(objs.read_object(repo, s)[1])
-        except KeyError:
+        info = _commit_tree_parents(repo, s, graph)
+        if info is None:
             continue
-        for p in c.parents:
+        _tree, parents = info
+        for p in parents:
             queue.append((depth + 1, p))
     if args.always:
         _print(sha[:7])
@@ -1547,35 +1581,54 @@ def cmd_blame(argv: list[str]) -> int:
     head = refs_mod.rev_parse(repo, "HEAD")
     if not head:
         return 128
-    head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
-    blobs = workdir.flatten_tree(repo, head_tree)
-    if args.path not in blobs:
+    graph = _graph_for_repo(repo)
+    head_info = _commit_tree_parents(repo, head, graph)
+    if head_info is None:
+        return 128
+    head_tree, _head_parents = head_info
+    head_entry = workdir.tree_path_entry(repo, head_tree, args.path)
+    if head_entry is None or head_entry.is_dir() or head_entry.is_gitlink():
         _err(f"fatal: no such path {args.path} in HEAD")
         return 128
-    current_text = objs.read_object(repo, blobs[args.path])[1].decode("utf-8", errors="replace")
+    current_text = objs.read_object(repo, head_entry.sha)[1].decode("utf-8", errors="replace")
     cur_lines = current_text.splitlines()
     blame_sha: list[Optional[str]] = [None] * len(cur_lines)
     chain: list[str] = []
     cur = head
     while cur:
         chain.append(cur)
-        c = objs.parse_commit(objs.read_object(repo, cur)[1])
-        if not c.parents:
+        info = _commit_tree_parents(repo, cur, graph)
+        if info is None:
             break
-        cur = c.parents[0]
+        _tree, parents = info
+        if not parents:
+            break
+        cur = parents[0]
     from .diff import diff_lines
     for i in range(len(chain) - 1):
         newer = chain[i]
         older = chain[i + 1]
-        n_tree = objs.parse_commit(objs.read_object(repo, newer)[1]).tree
-        o_tree = objs.parse_commit(objs.read_object(repo, older)[1]).tree
-        n_blobs = workdir.flatten_tree(repo, n_tree)
-        o_blobs = workdir.flatten_tree(repo, o_tree)
-        if args.path not in n_blobs:
+        if graph is not None and not graph.maybe_changed(newer, args.path):
+            continue
+        newer_info = _commit_tree_parents(repo, newer, graph)
+        older_info = _commit_tree_parents(repo, older, graph)
+        if newer_info is None or older_info is None:
+            continue
+        n_tree, _n_parents = newer_info
+        o_tree, _o_parents = older_info
+        n_entry = workdir.tree_path_entry(repo, n_tree, args.path)
+        o_entry = workdir.tree_path_entry(repo, o_tree, args.path)
+        if n_entry is None or n_entry.is_dir() or n_entry.is_gitlink():
             break
-        n_text = objs.read_object(repo, n_blobs[args.path])[1].decode("utf-8", errors="replace").splitlines()
-        o_text = (objs.read_object(repo, o_blobs[args.path])[1].decode("utf-8", errors="replace").splitlines()
-                  if args.path in o_blobs else [])
+        if o_entry is not None and (o_entry.is_dir() or o_entry.is_gitlink()):
+            o_entry = None
+        if o_entry is not None and o_entry.sha == n_entry.sha:
+            continue
+        n_text = objs.read_object(repo, n_entry.sha)[1].decode("utf-8", errors="replace").splitlines()
+        o_text = (
+            objs.read_object(repo, o_entry.sha)[1].decode("utf-8", errors="replace").splitlines()
+            if o_entry is not None else []
+        )
         ops = diff_lines(o_text, n_text)
         added = set()
         for kind, ai, bi in ops:
@@ -1645,9 +1698,9 @@ def cmd_shortlog(argv: list[str]) -> int:
         return 128
     by_author: dict[str, list[str]] = {}
     seen: set[str] = set()
-    stack = [head]
+    stack = deque([head])
     while stack:
-        s = stack.pop(0)
+        s = stack.popleft()
         if s in seen:
             continue
         seen.add(s)
@@ -1859,20 +1912,41 @@ _register_phase3()
 #           bisect / worktree
 
 
-def _loose_shas(repo: Repository) -> list[str]:
+def _iter_loose_shas(repo: Repository):
     obj_root = repo.gitdir / "objects"
-    out = []
     if obj_root.is_dir():
         for d in obj_root.iterdir():
             if not d.is_dir() or len(d.name) != 2:
                 continue
             for f in d.iterdir():
-                out.append(d.name + f.name)
-    return out
+                if f.is_file():
+                    yield d.name + f.name
 
 
-def _reachable(repo: Repository) -> set[str]:
-    from . import objects as _o
+def _loose_shas(repo: Repository) -> list[str]:
+    return list(_iter_loose_shas(repo))
+
+
+def _loose_count_and_size(repo: Repository) -> tuple[int, int]:
+    obj_root = repo.gitdir / "objects"
+    count = 0
+    size = 0
+    if obj_root.is_dir():
+        for d in obj_root.iterdir():
+            if not d.is_dir() or len(d.name) != 2:
+                continue
+            for f in d.iterdir():
+                if not f.is_file():
+                    continue
+                count += 1
+                try:
+                    size += f.stat().st_size
+                except OSError:
+                    pass
+    return count, size
+
+
+def _ref_tips(repo: Repository) -> set[str]:
     tips = set()
     for name in ("refs/heads", "refs/tags", "refs/remotes"):
         root = repo.gitdir / name
@@ -1886,13 +1960,35 @@ def _reachable(repo: Repository) -> set[str]:
     _, head = refs_mod.read_head(repo)
     if head:
         tips.add(head)
+    return tips
+
+
+def _reachable(repo: Repository) -> set[str]:
+    from . import objects as _o
+    tips = _ref_tips(repo)
+    if tips:
+        import zlib
+        try:
+            from . import pack as _p
+            bitmapped = _p.reachable_from_bitmaps(repo, sorted(tips))
+            if bitmapped is not None:
+                return bitmapped
+        except (OSError, ValueError, KeyError, zlib.error):
+            pass
     seen: set[str] = set()
+    graph = _graph_for_repo(repo)
     stack = list(tips)
     while stack:
         s = stack.pop()
         if s in seen:
             continue
         seen.add(s)
+        info = _commit_tree_parents(repo, s, graph)
+        if info is not None:
+            tree, parents = info
+            stack.append(tree)
+            stack.extend(parents)
+            continue
         try:
             t, data = _o.read_object(repo, s)
         except KeyError:
@@ -1912,28 +2008,63 @@ def _reachable(repo: Repository) -> set[str]:
     return seen
 
 
+_STREAM_PACK_OBJECT_LIMIT = 50000
+
+
+def _write_pack_files(
+    repo: Repository,
+    shas: list[str],
+    base: str,
+) -> tuple[str, Path, list[tuple[str, int, int]]]:
+    from . import pack as _p
+
+    pack_dir = repo.gitdir / "objects" / "pack"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    _p.clear_pack_cache(repo)
+    if len(shas) >= _STREAM_PACK_OBJECT_LIMIT:
+        tmp = pack_dir / f".tmp-{base}-{os.getpid()}-{time.time_ns()}.pack"
+        try:
+            pack_sha, entries = _p.write_pack_stream(repo, shas, tmp)
+            idx_bytes = _p.write_idx_v2_from_checksum(bytes.fromhex(pack_sha), entries, repo.object_format())
+            pack_path = pack_dir / f"{base}-{pack_sha}.pack"
+            os.replace(tmp, pack_path)
+            (pack_dir / f"{base}-{pack_sha}.idx").write_bytes(idx_bytes)
+            return pack_sha, pack_path, entries
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    pack_bytes, entries = _p.build_pack(repo, shas)
+    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
+    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
+    pack_path = pack_dir / f"{base}-{pack_sha}.pack"
+    pack_path.write_bytes(pack_bytes)
+    (pack_dir / f"{base}-{pack_sha}.idx").write_bytes(idx_bytes)
+    return pack_sha, pack_path, entries
+
+
 def cmd_pack_objects(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit pack-objects")
     ap.add_argument("base", help="pack file prefix (e.g. pack)")
     ap.add_argument("--stdout", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--write-bitmap-index", action="store_true")
+    ap.add_argument("--no-write-bitmap-index", action="store_true")
     args = ap.parse_args(argv)
+    if args.write_bitmap_index and not args.all:
+        ap.error("--write-bitmap-index requires --all")
     repo = _repo()
     from . import pack as _p
     if args.all:
         shas = sorted(_reachable(repo))
     else:
         shas = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
-    pack_bytes, entries = _p.build_pack(repo, shas)
-    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
-    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
     if args.stdout:
+        pack_bytes, _entries = _p.build_pack(repo, shas)
         sys.stdout.buffer.write(pack_bytes)
         return 0
-    pack_dir = repo.gitdir / "objects" / "pack"
-    pack_dir.mkdir(parents=True, exist_ok=True)
-    (pack_dir / f"{args.base}-{pack_sha}.pack").write_bytes(pack_bytes)
-    (pack_dir / f"{args.base}-{pack_sha}.idx").write_bytes(idx_bytes)
+    pack_sha, pack_path, entries = _write_pack_files(repo, shas, args.base)
+    if args.all and not args.no_write_bitmap_index:
+        _p.write_pack_bitmap(repo, pack_path, entries)
     _print(pack_sha)
     return 0
 
@@ -2033,6 +2164,8 @@ def cmd_verify_pack(argv: list[str]) -> int:
         except Exception as e:
             _err(f"verify failed: {e}")
             rc = 1
+        finally:
+            pk.close()
     return rc
 
 
@@ -2041,27 +2174,25 @@ def cmd_count_objects(argv: list[str]) -> int:
     ap.add_argument("-v", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
-    loose = _loose_shas(repo)
-    size = 0
-    obj_root = repo.gitdir / "objects"
-    if obj_root.is_dir():
-        for d in obj_root.iterdir():
-            if d.is_dir() and len(d.name) == 2:
-                for f in d.iterdir():
-                    size += f.stat().st_size
+    loose_count, size = _loose_count_and_size(repo)
     if args.v:
         from . import pack as _p
-        pack_count = 0
-        pack_objs = 0
-        for pk in _p._iter_packs(repo):
-            pack_count += 1
-            pack_objs += len(pk.shas)
-        _print(f"count: {len(loose)}")
+        midx = _p.read_midx(repo)
+        if midx is not None:
+            pack_count = len(midx.pack_names)
+            pack_objs = len(midx.shas)
+        else:
+            pack_count = 0
+            pack_objs = 0
+            for pk in _p._iter_packs(repo):
+                pack_count += 1
+                pack_objs += len(pk.shas)
+        _print(f"count: {loose_count}")
         _print(f"size: {size // 1024}")
         _print(f"in-pack: {pack_objs}")
         _print(f"packs: {pack_count}")
     else:
-        _print(f"{len(loose)} objects, {size // 1024} kilobytes")
+        _print(f"{loose_count} objects, {size // 1024} kilobytes")
     return 0
 
 
@@ -2069,21 +2200,19 @@ def cmd_repack(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit repack")
     ap.add_argument("-a", action="store_true")
     ap.add_argument("-d", action="store_true")
+    ap.add_argument("-b", "--write-bitmap-index", action="store_true")
+    ap.add_argument("--no-write-bitmap-index", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
     shas = sorted(_reachable(repo))
-    pack_bytes, entries = _p.build_pack(repo, shas)
-    idx_bytes = _p.write_idx_v2(pack_bytes, entries, repo.object_format())
-    pack_sha = repo.hash_hex(pack_bytes[:-repo.hash_len])
-    pack_dir = repo.gitdir / "objects" / "pack"
-    pack_dir.mkdir(parents=True, exist_ok=True)
-    (pack_dir / f"pack-{pack_sha}.pack").write_bytes(pack_bytes)
-    (pack_dir / f"pack-{pack_sha}.idx").write_bytes(idx_bytes)
+    pack_sha, pack_path, entries = _write_pack_files(repo, shas, "pack")
+    if not args.no_write_bitmap_index:
+        _p.write_pack_bitmap(repo, pack_path, entries)
     _print(f"pack-{pack_sha}")
     if args.d:
         packed = set(shas)
-        for sha in _loose_shas(repo):
+        for sha in _iter_loose_shas(repo):
             if sha in packed:
                 (repo.gitdir / "objects" / sha[:2] / sha[2:]).unlink(missing_ok=True)
     return 0
@@ -2096,7 +2225,7 @@ def cmd_prune(argv: list[str]) -> int:
     repo = _repo()
     reach = _reachable(repo)
     removed = 0
-    for sha in _loose_shas(repo):
+    for sha in _iter_loose_shas(repo):
         if sha not in reach:
             p = repo.gitdir / "objects" / sha[:2] / sha[2:]
             if args.dry_run:
@@ -2660,11 +2789,12 @@ def cmd_name_rev(argv: list[str]) -> int:
         s = refs_mod.read_ref(repo, f"refs/tags/{tag}")
         if s:
             tips.append((f"tags/{tag}", s))
+    graph = _graph_for_repo(repo)
     for label, tip in tips:
         seen: set[str] = set()
-        stack = [(tip, 0)]
+        stack = deque([(tip, 0)])
         while stack:
-            sha, depth = stack.pop(0)
+            sha, depth = stack.popleft()
             if sha in seen:
                 continue
             seen.add(sha)
@@ -2672,12 +2802,11 @@ def cmd_name_rev(argv: list[str]) -> int:
             if cur is None or cur[1] > depth:
                 suffix = "" if depth == 0 else f"~{depth}"
                 name_for[sha] = (label + suffix, depth)
-            try:
-                c = objs.parse_commit(objs.read_object(repo, sha)[1])
-                for p in c.parents:
+            info = _commit_tree_parents(repo, sha, graph)
+            if info is not None:
+                _tree, parents = info
+                for p in parents:
                     stack.append((p, depth + 1))
-            except KeyError:
-                pass
     if args.all:
         for sha, (name, _) in sorted(name_for.items()):
             _print(f"{sha} {name}")
@@ -3364,6 +3493,8 @@ def cmd_commit_graph(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="action", required=True)
     p_write = sub.add_parser("write")
     p_write.add_argument("--reachable", action="store_true")
+    p_write.add_argument("--changed-paths", action="store_true")
+    p_write.add_argument("--no-changed-paths", action="store_true")
     sub.add_parser("verify")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -3373,9 +3504,18 @@ def cmd_commit_graph(argv: list[str]) -> int:
 
     if args.action == "write":
         import struct
-        reach = _reachable(repo)
+        commit_candidates = None
+        tips = sorted(_ref_tips(repo))
+        if tips:
+            try:
+                from . import pack as _pack_mod
+
+                commit_candidates = _pack_mod.reachable_from_bitmaps(repo, tips, object_type="commit")
+            except Exception:
+                commit_candidates = None
+        reach = set() if commit_candidates is not None else _reachable(repo)
         commits: dict[str, objs.Commit] = {}
-        for sha in sorted(reach):
+        for sha in sorted(commit_candidates if commit_candidates is not None else reach):
             try:
                 t, data = objs.read_object(repo, sha)
                 if t == "commit":
@@ -3463,6 +3603,10 @@ def cmd_commit_graph(argv: list[str]) -> int:
                                              (b"CDAT", bytes(cdat))]
         if extra_edges:
             chunks.append((b"EDGE", bytes(extra_edges)))
+        if n and not args.no_changed_paths:
+            from . import bloom as _bloom
+            bidx, bdat = _bloom.build_commit_graph_bloom_chunks(repo, shas, commits)
+            chunks.extend([(b"BIDX", bidx), (b"BDAT", bdat)])
 
         # 4 bytes signature + 1 ver + 1 hashver + 1 chunks + 1 base
         hash_version = 2 if repo.object_format() == "sha256" else 1
@@ -3485,6 +3629,12 @@ def cmd_commit_graph(argv: list[str]) -> int:
         body = header + bytes(toc) + b"".join(d for _, d in chunks)
         trailer = repo.hash_bytes(body)
         cg.write_bytes(body + trailer)
+        try:
+            from . import commitgraph as _commitgraph
+
+            _commitgraph.clear_commit_graph_cache(repo)
+        except Exception:
+            pass
         _print(f"wrote commit-graph with {n} commits")
         return 0
 
@@ -3518,8 +3668,14 @@ def cmd_commit_graph(argv: list[str]) -> int:
             cid = entry[:4]
             off = struct.unpack(">Q", entry[4:])[0]
             offsets.append((cid, off))
+        chunks: dict[bytes, bytes] = {}
         for i, (cid, off) in enumerate(offsets):
             nxt = offsets[i + 1][1] if i + 1 < len(offsets) else len(raw) - repo.hash_len
+            if off > nxt or nxt > len(raw) - repo.hash_len:
+                _err("invalid chunk offsets")
+                return 1
+            if cid != b"\0\0\0\0":
+                chunks[cid] = raw[off:nxt]
             if cid == b"OIDL":
                 oidl_off, oidl_end = off, nxt
             if cid == b"CDAT":
@@ -3538,6 +3694,17 @@ def cmd_commit_graph(argv: list[str]) -> int:
                     return 1
             except KeyError:
                 _err(f"missing commit {sha}")
+                return 1
+        commit_count = len(sha_block) // repo.hash_len
+        if (b"BIDX" in chunks) != (b"BDAT" in chunks):
+            _err("commit-graph Bloom chunks must include both BIDX and BDAT")
+            return 1
+        if b"BIDX" in chunks:
+            try:
+                from . import bloom as _bloom
+                _bloom.read_commit_graph_bloom_filters(chunks[b"BIDX"], chunks[b"BDAT"], commit_count)
+            except ValueError as exc:
+                _err(f"invalid commit-graph Bloom filters: {exc}")
                 return 1
         _print("commit-graph ok")
         return 0
@@ -4558,11 +4725,15 @@ def cmd_prune_packed(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     from . import pack as _p
-    in_packs: set[str] = set()
-    for pk in _p._iter_packs(repo):
-        in_packs.update(pk.shas)
+    midx = _p.read_midx(repo)
+    if midx is not None:
+        in_packs: set[str] = set(midx.shas)
+    else:
+        in_packs = set()
+        for pk in _p._iter_packs(repo):
+            in_packs.update(pk.shas)
     removed = 0
-    for sha in _loose_shas(repo):
+    for sha in _iter_loose_shas(repo):
         if sha in in_packs:
             if args.dry_run:
                 _print(f"would prune {sha}")
@@ -4608,7 +4779,9 @@ def cmd_multi_pack_index(argv: list[str]) -> int:
     """Write and verify Git's binary multi-pack-index format."""
     ap = argparse.ArgumentParser(prog="pygit multi-pack-index")
     sub = ap.add_subparsers(dest="action", required=True)
-    sub.add_parser("write")
+    p_write = sub.add_parser("write")
+    p_write.add_argument("--bitmap", action="store_true")
+    p_write.add_argument("--no-bitmap", action="store_true")
     sub.add_parser("verify")
     sub.add_parser("expire")
     sub.add_parser("repack")
@@ -4617,7 +4790,13 @@ def cmd_multi_pack_index(argv: list[str]) -> int:
     pack_dir = repo.gitdir / "objects" / "pack"
     from . import pack as _p
     if args.action == "write":
-        _data, packs, objects = _p.write_midx(pack_dir, repo.object_format())
+        write_bitmap = args.bitmap and not args.no_bitmap
+        _data, packs, objects = _p.write_midx(
+            pack_dir,
+            repo.object_format(),
+            write_bitmap=write_bitmap,
+            repo=repo,
+        )
         _print(f"wrote multi-pack-index with {packs} packs, {objects} objects")
         return 0
     if args.action == "verify":
@@ -4626,6 +4805,9 @@ def cmd_multi_pack_index(argv: list[str]) -> int:
             return 1
         try:
             packs, objects = _p.verify_midx(pack_dir)
+            bitmaps = list(pack_dir.glob("multi-pack-index-*.bitmap"))
+            if bitmaps:
+                _p.verify_midx_bitmap(repo, pack_dir)
         except (OSError, ValueError) as exc:
             _err(f"multi-pack-index verify failed: {exc}")
             return 1
@@ -4721,8 +4903,8 @@ def cmd_diagnose(argv: list[str]) -> int:
     lines.append(f"worktree: {repo.path}")
     lines.append(f"branches: {len(refs_mod.list_branches(repo))}")
     lines.append(f"tags: {len(refs_mod.list_tags(repo))}")
-    loose = _loose_shas(repo)
-    lines.append(f"loose objects: {len(loose)}")
+    loose_count, _loose_size = _loose_count_and_size(repo)
+    lines.append(f"loose objects: {loose_count}")
     from . import pack as _p
     packs = list(_p._iter_packs(repo))
     lines.append(f"packs: {len(packs)}")
@@ -5281,25 +5463,26 @@ def _register_phase8() -> None:
         cur = head
         last_changed_sha = head
         last_blob = None
+        graph = _graph_for_repo(repo)
         while cur:
-            try:
-                c = objs.parse_commit(objs.read_object(repo, cur)[1])
-            except KeyError:
+            info = _commit_tree_parents(repo, cur, graph)
+            if info is None:
                 break
-            blobs = workdir.flatten_tree(repo, c.tree)
-            if a.path not in blobs:
+            tree, parents = info
+            entry = workdir.tree_path_entry(repo, tree, a.path)
+            if entry is None or entry.is_dir() or entry.is_gitlink():
                 if last_blob is not None:
                     break
-                cur = c.parents[0] if c.parents else None
+                cur = parents[0] if parents else None
                 continue
             if last_blob is None:
-                last_blob = blobs[a.path]
+                last_blob = entry.sha
                 last_changed_sha = cur
-            elif blobs[a.path] != last_blob:
+            elif entry.sha != last_blob:
                 break
             else:
                 last_changed_sha = cur
-            cur = c.parents[0] if c.parents else None
+            cur = parents[0] if parents else None
         _print(last_changed_sha)
         return 0
 

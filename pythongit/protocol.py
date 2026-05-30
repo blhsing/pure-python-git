@@ -255,6 +255,21 @@ def _build_pack(repo: Repository, shas: list[str]) -> bytes:
 def _collect_objects(repo: Repository, tip: str, stop_at: set[str]) -> list[str]:
     """Return all objects reachable from tip but not from stop_at."""
     from . import objects as objs
+    if not stop_at:
+        try:
+            from . import pack as pack_mod
+
+            bitmapped = pack_mod.reachable_from_bitmaps(repo, [tip])
+            if bitmapped is not None:
+                return list(bitmapped)
+        except Exception:
+            pass
+    try:
+        from . import commitgraph
+
+        graph = commitgraph.read_commit_graph(repo)
+    except Exception:
+        graph = None
     seen: set[str] = set()
     out: list[str] = []
     stack = [tip]
@@ -263,6 +278,13 @@ def _collect_objects(repo: Repository, tip: str, stop_at: set[str]) -> list[str]
         if sha in seen or sha in stop_at:
             continue
         seen.add(sha)
+        if graph is not None:
+            entry = graph.get(sha)
+            if entry is not None:
+                out.append(sha)
+                stack.append(entry.tree)
+                stack.extend(entry.parents)
+                continue
         try:
             t, data = objs.read_object(repo, sha)
         except KeyError:

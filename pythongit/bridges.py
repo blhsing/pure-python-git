@@ -277,11 +277,13 @@ def daemon_serve(base_path: str, host: str = "127.0.0.1", port: int = 9418) -> i
                 # send NAK + pack on side-band
                 self.request.sendall(_pkt(b"NAK\n"))
                 shas: list[str] = []
+                seen_shas: set[str] = set()
                 from .protocol import _collect_objects
                 for w in wants:
                     for o in _collect_objects(repo, w, set()):
-                        if o not in shas:
+                        if o not in seen_shas:
                             shas.append(o)
+                            seen_shas.add(o)
                 pack_bytes, _ = pack_mod.build_pack(repo, shas)
                 # chunk side-band channel 1
                 i = 0
@@ -440,10 +442,12 @@ def http_backend(method: str, path: str, body: bytes, base: Path) -> tuple[int, 
                 wants.append(line[5:].split()[0])
         from .protocol import _collect_objects
         shas: list[str] = []
+        seen_shas: set[str] = set()
         for w in wants:
             for o in _collect_objects(repo, w, set()):
-                if o not in shas:
+                if o not in seen_shas:
                     shas.append(o)
+                    seen_shas.add(o)
         pack_bytes, _ = pack_mod.build_pack(repo, shas)
         out = bytearray()
         out += _pkt(b"NAK\n")
