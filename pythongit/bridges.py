@@ -4,7 +4,7 @@
   http-fetch (dumb HTTP fetch), instaweb (basic browser),
   credential-store, maintenance (dispatcher), shell (restricted dispatcher),
   remote-helper / remote-ext / remote-fd (plug-in protocols),
-  fsmonitor (polling daemon), cvsexportcommit / cvsimport / cvsserver / svn
+  fsmonitor (native or polling watcher), cvsexportcommit / cvsimport / cvsserver / svn
   (shell out to cvs/svn binaries), gitk / gui / gitweb (tk + http.server).
 
 These mirror what the C implementations do — most just orchestrate other
@@ -36,15 +36,54 @@ from .repo import Repository
 # send-email — read an mbox of patches and SMTP them out.
 
 
+def credential_fill(fields: dict[str, str], *, use_external: bool = True) -> dict[str, str]:
+    """Resolve credentials from env, ~/.git-credentials, then configured helpers."""
+    out = dict(fields)
+    env_user = os.environ.get("GIT_USERNAME") or ""
+    env_pass = os.environ.get("GIT_PASSWORD") or os.environ.get("GIT_SMTP_PASSWORD") or ""
+    if env_user and not out.get("username"):
+        out["username"] = env_user
+    if env_pass and not out.get("password"):
+        out["password"] = env_pass
+    stored = credential_store("get", out)
+    for key in ("username", "password"):
+        if stored.get(key) and not out.get(key):
+            out[key] = stored[key]
+    if use_external and (not out.get("username") or not out.get("password")):
+        payload = "".join(f"{k}={v}\n" for k, v in out.items() if v) + "\n"
+        try:
+            proc = subprocess.run(
+                ["git", "credential", "fill"],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    if val and not out.get(key):
+                        out[key] = val
+    return out
+
+
 def send_email(mbox: str, *, to: list[str], from_addr: Optional[str] = None,
                smtp_host: str = "localhost", smtp_port: int = 25,
                smtp_user: Optional[str] = None, smtp_pass: Optional[str] = None,
                smtp_encryption: Optional[str] = None,
-               smtp_ssl_cert_path: Optional[str] = None) -> int:
+               smtp_ssl_cert_path: Optional[str] = None,
+               smtp_auth: str = "plain",
+               smtp_oauth2_token: Optional[str] = None,
+               use_credential_helpers: bool = True) -> int:
+    import base64
     import smtplib
     import ssl
     from email.message import EmailMessage
     encryption = (smtp_encryption or "auto").lower()
+    auth = (smtp_auth or "plain").lower()
     if encryption == "tls":
         encryption = "starttls"
     context = None
@@ -74,7 +113,22 @@ def send_email(mbox: str, *, to: list[str], from_addr: Optional[str] = None,
             s.starttls(context=context)
         elif encryption == "auto" and smtp_user:
             s.starttls()
-        if smtp_user:
+        should_fill = use_credential_helpers and (smtp_user or smtp_pass or auth in ("xoauth2", "oauth2") or smtp_host != "localhost")
+        if should_fill and (not smtp_user or not smtp_pass):
+            creds = credential_fill(
+                {"protocol": "smtp", "host": smtp_host, "username": smtp_user or ""},
+                use_external=use_credential_helpers,
+            )
+            smtp_user = smtp_user or creds.get("username")
+            smtp_pass = smtp_pass or creds.get("password")
+        if auth in ("xoauth2", "oauth2"):
+            token = smtp_oauth2_token or smtp_pass or ""
+            if smtp_user and token:
+                raw = f"user={smtp_user}\x01auth=Bearer {token}\x01\x01".encode()
+                code, resp = s.docmd("AUTH", "XOAUTH2 " + base64.b64encode(raw).decode("ascii"))
+                if code >= 400:
+                    raise RuntimeError(f"SMTP XOAUTH2 failed: {code} {resp!r}")
+        elif smtp_user:
             s.login(smtp_user, smtp_pass or "")
         for piece in pieces:
             try:
@@ -712,9 +766,11 @@ def launch_tk(repo: Repository) -> int:
         import tkinter as tk
         from tkinter import ttk, scrolledtext
     except ImportError:
-        print("tkinter not available", file=sys.stderr)
-        return 1
-    root = tk.Tk()
+        return launch_text_log(repo)
+    try:
+        root = tk.Tk()
+    except Exception:
+        return launch_text_log(repo)
     root.title(f"pygit gui — {repo.path}")
 
     frame = ttk.Frame(root, padding=8)
@@ -757,6 +813,22 @@ def launch_tk(repo: Repository) -> int:
     return 0
 
 
+def launch_text_log(repo: Repository, limit: int = 200) -> int:
+    head = refs_mod.rev_parse(repo, "HEAD")
+    cur = head
+    n = 0
+    while cur and n < limit:
+        try:
+            c = objs.parse_commit(objs.read_object(repo, cur)[1])
+        except KeyError:
+            break
+        subject = c.message.splitlines()[0] if c.message.strip() else ""
+        print(f"{cur[:8]} {subject}")
+        cur = c.parents[0] if c.parents else None
+        n += 1
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CVS / SVN bridges — shell out to the cvs/svn binaries (what git's C does too).
 
@@ -770,13 +842,22 @@ def shell_out(args: list[str], *, env: Optional[dict] = None, cwd: Optional[str]
 
 
 # ---------------------------------------------------------------------------
-# fsmonitor — polling daemon writing a list of recently-changed paths.
+# fsmonitor — native daemon where possible, polling fallback otherwise.
 
 
-def fsmonitor_run(repo: Repository, interval: float = 1.0, iterations: int = 0) -> int:
-    """Poll the worktree; print changed paths to stdout. Stops after `iterations`
-    polls (0 = run forever).
-    """
+def _emit_fsmonitor_path(repo: Repository, path: Path | str) -> None:
+    try:
+        rel = Path(path).resolve().relative_to(repo.path)
+        text = str(rel)
+    except Exception:
+        text = str(path)
+    text = text.replace(os.sep, "/")
+    if text and ".git" not in text.split("/"):
+        print(text)
+        sys.stdout.flush()
+
+
+def _fsmonitor_run_polling(repo: Repository, interval: float = 1.0, iterations: int = 0) -> int:
     snapshot: dict[str, float] = {}
 
     def scan():
@@ -813,3 +894,221 @@ def fsmonitor_run(repo: Repository, interval: float = 1.0, iterations: int = 0) 
         if iterations and n >= iterations:
             break
     return 0
+
+
+def _fsmonitor_run_windows(repo: Repository, iterations: int = 0) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    FILE_LIST_DIRECTORY = 0x0001
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+    FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002
+    FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
+    FILE_NOTIFY_CHANGE_SIZE = 0x00000008
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.CreateFileW(
+        str(repo.path),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+    try:
+        count = 0
+        while True:
+            buf = ctypes.create_string_buffer(64 * 1024)
+            returned = wintypes.DWORD()
+            ok = kernel32.ReadDirectoryChangesW(
+                handle,
+                ctypes.byref(buf),
+                len(buf),
+                True,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                ctypes.byref(returned),
+                None,
+                None,
+            )
+            if not ok:
+                raise OSError(ctypes.get_last_error(), "ReadDirectoryChangesW failed")
+            pos = 0
+            while pos < returned.value:
+                next_off = int.from_bytes(buf.raw[pos : pos + 4], "little")
+                name_len = int.from_bytes(buf.raw[pos + 8 : pos + 12], "little")
+                name = buf.raw[pos + 12 : pos + 12 + name_len].decode("utf-16le", errors="replace")
+                _emit_fsmonitor_path(repo, repo.path / name)
+                count += 1
+                if iterations and count >= iterations:
+                    return 0
+                if not next_off:
+                    break
+                pos += next_off
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _fsmonitor_run_inotify(repo: Repository, iterations: int = 0) -> int:
+    import ctypes
+    import errno
+    import select
+    import struct
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    watches: dict[int, Path] = {}
+    mask = 0x00000100 | 0x00000080 | 0x00000002 | 0x00000004 | 0x00000200 | 0x40000000
+
+    def add_dir(path: Path) -> None:
+        wd = libc.inotify_add_watch(fd, os.fsencode(path), mask)
+        if wd >= 0:
+            watches[wd] = path
+
+    try:
+        for root, dirs, _files in os.walk(repo.path):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            add_dir(Path(root))
+        count = 0
+        while True:
+            select.select([fd], [], [])
+            try:
+                data = os.read(fd, 64 * 1024)
+            except BlockingIOError:
+                continue
+            pos = 0
+            while pos + 16 <= len(data):
+                wd, event_mask, _cookie, name_len = struct.unpack_from("iIII", data, pos)
+                pos += 16
+                raw_name = data[pos : pos + name_len].split(b"\0", 1)[0]
+                pos += name_len
+                parent = watches.get(wd)
+                if parent is None or not raw_name:
+                    continue
+                path = parent / os.fsdecode(raw_name)
+                if event_mask & 0x40000000 and path.is_dir():
+                    add_dir(path)
+                _emit_fsmonitor_path(repo, path)
+                count += 1
+                if iterations and count >= iterations:
+                    return 0
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+
+
+def fsmonitor_backend() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "inotify"
+    return "polling"
+
+
+def fsmonitor_run(repo: Repository, interval: float = 1.0, iterations: int = 0, backend: str = "auto") -> int:
+    """Watch the worktree and print changed paths."""
+    if backend == "polling":
+        return _fsmonitor_run_polling(repo, interval=interval, iterations=iterations)
+    if backend == "auto" and iterations:
+        return _fsmonitor_run_polling(repo, interval=interval, iterations=iterations)
+    selected = fsmonitor_backend() if backend in ("auto", "native") else backend
+    if selected == "windows":
+        if sys.platform != "win32":
+            print("windows fsmonitor backend is not available on this platform", file=sys.stderr)
+            return 1
+        try:
+            return _fsmonitor_run_windows(repo, iterations)
+        except (AttributeError, OSError) as exc:
+            if backend != "auto":
+                print(f"native fsmonitor failed: {exc}", file=sys.stderr)
+                return 1
+    if selected == "inotify":
+        if not sys.platform.startswith("linux"):
+            print("inotify fsmonitor backend is not available on this platform", file=sys.stderr)
+            return 1
+        try:
+            return _fsmonitor_run_inotify(repo, iterations)
+        except (AttributeError, OSError) as exc:
+            if backend != "auto":
+                print(f"native fsmonitor failed: {exc}", file=sys.stderr)
+                return 1
+    if backend == "native":
+        print("native fsmonitor backend is not available on this platform", file=sys.stderr)
+        return 1
+    return _fsmonitor_run_polling(repo, interval=interval, iterations=iterations)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def fsmonitor_daemon(repo: Repository, op: str) -> int:
+    pid_file = repo.gitdir / "pygit-fsmonitor.pid"
+    log_file = repo.gitdir / "pygit-fsmonitor.log"
+    if op == "status":
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+            except ValueError:
+                pid = 0
+            if pid and _pid_alive(pid):
+                print(f"fsmonitor-daemon: running pid={pid} backend={fsmonitor_backend()}")
+                return 0
+        print(f"fsmonitor-daemon: stopped backend={fsmonitor_backend()}")
+        return 0
+    if op == "stop":
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            pid_file.unlink(missing_ok=True)
+        print("fsmonitor-daemon: stopped")
+        return 0
+    if op == "start":
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                if _pid_alive(pid):
+                    print(f"fsmonitor-daemon: already running pid={pid}")
+                    return 0
+            except ValueError:
+                pass
+        with log_file.open("ab") as log:
+            kwargs = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pythongit", "fsmonitor-daemon", "run"],
+                cwd=str(repo.path),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                **kwargs,
+            )
+        pid_file.write_text(str(proc.pid) + "\n", encoding="utf-8")
+        print(f"fsmonitor-daemon: started pid={proc.pid} backend={fsmonitor_backend()}")
+        return 0
+    if op == "run":
+        return fsmonitor_run(repo, iterations=0, backend="auto")
+    return 1

@@ -266,7 +266,10 @@ mechanism.
 from both tips with PARENT1/PARENT2 flags, marking double-flagged commits as
 results and pushing STALE to their ancestors. `merge.merge_blob` is a
 line-based three-way merge that consults the rerere cache before falling back
-to emitting conflict markers.
+to emitting conflict markers. The high-level three-way tree merge does
+conservative rename detection before content merge: exact object-id renames are
+handled directly, and small text blobs use a similarity check for rename/modify
+cases.
 
 ### Rerere
 
@@ -282,9 +285,9 @@ post-image automatically.
 `bisect_step` follows git's `best_bisection`: for each candidate commit,
 compute `min(reachable_from_it, n - reachable_from_it)` and pick the maximum;
 that is, the commit that splits the candidate DAG as evenly as possible. Parent
-lookups use the commit-graph when present. For very large candidate sets,
-`pygit` switches from exact transitive bitsets to a bounded-memory
-generation/topological median so bisect remains usable on large histories.
+lookups use the commit-graph when present. The scorer mirrors Git's `bisect.c`
+shape: single-parent chains inherit parent weights, while merge commits get an
+exact distance walk so shared ancestors are counted once.
 
 ### Pack writer (delta compression)
 
@@ -346,7 +349,7 @@ pip install pythongit[test]
 pytest
 ```
 
-99 tests pass:
+105 tests pass:
 
 | File                    | Coverage |
 |-------------------------|----------|
@@ -354,8 +357,8 @@ pytest
 | `unit_refs.py`          | symbolic refs, reflog, packed-refs, abbrev SHA |
 | `unit_index.py`         | DIRC v2 roundtrip, conflict stages, long paths |
 | `unit_pack.py`          | delta apply, idx v2, build_pack, inbound pack indexing, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
-| `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP unit-level |
-| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
+| `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP/XOAUTH2/fsmonitor/bisect unit-level |
+| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rename-aware merge, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 
 Tests that require the real `git` binary are silently skipped when it's not on
@@ -364,9 +367,9 @@ PATH, so the suite runs cleanly in containers without one.
 ## What's intentionally NOT implemented
 
 * `git filter-repo` (it's a separate Python tool anyway, not a git built-in).
-* The fancier merge strategies (`recursive`'s rename detection, `ort`'s
-  three-way for trees). `pygit merge-recursive` aliases to the default
-  three-way merge.
+* A byte-for-byte clone of Git's `ort` merge engine. `pygit merge-recursive`
+  uses the built-in rename-aware three-way merge rather than Git's full
+  strategy implementation.
 
 ## Limitations to know about
 
@@ -376,14 +379,14 @@ PATH, so the suite runs cleanly in containers without one.
   pack generation/indexing. Tree-diff commands skip identical subtrees. The
   remaining scale-sensitive cases are commands whose output inherently requires
   inspecting every path or blob.
-* `bisect` computes exact candidate weights for ordinary ranges. Above a large
-  threshold it uses a bounded-memory generation/topological median, so the pick
-  may differ from C Git's exact best bisection on unusually large DAGs.
-* `fsmonitor` uses polling, not OS-level inotify/fsevent. Configurable
-  interval; not free.
-* `send-email` uses `smtplib` with plain SMTP, STARTTLS/TLS, and SMTP-over-SSL.
-  It does not include provider-specific OAuth/keychain helpers.
-* `gitk` / `gui` need a working Tk install (`tkinter`).
+* `fsmonitor-daemon run` uses native filesystem notifications on Windows and
+  Linux (`ReadDirectoryChangesW` / inotify). One-shot `fsmonitor` calls and
+  unsupported platforms fall back to configurable polling.
+* `send-email` uses `smtplib` with plain SMTP, STARTTLS/TLS, SMTP-over-SSL,
+  XOAUTH2 bearer tokens, `~/.git-credentials`, and configured `git credential`
+  helpers. Browser-based provider OAuth consent flows are still external.
+* `gitk` / `gui` use Tk when available and fall back to a text log in headless
+  Python installs.
 
 ## Contributing
 

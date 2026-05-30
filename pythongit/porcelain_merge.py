@@ -46,9 +46,12 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
     head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
     other_tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
     from .sequencer import _apply_patch
-    new_tree, conflicts = _apply_patch(repo, base_tree, other_tree, head_tree)
+    new_tree, conflicts, conflict_idx = _apply_patch(repo, base_tree, other_tree, head_tree)
     workdir.checkout_tree(repo, new_tree)
     if conflicts:
+        if conflict_idx is not None:
+            from .index import write_index
+            write_index(repo, conflict_idx)
         (repo.gitdir / "MERGE_HEAD").write_text(other + "\n", encoding="utf-8")
         (repo.gitdir / "MERGE_MSG").write_text(message or f"Merge: {other_rev}\n", encoding="utf-8")
         return "", conflicts

@@ -197,6 +197,27 @@ def test_merge_conflict_creates_stages_and_blocks_commit(tmprepo):
     assert not idx2.has_conflicts()
 
 
+def test_merge_detects_rename_modify(tmprepo):
+    from tests.conftest import commit_one
+
+    repo, path = tmprepo
+    commit_one(repo, "old.txt", "base\n", "base")
+    assert cli_run("branch", "feat") == 0
+
+    (path / "old.txt").write_text("ours\n")
+    assert cli_run("add", "old.txt") == 0
+    assert cli_run("commit", "-m", "ours modifies") == 0
+
+    assert cli_run("checkout", "feat") == 0
+    assert cli_run("mv", "old.txt", "new.txt") == 0
+    assert cli_run("commit", "-m", "rename") == 0
+
+    assert cli_run("checkout", "main") == 0
+    assert cli_run("merge", "feat") == 0
+    assert not (path / "old.txt").exists()
+    assert (path / "new.txt").read_text() == "ours\n"
+
+
 def test_rerere_replays_on_second_attempt(tmprepo):
     from tests.conftest import commit_one
     repo, path = tmprepo

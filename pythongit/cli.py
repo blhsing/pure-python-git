@@ -1271,7 +1271,7 @@ def cmd_merge_tree(argv: list[str]) -> int:
     b_tree = objs.parse_commit(objs.read_object(repo, b)[1]).tree
     one_tree = objs.parse_commit(objs.read_object(repo, one)[1]).tree
     two_tree = objs.parse_commit(objs.read_object(repo, two)[1]).tree
-    tree, confs = sequencer._apply_patch(repo, b_tree, two_tree, one_tree)
+    tree, confs, _conflict_idx = sequencer._apply_patch(repo, b_tree, two_tree, one_tree)
     _print(tree)
     for p in confs:
         _print(f"CONFLICT {p}")
@@ -1908,6 +1908,77 @@ _register_phase3()
 #           bisect / worktree
 
 
+def _count_reachable_candidates(start: str, parents_map: dict[str, list[str]], candidates: set[str]) -> int:
+    """Count candidate ancestors reachable from start, including start."""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        while cur in candidates and cur not in seen:
+            seen.add(cur)
+            parents = parents_map.get(cur, [])
+            stack.extend(parents[1:])
+            if not parents:
+                break
+            cur = parents[0]
+    return len(seen)
+
+
+def _best_bisection_candidate(
+    candidates: set[str],
+    parents_map: dict[str, list[str]],
+) -> tuple[str, int]:
+    """Return the exact best-bisection candidate and its split distance.
+
+    This mirrors Git's bisect.c approach: roots have weight 1, single-parent
+    chains inherit parent weight + 1, and merge commits get an exact distance
+    walk because their parents can share ancestors.
+    """
+    if not candidates:
+        raise ValueError("no bisection candidates")
+    weights: dict[str, int] = {}
+    single_parent: set[str] = set()
+    children: dict[str, list[str]] = {c: [] for c in candidates}
+    for c_sha in candidates:
+        filtered = [p for p in parents_map.get(c_sha, []) if p in candidates]
+        parents_map[c_sha] = filtered
+        for p_sha in filtered:
+            children.setdefault(p_sha, []).append(c_sha)
+        if not filtered:
+            weights[c_sha] = 1
+        elif len(filtered) == 1:
+            single_parent.add(c_sha)
+        else:
+            weights[c_sha] = _count_reachable_candidates(c_sha, parents_map, candidates)
+
+    queue: list[str] = []
+    for known in weights:
+        queue.extend(children.get(known, []))
+    while queue:
+        c_sha = queue.pop()
+        if c_sha in weights or c_sha not in single_parent:
+            continue
+        parent = parents_map[c_sha][0]
+        if parent not in weights:
+            continue
+        weights[c_sha] = weights[parent] + 1
+        queue.extend(children.get(c_sha, []))
+
+    for c_sha in sorted(candidates - set(weights)):
+        weights[c_sha] = _count_reachable_candidates(c_sha, parents_map, candidates)
+
+    n = len(candidates)
+    best = ""
+    best_distance = -1
+    for c_sha in sorted(candidates):
+        weight = weights[c_sha]
+        distance = min(weight, n - weight)
+        if distance > best_distance:
+            best = c_sha
+            best_distance = distance
+    return best, best_distance
+
+
 def _iter_loose_shas(repo: Repository):
     from . import loose
 
@@ -2361,54 +2432,12 @@ def cmd_bisect(argv: list[str]) -> int:
             _print(f"{bads[0]} is the first bad commit")
             return 0
         # weight[c] = number of candidates reachable from c (including c)
-        # best = argmax(min(weight, n - weight)) — matches git/bisect.c best_bisection
+        # best = argmax(min(weight, n - weight)) - matches git/bisect.c best_bisection
         parents_map: dict[str, list[str]] = {}
         for c_sha in candidates:
             parents_map[c_sha] = [p for p in commit_parents(c_sha) if p in candidates]
-        indegree = {c: 0 for c in candidates}
-        for ps in parents_map.values():
-            for p in ps:
-                indegree[p] += 1
-        queue = sorted(c for c, deg in indegree.items() if deg == 0)
-        topo: list[str] = []
-        while queue:
-            c_sha = queue.pop()
-            topo.append(c_sha)
-            for p in parents_map.get(c_sha, []):
-                indegree[p] -= 1
-                if indegree[p] == 0:
-                    queue.append(p)
-
         n = len(candidates)
-        exact_limit = 20000
-        if n > exact_limit:
-            def rank_key(sha: str) -> tuple[int, str]:
-                entry = graph.get(sha) if graph is not None else None
-                return (entry.generation if entry is not None else 0, sha)
-
-            ranked = sorted(candidates, key=rank_key) if graph is not None else list(reversed(topo))
-            best_index = len(ranked) // 2
-            best = ranked[best_index] if ranked else next(iter(candidates))
-            best_distance = min(best_index, max(0, n - best_index - 1))
-        else:
-            positions = {c_sha: i for i, c_sha in enumerate(sorted(candidates))}
-            reachable: dict[str, int] = {}
-            for c_sha in reversed(topo):
-                r = 1 << positions[c_sha]
-                for p in parents_map.get(c_sha, []):
-                    r |= reachable[p]
-                reachable[c_sha] = r
-
-            best = None
-            best_distance = -1
-            for c_sha in sorted(candidates):  # stable for ties
-                w = reachable.get(c_sha, 1 << positions[c_sha]).bit_count()
-                distance = min(w, n - w)
-                if distance > best_distance:
-                    best_distance = distance
-                    best = c_sha
-            if best is None:
-                best = next(iter(candidates))
+        best, best_distance = _best_bisection_candidate(candidates, parents_map)
         _print(f"Bisecting: {n // 2} revisions left to test after this (roughly {best_distance} steps)")
         _print(f"[{best}] candidate")
         t, d = objs.read_object(repo, best)
@@ -2604,20 +2633,22 @@ def cmd_grep(argv: list[str]) -> int:
         if not full.exists():
             continue
         try:
-            text = full.read_text(encoding="utf-8", errors="replace")
+            fh = full.open("r", encoding="utf-8", errors="replace")
         except Exception:
             continue
         matched = False
-        for i, line in enumerate(text.splitlines(), 1):
-            if pat.search(line):
-                rc = 0
-                matched = True
-                if args.files_with_matches:
-                    break
-                prefix = f"{e.path}:"
-                if args.line_number:
-                    prefix += f"{i}:"
-                _print(prefix + line)
+        with fh:
+            for i, line in enumerate(fh, 1):
+                line = line.rstrip("\n")
+                if pat.search(line):
+                    rc = 0
+                    matched = True
+                    if args.files_with_matches:
+                        break
+                    prefix = f"{e.path}:"
+                    if args.line_number:
+                        prefix += f"{i}:"
+                    _print(prefix + line)
         if matched and args.files_with_matches:
             _print(e.path)
     return rc
@@ -4335,7 +4366,7 @@ def cmd_hook(argv: list[str]) -> int:
 
 
 def cmd_credential(argv: list[str]) -> int:
-    """Minimal credential helper: read description from stdin, return env-based creds."""
+    """Minimal credential helper: read description from stdin and resolve credentials."""
     ap = argparse.ArgumentParser(prog="pygit credential")
     ap.add_argument("op", choices=["fill", "approve", "reject"])
     args = ap.parse_args(argv)
@@ -4345,12 +4376,8 @@ def cmd_credential(argv: list[str]) -> int:
             k, _, v = line.partition("=")
             fields[k] = v
     if args.op == "fill":
-        u = os.environ.get("GIT_USERNAME") or os.environ.get("USERNAME") or ""
-        p = os.environ.get("GIT_PASSWORD") or ""
-        if u:
-            fields["username"] = u
-        if p:
-            fields["password"] = p
+        from . import bridges
+        fields = bridges.credential_fill(fields, use_external=False)
         for k in ("protocol", "host", "path", "username", "password"):
             if k in fields:
                 _print(f"{k}={fields[k]}")
@@ -5026,6 +5053,9 @@ def _register_phase8() -> None:
         ap.add_argument("--smtp-server-port", type=int, default=25)
         ap.add_argument("--smtp-user", default=None)
         ap.add_argument("--smtp-pass", default=None)
+        ap.add_argument("--smtp-auth", default="plain", choices=["plain", "xoauth2", "oauth2"])
+        ap.add_argument("--smtp-oauth2-token", default=None)
+        ap.add_argument("--no-credential-helper", action="store_true")
         ap.add_argument("--smtp-encryption", default=None,
                         help="tls/starttls or ssl; anything else disables encryption")
         ap.add_argument("--smtp-ssl", action="store_true",
@@ -5038,7 +5068,10 @@ def _register_phase8() -> None:
                                   smtp_host=args.smtp_server, smtp_port=args.smtp_server_port,
                                   smtp_user=args.smtp_user, smtp_pass=args.smtp_pass,
                                   smtp_encryption=enc,
-                                  smtp_ssl_cert_path=args.smtp_ssl_cert_path)
+                                  smtp_ssl_cert_path=args.smtp_ssl_cert_path,
+                                  smtp_auth=args.smtp_auth,
+                                  smtp_oauth2_token=args.smtp_oauth2_token,
+                                  use_credential_helpers=not args.no_credential_helper)
 
     def _cmd_difftool(argv):
         ap = argparse.ArgumentParser(prog="pygit difftool")
@@ -5112,17 +5145,15 @@ def _register_phase8() -> None:
         ap = argparse.ArgumentParser(prog="pygit fsmonitor")
         ap.add_argument("--iterations", type=int, default=1)
         ap.add_argument("--interval", type=float, default=1.0)
+        ap.add_argument("--backend", choices=["auto", "polling", "native", "windows", "inotify"], default="auto")
         a = ap.parse_args(argv)
-        return bridges.fsmonitor_run(_repo(), interval=a.interval, iterations=a.iterations)
+        return bridges.fsmonitor_run(_repo(), interval=a.interval, iterations=a.iterations, backend=a.backend)
 
     def _cmd_fsmonitor_daemon(argv):
         ap = argparse.ArgumentParser(prog="pygit fsmonitor-daemon")
         ap.add_argument("op", choices=["start", "stop", "run", "status"])
         a = ap.parse_args(argv)
-        if a.op == "run":
-            return bridges.fsmonitor_run(_repo(), iterations=0)
-        _print(f"fsmonitor-daemon: {a.op} (no-op in pygit)")
-        return 0
+        return bridges.fsmonitor_daemon(_repo(), a.op)
 
     def _cmd_daemon(argv):
         ap = argparse.ArgumentParser(prog="pygit daemon")

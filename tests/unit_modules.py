@@ -7,6 +7,7 @@ from pythongit import patch as patch_mod
 from pythongit import ignore as ignore_mod
 from pythongit import rerere as rerere_mod
 from pythongit import bridges as bridges_mod
+from pythongit import cli as cli_mod
 
 
 # --- diff -----------------------------------------------------------------
@@ -228,3 +229,118 @@ def test_send_email_uses_explicit_starttls(tmp_path, monkeypatch):
     assert rc == 0
     assert calls[:2] == [("connect", "localhost", 25), ("starttls", True)]
     assert ("send", "b@example.com", "test") in calls
+
+
+def test_send_email_uses_credential_helper_and_xoauth2(tmp_path, monkeypatch):
+    import base64
+    import subprocess
+    import smtplib
+    calls = []
+
+    class FakeSMTP:
+        def __init__(self, host, port):
+            calls.append(("connect", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def starttls(self, **kwargs):
+            calls.append(("starttls",))
+
+        def docmd(self, cmd, arg):
+            calls.append(("docmd", cmd, arg))
+            return 235, b"ok"
+
+        def send_message(self, msg):
+            calls.append(("send", msg["To"], msg["Subject"]))
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            ["git", "credential", "fill"],
+            0,
+            stdout="username=user@example.com\npassword=oauth-token\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    mbox = tmp_path / "patch.mbox"
+    mbox.write_text("From x\nSubject: test\n\nbody\n", encoding="utf-8")
+
+    rc = bridges_mod.send_email(
+        str(mbox),
+        to=["b@example.com"],
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        smtp_encryption="tls",
+        smtp_auth="xoauth2",
+    )
+
+    assert rc == 0
+    auth_call = next(c for c in calls if c[0] == "docmd")
+    assert auth_call[1] == "AUTH"
+    encoded = auth_call[2].split(" ", 1)[1]
+    decoded = base64.b64decode(encoded).decode()
+    assert "user=user@example.com" in decoded
+    assert "auth=Bearer oauth-token" in decoded
+
+
+def test_fsmonitor_auto_uses_polling_for_finite_iterations(tmprepo, monkeypatch):
+    calls = []
+
+    def fake_poll(repo, interval=1.0, iterations=0):
+        calls.append((interval, iterations))
+        return 0
+
+    monkeypatch.setattr(bridges_mod, "_fsmonitor_run_polling", fake_poll)
+    repo, _ = tmprepo
+    assert bridges_mod.fsmonitor_run(repo, interval=0.01, iterations=1, backend="auto") == 0
+    assert calls == [(0.01, 1)]
+
+
+def test_fsmonitor_explicit_native_backend_must_match_platform(tmprepo, monkeypatch, capsys):
+    repo, _ = tmprepo
+    monkeypatch.setattr(bridges_mod.sys, "platform", "darwin")
+
+    assert bridges_mod.fsmonitor_run(repo, backend="inotify") == 1
+
+    captured = capsys.readouterr()
+    assert "not available" in captured.err
+
+
+def test_bisect_exact_scorer_handles_large_linear_history():
+    count = 25001
+    commits = [f"{i:040x}" for i in range(count)]
+    candidates = set(commits)
+    parents = {commits[0]: []}
+    for i in range(1, count):
+        parents[commits[i]] = [commits[i - 1]]
+
+    best, distance = cli_mod._best_bisection_candidate(candidates, parents)
+
+    assert best == commits[(count // 2) - 1]
+    assert distance == count // 2
+
+
+def test_bisect_exact_scorer_counts_merge_ancestors_once():
+    root = "0" * 40
+    left = "1" * 40
+    right = "2" * 40
+    merge = "3" * 40
+    tip = "4" * 40
+    candidates = {root, left, right, merge, tip}
+    parents = {
+        root: [],
+        left: [root],
+        right: [root],
+        merge: [left, right],
+        tip: [merge],
+    }
+
+    best, distance = cli_mod._best_bisection_candidate(candidates, parents)
+
+    assert best == left
+    assert distance == 2
