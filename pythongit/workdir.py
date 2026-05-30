@@ -364,8 +364,8 @@ def write_tree(repo: Repository) -> str:
 def read_tree(repo: Repository, tree_sha: str) -> None:
     """Replace the index with the contents of the given tree (no worktree update)."""
     idx = Index()
-    for path, _mode, sha in iter_tree_files(repo, tree_sha):
-        idx.entries.append(IndexEntry(mode=REG_MODE, sha=sha, path=path))
+    for path, mode, sha in iter_tree_files(repo, tree_sha):
+        idx.entries.append(IndexEntry(mode=int(mode, 8), sha=sha, path=path))
     write_index(repo, idx)
 
 
@@ -385,13 +385,28 @@ def checkout_tree(repo: Repository, tree_sha: str) -> None:
                     pass
 
     new_idx = Index()
-    for path, _mode, sha in iter_tree_files(repo, tree_sha):
+    for path, mode, sha in iter_tree_files(repo, tree_sha):
         t, data = objs.read_object(repo, sha)
         if t != "blob":
             continue
         full = repo.path / path
         full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_bytes(data)
+        if mode == "120000":
+            if full.exists() or full.is_symlink():
+                full.unlink()
+            try:
+                os.symlink(data.decode("utf-8"), full)
+            except (AttributeError, NotImplementedError, OSError):
+                full.write_bytes(data)
+        else:
+            if full.exists() and full.is_symlink():
+                full.unlink()
+            full.write_bytes(data)
+            if int(mode, 8) & 0o111:
+                try:
+                    full.chmod(full.stat().st_mode | 0o111)
+                except OSError:
+                    pass
         st = full.lstat()
-        new_idx.entries.append(stat_to_entry(path, st, sha, REG_MODE))
+        new_idx.entries.append(stat_to_entry(path, st, sha, int(mode, 8)))
     write_index(repo, new_idx)

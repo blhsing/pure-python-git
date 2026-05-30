@@ -197,6 +197,54 @@ def test_merge_conflict_creates_stages_and_blocks_commit(tmprepo):
     assert not idx2.has_conflicts()
 
 
+def test_merge_ort_backend_matches_git_conflict_blob(tmprepo):
+    import subprocess
+    from tests.conftest import commit_one, real_git
+    from pythongit.index import read_index
+
+    gitbin = real_git()
+    if not gitbin:
+        return
+    repo, path = tmprepo
+    base = commit_one(repo, "f", "base\n", "base")
+    cli_run("branch", "feat")
+    cli_run("checkout", "feat")
+    commit_one(repo, "f", "theirs\n", "theirs")
+    cli_run("checkout", "main")
+    commit_one(repo, "f", "ours\n", "ours")
+
+    expected_tree = subprocess.run(
+        [
+            gitbin,
+            "-C",
+            str(path),
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            "--merge-base",
+            base,
+            "HEAD",
+            "feat",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert expected_tree.returncode == 1
+    tree = expected_tree.stdout.splitlines()[0]
+    expected_blob = subprocess.run(
+        [gitbin, "-C", str(path), "show", f"{tree}:f"],
+        capture_output=True,
+        timeout=10,
+    )
+    assert expected_blob.returncode == 0
+
+    assert cli_run("merge", "feat") == 1
+    assert (path / "f").read_bytes() == expected_blob.stdout
+    stages = read_index(repo).by_path_all_stages()["f"]
+    assert set(stages) == {1, 2, 3}
+
+
 def test_merge_detects_rename_modify(tmprepo):
     from tests.conftest import commit_one
 

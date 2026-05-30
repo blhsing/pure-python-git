@@ -93,6 +93,24 @@ def _apply_side_renames(
             other[new] = other.pop(old)
 
 
+def _note_rerere_conflicts(repo: Repository, tree: str, paths: list[str]) -> None:
+    from . import rerere as _rr
+
+    for path in paths:
+        entry = workdir.tree_path_entry(repo, tree, path)
+        if entry is None or entry.is_dir() or entry.is_gitlink():
+            continue
+        try:
+            obj_type, data = objs.read_object(repo, entry.sha)
+        except KeyError:
+            continue
+        if obj_type != "blob":
+            continue
+        text = data.decode("utf-8", errors="replace")
+        if "<<<<<<<" in text:
+            _rr.note_conflict(repo, path, text)
+
+
 def _make_commit(repo: Repository, tree: str, parents: list[str], message: str,
                  author: Optional[str] = None) -> str:
     name, email = repo.user()
@@ -108,15 +126,36 @@ def _make_commit(repo: Repository, tree: str, parents: list[str], message: str,
     return objs.write_object(repo, "commit", c.encode())
 
 
-def _apply_patch(repo: Repository, base_tree: str, target_tree: str,
-                 head_tree: str):
+def _apply_patch(
+    repo: Repository,
+    base_tree: str,
+    target_tree: str,
+    head_tree: str,
+    *,
+    ort_base: Optional[str] = None,
+    ort_ours: Optional[str] = None,
+    ort_theirs: Optional[str] = None,
+):
     """Three-way merge head_tree with target_tree using base_tree as base.
 
-    Returns (new_tree_sha, conflicted_paths). When a path conflicts, the
-    index records stages 1 (base), 2 (ours), 3 (theirs) instead of a
-    single stage-0 entry; the merged-with-markers content is written to
-    both worktree and used to build the returned tree placeholder.
+    Returns (new_tree_sha, conflicted_paths, conflict_index). When a path
+    conflicts, the conflict index records stages 1 (base), 2 (ours), 3
+    (theirs); the merged-with-markers content is kept in the returned tree for
+    checkout into the worktree.
     """
+    from . import ort as ort_mod
+
+    ort_result = ort_mod.merge_tree(
+        repo,
+        ort_base or base_tree,
+        ort_ours or head_tree,
+        ort_theirs or target_tree,
+    )
+    if ort_result is not None:
+        if ort_result.conflicts:
+            _note_rerere_conflicts(repo, ort_result.tree, ort_result.conflicts)
+        return ort_result.tree, ort_result.conflicts, ort_result.conflict_index
+
     base_orig = _tree_blobs(repo, base_tree)
     target_orig = _tree_blobs(repo, target_tree)
     head_orig = _tree_blobs(repo, head_tree)
@@ -223,7 +262,15 @@ def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[
     if not head_sha:
         raise ValueError("no HEAD")
     head_tree = _commit_obj(repo, head_sha).tree
-    new_tree, conflicts, conflict_idx = _apply_patch(repo, base_tree, target.tree, head_tree)
+    new_tree, conflicts, conflict_idx = _apply_patch(
+        repo,
+        base_tree,
+        target.tree,
+        head_tree,
+        ort_base=target.parents[0],
+        ort_ours="HEAD",
+        ort_theirs=target_sha,
+    )
     if conflicts:
         # leave merged-with-markers in workdir, do not commit
         workdir.checkout_tree(repo, new_tree)
@@ -252,7 +299,15 @@ def revert(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]
     if not head_sha:
         raise ValueError("no HEAD")
     head_tree = _commit_obj(repo, head_sha).tree
-    new_tree, conflicts, conflict_idx = _apply_patch(repo, base_tree, new_target_tree, head_tree)
+    new_tree, conflicts, conflict_idx = _apply_patch(
+        repo,
+        base_tree,
+        new_target_tree,
+        head_tree,
+        ort_base=target_sha,
+        ort_ours="HEAD",
+        ort_theirs=target.parents[0],
+    )
     if conflicts:
         workdir.checkout_tree(repo, new_tree)
         if conflict_idx is not None:

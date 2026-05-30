@@ -46,7 +46,15 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
     head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
     other_tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
     from .sequencer import _apply_patch
-    new_tree, conflicts, conflict_idx = _apply_patch(repo, base_tree, other_tree, head_tree)
+    new_tree, conflicts, conflict_idx = _apply_patch(
+        repo,
+        base_tree,
+        other_tree,
+        head_tree,
+        ort_base=base,
+        ort_ours="HEAD",
+        ort_theirs=other_rev,
+    )
     workdir.checkout_tree(repo, new_tree)
     if conflicts:
         if conflict_idx is not None:

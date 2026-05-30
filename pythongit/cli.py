@@ -1271,7 +1271,15 @@ def cmd_merge_tree(argv: list[str]) -> int:
     b_tree = objs.parse_commit(objs.read_object(repo, b)[1]).tree
     one_tree = objs.parse_commit(objs.read_object(repo, one)[1]).tree
     two_tree = objs.parse_commit(objs.read_object(repo, two)[1]).tree
-    tree, confs, _conflict_idx = sequencer._apply_patch(repo, b_tree, two_tree, one_tree)
+    tree, confs, _conflict_idx = sequencer._apply_patch(
+        repo,
+        b_tree,
+        two_tree,
+        one_tree,
+        ort_base=b,
+        ort_ours=one,
+        ort_theirs=two,
+    )
     _print(tree)
     for p in confs:
         _print(f"CONFLICT {p}")
@@ -4713,7 +4721,7 @@ def cmd_prune_packed(argv: list[str]) -> int:
 
 
 def cmd_merge_recursive(argv: list[str]) -> int:
-    """Alias: merge using the default (3-way) strategy."""
+    """Alias: merge using the default ort-backed strategy."""
     return cmd_merge(argv)
 
 

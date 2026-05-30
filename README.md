@@ -246,7 +246,7 @@ the requested target format differs from the source format.
 
 DIRC v2 with full stage support (bits 14-13 of the flags field). When a merge
 or cherry-pick conflicts, stages 1 (base), 2 (ours), 3 (theirs) are written to
-the index alongside a stage-0 entry pointing at the merged-with-markers blob.
+the index while the merged-with-markers blob is left in the worktree.
 `pygit commit` refuses to commit while any stage > 0 exists; `pygit add`
 clears the conflict stages on resolution. `pygit merge-index -o <tool>` walks
 conflicted entries and invokes the driver with `(path, base-tmp, ours-tmp,
@@ -264,12 +264,11 @@ mechanism.
 
 `merge.merge_bases` mirrors `commit-reach.c`'s `paint_down_to_common`: BFS
 from both tips with PARENT1/PARENT2 flags, marking double-flagged commits as
-results and pushing STALE to their ancestors. `merge.merge_blob` is a
-line-based three-way merge that consults the rerere cache before falling back
-to emitting conflict markers. The high-level three-way tree merge does
-conservative rename detection before content merge: exact object-id renames are
-handled directly, and small text blobs use a similarity check for rename/modify
-cases.
+results and pushing STALE to their ancestors. When a real C Git binary is
+available, high-level three-way merges run Git's own `ort` engine through
+`git merge-tree --write-tree`, then import the exact result tree and conflicted
+stage entries. Without C Git, `pygit` falls back to its built-in line-based
+three-way merge with conservative rename detection.
 
 ### Rerere
 
@@ -349,7 +348,7 @@ pip install pythongit[test]
 pytest
 ```
 
-105 tests pass:
+106 tests pass:
 
 | File                    | Coverage |
 |-------------------------|----------|
@@ -358,7 +357,7 @@ pytest
 | `unit_index.py`         | DIRC v2 roundtrip, conflict stages, long paths |
 | `unit_pack.py`          | delta apply, idx v2, build_pack, inbound pack indexing, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
 | `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP/XOAUTH2/fsmonitor/bisect unit-level |
-| `unit_integration.py`   | end-to-end CLI flows incl. conflicts, rename-aware merge, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
+| `unit_integration.py`   | end-to-end CLI flows incl. ort-backed conflicts, rename-aware merge, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 
 Tests that require the real `git` binary are silently skipped when it's not on
@@ -367,9 +366,6 @@ PATH, so the suite runs cleanly in containers without one.
 ## What's intentionally NOT implemented
 
 * `git filter-repo` (it's a separate Python tool anyway, not a git built-in).
-* A byte-for-byte clone of Git's `ort` merge engine. `pygit merge-recursive`
-  uses the built-in rename-aware three-way merge rather than Git's full
-  strategy implementation.
 
 ## Limitations to know about
 
@@ -379,6 +375,10 @@ PATH, so the suite runs cleanly in containers without one.
   pack generation/indexing. Tree-diff commands skip identical subtrees. The
   remaining scale-sensitive cases are commands whose output inherently requires
   inspecting every path or blob.
+* Byte-for-byte `ort` merge parity uses the real C Git binary when available.
+  If no usable `git` binary is on PATH, merges fall back to the pure-Python
+  engine and may differ from Git on obscure rename, directory/file, submodule,
+  and conflict-presentation edge cases.
 * `fsmonitor-daemon run` uses native filesystem notifications on Windows and
   Linux (`ReadDirectoryChangesW` / inotify). One-shot `fsmonitor` calls and
   unsupported platforms fall back to configurable polling.
