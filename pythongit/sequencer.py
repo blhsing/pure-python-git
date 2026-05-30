@@ -23,76 +23,6 @@ def _commit_obj(repo: Repository, sha: str) -> objs.Commit:
     return objs.parse_commit(data)
 
 
-def _tree_blobs(repo: Repository, tree: str) -> dict[str, str]:
-    return {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, tree)}
-
-
-def _blob_similarity(repo: Repository, a_sha: str, b_sha: str, *, max_bytes: int = 1024 * 1024) -> float:
-    from difflib import SequenceMatcher
-
-    try:
-        a_type, a_data = objs.read_object(repo, a_sha)
-        b_type, b_data = objs.read_object(repo, b_sha)
-    except KeyError:
-        return 0.0
-    if a_type != "blob" or b_type != "blob":
-        return 0.0
-    if len(a_data) > max_bytes or len(b_data) > max_bytes:
-        return 1.0 if a_sha == b_sha else 0.0
-    if not a_data and not b_data:
-        return 1.0
-    return SequenceMatcher(None, a_data, b_data, autojunk=False).ratio()
-
-
-def _detect_renames(repo: Repository, base: dict[str, str], side: dict[str, str]) -> dict[str, str]:
-    deleted = [p for p in base if p not in side]
-    added = [p for p in side if p not in base]
-    if not deleted or not added:
-        return {}
-    added_by_sha: dict[str, list[str]] = {}
-    for path in added:
-        added_by_sha.setdefault(side[path], []).append(path)
-    renames: dict[str, str] = {}
-    used_added: set[str] = set()
-    for old in deleted:
-        matches = [p for p in added_by_sha.get(base[old], []) if p not in used_added]
-        if matches:
-            new = sorted(matches)[0]
-            renames[old] = new
-            used_added.add(new)
-    remaining_deleted = [p for p in deleted if p not in renames]
-    remaining_added = [p for p in added if p not in used_added]
-    if len(remaining_deleted) * len(remaining_added) > 4096:
-        return renames
-    for old in remaining_deleted:
-        best_path = ""
-        best_score = 0.0
-        for new in remaining_added:
-            score = _blob_similarity(repo, base[old], side[new])
-            if score > best_score:
-                best_score = score
-                best_path = new
-        if best_path and best_score >= 0.60:
-            renames[old] = best_path
-            used_added.add(best_path)
-            remaining_added.remove(best_path)
-    return renames
-
-
-def _apply_side_renames(
-    base: dict[str, str],
-    side: dict[str, str],
-    other: dict[str, str],
-    renames: dict[str, str],
-) -> None:
-    for old, new in sorted(renames.items()):
-        if old not in base or new not in side:
-            continue
-        base[new] = base.pop(old)
-        if old in other and new not in other:
-            other[new] = other.pop(old)
-
-
 def _note_rerere_conflicts(repo: Repository, tree: str, paths: list[str]) -> None:
     from . import rerere as _rr
 
@@ -138,10 +68,11 @@ def _apply_patch(
 ):
     """Three-way merge head_tree with target_tree using base_tree as base.
 
-    Returns (new_tree_sha, conflicted_paths, conflict_index). When a path
-    conflicts, the conflict index records stages 1 (base), 2 (ours), 3
-    (theirs); the merged-with-markers content is kept in the returned tree for
-    checkout into the worktree.
+    Runs the pure-Python ort engine (:mod:`pythongit.ort`) and returns
+    (new_tree_sha, conflicted_paths, conflict_index). When a path conflicts,
+    the conflict index records stages 1 (base), 2 (ours), 3 (theirs); the
+    merged-with-markers content is kept in the returned tree for checkout into
+    the worktree.
     """
     from . import ort as ort_mod
 
@@ -151,106 +82,9 @@ def _apply_patch(
         ort_ours or head_tree,
         ort_theirs or target_tree,
     )
-    if ort_result is not None:
-        if ort_result.conflicts:
-            _note_rerere_conflicts(repo, ort_result.tree, ort_result.conflicts)
-        return ort_result.tree, ort_result.conflicts, ort_result.conflict_index
-
-    base_orig = _tree_blobs(repo, base_tree)
-    target_orig = _tree_blobs(repo, target_tree)
-    head_orig = _tree_blobs(repo, head_tree)
-    target_renames = _detect_renames(repo, base_orig, target_orig)
-    head_renames = _detect_renames(repo, base_orig, head_orig)
-    base = dict(base_orig)
-    target = dict(target_orig)
-    head = dict(head_orig)
-    rename_conflicts: dict[str, tuple[str, str]] = {}
-    for old, target_new in target_renames.items():
-        head_new = head_renames.get(old)
-        if head_new is not None and head_new != target_new:
-            rename_conflicts[old] = (head_new, target_new)
-    _apply_side_renames(base, target, head, {k: v for k, v in target_renames.items() if k not in rename_conflicts})
-    _apply_side_renames(base, head, target, {k: v for k, v in head_renames.items() if k not in rename_conflicts})
-    paths = sorted(set(base) | set(target) | set(head))
-    out: dict[str, str] = {}
-    stage_entries: list[tuple[str, int, str]] = []  # (path, stage, sha)
-    conflicts: list[str] = []
-    from . import rerere as _rr
-    for old, (head_new, target_new) in sorted(rename_conflicts.items()):
-        base_sha = base_orig[old]
-        head_sha = head_orig.get(head_new)
-        target_sha = target_orig.get(target_new)
-        if head_sha:
-            out[head_new] = head_sha
-        if target_sha:
-            out[target_new] = target_sha
-        conflicts.extend([head_new, target_new])
-        stage_entries.append((old, 1, base_sha))
-        if head_sha:
-            stage_entries.append((head_new, 2, head_sha))
-        if target_sha:
-            stage_entries.append((target_new, 3, target_sha))
-    for p in paths:
-        if any(p in pair for pair in rename_conflicts.values()):
-            continue
-        b = base.get(p)
-        t = target.get(p)
-        h = head.get(p)
-        if t == b:
-            if h is not None:
-                out[p] = h
-            continue
-        if h == b:
-            if t is not None:
-                out[p] = t
-            continue
-        if h == t:
-            if h is not None:
-                out[p] = h
-            continue
-        b_data = b and objs.read_object(repo, b)[1] or b""
-        t_data = t and objs.read_object(repo, t)[1] or b""
-        h_data = h and objs.read_object(repo, h)[1] or b""
-        merged, conf = merge_mod.merge_blob(b_data, h_data, t_data)
-        if conf:
-            replay = _rr.replay(repo, merged.decode("utf-8", errors="replace"))
-            if replay is not None:
-                merged = replay.encode("utf-8")
-                conf = False
-            else:
-                _rr.note_conflict(repo, p, merged.decode("utf-8", errors="replace"))
-        merged_sha = objs.write_object(repo, "blob", merged)
-        out[p] = merged_sha
-        if conf:
-            conflicts.append(p)
-            if b is not None:
-                stage_entries.append((p, 1, b))
-            if h is not None:
-                stage_entries.append((p, 2, h))
-            if t is not None:
-                stage_entries.append((p, 3, t))
-    from .index import Index, IndexEntry, REG_MODE, read_index, write_index
-    tree_idx = Index()
-    for path, sha in sorted(out.items()):
-        tree_idx.entries.append(IndexEntry(mode=REG_MODE, sha=sha, path=path))
-    saved_idx = read_index(repo) if (repo.gitdir / "index").exists() else None
-    try:
-        write_index(repo, tree_idx)
-        tree = workdir.write_tree(repo)
-    finally:
-        if saved_idx is not None:
-            write_index(repo, saved_idx)
-        else:
-            (repo.gitdir / "index").unlink(missing_ok=True)
-    conflict_idx = None
-    if stage_entries:
-        conflict_idx = Index()
-        conflict_idx.entries.extend(tree_idx.entries)
-        for path, stage, sha in stage_entries:
-            e = IndexEntry(mode=REG_MODE, sha=sha, path=path)
-            e.stage = stage
-            conflict_idx.entries.append(e)
-    return tree, conflicts, conflict_idx
+    if ort_result.conflicts:
+        _note_rerere_conflicts(repo, ort_result.tree, ort_result.conflicts)
+    return ort_result.tree, ort_result.conflicts, ort_result.conflict_index
 
 
 def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]:

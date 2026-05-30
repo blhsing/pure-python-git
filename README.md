@@ -25,6 +25,10 @@ pure-python-git/             (repo root)
 │   ├── workdir.py           add/rm/status/checkout, tree↔workdir
 │   ├── diff.py              Myers diff + unified-diff renderer
 │   ├── merge.py             merge-base + three-way blob merge
+│   ├── xdiff.py             xdiff port: histogram/Myers diff + xdl_merge
+│   ├── diffcore.py          diffcore-rename: spanhash similarity + matching
+│   ├── mergeort.py          merge-ort tree engine (collect/rename/process)
+│   ├── ort.py               ort adapter → OrtResult(tree, conflicts, index)
 │   ├── sequencer.py         cherry-pick / revert / rebase
 │   ├── porcelain_merge.py   ff + 3-way merge entry point
 │   ├── patch.py             unified-diff parser + applier
@@ -264,11 +268,29 @@ mechanism.
 
 `merge.merge_bases` mirrors `commit-reach.c`'s `paint_down_to_common`: BFS
 from both tips with PARENT1/PARENT2 flags, marking double-flagged commits as
-results and pushing STALE to their ancestors. When a real C Git binary is
-available, high-level three-way merges run Git's own `ort` engine through
-`git merge-tree --write-tree`, then import the exact result tree and conflicted
-stage entries. Without C Git, `pygit` falls back to its built-in line-based
-three-way merge with conservative rename detection.
+results and pushing STALE to their ancestors.
+
+High-level three-way merges run a pure-Python port of Git's own `ort` engine —
+no `git` binary and no fallback engine. The port lives in three modules and
+reproduces `git merge-tree --write-tree` byte-for-byte (result tree oid,
+conflicted blobs with markers, and conflicted index stages):
+
+* `xdiff.py` — Git's xdiff library: record classification, the **histogram**
+  diff that `ort` hardcodes for content merges (with the classic Myers
+  algorithm as its documented fallback), change compaction, and the zealous
+  three-way `xdl_merge` that emits `<<<<<<<` / `=======` / `>>>>>>>` markers.
+* `diffcore.py` — rename detection: the `diffcore-delta` spanhash similarity
+  estimator plus exact, basename-driven, and inexact NxM matrix matching from
+  `diffcore-rename.c`.
+* `mergeort.py` — the `merge-ort.c` tree engine: the recursive three-way tree
+  walk (`collect_merge_info`), file and **directory** rename detection and
+  resolution (`process_renames`), per-path resolution (`process_entry`), and
+  streamed result-tree assembly with conflicted index stages.
+
+`ort.py` is a thin adapter exposing `merge_tree(repo, merge_base, ours,
+theirs)`; the `merge_base`/`ours`/`theirs` arguments double as the
+conflict-marker labels, exactly as the corresponding `git merge-tree
+--merge-base` arguments do.
 
 ### Rerere
 
@@ -348,7 +370,7 @@ pip install pythongit[test]
 pytest
 ```
 
-106 tests pass:
+The suite passes:
 
 | File                    | Coverage |
 |-------------------------|----------|
@@ -358,10 +380,17 @@ pytest
 | `unit_pack.py`          | delta apply, idx v2, build_pack, inbound pack indexing, pack/MIDX bitmaps, binary MIDX, SHA-256 interop |
 | `unit_modules.py`       | diff/merge/patch/ignore/rerere/SMTP/XOAUTH2/fsmonitor/bisect unit-level |
 | `unit_integration.py`   | end-to-end CLI flows incl. ort-backed conflicts, rename-aware merge, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
+| `test_ort_parity.py`    | byte-for-byte `ort` parity vs `git merge-tree --write-tree` across every conflict type (content, modify/delete, add/add, rename/rename, rename/delete, directory rename, distinct-types, exec-bit) |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 
 Tests that require the real `git` binary are silently skipped when it's not on
 PATH, so the suite runs cleanly in containers without one.
+
+The pure-Python `ort` engine is additionally cross-checked against C Git with
+the differential fuzzers in `tests/diff_xdiff_harness.py` (blob-level 3-way
+merges vs `git merge-file`) and `tests/diff_ort_harness.py` (whole-tree merges
+vs `git merge-tree`); both compare results byte-for-byte over thousands of
+randomized cases.
 
 ## What's intentionally NOT implemented
 
@@ -375,10 +404,14 @@ PATH, so the suite runs cleanly in containers without one.
   pack generation/indexing. Tree-diff commands skip identical subtrees. The
   remaining scale-sensitive cases are commands whose output inherently requires
   inspecting every path or blob.
-* Byte-for-byte `ort` merge parity uses the real C Git binary when available.
-  If no usable `git` binary is on PATH, merges fall back to the pure-Python
-  engine and may differ from Git on obscure rename, directory/file, submodule,
-  and conflict-presentation edge cases.
+* The `ort` merge engine is a pure-Python reimplementation (no `git` binary,
+  no fallback) and is validated for byte-for-byte parity against
+  `git merge-tree --write-tree` across content merges, rename detection
+  (file and directory), and conflict presentation. It targets a single merge
+  base (as `git merge-tree --merge-base` provides); recursive merge of multiple
+  merge bases (a virtual ancestor) and full submodule fast-forward resolution
+  are not modelled, and `merge.conflictStyle`/whitespace merge drivers default
+  to Git's standard behavior.
 * `fsmonitor-daemon run` uses native filesystem notifications on Windows and
   Linux (`ReadDirectoryChangesW` / inotify). One-shot `fsmonitor` calls and
   unsupported platforms fall back to configurable polling.
