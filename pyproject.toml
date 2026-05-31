@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pure-python-git"
-version = "1.0.0"
+version = "1.0.1"
 description = "Pure-Python git reimplementation with a byte-exact in-process `ort` merge engine and no C `git` dependency. Installs `pygit`; opt-in `git` shim via `pip install pure-python-git[git]`."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -45,7 +45,7 @@ pygit = "pythongit.cli:main"
 # This pulls in `pure-python-git-shim`, whose only role is to register a `git`
 # console-script that calls pythongit.cli:main. Uninstall the shim with pip
 # to remove the shim without uninstalling the main package.
-git = ["pure-python-git-shim==0.1.0"]
+git = ["pure-python-git-shim>=0.1.1"]
 test = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

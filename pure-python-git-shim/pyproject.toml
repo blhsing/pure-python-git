@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pure-python-git-shim"
-version = "0.1.0"
+version = "0.1.1"
 description = "Drop-in `git` console-script that delegates to pure-python-git. Install via `pip install pure-python-git[git]`."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Ben Hsing", email = "blhsing@gmail.com" }]
 license = { file = "LICENSE" }
-dependencies = ["pure-python-git==0.1.0"]
+# Lower bound, not an exact pin: the shim only registers a `git` console-script
+# that calls pythongit.cli:main, so it works with any main-package version.
+# Exact-pinning forced a lockstep that broke the `[git]` extra on every release.
+dependencies = ["pure-python-git>=0.1.0"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
