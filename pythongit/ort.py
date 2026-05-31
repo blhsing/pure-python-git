@@ -70,13 +70,70 @@ def _resolve_attributes(repo: Repository):
     return mergeort.MergeAttributes.parse(text.decode("utf-8", "replace"))
 
 
+def _git_config_unquote(s: str) -> str:
+    """Apply git config value unquoting (quoted segments + \\" \\\\ \\n \\t \\b
+    escapes); configparser stores values verbatim, but git config quotes
+    command lines with spaces/quotes."""
+    out = []
+    i = 0
+    n = len(s)
+    in_quote = False
+    while i < n:
+        c = s[i]
+        if c == '"':
+            in_quote = not in_quote
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            out.append({'"': '"', "\\": "\\", "n": "\n", "t": "\t",
+                        "b": "\b"}.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _read_custom_drivers(repo: Repository) -> "tuple[dict, Optional[str]]":
+    """Parse merge.<name>.driver/recursive sections and merge.default. Read
+    with interpolation disabled since driver command lines contain literal
+    ``%O``/``%A``/``%B`` placeholders."""
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    cfg = repo.gitdir / "config"
+    if cfg.exists():
+        cp.read(cfg, encoding="utf-8")
+    drivers: dict = {}
+    merge_default = None
+    for section in cp.sections():
+        # git subsection sections look like:  merge "name"
+        if section == "merge":
+            if cp.has_option("merge", "default"):
+                merge_default = cp.get("merge", "default")
+            continue
+        parts = section.split(None, 1)
+        if parts[0] != "merge" or len(parts) != 2:
+            continue
+        name = parts[1].strip().strip('"')
+        entry = drivers.setdefault(name, {})
+        if cp.has_option(section, "driver"):
+            entry["driver"] = _git_config_unquote(cp.get(section, "driver"))
+        if cp.has_option(section, "recursive"):
+            entry["recursive"] = _git_config_unquote(cp.get(section, "recursive"))
+    return drivers, merge_default
+
+
 def _build_config(repo: Repository, base_tree: str, ours_tree: str,
                   theirs_tree: str) -> "mergeort.MergeConfig":
     cp = repo.config()
     style_name = cp.get("merge", "conflictstyle", fallback="merge")
     style = _CONFLICT_STYLES.get(style_name.strip().lower(), 0)
     attrs = _resolve_attributes(repo)
-    return mergeort.MergeConfig(conflict_style=style, attributes=attrs)
+    drivers, merge_default = _read_custom_drivers(repo)
+    return mergeort.MergeConfig(conflict_style=style, attributes=attrs,
+                                custom_drivers=drivers,
+                                merge_default=merge_default)
 
 
 def _result_index(repo: Repository, tree: str,
@@ -163,4 +220,5 @@ def _cfg_kwargs(cfg) -> dict:
                 xdl_flags=cfg.xdl_flags, attributes=cfg.attributes,
                 rename_detection=cfg.rename_detection,
                 rename_limit=cfg.rename_limit,
-                detect_directory_renames=cfg.detect_directory_renames)
+                detect_directory_renames=cfg.detect_directory_renames,
+                custom_drivers=cfg.custom_drivers, merge_default=cfg.merge_default)

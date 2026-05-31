@@ -89,15 +89,11 @@ class MergeAttributes:
                 value = attrs[attr]
         return value
 
-    def driver(self, path: str) -> str:
-        v = self._lookup(path, "merge")
-        if v is False:
-            return "binary"          # -merge
-        if v in (None, True, "unspecified"):
-            return "text"
-        if v in ("text", "binary", "union"):
-            return v
-        return "text"                # custom/unknown driver -> built-in text
+    def merge_attr(self, path: str):
+        """Raw ``merge`` attribute value for a path: True (set), False
+        (``-merge``), "unspecified" (``!merge``), a driver-name string, or
+        None when no rule matched."""
+        return self._lookup(path, "merge")
 
     def marker_size(self, path: str) -> int:
         v = self._lookup(path, "conflict-marker-size")
@@ -148,7 +144,9 @@ class Opt:
                  xdl_flags: int = xdiff.XDF_HISTOGRAM_DIFF,
                  attributes: Optional["MergeAttributes"] = None,
                  rename_detection: bool = True, rename_limit: int = 7000,
-                 detect_directory_renames: int = 1):
+                 detect_directory_renames: int = 1,
+                 custom_drivers: Optional[dict] = None,
+                 merge_default: Optional[str] = None):
         self.repo = repo
         self.ancestor = ancestor
         self.branch1 = branch1
@@ -168,18 +166,44 @@ class Opt:
         self.detect_directory_renames = detect_directory_renames
         self._attributes = attributes
         self._submodule_cache: dict[str, Optional[Repository]] = {}
+        # custom merge drivers: name -> {"driver": cmdline, "recursive": name}
+        self.custom_drivers = custom_drivers or {}
+        self.merge_default = merge_default
         # rename-detection bookkeeping populated during collect_merge_info
+        # relevant_sources = content- or location-relevant; relevant_content =
+        # the content-relevant subset (only these feed the inexact rename matrix)
         self.relevant_sources: dict[int, set] = {1: set(), 2: set()}
+        self.relevant_content: dict[int, set] = {1: set(), 2: set()}
         self.dirs_removed_relevance: dict[int, dict] = {1: {}, 2: {}}
 
     def is_null(self, oid: str) -> bool:
         return oid == self.null_oid or set(oid) == {"0"}
 
-    def merge_driver(self, path: str) -> str:
-        """Resolve the built-in merge driver for a path: text/binary/union."""
-        if self._attributes is None:
-            return "text"
-        return self._attributes.driver(path)
+    def resolve_driver(self, path: str):
+        """Resolve a path's merge driver, mirroring ll-merge.c's
+        find_ll_merge_driver. Returns ("builtin", "text"/"binary"/"union") or
+        ("ext", cmdline) for a configured custom driver."""
+        v = self._attributes.merge_attr(path) if self._attributes else None
+        if v is True:
+            name = "text"
+        elif v is False:
+            name = "binary"
+        elif v in (None, "unspecified"):
+            name = self.merge_default or "text"
+        else:
+            name = v
+        return self._resolve_named_driver(name)
+
+    def _resolve_named_driver(self, name: str):
+        drv = self.custom_drivers.get(name)
+        if drv and drv.get("driver"):
+            # virtual-ancestor merges prefer the driver's recursive variant
+            if self.call_depth and drv.get("recursive"):
+                return self._resolve_named_driver(drv["recursive"])
+            return ("ext", drv["driver"])
+        if name in ("text", "binary", "union"):
+            return ("builtin", name)
+        return ("builtin", "text")
 
     def marker_size(self, path: str) -> int:
         if self._attributes is None:
@@ -380,6 +404,8 @@ def _collect_rename_info(opt: Opt, fullpath: str, dirpath: str, match_mask: int,
             location_relevant = (dir_rename_mask == 0x07)
             if content_relevant or location_relevant:
                 opt.relevant_sources[side].add(fullpath)
+            if content_relevant:
+                opt.relevant_content[side].add(fullpath)
 
 
 # ---------------------------------------------------------------------------
@@ -396,14 +422,19 @@ def _read_blob(opt: Opt, oid: str) -> bytes:
     return data
 
 
-def _ll_merge(opt: Opt, orig: bytes, src1: bytes, src2: bytes, *,
+def _ll_merge(opt: Opt, orig: bytes, src1: bytes, src2: bytes, *, path: str,
               name1: str, name2: str, ancestor_name: str, marker_size: int,
-              virtual_ancestor: bool, variant: int, driver: str) -> tuple[bytes, int]:
+              virtual_ancestor: bool, variant: int, driver) -> tuple[bytes, int]:
     """Returns (result_bytes, status) where status 0=clean, 1=conflict,
-    2=binary conflict.  ``variant`` selects favor (0 normal / OURS / THEIRS /
-    UNION); ``driver`` is the resolved merge driver (text/binary/union)."""
-    if driver == "binary" or (
-            driver != "union"
+    2=binary conflict.  ``variant`` selects favor; ``driver`` is the resolved
+    driver, either ("builtin", name) or ("ext", cmdline)."""
+    kind, drv = driver
+    if kind == "ext":
+        return _ext_merge(opt, drv, orig, src1, src2, path=path,
+                          marker_size=marker_size, ancestor_name=ancestor_name,
+                          name1=name1, name2=name2)
+    if drv == "binary" or (
+            drv != "union"
             and (diffcore.buffer_is_binary(orig) or diffcore.buffer_is_binary(src1)
                  or diffcore.buffer_is_binary(src2))):
         # binary merge: ancestor for virtual merges, else ours/theirs by variant
@@ -414,13 +445,86 @@ def _ll_merge(opt: Opt, orig: bytes, src1: bytes, src2: bytes, *,
         if variant == xdiff.XDL_MERGE_FAVOR_OURS:
             return src1, 0
         return src1, 2
-    favor = xdiff.XDL_MERGE_FAVOR_UNION if driver == "union" else variant
+    favor = xdiff.XDL_MERGE_FAVOR_UNION if drv == "union" else variant
     result, nconf = xdiff.xdl_merge(
         orig, src1, src2,
         level=xdiff.XDL_MERGE_ZEALOUS, style=opt.conflict_style, favor=favor,
         flags=opt.xdl_flags, marker_size=marker_size,
         name1=name1, name2=name2, ancestor_name=ancestor_name)
     return result, (1 if nconf > 0 else 0)
+
+
+def _sq_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _ext_merge(opt: Opt, cmdline: str, orig: bytes, src1: bytes, src2: bytes, *,
+               path: str, marker_size: int, ancestor_name: str,
+               name1: str, name2: str) -> tuple[bytes, int]:
+    """Port of merge-ll.c:ll_ext_merge — run a user-configured merge driver.
+
+    Like git, the three inputs are written to *relative* temp files in the
+    repository root and the driver runs with cwd there, so the placeholders
+    expand to relative names (avoiding path-translation surprises)."""
+    import os
+    import subprocess
+    import shutil
+    cwd = str(opt.repo.path)
+    names = []
+    try:
+        for i, data in enumerate((orig, src1, src2)):
+            rel = f".merge_file_{os.getpid()}_{id(data) & 0xffffff:x}_{i}"
+            with open(os.path.join(cwd, rel), "wb") as fh:
+                fh.write(data)
+            names.append(rel)
+        repl = {
+            "O": names[0], "A": names[1], "B": names[2],
+            "L": str(marker_size), "P": _sq_quote(path),
+            "S": _sq_quote(ancestor_name or ""),
+            "X": _sq_quote(name1 or ""), "Y": _sq_quote(name2 or ""),
+        }
+        cmd = _expand_driver_cmd(cmdline, repl)
+        # git runs custom drivers through a POSIX shell (use_shell=1); use one
+        # when available so behavior matches across platforms.
+        sh = shutil.which("sh")
+        if sh:
+            proc = subprocess.run([sh, "-c", cmd], cwd=cwd)
+        else:
+            proc = subprocess.run(cmd, shell=True, cwd=cwd)
+        status = proc.returncode
+        with open(os.path.join(cwd, names[1]), "rb") as fh:
+            result = fh.read()
+    finally:
+        for rel in names:
+            try:
+                os.unlink(os.path.join(cwd, rel))
+            except OSError:
+                pass
+    # git: status 0 -> OK, 1..128 -> conflict, >128 -> error
+    return result, (0 if status == 0 else 1)
+
+
+def _expand_driver_cmd(fmt: str, repl: dict) -> str:
+    out = []
+    i = 0
+    n = len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c == "%" and i + 1 < n:
+            nxt = fmt[i + 1]
+            if nxt == "%":
+                out.append("%")
+            elif nxt in repl:
+                out.append(repl[nxt])
+            else:
+                out.append("%")
+                i += 1
+                continue
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def merge_3way(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
@@ -442,8 +546,8 @@ def merge_3way(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
     src1 = _read_blob(opt, a.oid)
     src2 = _read_blob(opt, b.oid)
     marker_size = opt.marker_size(path) + extra_marker_size
-    driver = opt.merge_driver(path)
-    return _ll_merge(opt, orig, src1, src2, name1=name1, name2=name2,
+    driver = opt.resolve_driver(path)
+    return _ll_merge(opt, orig, src1, src2, path=path, name1=name1, name2=name2,
                      ancestor_name=base, marker_size=marker_size,
                      virtual_ancestor=virtual_ancestor, variant=variant,
                      driver=driver)
@@ -646,6 +750,93 @@ def _update_dir_rename_counts(counts: dict, removed_dirs: set, relevance: dict,
             break
 
 
+_UNKNOWN_DIR = "/"
+
+
+def _dir_rename_already_determinable(counts: dict) -> bool:
+    """Port of diffcore-rename.c:dir_rename_already_determinable — whether the
+    top destination's count exceeds the runner-up plus the unknown count."""
+    first = second = unknown = 0
+    for dest_dir, count in counts.items():
+        if dest_dir == _UNKNOWN_DIR:
+            unknown = count
+        elif count >= first:
+            second = first
+            first = count
+        elif count >= second:
+            second = count
+    return first > second + unknown
+
+
+def _cull_known_dir_rename_sources(opt: Opt, side: int, base_map: dict,
+                                   side_map: dict, removed_dirs: set,
+                                   relevance: dict) -> set:
+    """Port of handle_early_known_dir_renames: a location-relevant rename
+    source whose directory rename is already determinable from exact renames
+    is not needed for inexact rename detection, so remove it (it would
+    otherwise steal a destination from a content-relevant source)."""
+    # exact renames (by oid) — they determine directory renames cheaply.
+    # Empty blobs are excluded from rename detection (rename_empty=0), so they
+    # must not count toward determinability either.
+    empty_oid = objs.hash_bytes("blob", b"", opt.repo)[0]
+    dst_by_oid: dict[str, list] = {}
+    for p in side_map:
+        if p not in base_map and side_map[p][1] != empty_oid:
+            dst_by_oid.setdefault(side_map[p][1], []).append(p)
+    exact_src: set = set()
+    used: set = set()
+    prelim: dict = {}
+    for s in sorted(p for p in base_map if p not in side_map):
+        oid = base_map[s][1]
+        if oid == empty_oid:
+            continue
+        cands = [d for d in dst_by_oid.get(oid, []) if d not in used]
+        if not cands:
+            continue
+        d = sorted(cands)[0]
+        used.add(d)
+        exact_src.add(s)
+        _update_dir_rename_counts(prelim, removed_dirs, relevance, s, d)
+
+    # supplement: each non-exact relevant source is a potential rename to an
+    # unknown directory
+    for s in opt.relevant_sources[side]:
+        if s in exact_src:
+            continue
+        d = _parent(s)
+        while d != "" and relevance.get(d, _NOT_RELEVANT) != _NOT_RELEVANT:
+            prelim.setdefault(d, {})
+            prelim[d][_UNKNOWN_DIR] = prelim[d].get(_UNKNOWN_DIR, 0) + 1
+            d = _parent(d)
+
+    # directories whose rename is already determinable no longer need per-file
+    # rename detection: downgrade RELEVANT_FOR_SELF -> RELEVANT_FOR_ANCESTOR
+    rel = dict(relevance)
+    for src_dir, counts in prelim.items():
+        if (rel.get(src_dir) == _RELEVANT_FOR_SELF
+                and _dir_rename_already_determinable(counts)):
+            rel[src_dir] = _RELEVANT_FOR_ANCESTOR
+
+    # remove location-only sources whose every ancestor dir is now ANCESTOR
+    culled = set(opt.relevant_sources[side])
+    for s in opt.relevant_sources[side]:
+        if s in exact_src or s in opt.relevant_content[side]:
+            continue
+        removable = True
+        d = _parent(s)
+        while True:
+            res = rel.get(d, _NOT_RELEVANT)
+            if res == _NOT_RELEVANT:
+                break
+            if res == _RELEVANT_FOR_SELF:
+                removable = False
+                break
+            d = _parent(d)
+        if removable:
+            culled.discard(s)
+    return culled
+
+
 def _get_provisional_directory_renames(counts: dict) -> tuple[dict, bool]:
     dir_renames: dict[str, str] = {}
     clean = True
@@ -832,12 +1023,16 @@ def detect_and_process_renames(opt: Opt, base: Optional[str], s1: Optional[str],
     relevance = opt.dirs_removed_relevance
     for side in (1, 2):
         side_map = side_maps[side]
-        rps = diffcore.detect_renames(opt.repo, base_map, side_map,
-                                      rename_limit=opt.rename_limit,
-                                      relevant_sources=opt.relevant_sources[side])
-        renamed_dsts = {p.dst.path for p in rps}
         # removed dirs on this side come from collect_merge_info (with relevance)
         removed_dirs[side] = set(relevance[side])
+        # cull location-relevant sources whose directory rename is already
+        # determinable (handle_early_known_dir_renames)
+        inexact_sources = _cull_known_dir_rename_sources(
+            opt, side, base_map, side_map, removed_dirs[side], relevance[side])
+        rps = diffcore.detect_renames(opt.repo, base_map, side_map,
+                                      rename_limit=opt.rename_limit,
+                                      relevant_sources=inexact_sources)
+        renamed_dsts = {p.dst.path for p in rps}
         # only renames with a relevant source feed directory-rename counting
         # (exact renames of irrelevant sources still move the file, but must
         # not imply a directory rename)
@@ -855,6 +1050,12 @@ def detect_and_process_renames(opt: Opt, base: Optional[str], s1: Optional[str],
 
     for side in (1, 2):
         dr, c = _get_provisional_directory_renames(dir_rename_count[side])
+        # A merely-removed directory (NOT_RELEVANT) does not yield an applied
+        # directory rename even though its first-time count is recorded as a
+        # basename hint; only directories within a directory-rename context
+        # (RELEVANT_FOR_SELF/ANCESTOR) do.
+        dr = {k: v for k, v in dr.items()
+              if relevance[side].get(k) != _NOT_RELEVANT}
         dir_renames[side] = dr
         clean &= c
 
@@ -1319,6 +1520,8 @@ class MergeConfig:
     rename_detection: bool = True
     rename_limit: int = 7000
     detect_directory_renames: int = 1
+    custom_drivers: Optional[dict] = None
+    merge_default: Optional[str] = None
 
 
 def _commit_tree(repo: Repository, commit_sha: str) -> str:
@@ -1414,7 +1617,8 @@ def _merge_ort_internal(repo: Repository, merge_bases: list, h1: str, h2: str,
               xdl_flags=cfg.xdl_flags, attributes=cfg.attributes,
               rename_detection=cfg.rename_detection,
               rename_limit=cfg.rename_limit,
-              detect_directory_renames=cfg.detect_directory_renames)
+              detect_directory_renames=cfg.detect_directory_renames,
+              custom_drivers=cfg.custom_drivers, merge_default=cfg.merge_default)
     opt.call_depth = call_depth
     tree, clean = merge_incore_nonrecursive(
         opt, merged_tree, _commit_tree(repo, h1), _commit_tree(repo, h2))

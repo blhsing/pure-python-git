@@ -282,6 +282,31 @@ def test_union_merge_attribute(tmprepo):
     assert p_stages == g_stages
 
 
+def test_custom_merge_driver(tmprepo):
+    """A configured custom .gitattributes merge driver must run (matching git),
+    not be silently downgraded to the text driver."""
+    import shutil
+    if not shutil.which("sh"):
+        pytest.skip("custom merge driver needs a POSIX shell")
+    repo, d = tmprepo
+    # driver prepends a marker to ours (%A); deterministic, shell-agnostic
+    drv = ("python -c \"import sys;a=open(sys.argv[2],'rb').read();"
+           "open(sys.argv[2],'wb').write(b'DRIVER:'+a)\" %O %A %B")
+    _g(d, "config", "merge.mydrv.driver", drv)
+    base = _commit(d, {"f.x": b"base\n"})
+    s1 = _commit(d, {"f.x": b"ours\n"})
+    s2 = _commit(d, {"f.x": b"theirs\n"})
+    (d / ".gitattributes").write_bytes(b"f.x merge=mydrv\n")
+    g_tree, g_stages = _git_merge_tree(d, base, s1, s2)
+    p_tree, p_stages = _py_merge_tree(repo, base, s1, s2)
+    import subprocess
+    content = subprocess.run([GIT, "-C", str(d), "cat-file", "-p", p_tree + ":f.x"],
+                             capture_output=True).stdout
+    assert p_tree == g_tree
+    assert content == b"DRIVER:ours\n"   # the driver actually ran
+    assert p_stages == g_stages
+
+
 def test_nested_directory_rename(tmprepo):
     _check(tmprepo,
            {"a/b/c/f1": b"1\n2\n3\n", "a/b/g": b"g\n"},

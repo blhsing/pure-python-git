@@ -291,7 +291,8 @@ conflicted blobs with markers, and conflicted index stages):
   (`process_renames`, dir-rename counting with RELEVANT_FOR_SELF/ANCESTOR
   gating), per-path resolution (`process_entry`, including the `call_depth`
   virtual-ancestor behaviors), submodule fast-forward, `.gitattributes`
-  `merge`/`conflict-marker-size` handling, and streamed result-tree assembly.
+  `merge`/`conflict-marker-size` handling (built-in text/binary/union plus
+  shell-executed custom drivers), and streamed result-tree assembly.
 * `ort.py` — adapter exposing `merge_tree(repo, merge_base, ours, theirs)`
   (explicit base, like `git merge-tree --merge-base`) and `merge_commits(repo,
   ours, theirs)` (computes all merge bases and **recursively** merges them into
@@ -414,13 +415,14 @@ randomized cases.
 * The `ort` merge engine is a pure-Python reimplementation (no `git` binary,
   no fallback), validated for byte-for-byte parity against
   `git merge-tree --write-tree` across content merges, file and directory
-  renames, recursive merges (criss-cross histories with a virtual ancestor),
-  submodule fast-forwards, conflict styles (merge/diff3/zdiff3), `merge=union`
-  attributes, and conflict presentation. Two areas are not fully modelled:
-  custom external `.gitattributes` merge drivers (treated as the built-in text
-  driver), and a small number of pathological deeply-nested simultaneous
-  directory-rename cases where Git's `merge-ort` deferred two-pass traversal
-  computes rename-source relevance slightly differently.
+  renames (including deeply-nested simultaneous renames), recursive merges
+  (criss-cross histories with a virtual ancestor), submodule fast-forwards,
+  conflict styles (merge/diff3/zdiff3), and `.gitattributes` merge handling —
+  the `merge`/`conflict-marker-size` attributes, the built-in text/binary/union
+  drivers, and **custom external merge drivers** (`merge.<name>.driver`), which
+  are executed through a POSIX shell exactly as Git does. Custom drivers are
+  the user's own configured tool, not a `git` dependency; on Windows they run
+  via the same `sh` Git for Windows uses.
 * `fsmonitor-daemon run` uses native filesystem notifications on Windows and
   Linux (`ReadDirectoryChangesW` / inotify). One-shot `fsmonitor` calls and
   unsupported platforms fall back to configurable polling.
