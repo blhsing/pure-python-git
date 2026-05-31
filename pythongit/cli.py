@@ -4879,7 +4879,8 @@ def cmd_diagnose(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     lines = []
-    lines.append(f"pythongit version: 0.1.0")
+    from . import __version__ as _ppg_version
+    lines.append(f"pythongit version: {_ppg_version}")
     lines.append(f"gitdir: {repo.gitdir}")
     lines.append(f"worktree: {repo.path}")
     lines.append(f"branches: {len(refs_mod.list_branches(repo))}")
@@ -4903,8 +4904,9 @@ def cmd_bugreport(argv: list[str]) -> int:
     ap.add_argument("-o", "--output-directory", default=None)
     args = ap.parse_args(argv)
     import platform
+    from . import __version__ as _ppg_version
     lines = []
-    lines.append(f"pythongit: 0.1.0")
+    lines.append(f"pythongit: {_ppg_version}")
     lines.append(f"python: {platform.python_version()}")
     lines.append(f"platform: {platform.platform()}")
     try:
