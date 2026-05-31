@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pure-python-git"
-version = "0.1.0"
-description = "Pure-Python reimplementation of git. Installs `pygit`; opt in to a drop-in `git` shim via `pip install pure-python-git[git]` or `pygit install-git-shim`."
+version = "0.2.0"
+description = "Pure-Python git reimplementation with a byte-exact in-process `ort` merge engine and no C `git` dependency. Installs `pygit`; opt-in `git` shim via `pip install pure-python-git[git]`."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Ben Hsing", email = "blhsing@gmail.com" }]
