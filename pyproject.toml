@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pure-python-git"
-version = "0.2.0"
+version = "1.0.0"
 description = "Pure-Python git reimplementation with a byte-exact in-process `ort` merge engine and no C `git` dependency. Installs `pygit`; opt-in `git` shim via `pip install pure-python-git[git]`."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ authors = [{ name = "Ben Hsing", email = "blhsing@gmail.com" }]
 license = { file = "LICENSE" }
 keywords = ["git", "vcs", "version-control", "scm"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
