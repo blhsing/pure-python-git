@@ -9,41 +9,6 @@ implemented, plus aliases and pythongit-specific helpers. The on-disk format is
 byte-for-byte compatible with real `git`, and the package optionally installs a
 drop-in `git` console script.
 
-```text
-pure-python-git/             (repo root)
-├── pyproject.toml
-├── README.md                this file
-├── pythongit/               importable package — at repo root
-│   ├── __init__.py
-│   ├── __main__.py          `python -m pythongit ...`
-│   ├── cli.py               command dispatch (161 commands)
-│   ├── repo.py              Repository discovery + config
-│   ├── objects.py           blob / tree / commit / tag encode/decode
-│   ├── refs.py              ref resolution, update, reflog hook
-│   ├── reflog.py            append-only ref log
-│   ├── index.py             DIRC v2 with conflict stages
-│   ├── workdir.py           add/rm/status/checkout, tree↔workdir
-│   ├── diff.py              Myers diff + unified-diff renderer
-│   ├── merge.py             merge-base + three-way blob merge
-│   ├── xdiff.py             xdiff port: histogram/Myers diff + xdl_merge
-│   ├── diffcore.py          diffcore-rename: spanhash similarity + matching
-│   ├── mergeort.py          merge-ort tree engine (collect/rename/process)
-│   ├── ort.py               ort adapter → OrtResult(tree, conflicts, index)
-│   ├── sequencer.py         cherry-pick / revert / rebase
-│   ├── porcelain_merge.py   ff + 3-way merge entry point
-│   ├── patch.py             unified-diff parser + applier
-│   ├── pack.py              pack v2 + idx v2, bitmaps, MIDX, streaming writer
-│   ├── commitgraph.py       cached commit-graph reader
-│   ├── bloom.py             changed-path Bloom filters
-│   ├── protocol.py          smart HTTPS clone / fetch / push
-│   ├── stash.py             refs/stash + reflog-backed stash
-│   ├── ignore.py            .gitignore engine
-│   ├── rerere.py            reuse recorded resolution
-│   └── bridges.py           daemon / http-backend / SMTP / Tk / shell-out
-├── pure-python-git-shim/    companion distribution (opt-in `git` shim)
-└── tests/                   pytest + script-style integration tests
-```
-
 ## Why does this exist?
 
 Sometimes you need `git` on a machine where you can't install a real `git`
