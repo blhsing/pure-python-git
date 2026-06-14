@@ -534,6 +534,51 @@ def test_status_groups_correctly(tmprepo):
     assert "a" in s["modified"]
 
 
+def test_status_and_add_respect_gitignore_for_untracked_files(tmprepo):
+    from pythongit import workdir
+    from pythongit.index import read_index
+
+    repo, path = tmprepo
+    (path / ".gitignore").write_text("*.log\nbuild/\n!keep.log\n")
+    (path / "ignored.log").write_text("ignored\n")
+    (path / "keep.log").write_text("keep\n")
+    (path / "build").mkdir()
+    (path / "build" / "out.o").write_text("object\n")
+
+    s = workdir.status(repo)
+    assert "ignored.log" not in s["untracked"]
+    assert "build/out.o" not in s["untracked"]
+    assert "keep.log" in s["untracked"]
+
+    workdir.add_paths(repo, ["."])
+    indexed = read_index(repo).by_path()
+    assert "ignored.log" not in indexed
+    assert "build/out.o" not in indexed
+    assert "keep.log" in indexed
+
+
+def test_status_reports_tracked_file_even_when_ignored(tmprepo):
+    from tests.conftest import commit_one
+    from pythongit import workdir
+
+    repo, path = tmprepo
+    commit_one(repo, "tracked.log", "old\n", "track log")
+    (path / ".gitignore").write_text("*.log\n")
+    (path / "tracked.log").write_text("new\n")
+
+    s = workdir.status(repo)
+    assert "tracked.log" in s["modified"]
+
+
+def test_check_ignore_honors_directory_only_pattern(tmprepo, capsys):
+    _repo, path = tmprepo
+    (path / ".gitignore").write_text("build/\n")
+    (path / "build").mkdir()
+
+    assert cli_run("check-ignore", "build") == 0
+    assert "build" in capsys.readouterr().out
+
+
 def test_format_patch_then_apply_roundtrip(tmprepo, tmp_path_factory):
     from tests.conftest import commit_one
     repo, path = tmprepo

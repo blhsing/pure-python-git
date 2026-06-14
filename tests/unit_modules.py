@@ -126,7 +126,73 @@ def test_ignore_directory_only(tmp_path):
     (tmp_path / ".gitignore").write_text("build/\n")
     ig = ignore_mod.load(tmp_path)
     assert ig.is_ignored("build", is_dir=True)
+    assert ig.is_ignored("build/out.o")
     assert not ig.is_ignored("build", is_dir=False)
+
+
+def test_ignore_nested_gitignore_scoped_to_its_directory(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / ".gitignore").write_text("*.html\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("docs/index.html")
+    assert not ig.is_ignored("index.html")
+    assert not ig.is_ignored("other/index.html")
+
+
+def test_ignore_path_patterns_are_relative_not_suffix_matches(tmp_path):
+    (tmp_path / ".gitignore").write_text("doc/frotz/\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("doc/frotz/file")
+    assert not ig.is_ignored("a/doc/frotz/file")
+
+
+def test_ignore_leading_slash_anchors_to_gitignore_directory(tmp_path):
+    (tmp_path / ".gitignore").write_text("/root.log\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("root.log")
+    assert not ig.is_ignored("sub/root.log")
+
+
+def test_ignore_double_star_pathname_forms(tmp_path):
+    (tmp_path / ".gitignore").write_text("**/foo\na/**/b\nabc/**\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("foo")
+    assert ig.is_ignored("x/y/foo")
+    assert ig.is_ignored("a/b")
+    assert ig.is_ignored("a/x/y/b")
+    assert ig.is_ignored("abc/x/y")
+    assert not ig.is_ignored("abc", is_dir=True)
+
+
+def test_ignore_negative_cannot_reinclude_inside_ignored_parent(tmp_path):
+    (tmp_path / ".gitignore").write_text("build/\n!build/keep.o\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("build/keep.o")
+
+
+def test_ignore_info_exclude_lower_precedence_than_gitignore(tmp_path):
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text("*.log\n")
+    (tmp_path / ".gitignore").write_text("!keep.log\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("drop.log")
+    assert not ig.is_ignored("keep.log")
+
+
+def test_ignore_escaped_comment_and_negation_prefixes(tmp_path):
+    (tmp_path / ".gitignore").write_text("\\#literal\n\\!literal\n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("#literal")
+    assert ig.is_ignored("!literal")
+
+
+def test_ignore_trailing_space_requires_escape(tmp_path):
+    (tmp_path / ".gitignore").write_text("plain   \nwith\\ \n")
+    ig = ignore_mod.load(tmp_path)
+    assert ig.is_ignored("plain")
+    assert not ig.is_ignored("plain   ")
+    assert ig.is_ignored("with ")
+    assert not ig.is_ignored("with")
 
 
 # --- rerere ---------------------------------------------------------------

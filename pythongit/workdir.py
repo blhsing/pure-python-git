@@ -7,6 +7,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+from . import ignore as ignore_mod
 from . import objects as objs
 from . import refs as refs_mod
 from .index import (
@@ -31,6 +32,13 @@ def _norm(p: str) -> str:
 def _ignored(rel: str) -> bool:
     parts = rel.split("/")
     return ".git" in parts
+
+
+def _is_dir_no_follow(path: Path) -> bool:
+    try:
+        return st_mod.S_ISDIR(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
 
 
 def iter_worktree(repo: Repository) -> list[str]:
@@ -116,6 +124,8 @@ def tree_path_entry(repo: Repository, tree_sha: str, path: str) -> Optional[objs
 
 def add_paths(repo: Repository, paths: Iterable[str]) -> None:
     idx = read_index(repo)
+    tracked = set(idx.by_path())
+    ignores = ignore_mod.load(repo.path)
     to_add: list[str] = []
     for p in paths:
         ap = (repo.path / p).resolve()
@@ -124,10 +134,12 @@ def add_paths(repo: Repository, paths: Iterable[str]) -> None:
                 dirs[:] = [d for d in dirs if d != ".git"]
                 for f in files:
                     rel = _norm(os.path.relpath(os.path.join(root, f), repo.path))
-                    if not _ignored(rel):
+                    if not _ignored(rel) and (rel in tracked or not ignores.is_ignored(rel)):
                         to_add.append(rel)
         else:
-            to_add.append(_norm(os.path.relpath(ap, repo.path)))
+            rel = _norm(os.path.relpath(ap, repo.path))
+            if rel in tracked or not ignores.is_ignored(rel, is_dir=_is_dir_no_follow(ap)):
+                to_add.append(rel)
     for rel in sorted(set(to_add)):
         full = repo.path / rel
         if not full.exists() and not full.is_symlink():
@@ -161,10 +173,11 @@ def rm_paths(repo: Repository, paths: Iterable[str], *, cached: bool = False) ->
 # status / diff target lists
 
 
-def status(repo: Repository) -> dict[str, list[str]]:
+def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list[str]]:
     """Return groups: staged_new, staged_mod, staged_del, mod, untracked."""
     idx = read_index(repo)
     by_path = idx.by_path()
+    ignores = None if include_ignored else ignore_mod.load(repo.path)
 
     head_tree = _head_tree_map(repo)
 
@@ -187,6 +200,8 @@ def status(repo: Repository) -> dict[str, list[str]]:
             sha, _ = objs.hash_bytes("blob", data, repo)
             if sha != by_path[rel].sha:
                 modified.append(rel)
+        elif ignores is not None and ignores.is_ignored(rel, is_dir=_is_dir_no_follow(full)):
+            pass
         else:
             untracked.append(rel)
         seen.discard(rel)

@@ -1506,12 +1506,8 @@ def cmd_clean(argv: list[str]) -> int:
     if not (args.force or args.dry_run):
         _err("fatal: clean.requireForce; use -f or -n")
         return 1
-    from . import ignore as _ig
-    ig = None if args.x else _ig.load(repo.path)
-    s = workdir.status(repo)
+    s = workdir.status(repo, include_ignored=args.x)
     for u in s["untracked"]:
-        if ig and ig.is_ignored(u):
-            continue
         p = repo.path / u
         if args.dry_run:
             _print(f"Would remove {u}")
@@ -1884,7 +1880,9 @@ def cmd_check_ignore(argv: list[str]) -> int:
     ig = _ig.load(repo.path)
     rc = 1
     for p in args.paths:
-        if ig.is_ignored(p):
+        match_path = p.replace(os.sep, "/")
+        is_dir = match_path.endswith("/") or (repo.path / p).is_dir()
+        if ig.is_ignored(match_path, is_dir=is_dir):
             _print(p)
             rc = 0
     return rc
