@@ -365,6 +365,21 @@ CASES: list[tuple] = [
     ("reset-path-status",
      BASE + [("write", "b.txt", "b\n"), ["add", "b.txt"], ["reset", "HEAD", "b.txt"]],
      ["status", "--porcelain"]),
+    # commit --amend --no-edit, rm -r, merge --abort
+    ("commit-amend-no-edit",
+     BASE + [("write", "c.txt", "c\n"), ["add", "c.txt"]], ["commit", "--amend", "--no-edit"]),
+    ("rm-recursive",
+     BASE + [("write", "dir/x.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c2"]], ["rm", "-r", "dir"]),
+    ("merge-abort-none", BASE, ["merge", "--abort"]),
+    ("branch-contains", TAGGED + [["branch", "feat"]], ["branch", "--contains", "HEAD~1"]),
+    # log range and path limiting
+    ("log-range", TAGGED, ["log", "--oneline", "HEAD~1..HEAD"]),
+    ("log-path",
+     BASE + [("write", "a.txt", "changed\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["log", "--oneline", "--", "a.txt"]),
+    ("log-path-other",
+     BASE + [("write", "a.txt", "changed\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["log", "--oneline", "--", "b.txt"]),
 ]
 
 

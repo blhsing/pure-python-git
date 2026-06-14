@@ -767,11 +767,23 @@ def cmd_rm(argv: list[str]) -> int:
         if not (norm in tracked or any(t.startswith(norm + "/") for t in tracked)):
             _err(f"fatal: pathspec '{ps}' did not match any files")
             return 128
+    # Expand directory pathspecs to the tracked files they contain.
+    expanded: list[str] = []
+    for ps in args.paths:
+        norm = ps.rstrip("/")
+        if norm in tracked:
+            expanded.append(norm)
+        else:
+            under = sorted(t for t in tracked if t.startswith(norm + "/"))
+            if under and not args.recursive:
+                _err(f"fatal: not removing '{ps}' recursively without -r")
+                return 1
+            expanded.extend(under)
     if args.dry_run:
-        for ps in args.paths:
-            _print(f"rm '{ps}'")
+        for rel in expanded:
+            _print(f"rm '{rel}'")
         return 0
-    removed = workdir.rm_paths(repo, args.paths, cached=args.cached)
+    removed = workdir.rm_paths(repo, expanded, cached=args.cached)
     for rel in removed:
         _print(f"rm '{rel}'")
     return 0
@@ -1080,6 +1092,7 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("-m", "--message", default=None)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--amend", action="store_true")
+    ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--allow-empty", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -1237,17 +1250,52 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--first-parent", dest="first_parent", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
-    ap.add_argument("rev", nargs="?", default="HEAD")
+    ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
-    sha = refs_mod.rev_parse(repo, args.rev)
+
+    # Split positionals into revisions and pathspecs.
+    revs: list[str] = []
+    log_paths: list[str] = []
+    if "--" in args.pos:
+        di = args.pos.index("--")
+        revs, log_paths = args.pos[:di], args.pos[di + 1:]
+    else:
+        for tok in args.pos:
+            if ".." in tok or refs_mod.rev_parse(repo, tok) is not None:
+                revs.append(tok)
+            elif (repo.path / tok).exists():
+                log_paths.append(tok)
+            else:
+                # Not a rev and not a path: keep as a rev so resolution errors.
+                revs.append(tok)
+    rev = revs[0] if revs else "HEAD"
+
+    exclude: set[str] = set()
+    if ".." in rev:
+        lo, _, hi = rev.partition("..")
+        sha = refs_mod.rev_parse(repo, hi or "HEAD")
+        if lo:
+            lo_sha = refs_mod.rev_parse(repo, lo)
+            if lo_sha:
+                stack = deque([lo_sha])
+                while stack:
+                    x = stack.popleft()
+                    if x in exclude:
+                        continue
+                    exclude.add(x)
+                    info = _commit_tree_parents(repo, x)
+                    if info:
+                        stack.extend(info[1])
+    else:
+        sha = refs_mod.rev_parse(repo, rev)
     if not sha:
         head_sym, _ = refs_mod.read_head(repo)
-        if args.rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
+        if rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
             branch = head_sym[len("refs/heads/"):]
             _err(f"fatal: your current branch '{branch}' does not have any commits yet")
             return 128
-        _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
+        _err(f"fatal: ambiguous argument '{rev}': unknown revision or path not in the working tree.")
         _err("Use '--' to separate paths from revisions, like this:")
         _err("'git <command> [<revision>...] -- [<file>...]'")
         return 128
@@ -1277,7 +1325,7 @@ def cmd_log(argv: list[str]) -> int:
     commit_list: list[str] = []
     while cur:
         s = cur.popleft()
-        if s in seen:
+        if s in seen or s in exclude:
             continue
         seen.add(s)
         info = _commit_tree_parents(repo, s)
@@ -1285,8 +1333,25 @@ def cmd_log(argv: list[str]) -> int:
             break
         commit_list.append(s)
         cur.extend(info[1][:1] if args.first_parent else info[1])
-        if args.max_count and len(commit_list) >= args.max_count:
+        if not log_paths and args.max_count and len(commit_list) >= args.max_count:
             break
+
+    if log_paths:
+        filtered: list[str] = []
+        for s in commit_list:
+            info = _commit_tree_parents(repo, s)
+            tree, parents = info[0], info[1]
+            ptree = _commit_tree_parents(repo, parents[0])[0] if parents else None
+            for path in log_paths:
+                before = workdir.tree_path_entry(repo, ptree, path) if ptree else None
+                after = workdir.tree_path_entry(repo, tree, path)
+                if (before.sha if before else None) != (after.sha if after else None):
+                    filtered.append(s)
+                    break
+            if args.max_count and len(filtered) >= args.max_count:
+                break
+        commit_list = filtered
+
     if args.reverse:
         commit_list = list(reversed(commit_list))
 
@@ -1891,6 +1956,7 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("-c", "--copy", action="store_true")
     ap.add_argument("-C", dest="force_copy", action="store_true")
     ap.add_argument("--show-current", action="store_true")
+    ap.add_argument("--contains", default=None)
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
     ap.add_argument("start", nargs="?")
@@ -1898,6 +1964,28 @@ def cmd_branch(argv: list[str]) -> int:
     repo = _repo()
     head_sym, _ = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+
+    contains_sha = refs_mod.rev_parse(repo, args.contains) if args.contains else None
+
+    def _branch_contains(branch: str) -> bool:
+        if contains_sha is None:
+            return True
+        tip = refs_mod.read_ref(repo, f"refs/heads/{branch}")
+        if tip is None:
+            return False
+        stack = deque([tip])
+        seen_c: set[str] = set()
+        while stack:
+            x = stack.popleft()
+            if x == contains_sha:
+                return True
+            if x in seen_c:
+                continue
+            seen_c.add(x)
+            info = _commit_tree_parents(repo, x)
+            if info:
+                stack.extend(info[1])
+        return False
 
     if args.move or args.force_move or args.copy or args.force_copy:
         if args.name is not None and args.start is not None:
@@ -1952,7 +2040,11 @@ def cmd_branch(argv: list[str]) -> int:
             names.extend((b, b) for b in refs_mod.list_branches(repo))
         if args.remotes or args.all:
             names.extend((f"remotes/{b}", None) for b in _remote_branches(repo))
-        shown = [(d, p) for d, p in names if not (pattern and not fnmatch.fnmatch(d, pattern))]
+        shown = [
+            (d, p) for d, p in names
+            if not (pattern and not fnmatch.fnmatch(d, pattern))
+            and (p is None or _branch_contains(p))
+        ]
         width = max((len(d) for d, _ in shown), default=0)
         for display, plain in shown:
             mark = "*" if plain is not None and plain == cur else " "
@@ -2819,11 +2911,27 @@ def cmd_merge(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit merge", add_help=False)
     ap.add_argument("--no-ff", action="store_true")
     ap.add_argument("--ff-only", action="store_true")
+    ap.add_argument("--abort", action="store_true")
+    ap.add_argument("--continue", dest="cont", action="store_true")
     ap.add_argument("-m", "--message", default=None)
-    ap.add_argument("other")
+    ap.add_argument("other", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import merge as _m
+
+    if args.abort:
+        if not (repo.gitdir / "MERGE_HEAD").exists():
+            _err("fatal: There is no merge to abort (MERGE_HEAD missing).")
+            return 128
+        for f in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"):
+            (repo.gitdir / f).unlink(missing_ok=True)
+        head = refs_mod.rev_parse(repo, "HEAD")
+        if head:
+            workdir.checkout_tree(repo, objs.parse_commit(objs.read_object(repo, head)[1]).tree)
+        return 0
+    if args.other is None:
+        _err("fatal: No commit specified and merge.defaultToUpstream not set.")
+        return 128
 
     head_sym, head_sha = refs_mod.read_head(repo)
     other_sha = refs_mod.rev_parse(repo, args.other)
