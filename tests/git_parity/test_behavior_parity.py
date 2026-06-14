@@ -223,12 +223,30 @@ CASES: list[tuple] = [
     ("update-ref-delete", BASE + [["branch", "tmp"]], ["update-ref", "-d", "refs/heads/tmp"]),
     # diff-tree -p
     ("diff-tree-patch", TAGGED, ["diff-tree", "-p", "HEAD"]),
+    # grep
+    ("grep", BASE, ["grep", "alpha"]),
+    ("grep-n", BASE, ["grep", "-n", "alpha"]),
+    ("grep-l", BASE, ["grep", "-l", "beta"]),
+    ("grep-c", BASE + [("write", "a.txt", "x\nx\ny\n"), ["add", "-A"], ["commit", "-m", "c2"]], ["grep", "-c", "x"]),
+    ("grep-nomatch", BASE, ["grep", "zzzzz"]),
+    # status untracked mode
+    ("status-uno", BASE + [("write", "u.txt", "u\n")], ["status", "-uno"]),
+    # ls-tree -l, cat-file --batch
+    ("ls-tree-long", BASE, ["ls-tree", "-l", "HEAD"]),
+    # log -p / --stat
+    ("log-patch", TAGGED, ["log", "-p", "-1"]),
+    ("log-stat", TAGGED, ["log", "--stat", "-1"]),
+    # stash
+    ("stash-push", BASE + [("write", "a.txt", "WIP\n")], ["stash"]),
+    ("stash-list",
+     BASE + [("write", "a.txt", "WIP\n"), ["stash"]], ["stash", "list"]),
 ]
 
 
 CASES_WITH_STDIN: list[tuple] = [
     ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
     ("cat-file-batch", BASE, ["cat-file", "--batch-check"], "HEAD\nmissingobj\n"),
+    ("cat-file-batch-content", BASE, ["cat-file", "--batch"], "HEAD:a.txt\n"),
 ]
 
 

@@ -35,7 +35,11 @@ def push(repo: Repository, message: str = "") -> Optional[str]:
     if not (status["staged_new"] or status["staged_mod"] or status["staged_del"] or status["modified"] or status["missing"]):
         return None
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else head_sha[:7]
-    msg = message or f"WIP on {branch}"
+    subject = objs.parse_commit(objs.read_object(repo, head_sha)[1]).message.splitlines()[0]
+    if message:
+        msg = f"On {branch}: {message}"
+    else:
+        msg = f"WIP on {branch}: {head_sha[:7]} {subject}"
 
     # 1) commit current index state
     idx_tree = workdir.write_tree(repo)

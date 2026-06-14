@@ -163,8 +163,10 @@ def _cat_file_batch(repo: Repository, check_only: bool) -> int:
             sys.stdout.write(f"{sha} {t} {len(data)}\n")
         else:
             sys.stdout.write(f"{sha} {t} {len(data)}\n")
+            sys.stdout.flush()
             sys.stdout.buffer.write(data)
-            sys.stdout.write("\n")
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
     return 0
 
 
@@ -217,6 +219,7 @@ def cmd_ls_tree(argv: list[str]) -> int:
     ap.add_argument("-r", action="store_true", help="recurse")
     ap.add_argument("-d", dest="dirs_only", action="store_true")
     ap.add_argument("-t", dest="show_trees", action="store_true")
+    ap.add_argument("-l", "--long", dest="long", action="store_true")
     ap.add_argument("--name-only", "--name-status", dest="name_only", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("treeish")
@@ -238,6 +241,15 @@ def cmd_ls_tree(argv: list[str]) -> int:
         obj_t = "tree" if e.is_dir() else "blob"
         if args.name_only:
             sys.stdout.write(path + eol)
+        elif args.long:
+            if e.is_dir():
+                size = "-"
+            else:
+                try:
+                    size = str(len(objs.read_object(repo, e.sha)[1]))
+                except KeyError:
+                    size = "-"
+            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {e.sha} {size:>7}\t{path}" + eol)
         else:
             sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{path}" + eol)
 
@@ -795,6 +807,10 @@ def cmd_status(argv: list[str]) -> int:
     head_sym, head_sha = refs_mod.read_head(repo)
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
     changes, untracked = _status_model(repo, s)
+    show_untracked = args.untracked_files != "no"
+    untracked_hidden = bool(untracked) and not show_untracked
+    if not show_untracked:
+        untracked = []
 
     porcelain = args.porcelain
     short_mode = args.short and not args.long and porcelain is None
@@ -816,10 +832,10 @@ def cmd_status(argv: list[str]) -> int:
         return 0
 
     # Long (default) format.
-    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha)
+    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden)
 
 
-def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha) -> int:
+def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden=False) -> int:
     unborn = head_sym is not None and head_sha is None
     if branch is not None:
         _print(f"On branch {branch}")
@@ -859,7 +875,9 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha) -> int
         _print("")
 
     if not staged and not unstaged and not untracked:
-        if unborn:
+        if untracked_hidden:
+            _print("nothing to commit (use -u to show untracked files)")
+        elif unborn:
             _print('nothing to commit (create/copy files and use "git add" to track)')
         else:
             _print("nothing to commit, working tree clean")
@@ -1074,6 +1092,8 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--format", default=None)
     ap.add_argument("--abbrev-commit", action="store_true")
+    ap.add_argument("-p", "--patch", action="store_true")
+    ap.add_argument("--stat", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -1142,6 +1162,16 @@ def cmd_log(argv: list[str]) -> int:
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
+            if args.stat or args.patch:
+                parent_tree = None
+                if c.parents:
+                    _, pd = objs.read_object(repo, c.parents[0])
+                    parent_tree = objs.parse_commit(pd).tree
+                _print("")
+                if args.stat:
+                    _diff_stat(_tree_changes(repo, parent_tree, c.tree))
+                else:
+                    _emit_tree_patch(repo, parent_tree, c.tree)
         cur.extend(c.parents)
         count += 1
         if args.max_count and count >= args.max_count:
@@ -2480,7 +2510,9 @@ def cmd_stash(argv: list[str]) -> int:
         if sha is None:
             _print("No local changes to save")
             return 0
-        _print(f"Saved working directory and index state: {sha[:7]}")
+        stashes = stash.list_stashes(repo)
+        saved_msg = stashes[0][2] if stashes else f"WIP on HEAD: {sha[:7]}"
+        _print(f"Saved working directory and index state {saved_msg}")
     elif action == "list":
         for i, sha, msg in stash.list_stashes(repo):
             _print(f"stash@{{{i}}}: {msg}")
@@ -3964,6 +3996,7 @@ def cmd_grep(argv: list[str]) -> int:
     ap.add_argument("-i", "--ignore-case", action="store_true")
     ap.add_argument("-n", "--line-number", action="store_true")
     ap.add_argument("-l", "--files-with-matches", action="store_true")
+    ap.add_argument("-c", "--count", action="store_true")
     ap.add_argument("-E", "--extended-regexp", action="store_true")
     ap.add_argument("--cached", action="store_true")
     ap.add_argument("pattern")
@@ -3985,16 +4018,22 @@ def cmd_grep(argv: list[str]) -> int:
             except Exception:
                 continue
             matched_file = False
+            count = 0
             for i, line in enumerate(text.splitlines(), 1):
                 if pat.search(line):
                     matched_file = True
-                    if args.files_with_matches:
+                    count += 1
+                    if args.files_with_matches and not args.count:
                         break
-                    prefix = f"{e.path}:"
-                    if args.line_number:
-                        prefix += f"{i}:"
-                    _print(prefix + line)
-            if matched_file and args.files_with_matches:
+                    if not args.count:
+                        prefix = f"{e.path}:"
+                        if args.line_number:
+                            prefix += f"{i}:"
+                        _print(prefix + line)
+            if args.count:
+                if count:
+                    _print(f"{e.path}:{count}")
+            elif matched_file and args.files_with_matches:
                 _print(e.path)
         return 0
 
@@ -4012,19 +4051,25 @@ def cmd_grep(argv: list[str]) -> int:
         except Exception:
             continue
         matched = False
+        count = 0
         with fh:
             for i, line in enumerate(fh, 1):
                 line = line.rstrip("\n")
                 if pat.search(line):
                     rc = 0
                     matched = True
-                    if args.files_with_matches:
+                    count += 1
+                    if args.files_with_matches and not args.count:
                         break
-                    prefix = f"{e.path}:"
-                    if args.line_number:
-                        prefix += f"{i}:"
-                    _print(prefix + line)
-        if matched and args.files_with_matches:
+                    if not args.count:
+                        prefix = f"{e.path}:"
+                        if args.line_number:
+                            prefix += f"{i}:"
+                        _print(prefix + line)
+        if args.count:
+            if count:
+                _print(f"{e.path}:{count}")
+        elif matched and args.files_with_matches:
             _print(e.path)
     return rc
 
