@@ -417,6 +417,13 @@ CASES: list[tuple] = [
               "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n"
               "@@ -1 +1 @@\n-alpha\n+ALPHA\n-- \n2.54.0\n\n")],
      ["am", "patch.mbox"]),
+    # fast-export stream
+    ("fast-export", TAGGED, ["fast-export", "HEAD"]),
+    # plumbing
+    ("ls-tree-full-tree",
+     BASE + [("write", "d/x.txt", "y\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["ls-tree", "--full-tree", "-r", "HEAD"]),
+    ("rev-parse-git-path", BASE, ["rev-parse", "--git-path", "objects"]),
 ]
 
 
@@ -424,6 +431,12 @@ CASES_WITH_STDIN: list[tuple] = [
     ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
     ("cat-file-batch", BASE, ["cat-file", "--batch-check"], "HEAD\nmissingobj\n"),
     ("cat-file-batch-content", BASE, ["cat-file", "--batch"], "HEAD:a.txt\n"),
+    ("patch-id", BASE, ["patch-id"],
+     "diff --git a/a.txt b/a.txt\nindex 814f4a4..ddc897f 100644\n--- a/a.txt\n+++ b/a.txt\n"
+     "@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n"),
+    ("stripspace", BASE, ["stripspace"], "  hello  \n\n\n\nworld\n\n"),
+    ("stripspace-comments", BASE, ["stripspace", "-s"], "# comment\nkeep\n"),
+    ("hash-object-stdin-paths", BASE, ["hash-object", "--stdin-paths"], "a.txt\n"),
 ]
 
 

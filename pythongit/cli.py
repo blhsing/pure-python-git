@@ -128,6 +128,7 @@ def cmd_hash_object(argv: list[str]) -> int:
     ap.add_argument("-w", action="store_true", help="write object")
     ap.add_argument("-t", default="blob", choices=["blob", "tree", "commit", "tag"])
     ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--stdin-paths", action="store_true")
     ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
     repo = None
@@ -142,6 +143,11 @@ def cmd_hash_object(argv: list[str]) -> int:
         else:
             _print(objs.hash_bytes(args.t, data, repo)[0])
 
+    if args.stdin_paths:
+        for line in sys.stdin.read().splitlines():
+            if line:
+                emit(Path(line).read_bytes())
+        return 0
     if args.stdin:
         emit(sys.stdin.buffer.read())
     if args.files:
@@ -241,6 +247,8 @@ def cmd_ls_tree(argv: list[str]) -> int:
     ap.add_argument("-t", dest="show_trees", action="store_true")
     ap.add_argument("-l", "--long", dest="long", action="store_true")
     ap.add_argument("--name-only", "--name-status", dest="name_only", action="store_true")
+    ap.add_argument("--full-tree", action="store_true")
+    ap.add_argument("--full-name", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("treeish")
     ap.add_argument("paths", nargs="*")
@@ -420,6 +428,7 @@ def cmd_rev_parse(argv: list[str]) -> int:
     quiet = False
     verified_count = 0
     after_dashdash = False
+    pending_git_path = False
 
     for arg in argv:
         if after_dashdash:
@@ -449,6 +458,23 @@ def cmd_rev_parse(argv: list[str]) -> int:
             continue
         if arg == "--show-object-format":
             _print(R().object_format())
+            continue
+        if pending_git_path:
+            pending_git_path = False
+            r = R()
+            cwd = Path(os.getcwd()).resolve()
+            base = os.path.relpath(r.gitdir, cwd) if (cwd == r.path and not r.bare) else str(r.gitdir)
+            _print(f"{base}/{arg}" if arg else base)
+            continue
+        if arg == "--git-path":
+            pending_git_path = True
+            continue
+        if arg.startswith("--git-path="):
+            r = R()
+            sub = arg.split("=", 1)[1]
+            cwd = Path(os.getcwd()).resolve()
+            base = os.path.relpath(r.gitdir, cwd) if (cwd == r.path and not r.bare) else str(r.gitdir)
+            _print(f"{base}/{sub}" if sub else base)
             continue
         if arg == "--show-toplevel":
             _print(str(R().path))
@@ -3863,7 +3889,7 @@ def cmd_archive(argv: list[str]) -> int:
         if args.output:
             Path(args.output).write_bytes(blob)
         else:
-            sys.stdout.buffer.write(blob)
+            _write_stdout_bytes(blob)
         return 0
 
     import io, zipfile
@@ -3875,7 +3901,7 @@ def cmd_archive(argv: list[str]) -> int:
     if args.output:
         Path(args.output).write_bytes(buf.getvalue())
     else:
-        sys.stdout.buffer.write(buf.getvalue())
+        _write_stdout_bytes(buf.getvalue())
     return 0
 
 
@@ -5444,44 +5470,67 @@ def cmd_fast_export(argv: list[str]) -> int:
     commit_mark: dict[str, int] = {}
     next_mark = 1
 
-    # emit blobs first
+    head_sym, _ = refs_mod.read_head(repo)
+    ref = head_sym if head_sym and head_sym.startswith("refs/heads/") else "refs/heads/main"
+
+    out = bytearray()
+
+    def w(s: str) -> None:
+        out.extend(s.encode("utf-8"))
+
+    reset_emitted = False
     for cs in order:
         c = objs.parse_commit(objs.read_object(repo, cs)[1])
-        for _path, _mode, bsha in workdir.iter_tree_files(repo, c.tree):
-            if bsha in blob_mark:
-                continue
-            _, data = objs.read_object(repo, bsha)
-            blob_mark[bsha] = next_mark
-            _print("blob")
-            _print(f"mark :{next_mark}")
-            _print(f"data {len(data)}")
-            sys.stdout.write(data.decode("utf-8", errors="replace") + "\n")
-            next_mark += 1
-    # emit commits
-    for cs in order:
-        c = objs.parse_commit(objs.read_object(repo, cs)[1])
+        parent = c.parents[0] if c.parents else None
+        parent_tree = objs.parse_commit(objs.read_object(repo, parent)[1]).tree if parent else None
+        changes = _tree_changes(repo, parent_tree, c.tree)
+
+        # Emit any new blobs referenced by this commit, in path order.
+        for path, _a, b in changes:
+            if b.present and b.sha not in blob_mark:
+                _, data = objs.read_object(repo, b.sha)
+                blob_mark[b.sha] = next_mark
+                w(f"blob\nmark :{next_mark}\ndata {len(data)}\n")
+                out.extend(data)
+                w("\n")
+                next_mark += 1
+
+        if not reset_emitted:
+            w(f"reset {ref}\n")
+            reset_emitted = True
+
         commit_mark[cs] = next_mark
-        _print("commit refs/heads/main")
-        _print(f"mark :{next_mark}")
-        if c.author:
-            _print(f"author {c.author}")
-        if c.committer:
-            _print(f"committer {c.committer}")
-        msg_bytes = c.message.encode("utf-8")
-        _print(f"data {len(msg_bytes)}")
-        sys.stdout.write(c.message + ("\n" if not c.message.endswith("\n") else ""))
-        if c.parents and c.parents[0] in commit_mark:
-            _print(f"from :{commit_mark[c.parents[0]]}")
+        w(f"commit {ref}\nmark :{next_mark}\n")
+        w(f"author {c.author}\ncommitter {c.committer}\n")
+        msg = c.message.encode("utf-8")
+        w(f"data {len(msg)}\n")
+        out.extend(msg)
+        if parent and parent in commit_mark:
+            w(f"from :{commit_mark[parent]}\n")
         for p in c.parents[1:]:
             if p in commit_mark:
-                _print(f"merge :{commit_mark[p]}")
-        # files: deleteall + M for each file
-        _print("deleteall")
-        for path, _mode, bsha in workdir.iter_tree_files(repo, c.tree):
-            _print(f"M 100644 :{blob_mark[bsha]} {path}")
-        _print("")
+                w(f"merge :{commit_mark[p]}\n")
+        for path, a, b in changes:
+            if b.present:
+                w(f"M {b.mode} :{blob_mark[b.sha]} {path}\n")
+            else:
+                w(f"D {path}\n")
+        w("\n")
         next_mark += 1
+
+    _write_stdout_bytes(bytes(out))
     return 0
+
+
+def _write_stdout_bytes(data: bytes) -> None:
+    """Write raw bytes to stdout, tolerating a text capture (e.g. pytest)."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        sys.stdout.flush()
+        buffer.write(data)
+        buffer.flush()
+    else:
+        sys.stdout.write(data.decode("utf-8", errors="surrogateescape"))
 
 
 def cmd_fast_import(argv: list[str]) -> int:
@@ -5612,8 +5661,10 @@ def cmd_fast_import(argv: list[str]) -> int:
                     s = refs_mod.rev_parse(repo, target)
                     if s:
                         refs_mod.update_ref(repo, ref, s, message="fast-import reset")
+            elif sub is not None:
+                # No "from" line follows this reset; let the main loop see it.
+                i -= 1
         # ignore other directives
-    _print(f"imported {len(marks)} objects")
     return 0
 
 
@@ -6723,7 +6774,8 @@ def cmd_patch_id(argv: list[str]) -> int:
 
     Also accepts a commit id as positional arg.
     """
-    ap = argparse.ArgumentParser(prog="pygit patch-id")
+    ap = argparse.ArgumentParser(prog="pygit patch-id", add_help=False)
+    ap.add_argument("--stable", action="store_true")
     ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
     if args.rev:
@@ -6733,17 +6785,58 @@ def cmd_patch_id(argv: list[str]) -> int:
             return 128
         _print(_patch_id_for_commit(repo, s) + " " + s)
         return 0
-    import hashlib, re
-    text = sys.stdin.read()
-    # strip hunk headers and pure-context lines
-    h = hashlib.sha1()
-    for line in text.splitlines():
-        if line.startswith("@@") or line.startswith("diff ") or line.startswith("index "):
-            continue
-        # strip context spaces
-        h.update(line.encode("utf-8", errors="replace"))
-    _print(h.hexdigest())
+    pid = _compute_patch_id(sys.stdin.read())
+    if pid is not None:
+        _print(f"{pid} {'0' * 40}")
     return 0
+
+
+def _scan_hunk_header(line: str) -> tuple[int, int]:
+    import re
+    m = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+    if not m:
+        return 0, 0
+    before = int(m.group(1)) if m.group(1) is not None else 1
+    after = int(m.group(2)) if m.group(2) is not None else 1
+    return before, after
+
+
+def _compute_patch_id(text: str) -> Optional[str]:
+    """Compute a patch-id exactly like C Git's get_one_patchid (default mode)."""
+    import hashlib
+    h = hashlib.sha1()
+    before = after = -1
+    patchlen = 0
+    for line in text.splitlines(keepends=True):
+        if line.startswith("\\ ") and len(line) > 12:
+            continue
+        if patchlen == 0 and not line.startswith("diff "):
+            continue
+        if before == -1:
+            if line.startswith("Binary files") or line.startswith("GIT binary patch"):
+                before = 0
+                continue
+            if line.startswith("index "):
+                continue
+            if line.startswith("--- "):
+                before = after = 1
+            elif not (line and line[0].isalpha()):
+                break
+        if before == 0 and after == 0:
+            if line.startswith("@@ -"):
+                before, after = _scan_hunk_header(line)
+                continue
+            if not line.startswith("diff "):
+                break
+            before = after = -1
+        if line and line[0] in "- ":
+            before -= 1
+        if line and line[0] in "+ ":
+            after -= 1
+        stripped = "".join(c for c in line if not c.isspace())
+        patchlen += len(stripped)
+        h.update(stripped.encode("utf-8", errors="replace"))
+    return h.hexdigest() if patchlen else None
 
 
 def cmd_checkout_index(argv: list[str]) -> int:
