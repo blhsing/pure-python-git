@@ -388,12 +388,15 @@ def cmd_mv(argv: list[str]) -> int:
 def cmd_status(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit status")
     ap.add_argument("-s", "--short", action="store_true")
+    ap.add_argument("-b", "--branch", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
     s = workdir.status(repo)
     head_sym, _ = refs_mod.read_head(repo)
     branch = head_sym[len("refs/heads/") :] if head_sym and head_sym.startswith("refs/heads/") else "(detached)"
     if args.short:
+        if args.branch:
+            _print(f"## {branch}")
         for p in s["staged_new"]:
             _print(f"A  {p}")
         for p in s["staged_mod"]:
@@ -481,14 +484,18 @@ def cmd_commit(argv: list[str]) -> int:
 def cmd_log(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit log")
     ap.add_argument("--oneline", action="store_true")
+    ap.add_argument("--decorate", nargs="?", const="short", default=None)
+    ap.add_argument("--no-decorate", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
         _err("fatal: bad revision")
         return 128
+    decorate = args.decorate is not None and not args.no_decorate
+    decorations = _commit_decorations(repo) if decorate else {}
     seen: set[str] = set()
     cur = deque([sha])
     count = 0
@@ -506,9 +513,10 @@ def cmd_log(argv: list[str]) -> int:
         c = objs.parse_commit(data)
         if args.oneline:
             first = c.message.splitlines()[0] if c.message.strip() else ""
-            _print(f"{s[:7]} {first}")
+            deco = _format_decoration(decorations.get(s, []))
+            _print(f"{s[:7]}{deco} {first}")
         else:
-            _print(f"commit {s}")
+            _print(f"commit {s}{_format_decoration(decorations.get(s, []))}")
             if len(c.parents) > 1:
                 _print("Merge: " + " ".join(p[:7] for p in c.parents))
             _print(f"Author: {c.author}")
@@ -522,6 +530,40 @@ def cmd_log(argv: list[str]) -> int:
         if args.max_count and count >= args.max_count:
             break
     return 0
+
+
+def _expand_count_shorthand(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    for a in argv:
+        if len(a) > 1 and a[0] == "-" and a[1:].isdigit():
+            out.extend(["-n", a[1:]])
+        else:
+            out.append(a)
+    return out
+
+
+def _commit_decorations(repo: Repository) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    head_sym, head_sha = refs_mod.read_head(repo)
+    if head_sha:
+        if head_sym and head_sym.startswith("refs/heads/"):
+            out.setdefault(head_sha, []).append(f"HEAD -> {head_sym[len('refs/heads/') :]}")
+        else:
+            out.setdefault(head_sha, []).append("HEAD")
+    for branch in refs_mod.list_branches(repo):
+        ref = f"refs/heads/{branch}"
+        sha = refs_mod.read_ref(repo, ref)
+        if sha and ref != head_sym:
+            out.setdefault(sha, []).append(branch)
+    for tag in refs_mod.list_tags(repo):
+        sha = refs_mod.read_ref(repo, f"refs/tags/{tag}")
+        if sha:
+            out.setdefault(sha, []).append(f"tag: {tag}")
+    return out
+
+
+def _format_decoration(names: list[str]) -> str:
+    return f" ({', '.join(names)})" if names else ""
 
 
 def cmd_show(argv: list[str]) -> int:
@@ -837,6 +879,7 @@ def _config_section_key(name: str) -> tuple[str, str]:
 
 def cmd_remote(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit remote")
+    ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="action")
     sub.add_parser("show")
     p_add = sub.add_parser("add")
@@ -850,7 +893,14 @@ def cmd_remote(argv: list[str]) -> int:
     if args.action in (None, "show"):
         for s in cp.sections():
             if s.startswith('remote "'):
-                _print(s[len('remote "') : -1])
+                name = s[len('remote "') : -1]
+                if args.verbose:
+                    url = cp.get(s, "url", fallback="")
+                    pushurl = cp.get(s, "pushurl", fallback=url)
+                    _print(f"{name}\t{url} (fetch)")
+                    _print(f"{name}\t{pushurl} (push)")
+                else:
+                    _print(name)
         return 0
     cfg_path = repo.gitdir / "config"
     if args.action == "add":

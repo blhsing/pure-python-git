@@ -350,6 +350,23 @@ def test_diff_show_log(tmprepo, capsys):
     assert cli_run("log", "--oneline") == 0
     out = capsys.readouterr().out
     assert "c1" in out and "c2" in out
+    assert cli_run("log", "--oneline", "--decorate", "-1") == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1
+    assert "(HEAD -> main)" in out
+
+
+def test_status_short_branch_option(tmprepo, capsys):
+    assert cli_run("status", "--short", "--branch") == 0
+    assert capsys.readouterr().out.startswith("## main\n")
+
+
+def test_remote_verbose_option(tmprepo, capsys):
+    assert cli_run("remote", "add", "origin", "https://example.com/repo.git") == 0
+    assert cli_run("remote", "-v") == 0
+    out = capsys.readouterr().out
+    assert "origin\thttps://example.com/repo.git (fetch)" in out
+    assert "origin\thttps://example.com/repo.git (push)" in out
 
 
 def test_describe_after_tag(tmprepo):
