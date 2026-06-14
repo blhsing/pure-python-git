@@ -1521,6 +1521,10 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("-r", "--remotes", action="store_true")
     ap.add_argument("-l", "--list", dest="list_mode", action="store_true")
+    ap.add_argument("-m", "--move", action="store_true")
+    ap.add_argument("-M", dest="force_move", action="store_true")
+    ap.add_argument("-c", "--copy", action="store_true")
+    ap.add_argument("-C", dest="force_copy", action="store_true")
     ap.add_argument("--show-current", action="store_true")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
@@ -1529,6 +1533,33 @@ def cmd_branch(argv: list[str]) -> int:
     repo = _repo()
     head_sym, _ = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+
+    if args.move or args.force_move or args.copy or args.force_copy:
+        if args.name is not None and args.start is not None:
+            src, dst = args.name, args.start
+        elif args.name is not None:
+            src, dst = cur, args.name
+        else:
+            _err("fatal: branch name required")
+            return 128
+        if src is None:
+            _err("fatal: no such branch")
+            return 128
+        sha = refs_mod.read_ref(repo, f"refs/heads/{src}")
+        if sha is None:
+            _err(f"fatal: Branch '{src}' not found.")
+            return 128
+        refs_mod.update_ref(repo, f"refs/heads/{dst}", sha)
+        if args.move or args.force_move:
+            old_log = repo.gitdir / "logs" / "refs" / "heads" / src
+            new_log = repo.gitdir / "logs" / "refs" / "heads" / dst
+            if old_log.exists():
+                new_log.parent.mkdir(parents=True, exist_ok=True)
+                old_log.replace(new_log)
+            refs_mod.delete_ref(repo, f"refs/heads/{src}")
+            if cur == src:
+                refs_mod.set_head(repo, f"refs/heads/{dst}")
+        return 0
 
     if args.show_current:
         if cur:
@@ -1584,7 +1615,11 @@ def cmd_tag(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     if args.list or (args.name is None and not args.delete):
+        import fnmatch
+        pattern = args.name
         for t in refs_mod.list_tags(repo):
+            if pattern and not fnmatch.fnmatch(t, pattern):
+                continue
             _print(t)
         return 0
     if args.delete:
@@ -1625,44 +1660,120 @@ def cmd_tag(argv: list[str]) -> int:
     return 0
 
 
+_DETACHED_ADVICE = (
+    "You are in 'detached HEAD' state. You can look around, make experimental\n"
+    "changes and commit them, and you can discard any commits you make in this\n"
+    "state without impacting any branches by switching back to a branch.\n"
+    "\n"
+    "If you want to create a new branch to retain commits you create, you may\n"
+    "do so (now or later) by using -c with the switch command. Example:\n"
+    "\n"
+    "  git switch -c <new-branch-name>\n"
+    "\n"
+    "Or undo this operation with:\n"
+    "\n"
+    "  git switch -\n"
+    "\n"
+    "Turn off this advice by setting config variable advice.detachedHead to false\n"
+    "\n"
+)
+
+
+def _restore_paths(repo: Repository, paths: list[str], source_tree: Optional[str], update_index: bool) -> None:
+    idx = read_index(repo)
+    by_path = idx.by_path()
+    for p in paths:
+        if source_tree is not None:
+            blob = refs_mod._object_at_path(repo, source_tree, p)
+            if blob is None:
+                continue
+        elif p in by_path:
+            blob = by_path[p].sha
+        else:
+            continue
+        _, data = objs.read_object(repo, blob)
+        (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
+        (repo.path / p).write_bytes(data)
+        if update_index and p in by_path:
+            from .index import IndexEntry, REG_MODE
+            idx.upsert(IndexEntry(mode=REG_MODE, sha=blob, path=p))
+    if update_index:
+        write_index(repo, idx)
+
+
 def cmd_checkout(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit checkout")
-    ap.add_argument("-b", dest="new_branch", default=None)
-    ap.add_argument("target", nargs="?")
-    args = ap.parse_args(argv)
+    new_branch: Optional[str] = None
+    revs: list[str] = []
+    paths: list[str] = []
+    after_dd = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if after_dd:
+            paths.append(a)
+        elif a == "--":
+            after_dd = True
+        elif a in ("-b", "-B"):
+            i += 1
+            new_branch = argv[i] if i < len(argv) else None
+        elif a.startswith("-") and a != "-":
+            pass
+        else:
+            revs.append(a)
+        i += 1
     repo = _repo()
-    if args.new_branch:
-        if refs_mod.read_ref(repo, f"refs/heads/{args.new_branch}") is not None:
-            _err(f"fatal: a branch named '{args.new_branch}' already exists")
+
+    if new_branch:
+        if refs_mod.read_ref(repo, f"refs/heads/{new_branch}") is not None:
+            _err(f"fatal: a branch named '{new_branch}' already exists")
             return 128
-        start = refs_mod.rev_parse(repo, args.target) if args.target else refs_mod.rev_parse(repo, "HEAD")
+        start = refs_mod.rev_parse(repo, revs[0]) if revs else refs_mod.rev_parse(repo, "HEAD")
         if not start:
-            _err(f"fatal: '{args.target}' is not a commit and a branch '{args.new_branch}' cannot be created from it")
+            _err(f"fatal: '{revs[0] if revs else 'HEAD'}' is not a commit and a branch '{new_branch}' cannot be created from it")
             return 128
-        refs_mod.update_ref(repo, f"refs/heads/{args.new_branch}", start)
-        refs_mod.set_head(repo, f"refs/heads/{args.new_branch}")
-        _err(f"Switched to a new branch '{args.new_branch}'")
+        refs_mod.update_ref(repo, f"refs/heads/{new_branch}", start)
+        refs_mod.set_head(repo, f"refs/heads/{new_branch}")
+        _err(f"Switched to a new branch '{new_branch}'")
         return 0
-    if not args.target:
-        ap.error("target required")
+
+    # Path-restore form: `checkout [<tree-ish>] -- <paths>` or `checkout <paths>`.
+    if paths or (after_dd):
+        source_tree = None
+        if revs:
+            src = refs_mod.rev_parse(repo, revs[0])
+            source_tree = _commit_tree(repo, src) if src else None
+        _restore_paths(repo, paths, source_tree, update_index=bool(revs))
+        return 0
+
+    if not revs:
+        _err("error: you must specify path(s) to restore")
+        return 1
+    target = revs[0]
     head_sym, _ = refs_mod.read_head(repo)
     cur_branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
-    is_branch = refs_mod.read_ref(repo, f"refs/heads/{args.target}") is not None
-    sha = refs_mod.rev_parse(repo, args.target)
+    is_branch = refs_mod.read_ref(repo, f"refs/heads/{target}") is not None
+    sha = refs_mod.rev_parse(repo, target)
     if not sha:
-        _err(f"error: pathspec '{args.target}' did not match any file(s) known to git")
+        _err(f"error: pathspec '{target}' did not match any file(s) known to git")
         return 1
     t, data = objs.read_object(repo, sha)
     tree = objs.parse_commit(data).tree if t == "commit" else sha
     workdir.checkout_tree(repo, tree)
     if is_branch:
-        if cur_branch == args.target:
-            _err(f"Already on '{args.target}'")
+        if cur_branch == target:
+            _err(f"Already on '{target}'")
         else:
-            refs_mod.set_head(repo, f"refs/heads/{args.target}")
-            _err(f"Switched to branch '{args.target}'")
+            refs_mod.set_head(repo, f"refs/heads/{target}")
+            _err(f"Switched to branch '{target}'")
     else:
         refs_mod.set_head(repo, sha)
+        from . import gitconfig
+        advice = (gitconfig.get(repo, "advice.detachedhead") or "").lower()
+        if advice not in ("false", "0", "no", "off"):
+            sys.stderr.write(f"Note: switching to '{target}'.\n\n")
+            sys.stderr.write(_DETACHED_ADVICE)
+        subject = objs.parse_commit(data).message.splitlines()[0] if t == "commit" else ""
+        _err(f"HEAD is now at {sha[:7]} {subject}")
     return 0
 
 
@@ -5311,26 +5422,15 @@ def cmd_diff_tree(argv: list[str]) -> int:
                 _print(f"D\t{p}")
             else:
                 _print(f"M\t{p}")
-        else:
+        elif not args.patch:
             ln = _raw_diff_status(a_mode, b_mode, a_sha, b_sha, p)
             if ln:
                 _print(ln)
     if args.patch:
-        from . import diff as _d
         for p, a_entry, b_entry in changes:
-            a_sha = a_entry.sha if a_entry else None
-            b_sha = b_entry.sha if b_entry else None
-            if a_sha == b_sha:
-                continue
-            at = bt = ""
-            if a_sha:
-                at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
-            if b_sha:
-                bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
-            out = _d.unified_diff(at, bt, f"a/{p}", f"b/{p}")
-            if out:
-                _print(f"diff --git a/{p} b/{p}")
-                _print(out.rstrip("\n"))
+            a_side = _side_from_object(repo, a_entry.mode, a_entry.sha) if a_entry else _ABSENT
+            b_side = _side_from_object(repo, b_entry.mode, b_entry.sha) if b_entry else _ABSENT
+            _emit_file_diff(p, a_side, b_side)
     return 0
 
 

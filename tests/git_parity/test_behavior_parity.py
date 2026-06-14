@@ -208,6 +208,21 @@ CASES: list[tuple] = [
     # hash-object / name-rev
     ("hash-object-file", BASE + [("write", "f.txt", "hello\n")], ["hash-object", "f.txt"]),
     ("name-rev", BASE, ["name-rev", "HEAD"]),
+    # branch move/copy
+    ("branch-move", BASE + [["branch", "old"]], ["branch", "-m", "old", "new"]),
+    ("branch-move-current", BASE, ["branch", "-m", "renamed"]),
+    ("branch-copy", BASE + [["branch", "src"]], ["branch", "-c", "src", "dst"]),
+    # checkout path restore
+    ("checkout-path", BASE + [("write", "a.txt", "changed\n")], ["checkout", "--", "a.txt"]),
+    ("restore-path", BASE + [("write", "a.txt", "changed\n")], ["restore", "a.txt"]),
+    ("checkout-detached", TAGGED, ["checkout", "HEAD~1"]),
+    # tag list with pattern
+    ("tag-list-pattern", BASE + [["tag", "v1.0"], ["tag", "v2.0"], ["tag", "other"]], ["tag", "-l", "v*"]),
+    # update-ref
+    ("update-ref-create", BASE, ["update-ref", "refs/heads/newb", "HEAD"]),
+    ("update-ref-delete", BASE + [["branch", "tmp"]], ["update-ref", "-d", "refs/heads/tmp"]),
+    # diff-tree -p
+    ("diff-tree-patch", TAGGED, ["diff-tree", "-p", "HEAD"]),
 ]
 
 
