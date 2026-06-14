@@ -374,6 +374,7 @@ The suite passes:
 | `test_ort_parity.py`    | byte-for-byte `ort` parity vs `git merge-tree --write-tree` across every conflict type (content, modify/delete, add/add, rename/rename, rename/delete, directory rename, distinct-types, exec-bit) |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 | `tests/git_parity`      | C Git 2.54.0 manifest coverage, exact built-in registry coverage, and oracle behavior comparisons |
+| `tests/git_parity/test_behavior_parity.py` | 140+ byte-for-byte behavior cases (return code, stdout, stderr) run against the real 2.54.0 oracle in a hermetic, deterministic environment — covers rev-parse, config, status, diff, log/show, commit, merge, branch, tag, checkout, ls-files, and more |
 
 Tests that require the real `git` binary are silently skipped when it's not on
 PATH, so the normal suite runs cleanly in containers without one. The dedicated
@@ -444,7 +445,12 @@ The project tries to follow git's published wire and on-disk format specs
    any pythongit-only command in `_PYGIT_EXTENSION_COMMANDS`.
 4. Add focused unit/integration tests plus a `tests/git_parity` oracle case for
    user-visible CLI behavior whenever the command can be exercised
-   deterministically.
+   deterministically. For new behavior, add a case to
+   `tests/git_parity/test_behavior_parity.py`: each case builds two identical
+   repos (one driven by the oracle, one by pythongit) under a hermetic,
+   deterministic environment and asserts byte-identical return code, stdout, and
+   stderr. Because author/committer identity and dates are pinned, commit object
+   ids are byte-comparable — divergence in any downstream output is caught.
 5. Run `python -m pytest`; when a Git 2.54.0 binary is available, also run the
    required parity gate shown above.
 
