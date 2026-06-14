@@ -75,8 +75,8 @@ def main() -> int:
         check(rc == 0, "clean -f runs")
         check(not (tmp / "junk.txt").exists(), "clean removed untracked")
 
-        # describe
-        run("tag", "v1")
+        # describe (annotated tags are what `describe` matches by default)
+        run("tag", "-a", "v1", "-m", "v1")
         rc = run("describe")
         check(rc == 0, "describe on tagged HEAD")
 

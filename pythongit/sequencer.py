@@ -43,14 +43,11 @@ def _note_rerere_conflicts(repo: Repository, tree: str, paths: list[str]) -> Non
 
 def _make_commit(repo: Repository, tree: str, parents: list[str], message: str,
                  author: Optional[str] = None) -> str:
-    name, email = repo.user()
-    when = int(time.time())
-    sig = objs.format_signature(name, email, when=when)
     c = objs.Commit(
         tree=tree,
         parents=parents,
-        author=author or sig,
-        committer=sig,
+        author=author or objs.build_signature(repo, "author"),
+        committer=objs.build_signature(repo, "committer"),
         message=message if message.endswith("\n") else message + "\n",
     )
     return objs.write_object(repo, "commit", c.encode())

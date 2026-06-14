@@ -531,6 +531,7 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--count", action="store_true")
     ap.add_argument("--max-count", "-n", type=int, default=None)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--reverse", action="store_true")
     ap.add_argument("revs", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -575,6 +576,8 @@ def cmd_rev_list(argv: list[str]) -> int:
     if args.count:
         _print(str(len(out)))
     else:
+        if args.reverse:
+            out = list(reversed(out))
         for s in out:
             _print(s)
     return 0
@@ -977,8 +980,10 @@ def cmd_commit(argv: list[str]) -> int:
     msg = message if message.endswith("\n") else message + "\n"
     c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
     sha = objs.write_object(repo, "commit", c.encode())
+    verb = "commit (initial)" if not parents else ("commit (amend)" if args.amend else "commit")
+    reflog_msg = f"{verb}: {msg.splitlines()[0]}"
     if head_sym:
-        refs_mod.update_ref(repo, head_sym, sha)
+        refs_mod.update_ref(repo, head_sym, sha, message=reflog_msg)
     else:
         refs_mod.set_head(repo, sha)
     if args.quiet:
@@ -1032,11 +1037,43 @@ def _print_commit_summary(repo: Repository, parent_tree: Optional[str], new_tree
         _print(line)
 
 
+def _parse_who(who: str) -> tuple[str, str]:
+    if who.endswith(">") and " <" in who:
+        name, email = who[:-1].split(" <", 1)
+        return name, email
+    return who, ""
+
+
+def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict) -> str:
+    a_who, _, _ = _split_ident(c.author)
+    c_who, _, _ = _split_ident(c.committer)
+    an, ae = _parse_who(a_who)
+    cn, ce = _parse_who(c_who)
+    subject = c.message.splitlines()[0] if c.message.strip() else ""
+    deco = _format_decoration(decorations.get(sha, []))
+    replacements = [
+        ("%H", sha), ("%h", sha[:7]),
+        ("%T", c.tree), ("%t", c.tree[:7]),
+        ("%P", " ".join(c.parents)), ("%p", " ".join(p[:7] for p in c.parents)),
+        ("%an", an), ("%ae", ae), ("%cn", cn), ("%ce", ce),
+        ("%ad", _format_ident_date(c.author)), ("%cd", _format_ident_date(c.committer)),
+        ("%s", subject), ("%d", deco),
+        ("%n", "\n"), ("%%", "%"),
+    ]
+    out = fmt
+    for token, value in replacements:
+        out = out.replace(token, value)
+    return out
+
+
 def cmd_log(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit log")
+    ap = argparse.ArgumentParser(prog="pygit log", add_help=False)
     ap.add_argument("--oneline", action="store_true")
     ap.add_argument("--decorate", nargs="?", const="short", default=None)
     ap.add_argument("--no-decorate", action="store_true")
+    ap.add_argument("--pretty", nargs="?", const="medium", default=None)
+    ap.add_argument("--format", default=None)
+    ap.add_argument("--abbrev-commit", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -1054,6 +1091,24 @@ def cmd_log(argv: list[str]) -> int:
         return 128
     decorate = args.decorate is not None and not args.no_decorate
     decorations = _commit_decorations(repo) if decorate else {}
+
+    # Determine output style.
+    fmt_string: Optional[str] = None
+    style = "medium"
+    if args.format is not None:
+        fmt_string = args.format
+        style = "format"
+    elif args.pretty is not None:
+        if args.pretty == "oneline":
+            style = "oneline_full"
+        elif args.pretty.startswith("format:") or args.pretty.startswith("tformat:"):
+            fmt_string = args.pretty.split(":", 1)[1]
+            style = "format"
+        else:
+            style = args.pretty
+    if args.oneline:
+        style = "oneline"
+
     seen: set[str] = set()
     cur = deque([sha])
     count = 0
@@ -1069,10 +1124,13 @@ def cmd_log(argv: list[str]) -> int:
         if t != "commit":
             break
         c = objs.parse_commit(data)
-        if args.oneline:
+        if style == "format":
+            _print(_expand_commit_format(repo, s, c, fmt_string, decorations))
+        elif style in ("oneline", "oneline_full"):
+            abbrev = s if style == "oneline_full" else s[:7]
             first = c.message.splitlines()[0] if c.message.strip() else ""
             deco = _format_decoration(decorations.get(s, []))
-            _print(f"{s[:7]}{deco} {first}")
+            _print(f"{abbrev}{deco} {first}")
         else:
             if count > 0:
                 _print("")
@@ -2200,39 +2258,60 @@ def cmd_merge(argv: list[str]) -> int:
     return 0
 
 
+def _print_pick_summary(repo: Repository, sha: str) -> None:
+    _, data = objs.read_object(repo, sha)
+    c = objs.parse_commit(data)
+    head_sym, _ = refs_mod.read_head(repo)
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else "detached HEAD"
+    _print(f"[{branch} {sha[:7]}] {c.message.splitlines()[0]}")
+    _print(f" Date: {_format_ident_date(c.author)}")
+    parent_tree = None
+    if c.parents:
+        _, pd = objs.read_object(repo, c.parents[0])
+        parent_tree = objs.parse_commit(pd).tree
+    _print_commit_summary(repo, parent_tree, c.tree)
+
+
 def cmd_cherry_pick(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit cherry-pick")
+    ap = argparse.ArgumentParser(prog="pygit cherry-pick", add_help=False)
+    ap.add_argument("-n", "--no-commit", action="store_true")
+    ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("rev")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import sequencer
     target = refs_mod.rev_parse(repo, args.rev)
     if not target:
+        _err(f"fatal: bad revision '{args.rev}'")
         return 128
     sha, conflicts = sequencer.cherry_pick(repo, target)
     if conflicts:
+        _err("error: could not apply " + target[:7] + "...")
         for p in conflicts:
-            _err(f"CONFLICT: {p}")
+            _print(f"CONFLICT (content): Merge conflict in {p}")
         return 1
-    _print(f"[cherry-pick] {sha[:7]}")
+    _print_pick_summary(repo, sha)
     return 0
 
 
 def cmd_revert(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit revert")
+    ap = argparse.ArgumentParser(prog="pygit revert", add_help=False)
+    ap.add_argument("-n", "--no-commit", action="store_true")
+    ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("rev")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import sequencer
     target = refs_mod.rev_parse(repo, args.rev)
     if not target:
+        _err(f"fatal: bad revision '{args.rev}'")
         return 128
     sha, conflicts = sequencer.revert(repo, target)
     if conflicts:
         for p in conflicts:
-            _err(f"CONFLICT: {p}")
+            _print(f"CONFLICT (content): Merge conflict in {p}")
         return 1
-    _print(f"[revert] {sha[:7]}")
+    _print_pick_summary(repo, sha)
     return 0
 
 
@@ -2252,14 +2331,22 @@ def cmd_rebase(argv: list[str]) -> int:
 
 
 def cmd_reflog(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit reflog")
+    ap = argparse.ArgumentParser(prog="pygit reflog", add_help=False)
+    ap.add_argument("-n", "--max-count", type=int, default=None)
+    ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(_expand_count_shorthand(argv))
+    # `reflog [show] [ref]`: the first positional may be the subcommand or a ref.
+    ref = args.ref
+    if args.action not in ("show",) and ref == "HEAD":
+        ref = args.action
     repo = _repo()
     from . import reflog
-    entries = reflog.read(repo, args.ref)
+    entries = reflog.read(repo, ref)
     for i, (old, new, ident, msg) in enumerate(reversed(entries)):
-        _print(f"{new[:7]} {args.ref}@{{{i}}}: {msg}")
+        if args.max_count is not None and i >= args.max_count:
+            break
+        _print(f"{new[:7]} {ref}@{{{i}}}: {msg}")
     return 0
 
 
@@ -2630,19 +2717,26 @@ def cmd_describe(argv: list[str]) -> int:
     if not sha:
         return 128
     tag_for: dict[str, str] = {}
+    have_unannotated = False
     for tag in refs_mod.list_tags(repo):
         ts = refs_mod.read_ref(repo, f"refs/tags/{tag}")
         if not ts:
             continue
+        annotated = False
         try:
             t, d = objs.read_object(repo, ts)
             if t == "tag":
+                annotated = True
                 for line in d.decode(errors="replace").splitlines():
                     if line.startswith("object "):
                         ts = line[len("object "):].strip()
                         break
         except KeyError:
             pass
+        if not annotated:
+            have_unannotated = True
+            if not args.tags:
+                continue
         tag_for[ts] = tag
     seen: set[str] = set()
     graph = _graph_for_repo(repo)
@@ -2667,7 +2761,11 @@ def cmd_describe(argv: list[str]) -> int:
     if args.always:
         _print(sha[:7])
         return 0
-    _err("fatal: no tags can describe")
+    if not args.tags and have_unannotated:
+        _err(f"fatal: No annotated tags can describe '{sha}'.")
+        _err("However, there were unannotated tags: try --tags.")
+    else:
+        _err("fatal: No names found, cannot describe anything.")
     return 128
 
 
@@ -3310,12 +3408,28 @@ def cmd_verify_pack(argv: list[str]) -> int:
     return rc
 
 
+def _loose_disk_kib(repo: Repository) -> int:
+    """Loose-object disk usage in KiB, matching C Git's du-style accounting."""
+    total_blocks = 0
+    objects = repo.gitdir / "objects"
+    if objects.exists():
+        for sub in objects.iterdir():
+            if len(sub.name) == 2 and sub.is_dir():
+                for obj in sub.iterdir():
+                    try:
+                        total_blocks += obj.stat().st_blocks
+                    except (OSError, AttributeError):
+                        pass
+    return total_blocks * 512 // 1024
+
+
 def cmd_count_objects(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit count-objects")
-    ap.add_argument("-v", action="store_true")
+    ap = argparse.ArgumentParser(prog="pygit count-objects", add_help=False)
+    ap.add_argument("-v", "--verbose", dest="v", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
-    loose_count, size = _loose_count_and_size(repo)
+    loose_count, _bytes = _loose_count_and_size(repo)
+    size = _loose_disk_kib(repo)
     if args.v:
         from . import pack as _p
         midx = _p.read_midx(repo)
@@ -3329,11 +3443,11 @@ def cmd_count_objects(argv: list[str]) -> int:
                 pack_count += 1
                 pack_objs += len(pk.shas)
         _print(f"count: {loose_count}")
-        _print(f"size: {size // 1024}")
+        _print(f"size: {size}")
         _print(f"in-pack: {pack_objs}")
         _print(f"packs: {pack_count}")
     else:
-        _print(f"{loose_count} objects, {size // 1024} kilobytes")
+        _print(f"{loose_count} objects, {size} kilobytes")
     return 0
 
 

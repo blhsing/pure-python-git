@@ -186,6 +186,28 @@ CASES: list[tuple] = [
     ("for-each-ref-short",
      BASE + [["branch", "feature"]], ["for-each-ref", "--format=%(refname:short)", "refs/heads"]),
     ("rev-list-all", BASE + [["branch", "feature"], ["tag", "v1"]], ["rev-list", "--all"]),
+    # log pretty/format, rev-list --reverse
+    ("log-format-H", TAGGED, ["log", "--format=%H"]),
+    ("log-pretty-oneline", TAGGED, ["log", "--pretty=oneline"]),
+    ("log-format-custom", TAGGED, ["log", "--format=%h %an %s"]),
+    ("rev-list-reverse", TAGGED, ["rev-list", "--reverse", "HEAD"]),
+    # reflog
+    ("reflog", TAGGED, ["reflog"]),
+    ("reflog-n1", TAGGED, ["reflog", "-1"]),
+    # describe (annotated-only by default)
+    ("describe-no-annotated", BASE + [["tag", "light"]], ["describe"]),
+    ("describe-annotated", BASE + [["tag", "-a", "v1", "-m", "v1"]], ["describe"]),
+    ("describe-no-tags", BASE, ["describe"]),
+    ("describe-tags-flag", BASE + [["tag", "light"]], ["describe", "--tags"]),
+    # cherry-pick / revert (author preservation -> identical object ids)
+    ("cherry-pick",
+     BASE + [["checkout", "-b", "topic"], ("write", "c.txt", "c\n"), ["add", "-A"],
+             ["commit", "-m", "add c"], ["checkout", "main"]],
+     ["cherry-pick", "topic"]),
+    ("revert", TAGGED, ["revert", "--no-edit", "HEAD"]),
+    # hash-object / name-rev
+    ("hash-object-file", BASE + [("write", "f.txt", "hello\n")], ["hash-object", "f.txt"]),
+    ("name-rev", BASE, ["name-rev", "HEAD"]),
 ]
 
 

@@ -412,7 +412,7 @@ def test_describe_after_tag(tmprepo):
     from tests.conftest import commit_one
     repo, _ = tmprepo
     commit_one(repo, "a", "1", "c1")
-    cli_run("tag", "v1")
+    cli_run("tag", "-a", "v1", "-m", "v1")
     assert cli_run("describe", "HEAD") == 0
 
 
