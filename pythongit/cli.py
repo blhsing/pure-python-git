@@ -1089,13 +1089,16 @@ def _commit_status_report(repo: Repository) -> int:
 
 def cmd_commit(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit commit", add_help=False)
-    ap.add_argument("-m", "--message", default=None)
+    ap.add_argument("-m", "--message", action="append", default=None)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--amend", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--allow-empty", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
+    # Multiple -m values are joined into paragraphs, like C Git.
+    if args.message is not None:
+        args.message = "\n\n".join(args.message)
     repo = _repo()
     try:
         from . import rerere as _rr
@@ -1352,6 +1355,8 @@ def cmd_log(argv: list[str]) -> int:
                 break
         commit_list = filtered
 
+    if args.max_count is not None:
+        commit_list = commit_list[:max(0, args.max_count)]
     if args.reverse:
         commit_list = list(reversed(commit_list))
 
@@ -2024,6 +2029,9 @@ def cmd_branch(argv: list[str]) -> int:
             _err("fatal: branch name required")
             return 128
         full = f"refs/heads/{args.name}"
+        if args.name == cur:
+            _err(f"error: cannot delete branch '{args.name}' used by worktree at '{repo.path}'")
+            return 1
         if refs_mod.read_ref(repo, full) is None:
             _err(f"error: branch '{args.name}' not found")
             return 1
@@ -6062,9 +6070,10 @@ def _raw_diff_status(a_mode: str, b_mode: str, a_sha: Optional[str], b_sha: Opti
 
 
 def cmd_diff_tree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit diff-tree")
+    ap = argparse.ArgumentParser(prog="pygit diff-tree", add_help=False)
     ap.add_argument("-r", action="store_true", help="recurse")
     ap.add_argument("-p", "--patch", action="store_true")
+    ap.add_argument("--root", action="store_true")
     ap.add_argument("--name-only", action="store_true")
     ap.add_argument("--name-status", action="store_true")
     ap.add_argument("rev1")

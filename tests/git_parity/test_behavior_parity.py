@@ -380,6 +380,14 @@ CASES: list[tuple] = [
     ("log-path-other",
      BASE + [("write", "a.txt", "changed\n"), ["add", "-A"], ["commit", "-m", "c2"]],
      ["log", "--oneline", "--", "b.txt"]),
+    # misc
+    ("commit-multi-message",
+     BASE + [("write", "x.txt", "x\n"), ["add", "x.txt"]], ["commit", "-m", "subject", "-m", "body"]),
+    ("branch-delete-current", BASE, ["branch", "-d", "main"]),
+    ("log-max-count-zero", TAGGED, ["log", "--oneline", "-0"]),
+    ("diff-tree-root", BASE, ["diff-tree", "--root", "-r", "HEAD"]),
+    ("rev-parse-abbrev-ref-at", BASE, ["rev-parse", "--abbrev-ref", "@"]),
+    ("status-after-rm-cached", BASE + [["rm", "--cached", "a.txt"]], ["status", "--porcelain"]),
 ]
 
 
