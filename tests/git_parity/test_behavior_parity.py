@@ -338,6 +338,19 @@ CASES: list[tuple] = [
     ("tag-sort-version",
      BASE + [["tag", "v2"], ["tag", "v1"], ["tag", "v10"]],
      ["tag", "--sort=version:refname"]),
+    # rename detection (exact and partial similarity via the spanhash estimator)
+    ("status-rename-porcelain",
+     BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"]],
+     ["status", "--porcelain"]),
+    ("status-rename-long",
+     BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"]],
+     ["status"]),
+    ("diff-rename-name-status",
+     BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\nL5\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3X\nL4\nL5\n"), ["add", "-A"]],
+     ["diff", "--cached", "-M", "--name-status"]),
 ]
 
 

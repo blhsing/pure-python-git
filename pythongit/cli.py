@@ -832,6 +832,27 @@ def _status_model(repo: Repository, s: dict) -> tuple[list[tuple[str, str, str]]
     return changes, sorted(s["untracked"])
 
 
+def _status_staged_renames(repo: Repository, s: dict) -> list:
+    """Detect staged renames (HEAD->index) and return (src, dst) pairs."""
+    if not s["staged_del"] or not s["staged_new"]:
+        return []
+    from . import diffcore
+    head_sha = refs_mod.rev_parse(repo, "HEAD")
+    head_map = _tree_map_full(repo, _commit_tree(repo, head_sha)) if head_sha else {}
+    idx = read_index(repo).by_path()
+    base_map: dict[str, tuple[int, str]] = {}
+    for p in s["staged_del"]:
+        if p in head_map:
+            base_map[p] = (int(head_map[p][0], 8), head_map[p][1])
+    side_map: dict[str, tuple[int, str]] = {}
+    for p in s["staged_new"]:
+        if p in idx:
+            side_map[p] = (idx[p].mode, idx[p].sha)
+    if not base_map or not side_map:
+        return []
+    return [(pair.src.path, pair.dst.path) for pair in diffcore.detect_renames(repo, base_map, side_map)]
+
+
 def _status_branch_header_short(repo: Repository, head_sym, head_sha) -> str:
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
     if head_sym and head_sha is None:
@@ -920,6 +941,10 @@ def cmd_status(argv: list[str]) -> int:
     head_sym, head_sha = refs_mod.read_head(repo)
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
     changes, untracked = _status_model(repo, s)
+    renames = _status_staged_renames(repo, s)
+    if renames:
+        consumed = {src for src, _ in renames} | {dst for _, dst in renames}
+        changes = [(p, x, y) for p, x, y in changes if p not in consumed]
     show_untracked = args.untracked_files != "no"
     untracked_hidden = bool(untracked) and not show_untracked
     if not show_untracked:
@@ -938,17 +963,19 @@ def cmd_status(argv: list[str]) -> int:
     if porcelain is not None or short_mode:
         if args.branch:
             emit(_status_branch_header_short(repo, head_sym, head_sha))
-        for p, x, y in changes:
-            emit(f"{x}{y} {p}")
+        entries = [(dst, f"R  {src} -> {dst}") for src, dst in renames]
+        entries += [(p, f"{x}{y} {p}") for p, x, y in changes]
+        for _key, line in sorted(entries):
+            emit(line)
         for p in untracked:
             emit(f"?? {p}")
         return 0
 
     # Long (default) format.
-    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden)
+    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden, renames)
 
 
-def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden=False) -> int:
+def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden=False, renames=None) -> int:
     unborn = head_sym is not None and head_sha is None
     if branch is not None:
         _print(f"On branch {branch}")
@@ -960,15 +987,17 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untrac
     staged = [(p, x) for p, x, y in changes if x != " "]
     unstaged = [(p, y) for p, x, y in changes if y != " "]
     label = {"A": "new file:   ", "M": "modified:   ", "D": "deleted:    "}
+    rename_rows = [(dst, f"\trenamed:    {src} -> {dst}") for src, dst in (renames or [])]
 
-    if staged:
+    if staged or rename_rows:
         _print("Changes to be committed:")
         if unborn:
             _print('  (use "git rm --cached <file>..." to unstage)')
         else:
             _print('  (use "git restore --staged <file>..." to unstage)')
-        for p, x in staged:
-            _print(f"\t{label[x]}{p}")
+        staged_rows = rename_rows + [(p, f"\t{label[x]}{p}") for p, x in staged]
+        for _key, line in sorted(staged_rows):
+            _print(line)
         _print("")
     if unstaged:
         _print("Changes not staged for commit:")
@@ -987,16 +1016,17 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untrac
             _print(f"\t{p}")
         _print("")
 
-    if not staged and not unstaged and not untracked:
+    has_staged = bool(staged) or bool(rename_rows)
+    if not has_staged and not unstaged and not untracked:
         if untracked_hidden:
             _print("nothing to commit (use -u to show untracked files)")
         elif unborn:
             _print('nothing to commit (create/copy files and use "git add" to track)')
         else:
             _print("nothing to commit, working tree clean")
-    elif not staged and not unstaged and untracked:
+    elif not has_staged and not unstaged and untracked:
         _print('nothing added to commit but untracked files present (use "git add" to track)')
-    elif not staged and unstaged:
+    elif not has_staged and unstaged:
         _print('no changes added to commit (use "git add" and/or "git commit -a")')
     return 0
 
@@ -1629,6 +1659,8 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--exit-code", dest="exit_code", action="store_true")
+    ap.add_argument("-M", "--find-renames", dest="find_renames", nargs="?", const=True, default=None)
+    ap.add_argument("--no-renames", dest="no_renames", action="store_true")
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
     revs: list[str] = []
@@ -1709,13 +1741,45 @@ def cmd_diff(argv: list[str]) -> int:
         for path, _, _ in changes:
             _print(path)
     elif args.name_status:
+        renames = []
+        if not args.no_renames:
+            renames, changes = _detect_changes_renames(repo, changes)
+        entries = [(dst, f"R{sim:03d}\t{src}\t{dst}") for src, dst, sim in renames]
         for path, a, b in changes:
             status = "A" if not a.present else ("D" if not b.present else "M")
-            _print(f"{status}\t{path}")
+            entries.append((path, f"{status}\t{path}"))
+        for _key, line in sorted(entries):
+            _print(line)
     else:
         for path, a, b in changes:
             _emit_file_diff(path, a, b)
     return 0
+
+
+def _detect_changes_renames(repo: Repository, changes: list):
+    """Split ``changes`` into detected (src, dst, similarity%) renames and the
+    remaining non-rename changes, using the validated spanhash estimator."""
+    from . import diffcore
+    base_map: dict[str, tuple[int, str]] = {}
+    side_map: dict[str, tuple[int, str]] = {}
+    for path, a, b in changes:
+        if a.present and not b.present:
+            base_map[path] = (int(a.mode, 8), a.sha)
+        elif b.present and not a.present and not b.worktree:
+            side_map[path] = (int(b.mode, 8), b.sha)
+    if not base_map or not side_map:
+        return [], changes
+    pairs = diffcore.detect_renames(repo, base_map, side_map)
+    renamed_src = {p.src.path for p in pairs}
+    renamed_dst = {p.dst.path for p in pairs}
+    renames = [(p.src.path, p.dst.path, int(p.score * 100 / diffcore.MAX_SCORE)) for p in pairs]
+    remaining = [
+        (path, a, b)
+        for path, a, b in changes
+        if not (a.present and not b.present and path in renamed_src)
+        and not (b.present and not a.present and path in renamed_dst)
+    ]
+    return renames, remaining
 
 
 def _diff_counts(a: _Side, b: _Side) -> tuple[int, int]:
