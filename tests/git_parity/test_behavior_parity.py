@@ -320,6 +320,24 @@ CASES: list[tuple] = [
      BASE + [["branch", "a"], ["branch", "b"]], ["for-each-ref", "--count=1", "--format=%(refname)"]),
     # notes
     ("notes-show", BASE + [["notes", "add", "-m", "a note"]], ["notes", "show"]),
+    # diff-files / diff-index raw, diff --quiet
+    ("diff-files", BASE + [("write", "a.txt", "CHANGED\n")], ["diff-files"]),
+    ("diff-files-name-only", BASE + [("write", "a.txt", "X\n")], ["diff-files", "--name-only"]),
+    ("diff-index-cached", BASE + [("write", "b.txt", "b\n"), ["add", "b.txt"]], ["diff-index", "--cached", "HEAD"]),
+    ("diff-quiet-clean", BASE, ["diff", "--quiet"]),
+    ("diff-quiet-dirty", BASE + [("write", "a.txt", "x\n")], ["diff", "--quiet"]),
+    # rev-parse --verify guard, rev-list --no-walk, log --first-parent
+    ("rev-parse-verify-multi", BASE, ["rev-parse", "--verify", "HEAD", "HEAD"]),
+    ("rev-list-no-walk", TAGGED, ["rev-list", "--no-walk", "HEAD"]),
+    ("log-first-parent", TAGGED, ["log", "--first-parent", "--oneline"]),
+    # cherry, tag --sort
+    ("cherry",
+     BASE + [["checkout", "-b", "topic"], ("write", "c.txt", "c\n"), ["add", "-A"],
+             ["commit", "-m", "t"]],
+     ["cherry", "main"]),
+    ("tag-sort-version",
+     BASE + [["tag", "v2"], ["tag", "v1"], ["tag", "v10"]],
+     ["tag", "--sort=version:refname"]),
 ]
 
 

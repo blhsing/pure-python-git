@@ -405,10 +405,20 @@ def cmd_rev_parse(argv: list[str]) -> int:
             repo = _repo()
         return repo
 
+    # --verify requires exactly one revision; reject extras before any output.
+    if "--verify" in argv:
+        rev_args = [a for a in argv if not a.startswith("-")]
+        if len(rev_args) > 1:
+            if "-q" not in argv and "--quiet" not in argv:
+                _err("fatal: Needed a single revision")
+                return 128
+            return 1
+
     abbrev = 0            # 0 = full hex; >0 = abbreviate to N chars
     symbolic: Optional[str] = None   # None | "full" | "abbrev"
     verify = False
     quiet = False
+    verified_count = 0
     after_dashdash = False
 
     for arg in argv:
@@ -520,6 +530,13 @@ def cmd_rev_parse(argv: list[str]) -> int:
                 _err("Use '--' to separate paths from revisions, like this:")
                 _err("'git <command> [<revision>...] -- [<file>...]'")
             return 128
+        if verify:
+            verified_count += 1
+            if verified_count > 1:
+                if quiet:
+                    return 1
+                _err("fatal: Needed a single revision")
+                return 128
         if symbolic is not None:
             full = refs_mod.dwim_full_name(r, arg) or arg
             _print(refs_mod.shorten_ref(full) if symbolic == "abbrev" else full)
@@ -604,6 +621,8 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--objects", action="store_true")
     ap.add_argument("--parents", action="store_true")
+    ap.add_argument("--no-walk", action="store_true")
+    ap.add_argument("--first-parent", action="store_true")
     ap.add_argument("revs", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -641,10 +660,12 @@ def cmd_rev_list(argv: list[str]) -> int:
         if info is None:
             continue
         out.append(sha)
-        _tree, parents = info
-        stack.extend(parents)
         if args.max_count and len(out) >= args.max_count:
             break
+        if args.no_walk:
+            continue
+        _tree, parents = info
+        stack.extend(parents[:1] if args.first_parent else parents)
     if args.count:
         _print(str(len(out)))
     elif args.objects:
@@ -1189,6 +1210,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--reverse", action="store_true")
+    ap.add_argument("--first-parent", dest="first_parent", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -1237,7 +1259,7 @@ def cmd_log(argv: list[str]) -> int:
         if info is None:
             break
         commit_list.append(s)
-        cur.extend(info[1])
+        cur.extend(info[1][:1] if args.first_parent else info[1])
         if args.max_count and len(commit_list) >= args.max_count:
             break
     if args.reverse:
@@ -1605,6 +1627,8 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--exit-code", dest="exit_code", action="store_true")
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
     revs: list[str] = []
@@ -1662,6 +1686,12 @@ def cmd_diff(argv: list[str]) -> int:
         wanted = set(paths)
         changes = [c for c in changes if c[0] in wanted or any(c[0].startswith(w.rstrip("/") + "/") for w in paths)]
 
+    if args.quiet:
+        return 1 if changes else 0
+    if args.exit_code:
+        for path, a, b in changes:
+            _emit_file_diff(path, a, b)
+        return 1 if changes else 0
     if args.raw:
         zero7 = "0000000"
         for path, a, b in changes:
@@ -1843,6 +1873,11 @@ def cmd_branch(argv: list[str]) -> int:
     return 0
 
 
+def _version_sort_key(name: str):
+    import re
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
+
+
 def _tag_annotation(repo: Repository, sha: Optional[str]) -> str:
     if sha is None:
         return ""
@@ -1868,14 +1903,23 @@ def cmd_tag(argv: list[str]) -> int:
     ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("-m", "--message", default=None)
     ap.add_argument("-n", nargs="?", const=1, type=int, default=None, dest="num")
+    ap.add_argument("--sort", default=None)
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.list or args.num is not None or (args.name is None and not args.delete):
+    if args.list or args.num is not None or args.sort is not None or (args.name is None and not args.delete):
         import fnmatch
         pattern = args.name
-        for t in refs_mod.list_tags(repo):
+        tags = list(refs_mod.list_tags(repo))
+        if args.sort:
+            key = args.sort.lstrip("-")
+            reverse = args.sort.startswith("-")
+            if key in ("version:refname", "v:refname"):
+                tags.sort(key=_version_sort_key, reverse=reverse)
+            else:
+                tags.sort(reverse=reverse)
+        for t in tags:
             if pattern and not fnmatch.fnmatch(t, pattern):
                 continue
             if args.num is not None:
@@ -4704,7 +4748,8 @@ def cmd_replace(argv: list[str]) -> int:
 
 def cmd_cherry(argv: list[str]) -> int:
     """Find commits in <head> that are not in <upstream> based on patch-id."""
-    ap = argparse.ArgumentParser(prog="pygit cherry")
+    ap = argparse.ArgumentParser(prog="pygit cherry", add_help=False)
+    ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("upstream")
     ap.add_argument("head", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
@@ -4773,9 +4818,12 @@ def cmd_cherry(argv: list[str]) -> int:
     for s in head_commits:
         pid = patch_id(s)
         mark = "-" if pid in up_patches else "+"
-        c = objs.parse_commit(objs.read_object(repo, s)[1])
-        subject = c.message.splitlines()[0] if c.message.strip() else ""
-        _print(f"{mark} {s} {subject}")
+        if args.verbose:
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            subject = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"{mark} {s} {subject}")
+        else:
+            _print(f"{mark} {s}")
     return 0
 
 
@@ -5833,9 +5881,8 @@ def cmd_diff_files(argv: list[str]) -> int:
             if args.name_only:
                 _print(e.path)
             else:
-                ln = _raw_diff_status(e.mode_str(), e.mode_str(), e.sha, sha, e.path)
-                if ln:
-                    _print(ln)
+                # The worktree side is not a stored object, so its id is zeros.
+                _print(f":{e.mode_str()} {e.mode_str()} {e.sha} {'0' * 40} M\t{e.path}")
     return 0
 
 
