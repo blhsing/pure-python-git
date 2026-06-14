@@ -3205,29 +3205,58 @@ _register_phase2()
 
 
 def cmd_apply(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit apply")
+    ap = argparse.ArgumentParser(prog="pygit apply", add_help=False)
     ap.add_argument("-R", "--reverse", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--numstat", action="store_true")
     ap.add_argument("file", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import patch
     text = sys.stdin.read() if not args.file else Path(args.file).read_text(encoding="utf-8", errors="replace")
-    if args.check:
-        patches = patch.parse_patch(text)
+    patches = patch.parse_patch(text)
+
+    def counts(fp) -> tuple[int, int]:
+        ins = sum(1 for h in fp.hunks for ln in h.lines if ln.startswith("+"))
+        dele = sum(1 for h in fp.hunks for ln in h.lines if ln.startswith("-"))
+        return ins, dele
+
+    if args.numstat:
         for fp in patches:
-            content = ""
-            tgt = repo.path / fp.target
-            if tgt.exists():
-                content = tgt.read_text(encoding="utf-8", errors="replace")
-            if patch.apply_to_text(content, fp.hunks, reverse=args.reverse) is None:
-                _err(f"error: patch failed: {fp.target}")
-                return 1
+            ins, dele = counts(fp)
+            _print(f"{ins}\t{dele}\t{fp.target}")
         return 0
-    applied, failed = patch.apply_patch_text(text, repo_path=repo.path, reverse=args.reverse)
-    for f in failed:
-        _err(f"error: failed: {f}")
-    return 0 if not failed else 1
+    if args.stat:
+        rows = []
+        for fp in patches:
+            ins, dele = counts(fp)
+            rows.append((fp.target, ins + dele, ins, dele))
+        if rows:
+            name_w = max(len(p) for p, *_ in rows)
+            count_w = max(len(str(t)) for _, t, *_ in rows)
+            ti = td = 0
+            for name, total, ins, dele in rows:
+                ti += ins
+                td += dele
+                bar = "+" * ins + "-" * dele
+                _print(f" {name:<{name_w}} | {total:>{count_w}} {bar}")
+            _print(_stat_summary_line(len(rows), ti, td))
+        return 0
+
+    for fp in patches:
+        tgt = repo.path / fp.target
+        content = tgt.read_text(encoding="utf-8", errors="replace") if tgt.exists() else ""
+        result = patch.apply_to_text(content, fp.hunks, reverse=args.reverse)
+        if result is None:
+            line = fp.hunks[0].a_start if fp.hunks else 1
+            _err(f"error: patch failed: {fp.target}:{line}")
+            _err(f"error: {fp.target}: patch does not apply")
+            return 1
+        if not args.check:
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            tgt.write_text(result, encoding="utf-8")
+    return 0
 
 
 def cmd_format_patch(argv: list[str]) -> int:
@@ -3286,64 +3315,76 @@ def cmd_format_patch(argv: list[str]) -> int:
 
     for i, sha in enumerate(commits, 1):
         c = objs.parse_commit(objs.read_object(repo, sha)[1])
-        subject = c.message.splitlines()[0] if c.message.strip() else ""
-        body_lines = c.message.splitlines()[1:]
+        msg_parts = c.message.rstrip("\n").split("\n\n", 1)
+        subject = msg_parts[0].replace("\n", " ") if c.message.strip() else ""
+        body_lines = msg_parts[1].splitlines() if len(msg_parts) > 1 else []
         parent_tree = ""
         if c.parents:
             parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-        diff_text = []
-        for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree or None, c.tree):
-            a_sha = a_entry.sha if a_entry else None
-            b_sha = b_entry.sha if b_entry else None
-            if a_sha == b_sha:
-                continue
-            at = bt = ""
-            if a_sha:
-                at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
-            if b_sha:
-                bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
-            d = _diff.unified_diff(at, bt, f"a/{p}", f"b/{p}")
-            if d:
-                diff_text.append(f"diff --git a/{p} b/{p}")
-                if a_sha is None:
-                    diff_text.append("new file mode 100644")
-                if b_sha is None:
-                    diff_text.append("deleted file mode 100644")
-                diff_text.append(d.rstrip("\n"))
-        mbox = []
-        mbox.append(f"From {sha} Mon Sep 17 00:00:00 2001")
-        mbox.append(f"From: {c.author.rsplit(' ', 2)[0] if c.author else 'unknown'}")
-        date_part = " ".join(c.author.split()[-2:]) if c.author else ""
-        mbox.append("Date: " + date_part)
-        mbox.append(f"Subject: [PATCH {i}/{len(commits)}] {subject}")
-        mbox.append("")
-        for bl in body_lines:
-            mbox.append(bl)
-        if not body_lines or body_lines[-1] != "":
-            mbox.append("")
-        mbox.append("---")
-        mbox.extend(diff_text)
-        mbox.append("")
-        mbox.append("-- ")
-        mbox.append("pythongit")
-        out = "\n".join(mbox) + "\n"
+        changes = _tree_changes(repo, parent_tree or None, c.tree)
+        stat = _capture_output(lambda: _emit_diffstat_summary(changes))
+        diff = _capture_output(lambda: [_emit_file_diff(p, a, b) for p, a, b in changes])
+
+        num = f" {i}/{len(commits)}" if len(commits) > 1 else ""
+        body = "\n".join(body_lines).rstrip("\n")
+        lines = [
+            f"From {sha} Mon Sep 17 00:00:00 2001",
+            f"From: {_split_ident(c.author)[0]}",
+            f"Date: {_format_rfc2822_date(c.author)}",
+            f"Subject: [PATCH{num}] {subject}",
+            "",
+        ]
+        if body:
+            lines.append(body)
+        lines.append("---")
+        lines.append(stat.rstrip("\n"))
+        lines.append("")
+        lines.append(diff.rstrip("\n"))
+        lines.append("-- ")
+        lines.append("2.54.0")
+        out = "\n".join(lines) + "\n"
         if args.stdout:
-            _print(out)
+            sys.stdout.write(out + "\n")
         else:
-            safe = "".join(ch if ch.isalnum() else "-" for ch in subject)[:50] or "patch"
+            safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in subject)[:52].strip("-") or "patch"
             fname = f"{i:04d}-{safe}.patch"
             (out_dir / fname).write_text(out, encoding="utf-8")
             _print(str(out_dir / fname))
     return 0
 
 
+def _capture_output(fn) -> str:
+    import io
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        fn()
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
+
+def _format_rfc2822_date(sig: str) -> str:
+    import datetime
+    _who, ts, tz = _split_ident(sig)
+    if ts is None or tz is None:
+        return sig
+    sign = 1 if tz[0] == "+" else -1
+    off_min = sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=off_min)
+    return dt.strftime("%a, %d %b %Y %H:%M:%S ") + tz
+
+
 def cmd_am(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit am")
-    ap.add_argument("file")
+    ap = argparse.ArgumentParser(prog="pygit am", add_help=False)
+    ap.add_argument("-3", "--3way", dest="threeway", action="store_true")
+    ap.add_argument("file", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import patch
-    text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+    text = (Path(args.file).read_text(encoding="utf-8", errors="replace")
+            if args.file else sys.stdin.read())
     msgs: list[list[str]] = []
     cur: list[str] = []
     for line in text.splitlines():
@@ -3362,6 +3403,7 @@ def cmd_am(argv: list[str]) -> int:
         headers = msg[:blank]
         body = msg[blank + 1 :]
         subject = ""
+        author_name = author_email = author_date = None
         for h in headers:
             if h.startswith("Subject: "):
                 subject = h[len("Subject: "):]
@@ -3369,6 +3411,11 @@ def cmd_am(argv: list[str]) -> int:
                     end = subject.find("]")
                     if end != -1:
                         subject = subject[end + 1 :].strip()
+            elif h.startswith("From: "):
+                who = h[len("From: "):]
+                author_name, author_email = _parse_who(who)
+            elif h.startswith("Date: "):
+                author_date = _rfc2822_to_raw(h[len("Date: "):])
         if "---" in body:
             sep = body.index("---")
             msg_lines = body[:sep]
@@ -3378,16 +3425,46 @@ def cmd_am(argv: list[str]) -> int:
             patch_text = ""
         applied, failed = patch.apply_patch_text(patch_text, repo_path=repo.path)
         if failed:
-            _err(f"am: failed to apply: {failed}")
-            return 1
+            _err(f"error: patch failed: {failed[0]}" if failed else "error: patch does not apply")
+            _err(f"Patch failed at 0001 {subject}")
+            return 128
         if applied:
             workdir.add_paths(repo, applied)
-        body_msg = "\n".join(l for l in msg_lines if l.strip())
+        body_msg = "\n".join(msg_lines).strip()
         full_msg = subject + (("\n\n" + body_msg) if body_msg else "")
-        rc = cmd_commit(["-m", full_msg])
+        _print(f"Applying: {subject}")
+        old_env: dict[str, Optional[str]] = {}
+        for key, val in (("GIT_AUTHOR_NAME", author_name), ("GIT_AUTHOR_EMAIL", author_email),
+                         ("GIT_AUTHOR_DATE", author_date)):
+            if val is not None:
+                old_env[key] = os.environ.get(key)
+                os.environ[key] = val
+        try:
+            rc = cmd_commit(["-q", "-m", full_msg])
+        finally:
+            for key, prev in old_env.items():
+                if prev is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prev
         if rc != 0:
             return rc
     return 0
+
+
+def _rfc2822_to_raw(value: str) -> str:
+    """Convert an RFC2822 date to Git's raw '<seconds> <±HHMM>' form."""
+    import email.utils
+    try:
+        dt = email.utils.parsedate_to_datetime(value.strip())
+    except (TypeError, ValueError):
+        return value.strip()
+    secs = int(dt.timestamp())
+    off = dt.utcoffset()
+    total = int(off.total_seconds()) if off is not None else 0
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    return f"{secs} {sign}{total // 3600:02d}{(total % 3600) // 60:02d}"
 
 
 def cmd_clean(argv: list[str]) -> int:
@@ -3690,10 +3767,78 @@ def cmd_shortlog(argv: list[str]) -> int:
     return 0
 
 
+def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], archive_time: int) -> bytes:
+    """Build a tar archive byte-for-byte identical to C Git's archive-tar.c."""
+    BLOCKSIZE = 512 * 20
+    TAR_UMASK = 0o002
+    out = bytearray()
+
+    def emit_header(name: str, mode: int, size: int, typeflag: str, linkname: str = "") -> None:
+        h = bytearray(512)
+        nb = name.encode("utf-8")
+        h[0:len(nb)] = nb
+        h[100:108] = b"%07o\0" % (mode & 0o7777)
+        h[108:116] = b"0000000\0"
+        h[116:124] = b"0000000\0"
+        h[124:136] = b"%011o\0" % size
+        h[136:148] = b"%011o\0" % archive_time
+        h[148:156] = b" " * 8  # checksum placeholder (spaces)
+        h[156] = ord(typeflag)
+        if linkname:
+            lb = linkname.encode("utf-8")
+            h[157:157 + len(lb)] = lb
+        h[257:263] = b"ustar\0"
+        h[263:265] = b"00"
+        h[265:269] = b"root"
+        h[297:301] = b"root"
+        h[329:337] = b"0000000\0"
+        h[337:345] = b"0000000\0"
+        h[148:156] = b"%07o\0" % sum(h)
+        out.extend(h)
+
+    def emit_content(data: bytes) -> None:
+        out.extend(data)
+        out.extend(b"\0" * ((-len(data)) % 512))
+
+    if commit_sha:
+        body = f" comment={commit_sha}\n"
+        total = len(body)
+        while len(str(total)) + len(body) != total:
+            total = len(str(total)) + len(body)
+        pax = f"{total}{body}".encode("utf-8")
+        emit_header("pax_global_header", 0o100666, len(pax), "g")
+        emit_content(pax)
+
+    def walk(tsha: str, prefix: str) -> None:
+        _, td = objs.read_object(repo, tsha)
+        for e in objs.parse_tree(td, repo.hash_len):
+            name = prefix + e.name
+            mode = int(e.mode, 8)
+            if e.is_dir():
+                emit_header(name + "/", (mode | 0o777) & ~TAR_UMASK, 0, "5")
+                walk(e.sha, name + "/")
+            elif e.mode == "120000":
+                _, target = objs.read_object(repo, e.sha)
+                emit_header(name, (mode | 0o777) & ~TAR_UMASK, 0, "2", target.decode("utf-8", "replace"))
+            elif e.is_gitlink():
+                continue
+            else:
+                _, blob = objs.read_object(repo, e.sha)
+                base = 0o777 if (mode & 0o100) else 0o666
+                emit_header(name, (mode | base) & ~TAR_UMASK, len(blob), "0")
+                emit_content(blob)
+
+    walk(tree, "")
+    out.extend(b"\0" * 1024)  # end-of-archive trailer
+    if len(out) % BLOCKSIZE:
+        out.extend(b"\0" * (BLOCKSIZE - len(out) % BLOCKSIZE))
+    return bytes(out)
+
+
 def cmd_archive(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit archive")
+    ap = argparse.ArgumentParser(prog="pygit archive", add_help=False)
     ap.add_argument("--format", default="tar", choices=["tar", "zip"])
-    ap.add_argument("-o", "--output", required=True)
+    ap.add_argument("-o", "--output", default=None)
     ap.add_argument("rev")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -3701,22 +3846,36 @@ def cmd_archive(argv: list[str]) -> int:
     if not sha:
         return 128
     t, data = objs.read_object(repo, sha)
-    tree = objs.parse_commit(data).tree if t == "commit" else sha
-    import io
-    if args.format == "tar":
-        import tarfile
-        with tarfile.open(args.output, "w") as tf:
-            for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
-                _, blob = objs.read_object(repo, bsha)
-                ti = tarfile.TarInfo(name=path)
-                ti.size = len(blob)
-                tf.addfile(ti, io.BytesIO(blob))
+    if t == "commit":
+        commit = objs.parse_commit(data)
+        tree = commit.tree
+        _who, archive_time, _tz = _split_ident(commit.committer)
+        commit_oid = sha
     else:
-        import zipfile
-        with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
-                _, blob = objs.read_object(repo, bsha)
-                zf.writestr(path, blob)
+        tree = sha
+        archive_time = 0
+        commit_oid = None
+    if archive_time is None:
+        archive_time = 0
+
+    if args.format == "tar":
+        blob = _git_archive_tar(repo, tree, commit_oid, archive_time)
+        if args.output:
+            Path(args.output).write_bytes(blob)
+        else:
+            sys.stdout.buffer.write(blob)
+        return 0
+
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
+            _, b = objs.read_object(repo, bsha)
+            zf.writestr(path, b)
+    if args.output:
+        Path(args.output).write_bytes(buf.getvalue())
+    else:
+        sys.stdout.buffer.write(buf.getvalue())
     return 0
 
 

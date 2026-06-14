@@ -56,8 +56,12 @@ def parse_patch(text: str) -> list[FilePatch]:
             i += 1
             continue
         if cur is None:
-            i += 1
-            continue
+            # A patch may begin directly with '--- ' (no 'diff --git' header).
+            if line.startswith("--- "):
+                cur = FilePatch()
+            else:
+                i += 1
+                continue
         if line.startswith("new file mode"):
             cur.new_file = True
             i += 1

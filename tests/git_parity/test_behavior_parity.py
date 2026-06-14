@@ -388,6 +388,35 @@ CASES: list[tuple] = [
     ("diff-tree-root", BASE, ["diff-tree", "--root", "-r", "HEAD"]),
     ("rev-parse-abbrev-ref-at", BASE, ["rev-parse", "--abbrev-ref", "@"]),
     ("status-after-rm-cached", BASE + [["rm", "--cached", "a.txt"]], ["status", "--porcelain"]),
+    # format-patch (single patch --stdout is deterministic)
+    ("format-patch-stdout", TAGGED, ["format-patch", "-1", "--stdout"]),
+    ("format-patch-newfile",
+     BASE + [("write", "n.txt", "fresh\n"), ["add", "-A"], ["commit", "-m", "add new"]],
+     ["format-patch", "-1", "--stdout"]),
+    # apply
+    ("apply-check",
+     BASE + [("write", "p.diff",
+              "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n")],
+     ["apply", "--check", "p.diff"]),
+    ("apply-numstat",
+     BASE + [("write", "p.diff",
+              "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n")],
+     ["apply", "--numstat", "p.diff"]),
+    ("apply-bad",
+     BASE + [("write", "p.diff",
+              "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-WRONG\n+ALPHA\n")],
+     ["apply", "--check", "p.diff"]),
+    # am (applies a patch and records a commit; "Applying:" line + exit code)
+    ("am",
+     BASE + [("write", "patch.mbox",
+              "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+              "From: Parity <parity@example.com>\n"
+              "Date: Tue, 14 Nov 2023 22:13:20 +0000\n"
+              "Subject: [PATCH] patched\n\n---\n a.txt | 2 +-\n"
+              " 1 file changed, 1 insertion(+), 1 deletion(-)\n\n"
+              "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n"
+              "@@ -1 +1 @@\n-alpha\n+ALPHA\n-- \n2.54.0\n\n")],
+     ["am", "patch.mbox"]),
 ]
 
 
@@ -408,3 +437,36 @@ def test_behavior_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_behavior_parity_stdin(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+def test_archive_tar_byte_identical(tmp_path: Path, git_254_oracle: str):
+    """`git archive --format=tar` is deterministic; assert byte-for-byte parity."""
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    setup = [
+        ("write", "a.txt", "hello\n"),
+        ("write", "run.sh", "#!/bin/sh\necho hi\n", 0o755),
+        ("write", "d/b.txt", "world\n"),
+        ("write", "d/nested/c.txt", "deep\n"),
+    ]
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+    outputs = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            path = repo / step[1]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(step[2])
+            if len(step) > 3:
+                path.chmod(step[3])
+        subprocess.run([*base, "add", "-A"], cwd=repo, env=env, capture_output=True)
+        subprocess.run([*base, "commit", "-m", "c"], cwd=repo, env=env, capture_output=True)
+        outputs[tool] = subprocess.run(
+            [*base, "archive", "--format=tar", "HEAD"], cwd=repo, env=env, capture_output=True
+        ).stdout
+    assert outputs["pygit"] == outputs["oracle"]
