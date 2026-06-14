@@ -149,16 +149,42 @@ def cmd_hash_object(argv: list[str]) -> int:
     return 0
 
 
+def _cat_file_batch(repo: Repository, check_only: bool) -> int:
+    for line in sys.stdin:
+        name = line.strip()
+        if not name:
+            continue
+        sha = refs_mod.rev_parse(repo, name)
+        if sha is None or not objs.object_exists(repo, sha):
+            sys.stdout.write(f"{name} missing\n")
+            continue
+        t, data = objs.read_object(repo, sha)
+        if check_only:
+            sys.stdout.write(f"{sha} {t} {len(data)}\n")
+        else:
+            sys.stdout.write(f"{sha} {t} {len(data)}\n")
+            sys.stdout.buffer.write(data)
+            sys.stdout.write("\n")
+    return 0
+
+
 def cmd_cat_file(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit cat-file")
+    ap = argparse.ArgumentParser(prog="pygit cat-file", add_help=False)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("-t", dest="show_type", action="store_true")
     g.add_argument("-s", dest="show_size", action="store_true")
     g.add_argument("-p", dest="pretty", action="store_true")
     g.add_argument("-e", dest="exists", action="store_true")
-    ap.add_argument("object")
+    g.add_argument("--batch", dest="batch", action="store_true")
+    g.add_argument("--batch-check", dest="batch_check", action="store_true")
+    ap.add_argument("object", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
+    if args.batch or args.batch_check:
+        return _cat_file_batch(repo, check_only=args.batch_check)
+    if args.object is None:
+        _err("fatal: <object> required")
+        return 128
     sha = refs_mod.rev_parse(repo, args.object)
     exists = sha is not None and objs.object_exists(repo, sha)
     if args.exists:
@@ -445,31 +471,80 @@ def cmd_rev_parse(argv: list[str]) -> int:
 
 
 def cmd_ls_files(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit ls-files")
+    ap = argparse.ArgumentParser(prog="pygit ls-files", add_help=False)
     ap.add_argument("-s", "--stage", action="store_true")
+    ap.add_argument("-c", "--cached", action="store_true")
+    ap.add_argument("-m", "--modified", action="store_true")
+    ap.add_argument("-o", "--others", action="store_true")
+    ap.add_argument("-d", "--deleted", action="store_true")
+    ap.add_argument("--exclude-standard", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     idx = read_index(repo)
-    for e in idx.entries:
-        if args.stage:
-            _print(f"{e.mode_str()} {e.sha} 0\t{e.path}")
-        else:
-            _print(e.path)
+    eol = "\0" if args.nul else "\n"
+
+    def match(p: str) -> bool:
+        if not args.paths:
+            return True
+        return any(p == ps or p.startswith(ps.rstrip("/") + "/") for ps in args.paths)
+
+    want_cached = args.cached or args.stage
+    if not (want_cached or args.modified or args.others or args.deleted):
+        want_cached = True
+
+    lines: list[tuple[str, str]] = []
+    if want_cached:
+        for e in idx.entries:
+            if match(e.path):
+                if args.stage:
+                    lines.append((e.path, f"{e.mode_str()} {e.sha} {getattr(e, 'stage', 0)}\t{e.path}"))
+                else:
+                    lines.append((e.path, e.path))
+    if args.modified or args.deleted or args.others:
+        status = workdir.status(repo, include_ignored=args.others and not args.exclude_standard)
+        if args.modified:
+            for p in status["modified"] + status["missing"]:
+                if match(p):
+                    lines.append((p, p))
+        if args.deleted:
+            for p in status["missing"]:
+                if match(p):
+                    lines.append((p, p))
+        if args.others:
+            for p in status["untracked"]:
+                if match(p):
+                    lines.append((p, p))
+
+    seen: set[str] = set()
+    for _path, line in sorted(lines):
+        if line in seen:
+            continue
+        seen.add(line)
+        sys.stdout.write(line + eol)
     return 0
 
 
 def cmd_rev_list(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit rev-list")
+    ap = argparse.ArgumentParser(prog="pygit rev-list", add_help=False)
     ap.add_argument("--count", action="store_true")
     ap.add_argument("--max-count", "-n", type=int, default=None)
-    ap.add_argument("revs", nargs="+")
-    args = ap.parse_args(argv)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("revs", nargs="*")
+    args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
     starts = []
+    if args.all:
+        for _ref, sha in _enumerate_refs(repo):
+            starts.append(sha)
     for r in args.revs:
         sha = refs_mod.rev_parse(repo, r)
         if sha:
             starts.append(sha)
+    if not starts and not args.all:
+        _err("usage: git rev-list [<options>] <commit>... [--] [<path>...]")
+        return 128
     if args.count and args.max_count is None and starts:
         try:
             from . import pack as _p
@@ -781,7 +856,10 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha) -> int
         _print("")
 
     if not staged and not unstaged and not untracked:
-        _print("nothing to commit, working tree clean")
+        if unborn:
+            _print('nothing to commit (create/copy files and use "git add" to track)')
+        else:
+            _print("nothing to commit, working tree clean")
     elif not staged and not unstaged and untracked:
         _print('nothing added to commit but untracked files present (use "git add" to track)')
     elif not staged and unstaged:
@@ -824,56 +902,95 @@ def _status_porcelain_v2(repo, s, changes, untracked, want_branch, head_sym, hea
     return 0
 
 
+def _commit_status_report(repo: Repository) -> int:
+    s = workdir.status(repo)
+    head_sym, head_sha = refs_mod.read_head(repo)
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+    changes, untracked = _status_model(repo, s)
+    _status_long(repo, s, changes, untracked, branch, head_sym, head_sha)
+    return 1
+
+
 def cmd_commit(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit commit")
-    ap.add_argument("-m", "--message", required=True)
+    ap = argparse.ArgumentParser(prog="pygit commit", add_help=False)
+    ap.add_argument("-m", "--message", default=None)
+    ap.add_argument("-a", "--all", action="store_true")
+    ap.add_argument("--amend", action="store_true")
     ap.add_argument("--allow-empty", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
-    # rerere: scan for newly-resolved conflicts and record postimages
     try:
         from . import rerere as _rr
         _rr.scan_and_record(repo)
     except Exception:
         pass
-    from .index import read_index as _read_index
-    cur_idx = _read_index(repo)
+
+    if args.all:
+        workdir.add_paths(repo, sorted(workdir.tracked_paths(repo)))
+
+    cur_idx = read_index(repo)
     if cur_idx.has_conflicts():
         _err("error: unresolved conflicts:")
         for p in cur_idx.conflicted_paths():
             _err(f"\t{p}")
         _err("hint: stage the resolved files with `pygit add` then commit again.")
         return 1
+
     tree = workdir.write_tree(repo)
     head_sym, parent = refs_mod.read_head(repo)
-    parents = [parent] if parent else []
-    if parent and not args.allow_empty:
-        # compare to parent's tree
-        t, data = objs.read_object(repo, parent)
-        if t == "commit":
-            pc = objs.parse_commit(data)
-            if pc.tree == tree:
-                _err("nothing to commit, working tree clean")
-                return 1
-    author_sig = objs.build_signature(repo, "author")
+
+    if args.amend:
+        if parent is None:
+            _err("fatal: You have nothing to amend.")
+            return 128
+        _, pdata = objs.read_object(repo, parent)
+        pc = objs.parse_commit(pdata)
+        parents = list(pc.parents)
+        author_sig = pc.author
+        message = args.message if args.message is not None else pc.message.rstrip("\n")
+        compare_tree = None
+        if pc.parents:
+            _, gpd = objs.read_object(repo, pc.parents[0])
+            compare_tree = objs.parse_commit(gpd).tree
+        if not args.allow_empty and compare_tree == tree:
+            _err("fatal: You asked to amend the most recent commit, but doing so would make")
+            _err("it empty. You can repeat your command with --allow-empty, or you can")
+            _err('remove the commit entirely with "git reset HEAD^".')
+            return 1
+    else:
+        if args.message is None:
+            _err('error: empty commit message')
+            return 1
+        parents = [parent] if parent else []
+        author_sig = objs.build_signature(repo, "author")
+        message = args.message
+        if parent and not args.allow_empty:
+            _, pdata = objs.read_object(repo, parent)
+            if objs.parse_commit(pdata).tree == tree:
+                return _commit_status_report(repo)
+        empty_tree_sha, _ = objs.hash_bytes("tree", b"", repo)
+        if parent is None and not args.allow_empty and tree == empty_tree_sha:
+            return _commit_status_report(repo)
+
     committer_sig = objs.build_signature(repo, "committer")
-    msg = args.message if args.message.endswith("\n") else args.message + "\n"
+    msg = message if message.endswith("\n") else message + "\n"
     c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
     sha = objs.write_object(repo, "commit", c.encode())
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha)
     else:
         refs_mod.set_head(repo, sha)
-    short = sha[:7]
-    if head_sym and head_sym.startswith("refs/heads/"):
-        branch = head_sym[len("refs/heads/"):]
-    else:
-        branch = "detached HEAD"
-    root = " (root-commit)" if not parents else ""
-    _print(f"[{branch}{root} {short}] {args.message.splitlines()[0]}")
+    if args.quiet:
+        return 0
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else "detached HEAD"
+    root = " (root-commit)" if not parents and not args.amend else ""
+    _print(f"[{branch}{root} {sha[:7]}] {msg.splitlines()[0]}")
+    if args.amend:
+        _print(f" Date: {_format_ident_date(author_sig)}")
     parent_tree = None
-    if parent:
-        _, pdata = objs.read_object(repo, parent)
+    if parents:
+        _, pdata = objs.read_object(repo, parents[0])
         parent_tree = objs.parse_commit(pdata).tree
     _print_commit_summary(repo, parent_tree, tree)
     return 0
@@ -2011,14 +2128,61 @@ def cmd_merge_base(argv: list[str]) -> int:
     return 0
 
 
+def _emit_diffstat_summary(changes: list) -> None:
+    _diff_stat(changes)
+    mode_lines: list[tuple[str, str]] = []
+    for path, a, b in changes:
+        if not a.present and b.present:
+            mode_lines.append((path, f" create mode {b.mode} {path}"))
+        elif a.present and not b.present:
+            mode_lines.append((path, f" delete mode {a.mode} {path}"))
+    for _, line in sorted(mode_lines):
+        _print(line)
+
+
 def cmd_merge(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge")
+    ap = argparse.ArgumentParser(prog="pygit merge", add_help=False)
     ap.add_argument("--no-ff", action="store_true")
     ap.add_argument("--ff-only", action="store_true")
     ap.add_argument("-m", "--message", default=None)
     ap.add_argument("other")
     args = ap.parse_args(argv)
     repo = _repo()
+    from . import merge as _m
+
+    head_sym, head_sha = refs_mod.read_head(repo)
+    other_sha = refs_mod.rev_parse(repo, args.other)
+    if not other_sha:
+        _err(f"merge: {args.other} - not something we can merge")
+        return 1
+    if head_sha is None:
+        _err("fatal: No current branch.")
+        return 128
+
+    bases = _m.merge_bases(repo, head_sha, other_sha)
+    if other_sha in bases or other_sha == head_sha:
+        _print("Already up to date.")
+        return 0
+
+    old_tree = objs.parse_commit(objs.read_object(repo, head_sha)[1]).tree
+    new_tree = objs.parse_commit(objs.read_object(repo, other_sha)[1]).tree
+
+    if bases == [head_sha] and not args.no_ff:
+        # Fast-forward.
+        _print(f"Updating {head_sha[:7]}..{other_sha[:7]}")
+        _print("Fast-forward")
+        if head_sym:
+            refs_mod.update_ref(repo, head_sym, other_sha)
+        else:
+            refs_mod.set_head(repo, other_sha)
+        workdir.checkout_tree(repo, new_tree)
+        _emit_diffstat_summary(_tree_changes(repo, old_tree, new_tree))
+        return 0
+
+    if args.ff_only:
+        _err("fatal: Not possible to fast-forward, aborting.")
+        return 128
+
     from . import porcelain_merge as pm
     try:
         sha, conflicts = pm.merge(repo, args.other, message=args.message, no_ff=args.no_ff)
@@ -2026,14 +2190,13 @@ def cmd_merge(argv: list[str]) -> int:
         _err(f"fatal: {e}")
         return 1
     if conflicts:
-        _err("Automatic merge failed; fix conflicts and then commit the result.")
         for p in conflicts:
-            _err(f"CONFLICT: {p}")
+            _print(f"CONFLICT (content): Merge conflict in {p}")
+        _err("Automatic merge failed; fix conflicts and then commit the result.")
         return 1
-    if args.ff_only:
-        # require ff: detect by checking new head's parents
-        pass
-    _print(f"Merged into {sha[:7]}")
+    _print("Merge made by the 'ort' strategy.")
+    merged_tree = objs.parse_commit(objs.read_object(repo, sha)[1]).tree
+    _emit_diffstat_summary(_tree_changes(repo, old_tree, merged_tree))
     return 0
 
 
@@ -2412,14 +2575,45 @@ def cmd_clean(argv: list[str]) -> int:
         _err("fatal: clean.requireForce; use -f or -n")
         return 1
     s = workdir.status(repo, include_ignored=args.x)
-    for u in s["untracked"]:
-        p = repo.path / u
+    tracked = workdir.tracked_paths(repo)
+
+    def dir_fully_untracked(d: str) -> bool:
+        prefix = d + "/"
+        return not any(t == d or t.startswith(prefix) for t in tracked)
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for u in sorted(s["untracked"]):
+        parts = u.split("/")
+        untracked_dir = None
+        for k in range(1, len(parts)):
+            d = "/".join(parts[:k])
+            if dir_fully_untracked(d):
+                untracked_dir = d
+                break
+        if untracked_dir is not None:
+            if args.d:
+                target = untracked_dir + "/"
+                if target not in seen:
+                    seen.add(target)
+                    targets.append(target)
+            # Without -d, untracked directories are left untouched.
+        elif u not in seen:
+            seen.add(u)
+            targets.append(u)
+
+    import shutil
+    for target in sorted(targets):
         if args.dry_run:
-            _print(f"Would remove {u}")
+            _print(f"Would remove {target}")
         else:
+            full = repo.path / target.rstrip("/")
             try:
-                p.unlink()
-                _print(f"Removing {u}")
+                if target.endswith("/"):
+                    shutil.rmtree(full)
+                else:
+                    full.unlink()
+                _print(f"Removing {target}")
             except OSError:
                 pass
     return 0
@@ -2555,9 +2749,10 @@ def cmd_blame(argv: list[str]) -> int:
 
 
 def cmd_for_each_ref(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit for-each-ref")
-    ap.add_argument("--format", default="%(objectname) %(objecttype) %(refname)")
-    ap.add_argument("pattern", nargs="?", default=None)
+    ap = argparse.ArgumentParser(prog="pygit for-each-ref", add_help=False)
+    ap.add_argument("--format", default="%(objectname) %(objecttype)\t%(refname)")
+    ap.add_argument("--count", type=int, default=None)
+    ap.add_argument("pattern", nargs="*", default=None)
     args = ap.parse_args(argv)
     repo = _repo()
     all_refs: dict[str, str] = {}
@@ -2572,9 +2767,13 @@ def cmd_for_each_ref(argv: list[str]) -> int:
                         all_refs[rel] = s
     for ref, s in refs_mod.read_packed_refs(repo).items():
         all_refs.setdefault(ref, s)
+    patterns = args.pattern or []
+    emitted = 0
     for ref in sorted(all_refs):
-        if args.pattern and not ref.startswith(args.pattern):
+        if patterns and not any(ref == p or ref.startswith(p.rstrip("/") + "/") for p in patterns):
             continue
+        if args.count is not None and emitted >= args.count:
+            break
         s = all_refs[ref]
         t = "commit"
         try:
@@ -2584,9 +2783,10 @@ def cmd_for_each_ref(argv: list[str]) -> int:
         line = args.format
         line = line.replace("%(objectname)", s)
         line = line.replace("%(objecttype)", t)
+        line = line.replace("%(refname:short)", refs_mod.shorten_ref(ref))
         line = line.replace("%(refname)", ref)
-        line = line.replace("%(refname:short)", ref.split("/", 2)[-1])
         _print(line)
+        emitted += 1
     return 0
 
 

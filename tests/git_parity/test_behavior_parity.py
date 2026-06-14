@@ -162,6 +162,36 @@ CASES: list[tuple] = [
     ("switch-create", BASE, ["switch", "-c", "feature"]),
     ("checkout-existing", BASE + [["branch", "feature"]], ["checkout", "feature"]),
     ("reset-hard", BASE + [("write", "a.txt", "changed\n")], ["reset", "--hard", "HEAD"]),
+    # ls-files selectors
+    ("lsfiles", BASE, ["ls-files"]),
+    ("lsfiles-modified", BASE + [("write", "a.txt", "changed\n")], ["ls-files", "-m"]),
+    ("lsfiles-others", BASE + [("write", "u.txt", "u\n")], ["ls-files", "-o", "--exclude-standard"]),
+    ("lsfiles-deleted", BASE + [("rm", "a.txt")], ["ls-files", "-d"]),
+    # commit modes
+    ("commit-all", BASE + [("write", "a.txt", "mod\n")], ["commit", "-a", "-m", "all"]),
+    ("commit-amend", BASE, ["commit", "--amend", "-m", "reworded"]),
+    ("commit-nothing", BASE, ["commit", "-m", "noop"]),
+    ("commit-allow-empty", BASE, ["commit", "--allow-empty", "-m", "empty"]),
+    # merge
+    ("merge-ff",
+     BASE + [["checkout", "-b", "topic"], ("write", "c.txt", "c\n"), ["add", "-A"],
+             ["commit", "-m", "t1"], ["checkout", "main"]],
+     ["merge", "topic"]),
+    ("merge-up-to-date", BASE, ["merge", "HEAD"]),
+    # clean
+    ("clean-dry-run", BASE + [("write", "junk.txt", "j\n")], ["clean", "-n"]),
+    ("clean-dirs", BASE + [("write", "jd/junk.txt", "j\n")], ["clean", "-n", "-d"]),
+    # for-each-ref / rev-list
+    ("for-each-ref", BASE + [["branch", "feature"], ["tag", "v1"]], ["for-each-ref"]),
+    ("for-each-ref-short",
+     BASE + [["branch", "feature"]], ["for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+    ("rev-list-all", BASE + [["branch", "feature"], ["tag", "v1"]], ["rev-list", "--all"]),
+]
+
+
+CASES_WITH_STDIN: list[tuple] = [
+    ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
+    ("cat-file-batch", BASE, ["cat-file", "--batch-check"], "HEAD\nmissingobj\n"),
 ]
 
 
@@ -169,3 +199,9 @@ CASES: list[tuple] = [
 def test_behavior_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", CASES_WITH_STDIN, ids=[c[0] for c in CASES_WITH_STDIN])
+def test_behavior_parity_stdin(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
