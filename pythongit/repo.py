@@ -33,7 +33,16 @@ class Repository:
 
     @classmethod
     def discover(cls, start: os.PathLike | str = ".") -> "Repository":
-        cur = Path(start).resolve()
+        env_git_dir = os.environ.get("GIT_DIR")
+        env_work_tree = os.environ.get("GIT_WORK_TREE")
+        if env_git_dir:
+            gitdir = Path(env_git_dir).resolve()
+            if env_work_tree:
+                return cls(Path(env_work_tree).resolve(), gitdir=gitdir)
+            if gitdir.name == ".git":
+                return cls(gitdir.parent, gitdir=gitdir)
+            return cls(gitdir, gitdir=gitdir, bare=True)
+        cur = Path(env_work_tree or start).resolve()
         for candidate in [cur, *cur.parents]:
             git = candidate / ".git"
             if git.is_dir():

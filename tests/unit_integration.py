@@ -369,6 +369,24 @@ def test_remote_verbose_option(tmprepo, capsys):
     assert "origin\thttps://example.com/repo.git (push)" in out
 
 
+def test_global_options_before_command(tmprepo, capsys):
+    repo, path = tmprepo
+    cwd = os.getcwd()
+    try:
+        os.chdir(path.parent)
+        assert cli_run("-C", str(path), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch") == 0
+        assert capsys.readouterr().out.startswith("## main\n")
+        assert os.getcwd() == str(path.parent)
+
+        assert cli_run("--git-dir", str(repo.gitdir), "--work-tree", str(path), "status", "--short", "--branch") == 0
+        assert capsys.readouterr().out.startswith("## main\n")
+
+        assert cli_run("version") == 0
+        assert capsys.readouterr().out.startswith("pygit version ")
+    finally:
+        os.chdir(cwd)
+
+
 def test_describe_after_tag(tmprepo):
     from tests.conftest import commit_one
     repo, _ = tmprepo

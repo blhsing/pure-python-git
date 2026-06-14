@@ -5560,24 +5560,160 @@ def _register_phase8() -> None:
 _register_phase8()
 
 
+_GLOBAL_FLAGS_IGNORED = {
+    "-p", "--paginate", "-P", "--no-pager",
+    "--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks",
+    "--no-advice", "--literal-pathspecs", "--glob-pathspecs",
+    "--noglob-pathspecs", "--icase-pathspecs",
+}
+_GLOBAL_EXIT = "__pygit_global_exit__"
+
+
+def _remember_env(old_env: dict[str, Optional[str]], key: str) -> None:
+    if key not in old_env:
+        old_env[key] = os.environ.get(key)
+
+
+def _set_temp_env(old_env: dict[str, Optional[str]], key: str, value: str) -> None:
+    _remember_env(old_env, key)
+    os.environ[key] = value
+
+
+def _restore_env(old_env: dict[str, Optional[str]]) -> None:
+    for key, value in old_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _normalize_global_path(path: str) -> str:
+    return str(Path(path).resolve())
+
+
+def _consume_global_options(argv: list[str]) -> tuple[list[str], dict[str, Optional[str]], str]:
+    old_env: dict[str, Optional[str]] = {}
+    old_cwd = os.getcwd()
+    out = list(argv)
+    i = 0
+    while i < len(out):
+        a = out[i]
+        if a == "--":
+            return out[i + 1 :], old_env, old_cwd
+        if a == "-C" or a.startswith("-C") and len(a) > 2:
+            if a == "-C":
+                if i + 1 >= len(out):
+                    raise SystemExit("option requires an argument -- C")
+                path = out[i + 1]
+                i += 2
+            else:
+                path = a[2:]
+                i += 1
+            if path:
+                os.chdir(path)
+            continue
+        if a == "-c" or a.startswith("-c") and len(a) > 2:
+            if a == "-c":
+                if i + 1 >= len(out):
+                    raise SystemExit("option requires an argument -- c")
+                value = out[i + 1]
+                i += 2
+            else:
+                value = a[2:]
+                i += 1
+            _remember_env(old_env, "GIT_CONFIG_PARAMETERS")
+            cur = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+            os.environ["GIT_CONFIG_PARAMETERS"] = (cur + "\n" if cur else "") + value
+            continue
+        if a.startswith("--config-env="):
+            spec = a.split("=", 1)[1]
+            name, sep, env_name = spec.partition("=")
+            if not sep or env_name not in os.environ:
+                raise SystemExit(f"invalid --config-env: {spec}")
+            _remember_env(old_env, "GIT_CONFIG_PARAMETERS")
+            cur = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+            os.environ["GIT_CONFIG_PARAMETERS"] = (cur + "\n" if cur else "") + f"{name}={os.environ[env_name]}"
+            i += 1
+            continue
+        if a == "--git-dir" or a.startswith("--git-dir="):
+            if a == "--git-dir":
+                if i + 1 >= len(out):
+                    raise SystemExit("option requires an argument -- git-dir")
+                path = out[i + 1]
+                i += 2
+            else:
+                path = a.split("=", 1)[1]
+                i += 1
+            _set_temp_env(old_env, "GIT_DIR", _normalize_global_path(path))
+            continue
+        if a == "--work-tree" or a.startswith("--work-tree="):
+            if a == "--work-tree":
+                if i + 1 >= len(out):
+                    raise SystemExit("option requires an argument -- work-tree")
+                path = out[i + 1]
+                i += 2
+            else:
+                path = a.split("=", 1)[1]
+                i += 1
+            _set_temp_env(old_env, "GIT_WORK_TREE", _normalize_global_path(path))
+            continue
+        if a == "--namespace" or a.startswith("--namespace="):
+            if a == "--namespace":
+                if i + 1 >= len(out):
+                    raise SystemExit("option requires an argument -- namespace")
+                value = out[i + 1]
+                i += 2
+            else:
+                value = a.split("=", 1)[1]
+                i += 1
+            _set_temp_env(old_env, "GIT_NAMESPACE", value)
+            continue
+        if a == "--bare":
+            _set_temp_env(old_env, "GIT_DIR", _normalize_global_path("."))
+            i += 1
+            continue
+        if a in _GLOBAL_FLAGS_IGNORED:
+            i += 1
+            continue
+        if a in ("--exec-path", "--html-path", "--man-path", "--info-path"):
+            _print("")
+            return [_GLOBAL_EXIT], old_env, old_cwd
+        if a.startswith("--exec-path="):
+            _set_temp_env(old_env, "GIT_EXEC_PATH", a.split("=", 1)[1])
+            i += 1
+            continue
+        return out[i:], old_env, old_cwd
+    return [], old_env, old_cwd
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:]) if argv is None else list(argv)
-    if not argv or argv[0] in ("-h", "--help"):
-        return cmd_help([])
-    if argv[0] == "--version":
-        from . import __version__
-        _print(f"pygit version {__version__}")
-        return 0
-    cmd = argv[0]
-    rest = argv[1:]
-    fn = _COMMANDS.get(cmd)
-    if fn is None:
-        _err(f"pygit: '{cmd}' is not a pygit command. See 'pygit help'.")
-        return 1
     try:
+        argv, old_env, old_cwd = _consume_global_options(argv)
+    except SystemExit as e:
+        _err(str(e))
+        return 129
+    try:
+        if not argv or argv[0] in ("-h", "--help"):
+            return cmd_help([])
+        if argv[0] == _GLOBAL_EXIT:
+            return 0
+        if argv[0] in ("--version", "-v", "version"):
+            from . import __version__
+            _print(f"pygit version {__version__}")
+            return 0
+        cmd = argv[0]
+        rest = argv[1:]
+        fn = _COMMANDS.get(cmd)
+        if fn is None:
+            _err(f"pygit: '{cmd}' is not a pygit command. See 'pygit help'.")
+            return 1
         return fn(rest)
     except RepositoryError as e:
         _err(f"fatal: {e}")
         return 128
     except BrokenPipeError:
         return 0
+    finally:
+        os.chdir(old_cwd)
+        _restore_env(old_env)
