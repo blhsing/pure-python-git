@@ -1188,12 +1188,7 @@ def _print_commit_summary(repo: Repository, parent_tree: Optional[str], new_tree
             mode_lines.append((path, f" delete mode {a.mode.zfill(6)} {path}"))
     if files == 0:
         return
-    parts = [f"{files} file{'s' if files != 1 else ''} changed"]
-    if insertions:
-        parts.append(f"{insertions} insertion{'s' if insertions != 1 else ''}(+)")
-    if deletions:
-        parts.append(f"{deletions} deletion{'s' if deletions != 1 else ''}(-)")
-    _print(" " + ", ".join(parts))
+    _print(_stat_summary_line(files, insertions, deletions))
     for _, line in sorted(mode_lines):
         _print(line)
 
@@ -1609,9 +1604,21 @@ def _emit_file_diff(path: str, a: _Side, b: _Side) -> None:
             _print(line)
 
 
-def _diff_stat(changes: list[tuple[str, _Side, _Side]]) -> None:
+def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None) -> None:
     rows: list[tuple[str, int, int, int]] = []  # path, ins, del, total
     total_ins = total_del = 0
+    for src, dst, _sim, src_side, dst_side in (renames or []):
+        a_lines = (src_side.data or b"").decode("utf-8", errors="replace").splitlines()
+        b_lines = (dst_side.data or b"").decode("utf-8", errors="replace").splitlines()
+        ins = dele = 0
+        for op in diff_mod.diff_lines(a_lines, b_lines):
+            if op[0] == "ins":
+                ins += 1
+            elif op[0] == "del":
+                dele += 1
+        rows.append((f"{src} => {dst}", ins, dele, ins + dele))
+        total_ins += ins
+        total_del += dele
     for path, a, b in changes:
         if a.sha == b.sha and a.mode == b.mode:
             continue
@@ -1638,14 +1645,19 @@ def _diff_stat(changes: list[tuple[str, _Side, _Side]]) -> None:
             _print(f" {path:<{name_w}} | Bin")
             continue
         bar = "+" * ins + "-" * dele
-        _print(f" {path:<{name_w}} | {total:>{count_w}} {bar}")
-    files = len(rows)
+        _print(f" {path:<{name_w}} | {total:>{count_w}}{(' ' + bar) if bar else ''}")
+    _print(_stat_summary_line(len(rows), total_ins, total_del))
+
+
+def _stat_summary_line(files: int, insertions: int, deletions: int) -> str:
+    """Render C Git's ' N files changed, X insertions(+), Y deletions(-)' line,
+    showing the zero parts only when both counts are zero."""
     parts = [f"{files} file{'s' if files != 1 else ''} changed"]
-    if total_ins:
-        parts.append(f"{total_ins} insertion{'s' if total_ins != 1 else ''}(+)")
-    if total_del:
-        parts.append(f"{total_del} deletion{'s' if total_del != 1 else ''}(-)")
-    _print(" " + ", ".join(parts))
+    if insertions or deletions == 0:
+        parts.append(f"{insertions} insertion{'s' if insertions != 1 else ''}(+)")
+    if deletions or insertions == 0:
+        parts.append(f"{deletions} deletion{'s' if deletions != 1 else ''}(-)")
+    return " " + ", ".join(parts)
 
 
 def cmd_diff(argv: list[str]) -> int:
@@ -1732,7 +1744,10 @@ def cmd_diff(argv: list[str]) -> int:
             b_sha = zero7 if (b.worktree or not b.present) else b.sha[:7]
             _print(f":{a.mode or '000000'} {b.mode or '000000'} {a_sha} {b_sha} {status}\t{path}")
     elif args.stat:
-        _diff_stat(changes)
+        stat_renames = []
+        if not args.no_renames:
+            stat_renames, changes = _detect_changes_renames(repo, changes)
+        _diff_stat(changes, stat_renames)
     elif args.numstat:
         _diff_numstat(changes)
     elif args.shortstat:
@@ -1744,16 +1759,42 @@ def cmd_diff(argv: list[str]) -> int:
         renames = []
         if not args.no_renames:
             renames, changes = _detect_changes_renames(repo, changes)
-        entries = [(dst, f"R{sim:03d}\t{src}\t{dst}") for src, dst, sim in renames]
+        entries = [(dst, f"R{sim:03d}\t{src}\t{dst}") for src, dst, sim, _sa, _db in renames]
         for path, a, b in changes:
             status = "A" if not a.present else ("D" if not b.present else "M")
             entries.append((path, f"{status}\t{path}"))
         for _key, line in sorted(entries):
             _print(line)
     else:
-        for path, a, b in changes:
-            _emit_file_diff(path, a, b)
+        renames = []
+        if not args.no_renames:
+            renames, changes = _detect_changes_renames(repo, changes)
+        emit = [(dst, lambda s=src, d=dst, sm=sim, sa=sa, db=db: _emit_rename_patch(s, d, sm, sa, db))
+                for src, dst, sim, sa, db in renames]
+        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b)) for path, a, b in changes]
+        for _key, fn in sorted(emit, key=lambda e: e[0]):
+            fn()
     return 0
+
+
+def _emit_rename_patch(src: str, dst: str, sim: int, src_side: _Side, dst_side: _Side) -> None:
+    _print(f"diff --git a/{src} b/{dst}")
+    _print(f"similarity index {sim}%")
+    _print(f"rename from {src}")
+    _print(f"rename to {dst}")
+    if src_side.sha == dst_side.sha:
+        return
+    _print(f"index {src_side.sha[:7]}..{dst_side.sha[:7]} {dst_side.mode}")
+    a_text = (src_side.data or b"").decode("utf-8", errors="replace")
+    b_text = (dst_side.data or b"").decode("utf-8", errors="replace")
+    _print(f"--- a/{src}")
+    _print(f"+++ b/{dst}")
+    for line in diff_mod.format_hunks(
+        a_text.splitlines(), b_text.splitlines(),
+        a_no_newline=bool(a_text) and not a_text.endswith("\n"),
+        b_no_newline=bool(b_text) and not b_text.endswith("\n"),
+    ):
+        _print(line)
 
 
 def _detect_changes_renames(repo: Repository, changes: list):
@@ -1769,10 +1810,15 @@ def _detect_changes_renames(repo: Repository, changes: list):
             side_map[path] = (int(b.mode, 8), b.sha)
     if not base_map or not side_map:
         return [], changes
+    by_path = {p: (a, b) for p, a, b in changes}
     pairs = diffcore.detect_renames(repo, base_map, side_map)
     renamed_src = {p.src.path for p in pairs}
     renamed_dst = {p.dst.path for p in pairs}
-    renames = [(p.src.path, p.dst.path, int(p.score * 100 / diffcore.MAX_SCORE)) for p in pairs]
+    renames = [
+        (p.src.path, p.dst.path, int(p.score * 100 / diffcore.MAX_SCORE),
+         by_path[p.src.path][0], by_path[p.dst.path][1])
+        for p in pairs
+    ]
     remaining = [
         (path, a, b)
         for path, a, b in changes
@@ -1816,12 +1862,7 @@ def _diff_shortstat(changes: list) -> None:
             total_del += dele
     if files == 0:
         return
-    parts = [f"{files} file{'s' if files != 1 else ''} changed"]
-    if total_ins:
-        parts.append(f"{total_ins} insertion{'s' if total_ins != 1 else ''}(+)")
-    if total_del:
-        parts.append(f"{total_del} deletion{'s' if total_del != 1 else ''}(-)")
-    _print(" " + ", ".join(parts))
+    _print(_stat_summary_line(files, total_ins, total_del))
 
 
 def _remote_branches(repo: Repository) -> list[str]:
@@ -2195,15 +2236,69 @@ def cmd_restore(argv: list[str]) -> int:
 
 
 def cmd_reset(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit reset")
+    ap = argparse.ArgumentParser(prog="pygit reset", add_help=False)
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--soft", action="store_true")
     g.add_argument("--mixed", action="store_true")
     g.add_argument("--hard", action="store_true")
-    ap.add_argument("target", nargs="?", default="HEAD")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("args", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
-    sha = refs_mod.rev_parse(repo, args.target)
+
+    # Split into an optional treeish and pathspecs.
+    positionals = list(args.args)
+    paths: list[str] = []
+    if "--" in positionals:
+        idx_dd = positionals.index("--")
+        paths = positionals[idx_dd + 1:]
+        positionals = positionals[:idx_dd]
+    treeish = "HEAD"
+    if positionals:
+        if refs_mod.rev_parse(repo, positionals[0]) is not None and (len(positionals) > 1 or paths or not (repo.path / positionals[0]).exists()):
+            treeish = positionals[0]
+            paths = positionals[1:] + paths
+        else:
+            paths = positionals + paths
+
+    if paths:
+        # Pathspec reset: restore the named index entries to <treeish>.
+        sha = refs_mod.rev_parse(repo, treeish)
+        if sha is None:
+            _err(f"fatal: ambiguous argument '{treeish}'")
+            return 128
+        tree = _commit_tree(repo, sha) or sha
+        idx = read_index(repo)
+        for p in paths:
+            blob = refs_mod._object_at_path(repo, tree, p)
+            if blob is None:
+                idx.remove(p)
+            else:
+                from .index import IndexEntry, REG_MODE
+                idx.upsert(IndexEntry(mode=REG_MODE, sha=blob, path=p))
+        write_index(repo, idx)
+        # Report files now differing between the worktree and the reset index,
+        # matching C Git's "Unstaged changes after reset:" diff-files summary.
+        new_idx = read_index(repo).by_path()
+        modified: list[str] = []
+        for p in paths:
+            entry = new_idx.get(p)
+            if entry is None:
+                continue
+            full = repo.path / p
+            if not (full.exists() or full.is_symlink()):
+                modified.append((p, "D"))
+            else:
+                wt_sha, _ = objs.hash_bytes("blob", full.read_bytes(), repo)
+                if wt_sha != entry.sha:
+                    modified.append((p, "M"))
+        if modified and not args.quiet:
+            _print("Unstaged changes after reset:")
+            for p, st in sorted(modified):
+                _print(f"{st}\t{p}")
+        return 0
+
+    sha = refs_mod.rev_parse(repo, treeish)
     if not sha:
         return 128
     head_sym, _ = refs_mod.read_head(repo)

@@ -351,6 +351,20 @@ CASES: list[tuple] = [
      BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\nL5\n"), ["add", "-A"], ["commit", "-m", "c2"],
              ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3X\nL4\nL5\n"), ["add", "-A"]],
      ["diff", "--cached", "-M", "--name-status"]),
+    ("diff-rename-patch",
+     BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"]],
+     ["diff", "--cached", "-M"]),
+    ("diff-rename-stat",
+     BASE + [("write", "r.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ("rm", "r.txt"), ("write", "moved.txt", "L1\nL2\nL3\nL4\n"), ["add", "-A"]],
+     ["diff", "--cached", "-M", "--stat"]),
+    # reset pathspec (unstage)
+    ("reset-path",
+     BASE + [("write", "b.txt", "b\n"), ["add", "b.txt"]], ["reset", "HEAD", "b.txt"]),
+    ("reset-path-status",
+     BASE + [("write", "b.txt", "b\n"), ["add", "b.txt"], ["reset", "HEAD", "b.txt"]],
+     ["status", "--porcelain"]),
 ]
 
 
