@@ -175,18 +175,35 @@ def _cat_file_batch(repo: Repository, check_only: bool) -> int:
 
 def cmd_cat_file(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit cat-file", add_help=False)
-    g = ap.add_mutually_exclusive_group(required=True)
+    g = ap.add_mutually_exclusive_group()
     g.add_argument("-t", dest="show_type", action="store_true")
     g.add_argument("-s", dest="show_size", action="store_true")
     g.add_argument("-p", dest="pretty", action="store_true")
     g.add_argument("-e", dest="exists", action="store_true")
     g.add_argument("--batch", dest="batch", action="store_true")
     g.add_argument("--batch-check", dest="batch_check", action="store_true")
-    ap.add_argument("object", nargs="?")
+    ap.add_argument("pos", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     if args.batch or args.batch_check:
         return _cat_file_batch(repo, check_only=args.batch_check)
+
+    # The `cat-file <type> <object>` form prints the raw object content.
+    has_flag = args.show_type or args.show_size or args.pretty or args.exists
+    if not has_flag and len(args.pos) == 2 and args.pos[0] in ("blob", "commit", "tree", "tag"):
+        want_type, obj = args.pos
+        sha = refs_mod.rev_parse(repo, obj)
+        if sha is None or not objs.object_exists(repo, sha):
+            _err(f"fatal: Not a valid object name {obj}")
+            return 128
+        t, data = objs.read_object(repo, sha)
+        if t != want_type:
+            _err(f"fatal: cat-file {want_type}: bad file")
+            return 128
+        sys.stdout.buffer.write(data)
+        return 0
+
+    args.object = args.pos[0] if args.pos else None
     if args.object is None:
         _err("fatal: <object> required")
         return 128
@@ -572,6 +589,7 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--objects", action="store_true")
+    ap.add_argument("--parents", action="store_true")
     ap.add_argument("revs", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -632,7 +650,12 @@ def cmd_rev_list(argv: list[str]) -> int:
         if args.reverse:
             out = list(reversed(out))
         for s in out:
-            _print(s)
+            if args.parents:
+                info = _commit_tree_parents(repo, s, graph)
+                parents = " ".join(info[1]) if info else ""
+                _print(f"{s} {parents}".rstrip())
+            else:
+                _print(s)
     return 0
 
 
@@ -1151,6 +1174,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--reverse", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -1186,21 +1210,27 @@ def cmd_log(argv: list[str]) -> int:
     if args.oneline:
         style = "oneline"
 
+    # Collect the ordered list of commit shas first so --reverse can flip it.
     seen: set[str] = set()
     cur = deque([sha])
-    count = 0
+    commit_list: list[str] = []
     while cur:
         s = cur.popleft()
         if s in seen:
             continue
         seen.add(s)
-        try:
-            t, data = objs.read_object(repo, s)
-        except KeyError:
+        info = _commit_tree_parents(repo, s)
+        if info is None:
             break
-        if t != "commit":
+        commit_list.append(s)
+        cur.extend(info[1])
+        if args.max_count and len(commit_list) >= args.max_count:
             break
-        c = objs.parse_commit(data)
+    if args.reverse:
+        commit_list = list(reversed(commit_list))
+
+    for count, s in enumerate(commit_list):
+        c = objs.parse_commit(objs.read_object(repo, s)[1])
         if style == "format":
             _print(_expand_commit_format(repo, s, c, fmt_string, decorations))
         elif style in ("oneline", "oneline_full"):
@@ -1237,10 +1267,6 @@ def cmd_log(argv: list[str]) -> int:
                         _print(f"{st}\t{path}")
                 else:
                     _emit_tree_patch(repo, parent_tree, c.tree)
-        cur.extend(c.parents)
-        count += 1
-        if args.max_count and count >= args.max_count:
-            break
     return 0
 
 
@@ -1312,8 +1338,26 @@ def cmd_show(argv: list[str]) -> int:
         return 128
     t, data = objs.read_object(repo, sha)
     if t == "tag":
-        # Peel an annotated tag to its target and show that.
-        target = refs_mod._tag_target(data)
+        # Print the annotated-tag header, then peel to its target.
+        header, _, tagmsg = data.decode("utf-8", errors="replace").partition("\n\n")
+        tag_name = ""
+        tagger = ""
+        target = None
+        for line in header.splitlines():
+            key, _, val = line.partition(" ")
+            if key == "tag":
+                tag_name = val
+            elif key == "tagger":
+                tagger = val
+            elif key == "object":
+                target = val.strip()
+        _print(f"tag {tag_name}")
+        if tagger:
+            _print(f"Tagger: {_split_ident(tagger)[0]}")
+            _print(f"Date:   {_format_ident_date(tagger)}")
+        _print("")
+        _print(tagmsg.rstrip("\n"))
+        _print("")
         if target:
             sha = target
             t, data = objs.read_object(repo, sha)
@@ -1386,12 +1430,13 @@ def _print_tree_diff(repo: Repository, a_tree: str, b_tree: str) -> None:
 
 
 class _Side:
-    __slots__ = ("mode", "sha", "data")
+    __slots__ = ("mode", "sha", "data", "worktree")
 
-    def __init__(self, mode: Optional[str], sha: Optional[str], data: Optional[bytes]):
+    def __init__(self, mode: Optional[str], sha: Optional[str], data: Optional[bytes], worktree: bool = False):
         self.mode = mode
         self.sha = sha
         self.data = data
+        self.worktree = worktree
 
     @property
     def present(self) -> bool:
@@ -1421,7 +1466,7 @@ def _side_from_worktree(repo: Repository, path: str) -> _Side:
     else:
         data = full.read_bytes()
     sha, _ = objs.hash_bytes("blob", data, repo)
-    return _Side(_wt_mode(full), sha, data)
+    return _Side(_wt_mode(full), sha, data, worktree=True)
 
 
 def _tree_map_full(repo: Repository, tree_sha: Optional[str]) -> dict[str, tuple[str, str]]:
@@ -1530,6 +1575,7 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--raw", action="store_true")
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
     revs: list[str] = []
@@ -1587,7 +1633,14 @@ def cmd_diff(argv: list[str]) -> int:
         wanted = set(paths)
         changes = [c for c in changes if c[0] in wanted or any(c[0].startswith(w.rstrip("/") + "/") for w in paths)]
 
-    if args.stat:
+    if args.raw:
+        zero7 = "0000000"
+        for path, a, b in changes:
+            status = "A" if not a.present else ("D" if not b.present else "M")
+            a_sha = a.sha[:7] if a.present else zero7
+            b_sha = zero7 if (b.worktree or not b.present) else b.sha[:7]
+            _print(f":{a.mode or '000000'} {b.mode or '000000'} {a_sha} {b_sha} {status}\t{path}")
+    elif args.stat:
         _diff_stat(changes)
     elif args.numstat:
         _diff_numstat(changes)
@@ -2438,21 +2491,41 @@ for _n in _PHASE2:
 
 
 def cmd_merge_base(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge-base")
-    ap.add_argument("a")
-    ap.add_argument("b")
+    ap = argparse.ArgumentParser(prog="pygit merge-base", add_help=False)
+    ap.add_argument("--is-ancestor", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--independent", action="store_true")
+    ap.add_argument("commits", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import merge as _m
-    a = refs_mod.rev_parse(repo, args.a)
-    b = refs_mod.rev_parse(repo, args.b)
-    if not a or not b:
+    shas = [refs_mod.rev_parse(repo, c) for c in args.commits]
+    if any(s is None for s in shas):
         return 128
-    bases = _m.merge_bases(repo, a, b)
+
+    if args.is_ancestor:
+        if len(shas) != 2:
+            _err("fatal: --is-ancestor takes exactly two commits")
+            return 128
+        a, b = shas
+        return 0 if a in _m.merge_bases(repo, a, b) else 1
+
+    if len(shas) == 1:
+        bases = [shas[0]]
+    else:
+        bases = _m.merge_bases(repo, shas[0], shas[1])
+        for extra in shas[2:]:
+            merged: list[str] = []
+            for base in bases:
+                merged.extend(_m.merge_bases(repo, base, extra))
+            bases = sorted(set(merged))
     if not bases:
         return 1
-    for s in bases:
-        _print(s)
+    if args.all:
+        for s in sorted(bases):
+            _print(s)
+    else:
+        _print(bases[0])
     return 0
 
 
@@ -4315,8 +4388,10 @@ def cmd_mktag(argv: list[str]) -> int:
 
 
 def cmd_name_rev(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit name-rev")
+    ap = argparse.ArgumentParser(prog="pygit name-rev", add_help=False)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--tags", action="store_true")
     ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -4351,17 +4426,21 @@ def cmd_name_rev(argv: list[str]) -> int:
                     stack.append((p, depth + 1))
     if args.all:
         for sha, (name, _) in sorted(name_for.items()):
-            _print(f"{sha} {name}")
+            if args.name_only:
+                _print(name)
+            else:
+                _print(f"{sha} {name}")
         return 0
     if args.rev:
         s = refs_mod.rev_parse(repo, args.rev)
         if not s:
             return 128
-        if s in name_for:
-            _print(f"{args.rev} {name_for[s][0]}")
-            return 0
-        _print(f"{args.rev} undefined")
-        return 1
+        name = name_for[s][0] if s in name_for else "undefined"
+        if args.name_only:
+            _print(name)
+        else:
+            _print(f"{args.rev} {name}")
+        return 0 if s in name_for else 1
     return 0
 
 

@@ -278,6 +278,19 @@ CASES: list[tuple] = [
     ("worktree-list", BASE, ["worktree", "list"]),
     # blame
     ("blame", BASE + [("write", "a.txt", "x\ny\nz\n"), ["add", "-A"], ["commit", "-m", "c2"]], ["blame", "a.txt"]),
+    # merge-base
+    ("merge-base", TAGGED, ["merge-base", "HEAD", "HEAD~1"]),
+    ("merge-base-is-ancestor-yes", TAGGED, ["merge-base", "--is-ancestor", "HEAD~1", "HEAD"]),
+    ("merge-base-is-ancestor-no", TAGGED, ["merge-base", "--is-ancestor", "HEAD", "HEAD~1"]),
+    # rev-list / log
+    ("rev-list-parents", TAGGED, ["rev-list", "--parents", "HEAD"]),
+    ("log-reverse", TAGGED, ["log", "--oneline", "--reverse"]),
+    ("rev-parse-parents", TAGGED, ["rev-parse", "HEAD^@"]),
+    # name-rev / show tag / diff raw / cat-file type form
+    ("name-rev-name-only", BASE, ["name-rev", "--name-only", "HEAD"]),
+    ("show-tag", BASE + [["tag", "-a", "v1", "-m", "tagmsg"]], ["show", "v1"]),
+    ("diff-raw", BASE + [("write", "a.txt", "X\n")], ["diff", "--raw"]),
+    ("cat-file-type-form", BASE, ["cat-file", "commit", "HEAD"]),
 ]
 
 
