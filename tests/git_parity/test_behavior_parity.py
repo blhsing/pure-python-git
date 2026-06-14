@@ -259,6 +259,25 @@ CASES: list[tuple] = [
     ("rev-list-objects", BASE, ["rev-list", "--objects", "HEAD"]),
     # annotated tag inspection
     ("cat-file-tag", BASE + [["tag", "-a", "v1", "-m", "ann msg"]], ["cat-file", "-p", "v1"]),
+    # rev-parse object format / common dir
+    ("rev-parse-object-format", BASE, ["rev-parse", "--show-object-format"]),
+    ("rev-parse-common-dir", BASE, ["rev-parse", "--git-common-dir"]),
+    # check-ref-format
+    ("check-ref-format-valid", [], ["check-ref-format", "refs/heads/main"]),
+    ("check-ref-format-invalid", [], ["check-ref-format", "refs/heads/..bad"]),
+    ("check-ref-format-branch", [], ["check-ref-format", "--branch", "feature"]),
+    # check-ignore
+    ("check-ignore",
+     BASE + [("write", ".gitignore", "*.log\n"), ("write", "x.log", "x\n")], ["check-ignore", "x.log"]),
+    ("check-ignore-verbose",
+     BASE + [("write", ".gitignore", "*.log\n"), ("write", "x.log", "x\n")], ["check-ignore", "-v", "x.log"]),
+    # hash-object multiple, update-ref -m, worktree list
+    ("hash-object-multi", [("write", "f1", "a\n"), ("write", "f2", "b\n")], ["hash-object", "f1", "f2"]),
+    ("update-ref-message",
+     BASE + [["update-ref", "-m", "test msg", "refs/heads/main", "HEAD"]], ["reflog"]),
+    ("worktree-list", BASE, ["worktree", "list"]),
+    # blame
+    ("blame", BASE + [("write", "a.txt", "x\ny\nz\n"), ["add", "-A"], ["commit", "-m", "c2"]], ["blame", "a.txt"]),
 ]
 
 

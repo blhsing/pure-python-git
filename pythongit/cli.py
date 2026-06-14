@@ -124,28 +124,31 @@ def cmd_init(argv: list[str]) -> int:
 
 
 def cmd_hash_object(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit hash-object")
+    ap = argparse.ArgumentParser(prog="pygit hash-object", add_help=False)
     ap.add_argument("-w", action="store_true", help="write object")
     ap.add_argument("-t", default="blob", choices=["blob", "tree", "commit", "tag"])
     ap.add_argument("--stdin", action="store_true")
-    ap.add_argument("file", nargs="?")
+    ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
-    if args.stdin:
-        data = sys.stdin.buffer.read()
-    elif args.file:
-        data = Path(args.file).read_bytes()
-    else:
-        ap.error("need file or --stdin")
-    if args.w:
+    repo = None
+    try:
         repo = _repo()
-        sha = objs.write_object(repo, args.t, data)
-    else:
-        try:
-            repo = _repo()
-        except RepositoryError:
-            repo = None
-        sha, _ = objs.hash_bytes(args.t, data, repo)
-    _print(sha)
+    except RepositoryError:
+        pass
+
+    def emit(data: bytes) -> None:
+        if args.w:
+            _print(objs.write_object(repo, args.t, data))
+        else:
+            _print(objs.hash_bytes(args.t, data, repo)[0])
+
+    if args.stdin:
+        emit(sys.stdin.buffer.read())
+    if args.files:
+        for f in args.files:
+            emit(Path(f).read_bytes())
+    elif not args.stdin:
+        ap.error("need file or --stdin")
     return 0
 
 
@@ -313,8 +316,10 @@ def cmd_commit_tree(argv: list[str]) -> int:
 
 
 def cmd_update_ref(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit update-ref")
+    ap = argparse.ArgumentParser(prog="pygit update-ref", add_help=False)
     ap.add_argument("-d", dest="delete", action="store_true")
+    ap.add_argument("-m", dest="message", default="")
+    ap.add_argument("--no-deref", action="store_true")
     ap.add_argument("ref")
     ap.add_argument("value", nargs="?")
     args = ap.parse_args(argv)
@@ -325,7 +330,7 @@ def cmd_update_ref(argv: list[str]) -> int:
     if not args.value:
         ap.error("value required")
     sha = refs_mod.rev_parse(repo, args.value) or args.value
-    refs_mod.update_ref(repo, args.ref, sha)
+    refs_mod.update_ref(repo, args.ref, sha, message=args.message)
     return 0
 
 
@@ -405,6 +410,17 @@ def cmd_rev_parse(argv: list[str]) -> int:
             continue
         if arg == "--absolute-git-dir":
             _print(str(R().gitdir))
+            continue
+        if arg == "--git-common-dir":
+            r = R()
+            cwd = Path(os.getcwd()).resolve()
+            if cwd == r.path and not r.bare:
+                _print(os.path.relpath(r.gitdir, cwd))
+            else:
+                _print(str(r.gitdir))
+            continue
+        if arg == "--show-object-format":
+            _print(R().object_format())
             continue
         if arg == "--show-toplevel":
             _print(str(R().path))
@@ -3099,12 +3115,32 @@ def cmd_blame(argv: list[str]) -> int:
     for idx in range(len(blame_sha)):
         if blame_sha[idx] is None:
             blame_sha[idx] = chain[-1] if chain else head
-    for idx, line in enumerate(cur_lines):
-        s = blame_sha[idx] or "????????"
+
+    info: dict[str, tuple[str, str, bool]] = {}
+    for s in set(b for b in blame_sha if b):
         c = objs.parse_commit(objs.read_object(repo, s)[1])
-        author = c.author.rsplit("<", 1)[0].strip()
-        _print(f"{s[:8]} ({author} {idx + 1}) {line}")
+        who, _ts, _tz = _split_ident(c.author)
+        name = _parse_who(who)[0]
+        info[s] = (name, _format_blame_date(c.author), not c.parents)
+    author_w = max((len(v[0]) for v in info.values()), default=0)
+    lineno_w = len(str(len(cur_lines)))
+    for idx, line in enumerate(cur_lines):
+        s = blame_sha[idx] or "0" * 40
+        name, date, boundary = info.get(s, ("", "", False))
+        field = ("^" + s[:7]) if boundary else s[:8]
+        _print(f"{field} ({name:<{author_w}} {date} {idx + 1:>{lineno_w}}) {line}")
     return 0
+
+
+def _format_blame_date(sig: str) -> str:
+    import datetime
+    _who, ts, tz = _split_ident(sig)
+    if ts is None or tz is None:
+        return ""
+    sign = 1 if tz[0] == "+" else -1
+    off_min = sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=off_min)
+    return dt.strftime("%Y-%m-%d %H:%M:%S ") + tz
 
 
 def cmd_for_each_ref(argv: list[str]) -> int:
@@ -3375,7 +3411,9 @@ def cmd_update_index(argv: list[str]) -> int:
 
 
 def cmd_check_ignore(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit check-ignore")
+    ap = argparse.ArgumentParser(prog="pygit check-ignore", add_help=False)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-n", "--non-matching", action="store_true")
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -3385,9 +3423,15 @@ def cmd_check_ignore(argv: list[str]) -> int:
     for p in args.paths:
         match_path = p.replace(os.sep, "/")
         is_dir = match_path.endswith("/") or (repo.path / p).is_dir()
-        if ig.is_ignored(match_path, is_dir=is_dir):
-            _print(p)
+        rule = ig.match_rule(match_path, is_dir=is_dir)
+        if rule is not None:
             rc = 0
+            if args.verbose:
+                _print(f"{rule.source}:{rule.lineno}:{rule.raw}\t{p}")
+            else:
+                _print(p)
+        elif args.verbose and args.non_matching:
+            _print(f"::\t{p}")
     return rc
 
 
@@ -4042,7 +4086,10 @@ def cmd_worktree(argv: list[str]) -> int:
         return 0
     if args.action == "list":
         head = refs_mod.rev_parse(repo, "HEAD") or ""
-        _print(f"{repo.path} {head} [main]")
+        head_sym, _ = refs_mod.read_head(repo)
+        branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+        label = f"[{branch}]" if branch else "(detached HEAD)"
+        _print(f"{repo.path} {head[:7]} {label}")
         if worktrees_dir.exists():
             for d in worktrees_dir.iterdir():
                 if d.is_dir():
@@ -4051,7 +4098,7 @@ def cmd_worktree(argv: list[str]) -> int:
                     if gitdir_file.exists() and head_file.exists():
                         wt_path = Path(gitdir_file.read_text().strip()).parent
                         wt_head = head_file.read_text().strip()
-                        _print(f"{wt_path} {wt_head} [{d.name}]")
+                        _print(f"{wt_path} {wt_head[:7]} [{d.name}]")
         return 0
     if args.action == "remove":
         import shutil as _sh
@@ -5752,7 +5799,9 @@ def cmd_check_ref_format(argv: list[str]) -> int:
             break
     if bad:
         return 1
-    _print(full)
+    # A plain valid ref name produces no output; --branch echoes the name.
+    if args.branch:
+        _print(full)
     return 0
 
 

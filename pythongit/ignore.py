@@ -7,9 +7,12 @@ from pathlib import Path
 
 
 class IgnoreRule:
-    __slots__ = ("pattern", "negate", "dir_only", "pathname", "base", "regex")
+    __slots__ = ("pattern", "negate", "dir_only", "pathname", "base", "regex", "raw", "source", "lineno")
 
-    def __init__(self, raw: str, base: str):
+    def __init__(self, raw: str, base: str, source: str = "", lineno: int = 0):
+        self.raw = raw
+        self.source = source
+        self.lineno = lineno
         self.negate = False
         self.dir_only = False
         self.pathname = False
@@ -71,45 +74,54 @@ class IgnoreSet:
     def __init__(self) -> None:
         self.rules: list[IgnoreRule] = []
 
-    def add_file(self, gitignore_path: Path, base_rel: str) -> None:
+    def add_file(self, gitignore_path: Path, base_rel: str, source: str = "") -> None:
         if not gitignore_path.exists() or gitignore_path.is_symlink():
             return
-        for line in gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        display = source or gitignore_path.name
+        for lineno, line in enumerate(
+            gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
             line = _trim_trailing_spaces(line)
             if not line or line.startswith("#"):
                 continue
-            self.rules.append(IgnoreRule(line, base_rel))
+            self.rules.append(IgnoreRule(line, base_rel, display, lineno))
 
     def is_ignored(self, rel_path: str, is_dir: bool = False) -> bool:
+        return self.match_rule(rel_path, is_dir) is not None
+
+    def match_rule(self, rel_path: str, is_dir: bool = False):
+        """Return the IgnoreRule that decides ``rel_path`` (last positive match
+        with no later negation), or None when the path is not ignored."""
         rel_path, is_dir = _normalize_path(rel_path, is_dir)
         if not rel_path:
-            return False
+            return None
         parts = rel_path.split("/")
         for i in range(1, len(parts)):
-            if self._last_match("/".join(parts[:i]), True):
-                return True
-        return self._last_match(rel_path, is_dir)
+            rule = self._last_match_rule("/".join(parts[:i]), True)
+            if rule is not None:
+                return rule
+        return self._last_match_rule(rel_path, is_dir)
 
-    def _last_match(self, rel_path: str, is_dir: bool) -> bool:
-        ignored = False
+    def _last_match_rule(self, rel_path: str, is_dir: bool):
+        result = None
         for r in self.rules:
             if r.match(rel_path, is_dir):
-                ignored = not r.negate
-        return ignored
+                result = None if r.negate else r
+        return result
 
 
 def load(repo_path: Path) -> IgnoreSet:
     s = IgnoreSet()
     # Lower-precedence excludes are loaded first; later matches override them.
-    s.add_file(repo_path / ".git" / "info" / "exclude", "")
-    s.add_file(repo_path / ".gitignore", "")
+    s.add_file(repo_path / ".git" / "info" / "exclude", "", ".git/info/exclude")
+    s.add_file(repo_path / ".gitignore", "", ".gitignore")
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d != ".git"]
         if ".gitignore" in files:
             rel_root = os.path.relpath(root, repo_path).replace(os.sep, "/")
             if rel_root == ".":
                 continue
-            s.add_file(Path(root) / ".gitignore", rel_root)
+            s.add_file(Path(root) / ".gitignore", rel_root, f"{rel_root}/.gitignore")
     return s
 
 
