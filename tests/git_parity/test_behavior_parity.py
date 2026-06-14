@@ -291,6 +291,20 @@ CASES: list[tuple] = [
     ("show-tag", BASE + [["tag", "-a", "v1", "-m", "tagmsg"]], ["show", "v1"]),
     ("diff-raw", BASE + [("write", "a.txt", "X\n")], ["diff", "--raw"]),
     ("cat-file-type-form", BASE, ["cat-file", "commit", "HEAD"]),
+    # rev-parse abbrev/path
+    ("rev-parse-short4", BASE, ["rev-parse", "--short=4", "HEAD"]),
+    ("rev-parse-index-path", BASE, ["rev-parse", ":a.txt"]),
+    ("rev-parse-tree-peel", BASE, ["rev-parse", "HEAD^{tree}"]),
+    # show --format
+    ("show-format", BASE, ["show", "-s", "--format=%H"]),
+    # ls-files --error-unmatch
+    ("ls-files-error-unmatch-ok", BASE, ["ls-files", "--error-unmatch", "a.txt"]),
+    ("ls-files-error-unmatch-fail", BASE, ["ls-files", "--error-unmatch", "nope.txt"]),
+    # tag -n
+    ("tag-n", BASE + [["tag", "-a", "v1", "-m", "ann line"]], ["tag", "-n"]),
+    # check-attr
+    ("check-attr",
+     BASE + [("write", ".gitattributes", "*.txt text\n")], ["check-attr", "text", "a.txt"]),
 ]
 
 

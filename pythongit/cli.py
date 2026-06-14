@@ -491,6 +491,9 @@ def cmd_rev_parse(argv: list[str]) -> int:
             except ValueError:
                 abbrev = 7
             continue
+        if arg in ("--flags", "--no-flags", "--revs-only", "--no-revs", "--symbolic", "--local-env-vars"):
+            # Output filters; with no further args they produce nothing.
+            continue
         if arg == "--symbolic-full-name":
             symbolic = "full"
             continue
@@ -534,12 +537,22 @@ def cmd_ls_files(argv: list[str]) -> int:
     ap.add_argument("-o", "--others", action="store_true")
     ap.add_argument("-d", "--deleted", action="store_true")
     ap.add_argument("--exclude-standard", action="store_true")
+    ap.add_argument("--error-unmatch", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     idx = read_index(repo)
     eol = "\0" if args.nul else "\n"
+
+    if args.error_unmatch:
+        tracked = set(idx.by_path())
+        for ps in args.paths:
+            norm = ps.rstrip("/")
+            if not (norm in tracked or any(t.startswith(norm + "/") for t in tracked)):
+                _err(f"error: pathspec '{ps}' did not match any file(s) known to git")
+                _err("Did you forget to 'git add'?")
+                return 1
 
     def match(p: str) -> bool:
         if not args.paths:
@@ -1329,6 +1342,8 @@ def cmd_show(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit show", add_help=False)
     ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
     ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--format", default=None)
+    ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -1336,6 +1351,19 @@ def cmd_show(argv: list[str]) -> int:
     if not sha:
         _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
         return 128
+    fmt = args.format
+    if fmt is None and args.pretty and (args.pretty.startswith("format:") or args.pretty.startswith("tformat:")):
+        fmt = args.pretty.split(":", 1)[1]
+    if fmt is not None:
+        peeled = refs_mod.rev_parse(repo, args.rev + "^{commit}") or sha
+        c = objs.parse_commit(objs.read_object(repo, peeled)[1])
+        _print(_expand_commit_format(repo, peeled, c, fmt, {}))
+        if not args.no_patch and not args.stat:
+            ptree = None
+            if c.parents:
+                ptree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
+            _emit_tree_patch(repo, ptree, c.tree)
+        return 0
     t, data = objs.read_object(repo, sha)
     if t == "tag":
         # Print the annotated-tag header, then peel to its target.
@@ -1814,6 +1842,22 @@ def cmd_branch(argv: list[str]) -> int:
     return 0
 
 
+def _tag_annotation(repo: Repository, sha: Optional[str]) -> str:
+    if sha is None:
+        return ""
+    try:
+        t, data = objs.read_object(repo, sha)
+    except KeyError:
+        return ""
+    if t == "tag":
+        _header, _, msg = data.decode("utf-8", errors="replace").partition("\n\n")
+        return msg.splitlines()[0] if msg.strip() else ""
+    if t == "commit":
+        c = objs.parse_commit(data)
+        return c.message.splitlines()[0] if c.message.strip() else ""
+    return ""
+
+
 def cmd_tag(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit tag", add_help=False)
     ap.add_argument("-d", "--delete", action="store_true")
@@ -1822,17 +1866,21 @@ def cmd_tag(argv: list[str]) -> int:
     ap.add_argument("-s", "--sign", action="store_true")
     ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("-m", "--message", default=None)
+    ap.add_argument("-n", nargs="?", const=1, type=int, default=None, dest="num")
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.list or (args.name is None and not args.delete):
+    if args.list or args.num is not None or (args.name is None and not args.delete):
         import fnmatch
         pattern = args.name
         for t in refs_mod.list_tags(repo):
             if pattern and not fnmatch.fnmatch(t, pattern):
                 continue
-            _print(t)
+            if args.num is not None:
+                _print(f"{t:<15} {_tag_annotation(repo, refs_mod.read_ref(repo, f'refs/tags/{t}'))}")
+            else:
+                _print(t)
         return 0
     if args.delete:
         ref = f"refs/tags/{args.name}"
