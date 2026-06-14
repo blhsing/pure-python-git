@@ -14,6 +14,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-git-254-oracle",
+        action="store_true",
+        help="fail Git parity tests unless PYGIT_PARITY_GIT is a git version 2.54.0 binary",
+    )
+
+
 def _is_real_git(path: str) -> bool:
     """A real git binary identifies itself as 'git version X.Y.Z'. Pythongit's
     `git` shim prints 'pygit version ...' for --version. Use this to
@@ -56,6 +64,31 @@ def real_git() -> str | None:
         if cand not in seen and os.path.isfile(cand) and _is_real_git(cand):
             return cand
     return None
+
+
+@pytest.fixture
+def git_254_oracle(pytestconfig) -> str:
+    git = os.environ.get("PYGIT_PARITY_GIT")
+    require = pytestconfig.getoption("--require-git-254-oracle")
+    if not git:
+        msg = "set PYGIT_PARITY_GIT to a C Git 2.54.0 binary"
+        if require:
+            pytest.fail(msg)
+        pytest.skip(msg)
+    try:
+        result = subprocess.run([git, "--version"], text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        msg = f"could not run PYGIT_PARITY_GIT={git!r}: {exc}"
+        if require:
+            pytest.fail(msg)
+        pytest.skip(msg)
+    version = (result.stdout + result.stderr).strip()
+    if result.returncode != 0 or not version.startswith("git version 2.54.0"):
+        msg = f"PYGIT_PARITY_GIT must be git version 2.54.0, got {version!r}"
+        if require:
+            pytest.fail(msg)
+        pytest.skip(msg)
+    return git
 
 
 @pytest.fixture

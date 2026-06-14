@@ -119,6 +119,67 @@ jobs:
           python -m pip uninstall -y pure-python-git-shim
           [ ! -f "$shim" ] || (echo "pip uninstall left $shim behind"; exit 1)
 
+  git-254-parity:
+    name: C Git 2.54.0 parity
+    runs-on: ubuntu-latest
+    env:
+      GIT_254_URL: https://github.com/git/git/archive/refs/tags/v2.54.0.tar.gz
+      GIT_254_SHA256: 7b01a23c44c9ccfca2e3ad9daf8cbdd4d4caaaa6b5181e77e16e60c6ae5f772a
+      GIT_254_PREFIX: ${{ github.workspace }}/.cache/git-2.54.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Cache C Git 2.54.0 build
+        id: cache-git-254
+        uses: actions/cache@v4
+        with:
+          path: .cache/git-2.54.0
+          key: git-2.54.0-ubuntu-${{ env.GIT_254_SHA256 }}
+
+      - name: Install C Git build dependencies
+        if: steps.cache-git-254.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gettext libcurl4-gnutls-dev libexpat1-dev libssl-dev zlib1g-dev
+
+      - name: Build C Git 2.54.0 oracle
+        if: steps.cache-git-254.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L "$GIT_254_URL" -o /tmp/git-2.54.0.tar.gz
+          echo "$GIT_254_SHA256  /tmp/git-2.54.0.tar.gz" | sha256sum -c -
+          rm -rf /tmp/git-2.54.0-src
+          mkdir -p /tmp/git-2.54.0-src "$GIT_254_PREFIX"
+          tar -xzf /tmp/git-2.54.0.tar.gz -C /tmp/git-2.54.0-src --strip-components=1
+          make -C /tmp/git-2.54.0-src -j"$(nproc)" prefix="$GIT_254_PREFIX" NO_TCLTK=YesPlease all install
+
+      - name: Verify oracle version
+        run: |
+          "$GIT_254_PREFIX/bin/git" --version | grep -q "git version 2.54.0"
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Configure oracle identity
+        run: |
+          "$GIT_254_PREFIX/bin/git" config --global user.name "ci"
+          "$GIT_254_PREFIX/bin/git" config --global user.email "ci@example.invalid"
+          "$GIT_254_PREFIX/bin/git" config --global init.defaultBranch main
+
+      - name: Run required parity tests
+        env:
+          PYGIT_PARITY_GIT: ${{ env.GIT_254_PREFIX }}/bin/git
+        run: python -m pytest -v --color=yes tests/git_parity --require-git-254-oracle
+
   build:
     name: build wheel + sdist
     runs-on: ubuntu-latest

@@ -1081,6 +1081,18 @@ def cmd_uninstall_git_shim(argv: list[str]) -> int:
     return 0
 
 
+def cmd_version(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="pygit version")
+    ap.add_argument("--build-options", action="store_true")
+    args = ap.parse_args(argv)
+    from . import __version__
+    _print(f"pygit version {__version__}")
+    if args.build_options:
+        _print("cpu: pure-python")
+        _print("sizeof-long: 8")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # stubs that record they are not yet implemented (Phase 2)
 
@@ -1142,6 +1154,7 @@ _COMMANDS = {
     "fsck": cmd_fsck,
     "gc": cmd_gc,
     "help": cmd_help,
+    "version": cmd_version,
     "install-git-shim": cmd_install_git_shim,
     "uninstall-git-shim": cmd_uninstall_git_shim,
 }
@@ -5089,8 +5102,10 @@ def _oos(name: str, reason: str):
 
 
 def _register_phase8() -> None:
+    _COMMANDS["stage"] = cmd_add
     _COMMANDS["init-db"] = cmd_init_db
     _COMMANDS["annotate"] = cmd_annotate
+    _COMMANDS["pickaxe"] = cmd_blame
     _COMMANDS["patch-id"] = cmd_patch_id
     _COMMANDS["checkout-index"] = cmd_checkout_index
     _COMMANDS["fmt-merge-msg"] = cmd_fmt_merge_msg
@@ -5099,9 +5114,14 @@ def _register_phase8() -> None:
     _COMMANDS["upload-pack"] = cmd_upload_pack
     _COMMANDS["receive-pack"] = cmd_receive_pack
     _COMMANDS["upload-archive"] = cmd_upload_archive
+    _COMMANDS["upload-archive--writer"] = cmd_upload_archive
     _COMMANDS["pack-redundant"] = cmd_pack_redundant
     _COMMANDS["prune-packed"] = cmd_prune_packed
+    _COMMANDS["fsck-objects"] = cmd_fsck
     _COMMANDS["merge-recursive"] = cmd_merge_recursive
+    _COMMANDS["merge-recursive-ours"] = cmd_merge_recursive
+    _COMMANDS["merge-recursive-theirs"] = cmd_merge_recursive
+    _COMMANDS["merge-subtree"] = cmd_merge_recursive
     _COMMANDS["merge-ours"] = cmd_merge_ours
     _COMMANDS["multi-pack-index"] = cmd_multi_pack_index
     _COMMANDS["for-each-repo"] = cmd_for_each_repo
@@ -5113,7 +5133,9 @@ def _register_phase8() -> None:
     _COMMANDS["replay"] = cmd_replay
     _COMMANDS["backfill"] = cmd_backfill
     _COMMANDS["convert-object-format"] = cmd_convert_object_format
+    _COMMANDS["submodule--helper"] = cmd_submodule_helper
     _COMMANDS["submodule-helper"] = cmd_submodule_helper
+    _COMMANDS["checkout--worker"] = cmd_checkout_worker
     _COMMANDS["checkout-worker"] = cmd_checkout_worker
 
     # explicit out-of-scope stubs
@@ -5395,9 +5417,11 @@ def _register_phase8() -> None:
     _COMMANDS["cvsserver"] = _cmd_cvs_bridge("cvsserver")
     _COMMANDS["svn"] = _cmd_svn
     _COMMANDS["credential-cache"] = _cmd_credential_cache
+    _COMMANDS["credential-cache--daemon"] = _cmd_credential_cache_daemon
     _COMMANDS["credential-cache-daemon"] = _cmd_credential_cache_daemon
     _COMMANDS["credential-store"] = _cmd_credential_store
     _COMMANDS["fsmonitor"] = _cmd_fsmonitor
+    _COMMANDS["fsmonitor--daemon"] = _cmd_fsmonitor_daemon
     _COMMANDS["fsmonitor-daemon"] = _cmd_fsmonitor_daemon
     _COMMANDS["remote-helper"] = _cmd_mergetool_remote_helper
     _COMMANDS["remote-ext"] = _cmd_remote_ext
@@ -5563,6 +5587,40 @@ def _register_phase8() -> None:
 _register_phase8()
 
 
+_PYGIT_EXTENSION_COMMANDS = frozenset({
+    "checkout-worker",
+    "convert-object-format",
+    "credential-cache-daemon",
+    "cvsexportcommit",
+    "cvsimport",
+    "cvsserver",
+    "daemon",
+    "fsmonitor",
+    "fsmonitor-daemon",
+    "gitk",
+    "gitweb",
+    "gui",
+    "http-backend",
+    "http-fetch",
+    "install-git-shim",
+    "instaweb",
+    "mergetool",
+    "remote-helper",
+    "request-pull",
+    "send-email",
+    "shell",
+    "submodule",
+    "submodule-helper",
+    "svn",
+    "uninstall-git-shim",
+    "url-parse",
+})
+
+
+def cgit_compatible_commands() -> set[str]:
+    return set(_COMMANDS) - set(_PYGIT_EXTENSION_COMMANDS)
+
+
 _GLOBAL_FLAGS_IGNORED = {
     "-p", "--paginate", "-P", "--no-pager",
     "--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks",
@@ -5701,10 +5759,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             return cmd_help([])
         if argv[0] == _GLOBAL_EXIT:
             return 0
-        if argv[0] in ("--version", "-v", "version"):
+        if argv[0] in ("--version", "-v"):
             from . import __version__
             _print(f"pygit version {__version__}")
             return 0
+        if argv[0] == "version":
+            return cmd_version(argv[1:])
         cmd = argv[0]
         rest = argv[1:]
         fn = _COMMANDS.get(cmd)

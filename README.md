@@ -119,9 +119,16 @@ pygit convert-object-format --object-format=sha1 ./sha256-copy ./sha1-copy
 The command surface covers git built-ins plus aliases and pythongit-specific
 helpers. CLI parity is tracked against C Git 2.54.0 from the upstream
 implementation source: `tools/git_cli_manifest.py` generates
-`tests/git_parity/manifest/git-2.54.0.json`, and optional behavior checks run
-when `PYGIT_PARITY_GIT` points at a `git version 2.54.0` binary. Selected
-highlights:
+`tests/git_parity/manifest/git-2.54.0.json`. A dedicated CI job builds a
+`git version 2.54.0` oracle and runs:
+
+```bash
+PYGIT_PARITY_GIT=/path/to/git-2.54.0 \
+  python -m pytest tests/git_parity --require-git-254-oracle
+```
+
+Without `--require-git-254-oracle`, local runs skip behavior checks when the
+oracle binary is unavailable. Selected highlights:
 
 **Plumbing.** `hash-object`, `cat-file`, `ls-tree`, `write-tree`, `read-tree`,
 `commit-tree`, `mktree`, `mktag`, `update-ref`, `symbolic-ref`, `rev-parse`,

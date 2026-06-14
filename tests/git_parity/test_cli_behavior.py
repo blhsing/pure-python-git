@@ -1,109 +1,101 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from pathlib import Path
 
-import pytest
+from tests.git_parity.support import (
+    assert_same_result,
+    configure_pygit_identity,
+    init_repo_pair,
+    init_with_pygit,
+    pygit_cmd,
+    run_cmd,
+)
 
 
-ROOT = Path(__file__).resolve().parents[2]
-PYGIT = [sys.executable, "-m", "pythongit"]
-
-
-def _run(cmd: list[str], cwd: Path, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    merged_env = os.environ.copy()
-    merged_env["PYTHONPATH"] = str(ROOT) + os.pathsep + merged_env.get("PYTHONPATH", "")
-    if env:
-        merged_env.update(env)
-    return subprocess.run(cmd, cwd=cwd, env=merged_env, text=True, capture_output=True, timeout=10)
-
-
-@pytest.fixture
-def run_cmd():
-    return _run
-
-
-@pytest.fixture
-def pygit_cmd() -> list[str]:
-    return list(PYGIT)
-
-
-@pytest.fixture
-def oracle_git() -> str:
-    git = os.environ.get("PYGIT_PARITY_GIT")
-    if not git:
-        pytest.skip("set PYGIT_PARITY_GIT to a C Git 2.54.0 binary to run parity tests")
-    result = subprocess.run([git, "--version"], text=True, capture_output=True, timeout=10)
-    version = (result.stdout + result.stderr).strip()
-    if result.returncode != 0 or not version.startswith("git version 2.54.0"):
-        pytest.skip(f"PYGIT_PARITY_GIT must be git version 2.54.0, got {version!r}")
-    return git
-
-
-def _init_with_pygit(run_cmd, pygit_cmd: list[str], path: Path) -> None:
-    path.mkdir()
-    result = run_cmd([*pygit_cmd, "init", "-b", "main", "."], path)
-    assert result.returncode == 0, result.stderr
-
-
-def _configure_identity(run_cmd, pygit_cmd: list[str], path: Path) -> None:
-    assert run_cmd([*pygit_cmd, "config", "user.name", "Parity"], path).returncode == 0
-    assert run_cmd([*pygit_cmd, "config", "user.email", "parity@example.com"], path).returncode == 0
-
-
-def test_status_short_branch_unborn_matches_c_git_254(tmp_path: Path, oracle_git: str, pygit_cmd, run_cmd):
+def test_status_short_branch_unborn_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
     repo = tmp_path / "repo"
-    _init_with_pygit(run_cmd, pygit_cmd, repo)
+    init_with_pygit(repo)
 
-    oracle = run_cmd([oracle_git, "status", "--short", "--branch"], repo)
-    actual = run_cmd([*pygit_cmd, "status", "--short", "--branch"], repo)
+    oracle = run_cmd([git_254_oracle, "status", "--short", "--branch"], repo)
+    actual = run_cmd([*pygit_cmd(), "status", "--short", "--branch"], repo)
 
-    assert actual.returncode == oracle.returncode
-    assert actual.stdout == oracle.stdout
+    assert_same_result(actual, oracle)
 
 
-def test_remote_verbose_matches_c_git_254(tmp_path: Path, oracle_git: str, pygit_cmd, run_cmd):
+def test_remote_verbose_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
     repo = tmp_path / "repo"
-    _init_with_pygit(run_cmd, pygit_cmd, repo)
-    assert run_cmd([*pygit_cmd, "remote", "add", "origin", "https://example.com/repo.git"], repo).returncode == 0
+    init_with_pygit(repo)
+    assert run_cmd([*pygit_cmd(), "remote", "add", "origin", "https://example.com/repo.git"], repo).returncode == 0
 
-    oracle = run_cmd([oracle_git, "remote", "-v"], repo)
-    actual = run_cmd([*pygit_cmd, "remote", "-v"], repo)
+    oracle = run_cmd([git_254_oracle, "remote", "-v"], repo)
+    actual = run_cmd([*pygit_cmd(), "remote", "-v"], repo)
 
-    assert actual.returncode == oracle.returncode
-    assert actual.stdout == oracle.stdout
+    assert_same_result(actual, oracle)
 
 
-def test_log_oneline_decorate_matches_c_git_254(tmp_path: Path, oracle_git: str, pygit_cmd, run_cmd):
+def test_log_oneline_decorate_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
     repo = tmp_path / "repo"
-    _init_with_pygit(run_cmd, pygit_cmd, repo)
-    _configure_identity(run_cmd, pygit_cmd, repo)
+    init_with_pygit(repo)
+    configure_pygit_identity(repo)
     (repo / "a.txt").write_text("one\n", encoding="utf-8")
-    assert run_cmd([*pygit_cmd, "add", "a.txt"], repo).returncode == 0
-    commit = run_cmd([*pygit_cmd, "commit", "-m", "one"], repo)
+    assert run_cmd([*pygit_cmd(), "add", "a.txt"], repo).returncode == 0
+    commit = run_cmd([*pygit_cmd(), "commit", "-m", "one"], repo)
     assert commit.returncode == 0, commit.stderr
 
-    oracle = run_cmd([oracle_git, "log", "--oneline", "--decorate", "-1"], repo)
-    actual = run_cmd([*pygit_cmd, "log", "--oneline", "--decorate", "-1"], repo)
+    oracle = run_cmd([git_254_oracle, "log", "--oneline", "--decorate", "-1"], repo)
+    actual = run_cmd([*pygit_cmd(), "log", "--oneline", "--decorate", "-1"], repo)
 
-    assert actual.returncode == oracle.returncode
-    assert actual.stdout == oracle.stdout
+    assert_same_result(actual, oracle)
 
 
-def test_global_options_before_command_match_c_git_254(tmp_path: Path, oracle_git: str, pygit_cmd, run_cmd):
+def test_global_options_before_command_match_c_git_254(tmp_path: Path, git_254_oracle: str):
     repo = tmp_path / "repo"
-    _init_with_pygit(run_cmd, pygit_cmd, repo)
+    init_with_pygit(repo)
 
     oracle = run_cmd(
-        [oracle_git, "-C", str(repo), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch"],
+        [git_254_oracle, "-C", str(repo), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch"],
         tmp_path,
     )
     actual = run_cmd(
-        [*pygit_cmd, "-C", str(repo), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch"],
+        [*pygit_cmd(), "-C", str(repo), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch"],
         tmp_path,
     )
 
-    assert actual.returncode == oracle.returncode
-    assert actual.stdout == oracle.stdout
+    assert_same_result(actual, oracle)
+
+
+def test_config_replace_all_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
+    oracle_repo, actual_repo = init_repo_pair(tmp_path)
+
+    oracle = run_cmd([git_254_oracle, "config", "--replace-all", "user.name", "Alice"], oracle_repo)
+    actual = run_cmd([*pygit_cmd(), "config", "--replace-all", "user.name", "Alice"], actual_repo)
+    assert_same_result(actual, oracle)
+
+    oracle_read = run_cmd([git_254_oracle, "config", "user.name"], oracle_repo)
+    actual_read = run_cmd([*pygit_cmd(), "config", "user.name"], actual_repo)
+    assert_same_result(actual_read, oracle_read)
+
+
+def test_stage_alias_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
+    oracle_repo, actual_repo = init_repo_pair(tmp_path)
+    (oracle_repo / "a.txt").write_text("one\n", encoding="utf-8")
+    (actual_repo / "a.txt").write_text("one\n", encoding="utf-8")
+
+    oracle = run_cmd([git_254_oracle, "stage", "a.txt"], oracle_repo)
+    actual = run_cmd([*pygit_cmd(), "stage", "a.txt"], actual_repo)
+    assert_same_result(actual, oracle)
+
+    oracle_status = run_cmd([git_254_oracle, "status", "--short"], oracle_repo)
+    actual_status = run_cmd([*pygit_cmd(), "status", "--short"], actual_repo)
+    assert_same_result(actual_status, oracle_status)
+
+
+def test_remote_show_without_args_matches_c_git_254(tmp_path: Path, git_254_oracle: str):
+    oracle_repo, actual_repo = init_repo_pair(tmp_path)
+    for repo, cmd in ((oracle_repo, [git_254_oracle]), (actual_repo, pygit_cmd())):
+        added = run_cmd([*cmd, "remote", "add", "origin", "https://example.com/repo.git"], repo)
+        assert added.returncode == 0, added.stderr
+
+    oracle = run_cmd([git_254_oracle, "remote", "show"], oracle_repo)
+    actual = run_cmd([*pygit_cmd(), "remote", "show"], actual_repo)
+    assert_same_result(actual, oracle)
