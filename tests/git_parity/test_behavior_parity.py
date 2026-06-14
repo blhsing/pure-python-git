@@ -240,6 +240,25 @@ CASES: list[tuple] = [
     ("stash-push", BASE + [("write", "a.txt", "WIP\n")], ["stash"]),
     ("stash-list",
      BASE + [("write", "a.txt", "WIP\n"), ["stash"]], ["stash", "list"]),
+    # rev-parse ref expansion
+    ("rev-parse-all", BASE + [["branch", "b1"], ["tag", "t1"]], ["rev-parse", "--all"]),
+    ("rev-parse-branches", BASE + [["branch", "b1"]], ["rev-parse", "--branches"]),
+    ("rev-parse-tags", BASE + [["tag", "t1"]], ["rev-parse", "--tags"]),
+    # diff numstat/shortstat/name-status
+    ("diff-numstat", BASE + [("write", "a.txt", "alpha\nmore\n")], ["diff", "--numstat"]),
+    ("diff-shortstat", BASE + [("write", "a.txt", "alpha\nmore\nx\n")], ["diff", "--shortstat"]),
+    ("diff-name-status", BASE + [("write", "c.txt", "c\n"), ["add", "-A"]], ["diff", "--cached", "--name-status"]),
+    # log name flags
+    ("log-name-status", TAGGED, ["log", "--name-status", "-1"]),
+    ("log-name-only", TAGGED, ["log", "--name-only", "-1"]),
+    # branch -v
+    ("branch-verbose", BASE + [["branch", "feat"]], ["branch", "-v"]),
+    # rebase up to date
+    ("rebase-up-to-date", TAGGED, ["rebase", "HEAD"]),
+    # rev-list --objects
+    ("rev-list-objects", BASE, ["rev-list", "--objects", "HEAD"]),
+    # annotated tag inspection
+    ("cat-file-tag", BASE + [["tag", "-a", "v1", "-m", "ann msg"]], ["cat-file", "-p", "v1"]),
 ]
 
 

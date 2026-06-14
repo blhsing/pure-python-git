@@ -432,6 +432,17 @@ def cmd_rev_parse(argv: list[str]) -> int:
         if arg == "--is-bare-repository":
             _print("true" if R().bare else "false")
             continue
+        if arg in ("--all", "--branches", "--tags", "--remotes"):
+            prefix = {
+                "--all": "refs/",
+                "--branches": "refs/heads/",
+                "--tags": "refs/tags/",
+                "--remotes": "refs/remotes/",
+            }[arg]
+            for refname, refsha in _enumerate_refs(R()):
+                if refname.startswith(prefix):
+                    _print(refsha)
+            continue
         if arg == "--verify":
             verify = True
             continue
@@ -544,6 +555,7 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--max-count", "-n", type=int, default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--reverse", action="store_true")
+    ap.add_argument("--objects", action="store_true")
     ap.add_argument("revs", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -587,12 +599,39 @@ def cmd_rev_list(argv: list[str]) -> int:
             break
     if args.count:
         _print(str(len(out)))
+    elif args.objects:
+        for s in out:
+            _print(s)
+        seen_obj: set[str] = set()
+        for s in out:
+            info = _commit_tree_parents(repo, s, graph)
+            if info is None:
+                continue
+            for osha, opath in _walk_objects(repo, info[0], ""):
+                if osha in seen_obj:
+                    continue
+                seen_obj.add(osha)
+                _print(f"{osha} {opath}")
     else:
         if args.reverse:
             out = list(reversed(out))
         for s in out:
             _print(s)
     return 0
+
+
+def _walk_objects(repo: Repository, tree_sha: str, prefix: str):
+    yield (tree_sha, prefix.rstrip("/"))
+    try:
+        _, data = objs.read_object(repo, tree_sha)
+    except KeyError:
+        return
+    for e in objs.parse_tree(data, repo.hash_len):
+        path = prefix + e.name
+        if e.is_dir():
+            yield from _walk_objects(repo, e.sha, path + "/")
+        elif not e.is_gitlink():
+            yield (e.sha, path)
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1133,8 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--abbrev-commit", action="store_true")
     ap.add_argument("-p", "--patch", action="store_true")
     ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -1162,14 +1203,22 @@ def cmd_log(argv: list[str]) -> int:
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
-            if args.stat or args.patch:
+            if args.stat or args.patch or args.name_only or args.name_status:
                 parent_tree = None
                 if c.parents:
                     _, pd = objs.read_object(repo, c.parents[0])
                     parent_tree = objs.parse_commit(pd).tree
+                tchanges = _tree_changes(repo, parent_tree, c.tree)
                 _print("")
                 if args.stat:
-                    _diff_stat(_tree_changes(repo, parent_tree, c.tree))
+                    _diff_stat(tchanges)
+                elif args.name_only:
+                    for path, _a, _b in tchanges:
+                        _print(path)
+                elif args.name_status:
+                    for path, a, b in tchanges:
+                        st = "A" if not a.present else ("D" if not b.present else "M")
+                        _print(f"{st}\t{path}")
                 else:
                     _emit_tree_patch(repo, parent_tree, c.tree)
         cur.extend(c.parents)
@@ -1461,7 +1510,10 @@ def cmd_diff(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit diff", add_help=False)
     ap.add_argument("--cached", "--staged", dest="cached", action="store_true")
     ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--numstat", action="store_true")
+    ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--name-status", dest="name_status", action="store_true")
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
     revs: list[str] = []
@@ -1521,13 +1573,63 @@ def cmd_diff(argv: list[str]) -> int:
 
     if args.stat:
         _diff_stat(changes)
+    elif args.numstat:
+        _diff_numstat(changes)
+    elif args.shortstat:
+        _diff_shortstat(changes)
     elif args.name_only:
         for path, _, _ in changes:
             _print(path)
+    elif args.name_status:
+        for path, a, b in changes:
+            status = "A" if not a.present else ("D" if not b.present else "M")
+            _print(f"{status}\t{path}")
     else:
         for path, a, b in changes:
             _emit_file_diff(path, a, b)
     return 0
+
+
+def _diff_counts(a: _Side, b: _Side) -> tuple[int, int]:
+    if _is_binary(a.data) or _is_binary(b.data):
+        return -1, -1
+    a_lines = (a.data or b"").decode("utf-8", errors="replace").splitlines()
+    b_lines = (b.data or b"").decode("utf-8", errors="replace").splitlines()
+    ins = dele = 0
+    for op in diff_mod.diff_lines(a_lines, b_lines):
+        if op[0] == "ins":
+            ins += 1
+        elif op[0] == "del":
+            dele += 1
+    return ins, dele
+
+
+def _diff_numstat(changes: list) -> None:
+    for path, a, b in changes:
+        ins, dele = _diff_counts(a, b)
+        if ins < 0:
+            _print(f"-\t-\t{path}")
+        else:
+            _print(f"{ins}\t{dele}\t{path}")
+
+
+def _diff_shortstat(changes: list) -> None:
+    files = total_ins = total_del = 0
+    for _path, a, b in changes:
+        files += 1
+        ins, dele = _diff_counts(a, b)
+        if ins > 0:
+            total_ins += ins
+        if dele > 0:
+            total_del += dele
+    if files == 0:
+        return
+    parts = [f"{files} file{'s' if files != 1 else ''} changed"]
+    if total_ins:
+        parts.append(f"{total_ins} insertion{'s' if total_ins != 1 else ''}(+)")
+    if total_del:
+        parts.append(f"{total_del} deletion{'s' if total_del != 1 else ''}(-)")
+    _print(" " + ", ".join(parts))
 
 
 def _remote_branches(repo: Repository) -> list[str]:
@@ -1617,11 +1719,22 @@ def cmd_branch(argv: list[str]) -> int:
             names.extend((b, b) for b in refs_mod.list_branches(repo))
         if args.remotes or args.all:
             names.extend((f"remotes/{b}", None) for b in _remote_branches(repo))
-        for display, plain in names:
-            if pattern and not fnmatch.fnmatch(display, pattern):
-                continue
+        shown = [(d, p) for d, p in names if not (pattern and not fnmatch.fnmatch(d, pattern))]
+        width = max((len(d) for d, _ in shown), default=0)
+        for display, plain in shown:
             mark = "*" if plain is not None and plain == cur else " "
-            _print(f"{mark} {display}")
+            if args.verbose:
+                ref = f"refs/heads/{display}" if plain is not None else f"refs/remotes/{display[len('remotes/'):]}"
+                sha = refs_mod.read_ref(repo, ref)
+                subject = ""
+                if sha:
+                    try:
+                        subject = objs.parse_commit(objs.read_object(repo, sha)[1]).message.splitlines()[0]
+                    except (KeyError, IndexError):
+                        subject = ""
+                _print(f"{mark} {display:<{width}} {sha[:7] if sha else ''} {subject}".rstrip())
+            else:
+                _print(f"{mark} {display}")
         return 0
 
     start = refs_mod.rev_parse(repo, args.start) if args.start else refs_mod.rev_parse(repo, "HEAD")
@@ -2457,17 +2570,22 @@ def cmd_revert(argv: list[str]) -> int:
 
 
 def cmd_rebase(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit rebase")
+    ap = argparse.ArgumentParser(prog="pygit rebase", add_help=False)
     ap.add_argument("upstream")
     args = ap.parse_args(argv)
     repo = _repo()
+    head_sym, _ = refs_mod.read_head(repo)
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else "HEAD"
     from . import sequencer
     picked, conflicts = sequencer.rebase_onto(repo, args.upstream)
     if conflicts:
         for p in conflicts:
             _err(f"CONFLICT: {p}")
         return 1
-    _print(f"Rebased {picked} commit(s) onto {args.upstream}")
+    if picked == 0:
+        _print(f"Current branch {branch} is up to date.")
+    else:
+        _print(f"Successfully rebased and updated {head_sym or 'HEAD'}.")
     return 0
 
 
