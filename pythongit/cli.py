@@ -363,10 +363,11 @@ def cmd_symbolic_ref(argv: list[str]) -> int:
     repo = _repo()
     p = repo.gitdir / args.name
     if args.delete:
-        if not p.exists():
+        txt = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+        if not txt.startswith("ref: "):
             if not args.quiet:
-                _err(f"fatal: ref {args.name} is not a symbolic ref")
-            return 1
+                _err(f"fatal: Cannot delete {args.name}, not a symbolic ref")
+            return 128
         p.unlink()
         return 0
     if args.target is None:
@@ -2127,8 +2128,9 @@ def cmd_config(argv: list[str]) -> int:
 
     is_global = False
     is_local = False
+    name_only = False
     file_path: Optional[str] = None
-    action: Optional[str] = None   # get | get_all | list | unset | unset_all | add | replace_all
+    action: Optional[str] = None   # get | get_all | get_regexp | list | unset | unset_all | add | replace_all
     positional: list[str] = []
     i = 0
     while i < len(argv):
@@ -2139,6 +2141,8 @@ def cmd_config(argv: list[str]) -> int:
             is_local = True
         elif a == "--system":
             pass
+        elif a == "--name-only":
+            name_only = True
         elif a in ("-f", "--file"):
             i += 1
             file_path = argv[i] if i < len(argv) else None
@@ -2150,6 +2154,8 @@ def cmd_config(argv: list[str]) -> int:
             action = "get"
         elif a == "--get-all":
             action = "get_all"
+        elif a == "--get-regexp":
+            action = "get_regexp"
         elif a == "--unset":
             action = "unset"
         elif a == "--unset-all":
@@ -2187,8 +2193,25 @@ def cmd_config(argv: list[str]) -> int:
         except RepositoryError:
             repo = None
         for key, value in gitconfig.list_all(repo):
-            _print(f"{key}={value}")
+            _print(key if name_only else f"{key}={value}")
         return 0
+
+    if action == "get_regexp":
+        try:
+            repo = _repo()
+        except RepositoryError:
+            repo = None
+        import re as _re
+        if not positional:
+            _err("error: wrong number of arguments, should be from 1 to 3")
+            return 129
+        pat = _re.compile(positional[0])
+        found = False
+        for key, value in gitconfig.list_all(repo):
+            if pat.search(key):
+                _print(key if name_only else f"{key} {value}")
+                found = True
+        return 0 if found else 1
 
     if not positional:
         _err("error: wrong number of arguments, should be from 1 to 3")
@@ -3446,9 +3469,16 @@ def cmd_show_ref(argv: list[str]) -> int:
     ap.add_argument("--heads", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("-d", "--dereference", action="store_true")
+    ap.add_argument("-s", "--hash", action="store_true")
     ap.add_argument("patterns", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+
+    def show(sha: str, refname: str) -> None:
+        if args.hash:
+            _print(sha)
+        else:
+            _print(f"{sha} {refname}")
 
     if args.verify:
         printed = 0
@@ -3457,7 +3487,7 @@ def cmd_show_ref(argv: list[str]) -> int:
             if sha is None:
                 _err(f"fatal: '{pat}' - not a valid ref")
                 return 128
-            _print(f"{sha} {pat}")
+            show(sha, pat)
             printed += 1
         return 0 if printed else 1
 
@@ -3470,7 +3500,7 @@ def cmd_show_ref(argv: list[str]) -> int:
     if args.head:
         _, headsha = refs_mod.read_head(repo)
         if headsha:
-            _print(f"{headsha} HEAD")
+            show(headsha, "HEAD")
             printed += 1
     for refname, sha in _enumerate_refs(repo):
         if args.heads and not refname.startswith("refs/heads/"):
@@ -3479,7 +3509,7 @@ def cmd_show_ref(argv: list[str]) -> int:
             continue
         if not matches(refname):
             continue
-        _print(f"{sha} {refname}")
+        show(sha, refname)
         printed += 1
     return 0 if printed else 1
 
@@ -3502,10 +3532,11 @@ def cmd_mktree(argv: list[str]) -> int:
 
 
 def cmd_update_index(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit update-index")
+    ap = argparse.ArgumentParser(prog="pygit update-index", add_help=False)
     ap.add_argument("--add", action="store_true")
     ap.add_argument("--remove", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--chmod", choices=["+x", "-x"], default=None)
     ap.add_argument("--cacheinfo", nargs=3, metavar=("MODE", "SHA", "PATH"))
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
@@ -3515,6 +3546,18 @@ def cmd_update_index(argv: list[str]) -> int:
     if args.cacheinfo:
         mode_s, sha, path = args.cacheinfo
         idx.upsert(IndexEntry(mode=int(mode_s, 8), sha=sha, path=path))
+        write_index(repo, idx)
+        return 0
+    if args.chmod is not None:
+        by_path = idx.by_path()
+        executable = args.chmod == "+x"
+        for p in args.paths:
+            entry = by_path.get(p)
+            if entry is None:
+                _err(f"fatal: git update-index: cannot chmod {args.chmod[1]} '{p}'")
+                return 128
+            entry.mode = 0o100755 if executable else 0o100644
+            idx.upsert(entry)
         write_index(repo, idx)
         return 0
     if args.refresh:

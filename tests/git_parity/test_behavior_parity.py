@@ -305,6 +305,21 @@ CASES: list[tuple] = [
     # check-attr
     ("check-attr",
      BASE + [("write", ".gitattributes", "*.txt text\n")], ["check-attr", "text", "a.txt"]),
+    # config typed/regexp/name-only
+    ("config-get-regexp",
+     BASE + [["config", "user.name", "X"], ["config", "user.email", "x@e"]],
+     ["config", "--get-regexp", "user.*"]),
+    ("config-name-only-list",
+     BASE + [["config", "user.name", "X"]], ["config", "--name-only", "--list"]),
+    ("config-int", BASE + [["config", "core.x", "42"]], ["config", "--int", "core.x"]),
+    ("config-bool", BASE + [["config", "core.y", "true"]], ["config", "--bool", "core.y"]),
+    # show-ref --hash, symbolic-ref -d, update-index --chmod
+    ("show-ref-hash", BASE + [["branch", "feat"]], ["show-ref", "--hash"]),
+    ("symbolic-ref-delete-missing", BASE, ["symbolic-ref", "-d", "refs/heads/nope"]),
+    ("for-each-ref-count",
+     BASE + [["branch", "a"], ["branch", "b"]], ["for-each-ref", "--count=1", "--format=%(refname)"]),
+    # notes
+    ("notes-show", BASE + [["notes", "add", "-m", "a note"]], ["notes", "show"]),
 ]
 
 
