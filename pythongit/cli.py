@@ -392,11 +392,14 @@ def cmd_status(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     s = workdir.status(repo)
-    head_sym, _ = refs_mod.read_head(repo)
+    head_sym, head_sha = refs_mod.read_head(repo)
     branch = head_sym[len("refs/heads/") :] if head_sym and head_sym.startswith("refs/heads/") else "(detached)"
     if args.short:
         if args.branch:
-            _print(f"## {branch}")
+            if head_sym and head_sha is None:
+                _print(f"## No commits yet on {branch}")
+            else:
+                _print(f"## {branch}")
         for p in s["staged_new"]:
             _print(f"A  {p}")
         for p in s["staged_mod"]:

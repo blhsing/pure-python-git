@@ -358,7 +358,7 @@ def test_diff_show_log(tmprepo, capsys):
 
 def test_status_short_branch_option(tmprepo, capsys):
     assert cli_run("status", "--short", "--branch") == 0
-    assert capsys.readouterr().out.startswith("## main\n")
+    assert capsys.readouterr().out.startswith("## No commits yet on main\n")
 
 
 def test_remote_verbose_option(tmprepo, capsys):
@@ -375,11 +375,11 @@ def test_global_options_before_command(tmprepo, capsys):
     try:
         os.chdir(path.parent)
         assert cli_run("-C", str(path), "--no-pager", "-c", "core.quotePath=false", "status", "--short", "--branch") == 0
-        assert capsys.readouterr().out.startswith("## main\n")
+        assert capsys.readouterr().out.startswith("## No commits yet on main\n")
         assert os.getcwd() == str(path.parent)
 
         assert cli_run("--git-dir", str(repo.gitdir), "--work-tree", str(path), "status", "--short", "--branch") == 0
-        assert capsys.readouterr().out.startswith("## main\n")
+        assert capsys.readouterr().out.startswith("## No commits yet on main\n")
 
         assert cli_run("version") == 0
         assert capsys.readouterr().out.startswith("pygit version ")

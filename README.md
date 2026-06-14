@@ -4,8 +4,8 @@
 [![PyPI](https://img.shields.io/pypi/v/pure-python-git.svg)](https://pypi.org/project/pure-python-git/)
 
 A pure-Python reimplementation of `git`. No external runtime dependencies — just
-the Python standard library. All 141 of git's built-in subcommands are
-implemented, plus aliases and pythongit-specific helpers. The on-disk format is
+the Python standard library. It implements a broad set of git built-in
+subcommands, aliases, and pythongit-specific helpers. The on-disk format is
 byte-for-byte compatible with real `git`, and the package optionally installs a
 drop-in `git` console script.
 
@@ -116,8 +116,12 @@ pygit convert-object-format --object-format=sha1 ./sha256-copy ./sha1-copy
 
 ## Supported commands
 
-All 141 git built-in subcommands plus aliases and pythongit-specific helpers
-(161 entries in total). Selected highlights:
+The command surface covers git built-ins plus aliases and pythongit-specific
+helpers. CLI parity is tracked against C Git 2.54.0 from the upstream
+implementation source: `tools/git_cli_manifest.py` generates
+`tests/git_parity/manifest/git-2.54.0.json`, and optional behavior checks run
+when `PYGIT_PARITY_GIT` points at a `git version 2.54.0` binary. Selected
+highlights:
 
 **Plumbing.** `hash-object`, `cat-file`, `ls-tree`, `write-tree`, `read-tree`,
 `commit-tree`, `mktree`, `mktag`, `update-ref`, `symbolic-ref`, `rev-parse`,
