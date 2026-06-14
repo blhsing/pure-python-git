@@ -369,6 +369,27 @@ def test_remote_verbose_option(tmprepo, capsys):
     assert "origin\thttps://example.com/repo.git (push)" in out
 
 
+def test_fetch_accepts_explicit_refspec(tmprepo, monkeypatch, capsys):
+    from pythongit import protocol
+
+    repo, _ = tmprepo
+    captured = {}
+
+    def fake_fetch(fetch_repo, remote="origin", refspecs=None):
+        captured["repo"] = fetch_repo
+        captured["remote"] = remote
+        captured["refspecs"] = refspecs
+        return {"FETCH_HEAD": "a" * repo.hex_len}
+
+    monkeypatch.setattr(protocol, "fetch", fake_fetch)
+
+    assert cli_run("fetch", "origin", "main") == 0
+    assert captured["repo"].path == repo.path
+    assert captured["remote"] == "origin"
+    assert captured["refspecs"] == ["main"]
+    assert "FETCH_HEAD" in capsys.readouterr().out
+
+
 def test_global_options_before_command(tmprepo, capsys):
     repo, path = tmprepo
     cwd = os.getcwd()

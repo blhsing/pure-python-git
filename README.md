@@ -116,11 +116,18 @@ pygit convert-object-format --object-format=sha1 ./sha256-copy ./sha1-copy
 
 ## Supported commands
 
-The command surface covers git built-ins plus aliases and pythongit-specific
-helpers. CLI parity is tracked against C Git 2.54.0 from the upstream
-implementation source: `tools/git_cli_manifest.py` generates
-`tests/git_parity/manifest/git-2.54.0.json`. A dedicated CI job builds a
-`git version 2.54.0` oracle and runs:
+The command surface covers the 147 built-ins from C Git 2.54.0 plus
+pythongit-specific helpers. Runtime registration is checked against the
+source-derived manifest in
+`tests/git_parity/manifest/git-2.54.0.json`, so upstream built-in names such as
+`stage`, `pickaxe`, `fsck-objects`, `checkout--worker`,
+`credential-cache--daemon`, and `submodule--helper` remain available under the
+same spellings as C Git. Pythongit-only helpers are kept separate from the
+compatibility surface.
+
+CLI parity is tracked against C Git 2.54.0 from the upstream implementation
+source: `tools/git_cli_manifest.py` regenerates the manifest, and a dedicated
+CI job builds a `git version 2.54.0` oracle and runs:
 
 ```bash
 PYGIT_PARITY_GIT=/path/to/git-2.54.0 \
@@ -350,8 +357,8 @@ bodies.
 ## Testing
 
 ```bash
-pip install pythongit[test]
-pytest
+pip install -e ".[test]"
+python -m pytest
 ```
 
 The suite passes:
@@ -366,9 +373,24 @@ The suite passes:
 | `unit_integration.py`   | end-to-end CLI flows incl. ort-backed conflicts, rename-aware merge, rerere replay, SHA-256 translation, loose cache, streaming upload-pack, recursive tree diff |
 | `test_ort_parity.py`    | byte-for-byte `ort` parity vs `git merge-tree --write-tree` across every conflict type (content, modify/delete, add/add, rename/rename, rename/delete, directory rename, distinct-types, exec-bit) |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
+| `tests/git_parity`      | C Git 2.54.0 manifest coverage, exact built-in registry coverage, and oracle behavior comparisons |
 
 Tests that require the real `git` binary are silently skipped when it's not on
-PATH, so the suite runs cleanly in containers without one.
+PATH, so the normal suite runs cleanly in containers without one. The dedicated
+`git-254-parity` CI job is stricter: it builds C Git 2.54.0 from the pinned
+upstream tarball, verifies the archive SHA-256, sets `PYGIT_PARITY_GIT`, and
+runs the parity tests with `--require-git-254-oracle`.
+
+To run the same required parity gate locally, build or install a `git version
+2.54.0` binary and run:
+
+```bash
+PYGIT_PARITY_GIT=/path/to/git-2.54.0 \
+  python -m pytest tests/git_parity --require-git-254-oracle
+```
+
+Without `--require-git-254-oracle`, the behavior-comparison tests skip when the
+oracle is unavailable, while manifest and registry coverage still run.
 
 The pure-Python `ort` engine is additionally cross-checked against C Git with
 the differential fuzzers in `tests/diff_xdiff_harness.py` (blob-level 3-way
@@ -411,16 +433,20 @@ randomized cases.
 ## Contributing
 
 The project tries to follow git's published wire and on-disk format specs
-(`Documentation/gitformat-*.adoc`, `Documentation/technical/*.adoc`). When
-adding a feature:
+(`Documentation/gitformat-*.adoc`, `Documentation/technical/*.adoc`) and C Git
+2.54.0's implementation behavior. When adding or changing CLI behavior:
 
-1. Find the matching `builtin/<name>.c` and read its argument parser to figure
-   out the flag set people actually use.
-2. Implement the behavior, but only the common flags first. Less-common flags
-   should `argparse.error` rather than silently misbehave.
-3. Add a unit test in `tests/unit_*.py`. If real `git` can verify the output,
-   also add an interop check.
-4. Run `pytest` — must remain green.
+1. Find the matching C implementation in the Git 2.54.0 source and compare its
+   parser, setup flags, output, exit codes, and repository mutations.
+2. Regenerate or inspect `tests/git_parity/manifest/git-2.54.0.json` with
+   `tools/git_cli_manifest.py` when the upstream source target changes.
+3. Keep every C Git built-in registered under its exact 2.54.0 name; classify
+   any pythongit-only command in `_PYGIT_EXTENSION_COMMANDS`.
+4. Add focused unit/integration tests plus a `tests/git_parity` oracle case for
+   user-visible CLI behavior whenever the command can be exercised
+   deterministically.
+5. Run `python -m pytest`; when a Git 2.54.0 binary is available, also run the
+   required parity gate shown above.
 
 ## License
 

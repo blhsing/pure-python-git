@@ -371,10 +371,46 @@ def clone(url: str, target_dir: str, object_format: str | None = None) -> Reposi
 
 
 # ---------------------------------------------------------------------------
-# fetch — like clone, but updates remote-tracking refs only.
+# fetch — like clone; default fetch updates remote-tracking refs, while
+# explicit branch refspecs are fetched to FETCH_HEAD unless a destination is
+# given.
 
 
-def fetch(repo: Repository, remote: str = "origin") -> dict[str, str]:
+def _resolve_remote_fetch_ref(remote_refs: dict[str, str], source: str) -> tuple[str, str]:
+    candidates = [source]
+    if not source.startswith("refs/"):
+        candidates.extend((f"refs/heads/{source}", f"refs/tags/{source}"))
+    for name in candidates:
+        sha = remote_refs.get(name)
+        if sha:
+            return name, sha
+    raise RuntimeError(f"couldn't find remote ref {source}")
+
+
+def _normalize_fetch_destination(remote_name: str, destination: str) -> str:
+    if destination.startswith("refs/"):
+        return destination
+    if remote_name.startswith("refs/tags/"):
+        return f"refs/tags/{destination}"
+    return f"refs/heads/{destination}"
+
+
+def _fetch_head_note(remote_name: str, url: str) -> str:
+    if remote_name == "HEAD":
+        return f"'{remote_name}' of {url}"
+    if remote_name.startswith("refs/heads/"):
+        return f"branch '{remote_name[len('refs/heads/'):]}' of {url}"
+    if remote_name.startswith("refs/tags/"):
+        return f"tag '{remote_name[len('refs/tags/'):]}' of {url}"
+    return f"'{remote_name}' of {url}"
+
+
+def _write_fetch_head(repo: Repository, entries: list[tuple[str, str]], url: str) -> None:
+    lines = [f"{sha}\t\t{_fetch_head_note(name, url)}\n" for name, sha in entries]
+    (repo.gitdir / "FETCH_HEAD").write_text("".join(lines), encoding="utf-8")
+
+
+def fetch(repo: Repository, remote: str = "origin", refspecs: list[str] | None = None) -> dict[str, str]:
     from . import pack as pack_mod
     from . import refs as refs_mod
     cp = repo.config()
@@ -389,7 +425,19 @@ def fetch(repo: Repository, remote: str = "origin") -> dict[str, str]:
         s = refs_mod.read_ref(repo, f"refs/heads/{b}")
         if s:
             haves.append(s)
-    wants = sorted(set(remote_refs.values()) - set(haves))
+    explicit: list[tuple[str, str, str | None]] = []
+    if refspecs:
+        for raw in refspecs:
+            spec = raw[1:] if raw.startswith("+") else raw
+            source, has_destination, destination = spec.partition(":")
+            if not source:
+                continue
+            remote_name, sha = _resolve_remote_fetch_ref(remote_refs, source)
+            dst_ref = _normalize_fetch_destination(remote_name, destination) if has_destination and destination else None
+            explicit.append((remote_name, sha, dst_ref))
+        wants = sorted({sha for _name, sha, _dst in explicit} - set(haves))
+    else:
+        wants = sorted(set(remote_refs.values()) - set(haves))
     updated: dict[str, str] = {}
     if wants:
         tmp_pack = None
@@ -409,15 +457,28 @@ def fetch(repo: Repository, remote: str = "origin") -> dict[str, str]:
                     os.unlink(str(Path(tmp_pack).with_suffix(".idx")))
                 except OSError:
                     pass
+    if explicit:
+        fetch_head_entries = []
+        for name, sha, dst_ref in explicit:
+            if dst_ref:
+                cur = refs_mod.read_ref(repo, dst_ref)
+                if cur != sha:
+                    refs_mod.update_ref(repo, dst_ref, sha, message=f"fetch {remote}")
+                    updated[dst_ref] = sha
+            else:
+                fetch_head_entries.append((name, sha))
+                updated["FETCH_HEAD"] = sha
+        if fetch_head_entries:
+            _write_fetch_head(repo, fetch_head_entries, url)
+        return updated
     for name, sha in remote_refs.items():
-        if not name.startswith("refs/heads/"):
-            continue
-        branch = name[len("refs/heads/"):]
-        ref = f"refs/remotes/{remote}/{branch}"
-        cur = refs_mod.read_ref(repo, ref)
-        if cur != sha:
-            refs_mod.update_ref(repo, ref, sha, message=f"fetch {remote}")
-            updated[ref] = sha
+        if name.startswith("refs/heads/"):
+            branch = name[len("refs/heads/"):]
+            ref = f"refs/remotes/{remote}/{branch}"
+            cur = refs_mod.read_ref(repo, ref)
+            if cur != sha:
+                refs_mod.update_ref(repo, ref, sha, message=f"fetch {remote}")
+                updated[ref] = sha
     return updated
 
 

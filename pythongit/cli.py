@@ -1310,10 +1310,11 @@ def cmd_stash(argv: list[str]) -> int:
 def cmd_fetch(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit fetch")
     ap.add_argument("remote", nargs="?", default="origin")
+    ap.add_argument("refspecs", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import protocol
-    updated = protocol.fetch(repo, args.remote)
+    updated = protocol.fetch(repo, args.remote, args.refspecs or None)
     for ref, sha in updated.items():
         _print(f" * {ref} -> {sha[:7]}")
     if not updated:

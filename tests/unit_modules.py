@@ -205,6 +205,44 @@ def test_protocol_auth_header_uses_github_token_env(tmp_path, monkeypatch):
     assert header == "Basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0LXRva2Vu"
 
 
+def test_protocol_fetch_explicit_branch_writes_fetch_head(tmprepo, monkeypatch):
+    from pythongit import refs
+    from pythongit import pack as pack_mod
+
+    repo, _ = tmprepo
+    cfg = repo.gitdir / "config"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8")
+        + '[remote "origin"]\n'
+        + "\turl = https://example.com/repo.git\n"
+        + "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        encoding="utf-8",
+    )
+    main_sha = "a" * repo.hex_len
+    other_sha = "b" * repo.hex_len
+    wanted = []
+
+    monkeypatch.setattr(
+        protocol_mod,
+        "discover_refs",
+        lambda _url: {"refs/heads/main": main_sha, "refs/heads/other": other_sha},
+    )
+
+    def fake_fetch_pack_to_file(_url, wants, _path, haves=None):
+        wanted.extend(wants)
+        return 0
+
+    monkeypatch.setattr(protocol_mod, "fetch_pack_to_file", fake_fetch_pack_to_file)
+    monkeypatch.setattr(pack_mod, "install_pack_file", lambda _repo, _path: None)
+
+    updated = protocol_mod.fetch(repo, "origin", ["main"])
+
+    assert updated == {"FETCH_HEAD": main_sha}
+    assert wanted == [main_sha]
+    assert refs.read_ref(repo, "refs/remotes/origin/main") is None
+    assert "branch 'main' of https://example.com/repo.git" in (repo.gitdir / "FETCH_HEAD").read_text()
+
+
 # --- rerere ---------------------------------------------------------------
 
 
