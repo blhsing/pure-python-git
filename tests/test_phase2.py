@@ -39,7 +39,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="pygit-p2-"))
     try:
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t")
         run("config", "user.email", "t@e.com")
 
@@ -112,7 +112,7 @@ def main() -> int:
         shutil.rmtree(tmp)
         tmp.mkdir()
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t"); run("config", "user.email", "t@e.com")
         (tmp / "f.txt").write_text("A\n"); run("add", "f.txt"); run("commit", "-m", "A")
         run("branch", "topic")

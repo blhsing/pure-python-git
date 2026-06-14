@@ -66,17 +66,60 @@ def _commit_tree_parents(repo: Repository, sha: str, graph=None) -> Optional[tup
 # plumbing
 
 
+_DEFAULT_BRANCH_HINT = (
+    "hint: Using 'master' as the name for the initial branch. This default branch name\n"
+    "hint: will change to \"main\" in Git 3.0. To configure the initial branch name\n"
+    "hint: to use in all of your new repositories, which will suppress this warning,\n"
+    "hint: call:\n"
+    "hint:\n"
+    "hint: \tgit config --global init.defaultBranch <name>\n"
+    "hint:\n"
+    "hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and\n"
+    "hint: 'development'. The just-created branch can be renamed via this command:\n"
+    "hint:\n"
+    "hint: \tgit branch -m <name>\n"
+    "hint:\n"
+    "hint: Disable this message with \"git config set advice.defaultBranchName false\"\n"
+)
+
+
 def cmd_init(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit init")
+    ap = argparse.ArgumentParser(prog="pygit init", add_help=False)
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--bare", action="store_true")
     ap.add_argument("--object-format", choices=["sha1", "sha256"], default="sha1")
-    ap.add_argument("-b", "--initial-branch", default="main")
+    ap.add_argument("-b", "--initial-branch", default=None)
+    ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
-    repo = Repository.init(args.path, bare=args.bare, object_format=args.object_format)
-    if args.initial_branch != "main":
-        (repo.gitdir / "HEAD").write_text(f"ref: refs/heads/{args.initial_branch}\n", encoding="utf-8")
-    _print(f"Initialized empty Git repository in {repo.gitdir}")
+
+    from . import gitconfig
+    target = Path(args.path).resolve()
+    gitdir = target if args.bare else target / ".git"
+    already = (gitdir / "HEAD").exists()
+
+    show_hint = False
+    if args.initial_branch is not None:
+        branch = args.initial_branch
+    else:
+        configured = gitconfig.get(None, "init.defaultbranch")
+        if configured:
+            branch = configured
+        else:
+            branch = "master"
+            advice = (gitconfig.get(None, "advice.defaultbranchname") or "").lower()
+            show_hint = not already and advice not in ("false", "0", "no", "off")
+
+    repo = Repository.init(target, bare=args.bare, object_format=args.object_format)
+    if not already:
+        (repo.gitdir / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
+
+    if already and args.initial_branch is not None:
+        _err(f"warning: re-init: ignored --initial-branch={args.initial_branch}")
+    if show_hint:
+        sys.stderr.write(_DEFAULT_BRANCH_HINT)
+    if not args.quiet:
+        word = "Reinitialized existing" if already else "Initialized empty"
+        _print(f"{word} Git repository in {repo.gitdir}/")
     return 0
 
 
@@ -117,25 +160,25 @@ def cmd_cat_file(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.object)
-    if not sha:
-        _err(f"fatal: Not a valid object name {args.object}")
+    exists = sha is not None and objs.object_exists(repo, sha)
+    if args.exists:
+        return 0 if exists else 1
+    if sha is None or not exists:
+        if (args.show_type or args.show_size) and sha is not None:
+            _err("fatal: git cat-file: could not get object info")
+        else:
+            _err(f"fatal: Not a valid object name {args.object}")
         return 128
-    try:
-        t, data = objs.read_object(repo, sha)
-    except KeyError:
-        _err(f"fatal: object {sha} not found")
-        return 128
+    t, data = objs.read_object(repo, sha)
     if args.show_type:
         _print(t)
     elif args.show_size:
         _print(str(len(data)))
-    elif args.exists:
-        return 0
     elif args.pretty:
         if t == "tree":
             for e in objs.parse_tree(data, repo.hash_len):
                 obj_t = "tree" if e.is_dir() else "blob"
-                _print(f"{int(e.mode):06o} {obj_t} {e.sha}\t{e.name}")
+                _print(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{e.name}")
         else:
             sys.stdout.buffer.write(data)
             if not data.endswith(b"\n"):
@@ -144,31 +187,48 @@ def cmd_cat_file(argv: list[str]) -> int:
 
 
 def cmd_ls_tree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit ls-tree")
+    ap = argparse.ArgumentParser(prog="pygit ls-tree", add_help=False)
     ap.add_argument("-r", action="store_true", help="recurse")
+    ap.add_argument("-d", dest="dirs_only", action="store_true")
+    ap.add_argument("-t", dest="show_trees", action="store_true")
+    ap.add_argument("--name-only", "--name-status", dest="name_only", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("treeish")
+    ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.treeish)
     if not sha:
-        _err("fatal: not a tree-ish")
+        _err(f"fatal: Not a valid object name {args.treeish}")
         return 128
     t, data = objs.read_object(repo, sha)
     if t == "commit":
-        c = objs.parse_commit(data)
-        sha = c.tree
-        t, data = objs.read_object(repo, sha)
+        sha = objs.parse_commit(data).tree
+    elif t == "tag":
+        sha = refs_mod._peel_to_type(repo, sha, "tree") or sha
+    eol = "\0" if args.nul else "\n"
+
+    def emit(e, path):
+        obj_t = "tree" if e.is_dir() else "blob"
+        if args.name_only:
+            sys.stdout.write(path + eol)
+        else:
+            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{path}" + eol)
 
     def walk(tsha: str, prefix: str = "") -> None:
         _t, td = objs.read_object(repo, tsha)
         for e in objs.parse_tree(td, repo.hash_len):
-            obj_t = "tree" if e.is_dir() else "blob"
             path = prefix + e.name
-            if args.r and obj_t == "tree":
-                walk(e.sha, path + "/")
+            if e.is_dir():
+                if args.r:
+                    if args.show_trees:
+                        emit(e, path)
+                    walk(e.sha, path + "/")
+                else:
+                    emit(e, path)
             else:
-                mode = e.mode if len(e.mode) == 6 else e.mode.zfill(6)
-                _print(f"{mode} {obj_t} {e.sha}\t{path}")
+                if not args.dirs_only:
+                    emit(e, path)
 
     walk(sha)
     return 0
@@ -202,14 +262,11 @@ def cmd_commit_tree(argv: list[str]) -> int:
     ap.add_argument("-m", "--message", required=True)
     args = ap.parse_args(argv)
     repo = _repo()
-    name, email = repo.user()
-    when = int(time.time())
-    sig = objs.format_signature(name, email, when=when)
     c = objs.Commit(
         tree=args.tree,
         parents=list(args.parent),
-        author=sig,
-        committer=sig,
+        author=objs.build_signature(repo, "author"),
+        committer=objs.build_signature(repo, "committer"),
         message=args.message if args.message.endswith("\n") else args.message + "\n",
     )
     sha = objs.write_object(repo, "commit", c.encode())
@@ -235,46 +292,155 @@ def cmd_update_ref(argv: list[str]) -> int:
 
 
 def cmd_symbolic_ref(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit symbolic-ref")
+    ap = argparse.ArgumentParser(prog="pygit symbolic-ref", add_help=False)
+    ap.add_argument("--short", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-d", "--delete", action="store_true")
+    ap.add_argument("-m", dest="reason", default=None)
     ap.add_argument("name")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     p = repo.gitdir / args.name
+    if args.delete:
+        if not p.exists():
+            if not args.quiet:
+                _err(f"fatal: ref {args.name} is not a symbolic ref")
+            return 1
+        p.unlink()
+        return 0
     if args.target is None:
         if not p.exists():
-            return 1
+            if not args.quiet:
+                _err(f"fatal: ref {args.name} is not a symbolic ref")
+            return 128
         txt = p.read_text(encoding="utf-8").strip()
         if txt.startswith("ref: "):
-            _print(txt[5:])
+            target = txt[5:].strip()
+            _print(refs_mod.shorten_ref(target) if args.short else target)
             return 0
+        if not args.quiet:
+            _err(f"fatal: ref {args.name} is not a symbolic ref")
         return 1
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(f"ref: {args.target}\n", encoding="utf-8")
     return 0
 
 
+def _is_inside(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def cmd_rev_parse(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit rev-parse")
-    ap.add_argument("--git-dir", action="store_true")
-    ap.add_argument("--show-toplevel", action="store_true")
-    ap.add_argument("--verify", action="store_true")
-    ap.add_argument("name", nargs="?")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    if args.git_dir:
-        _print(str(repo.gitdir))
-        return 0
-    if args.show_toplevel:
-        _print(str(repo.path))
-        return 0
-    if not args.name:
-        return 0
-    sha = refs_mod.rev_parse(repo, args.name)
-    if not sha:
-        _err(f"fatal: ambiguous argument '{args.name}'")
-        return 128
-    _print(sha)
+    repo: Optional[Repository] = None
+
+    def R() -> Repository:
+        nonlocal repo
+        if repo is None:
+            repo = _repo()
+        return repo
+
+    abbrev = 0            # 0 = full hex; >0 = abbreviate to N chars
+    symbolic: Optional[str] = None   # None | "full" | "abbrev"
+    verify = False
+    quiet = False
+    after_dashdash = False
+
+    for arg in argv:
+        if after_dashdash:
+            _print(arg)
+            continue
+        if arg == "--":
+            after_dashdash = True
+            continue
+        if arg == "--git-dir":
+            r = R()
+            cwd = Path(os.getcwd()).resolve()
+            if cwd == r.path and not r.bare:
+                _print(os.path.relpath(r.gitdir, cwd))
+            else:
+                _print(str(r.gitdir))
+            continue
+        if arg == "--absolute-git-dir":
+            _print(str(R().gitdir))
+            continue
+        if arg == "--show-toplevel":
+            _print(str(R().path))
+            continue
+        if arg == "--show-prefix":
+            r = R()
+            rel = os.path.relpath(Path(os.getcwd()).resolve(), r.path)
+            _print("" if rel == "." else rel.replace(os.sep, "/") + "/")
+            continue
+        if arg == "--show-cdup":
+            r = R()
+            rel = os.path.relpath(Path(os.getcwd()).resolve(), r.path)
+            depth = 0 if rel == "." else len(Path(rel).parts)
+            _print("../" * depth)
+            continue
+        if arg == "--is-inside-work-tree":
+            r = R()
+            inside_git = _is_inside(Path(os.getcwd()).resolve(), r.gitdir)
+            _print("false" if (r.bare or inside_git) else "true")
+            continue
+        if arg == "--is-inside-git-dir":
+            r = R()
+            _print("true" if _is_inside(Path(os.getcwd()).resolve(), r.gitdir) else "false")
+            continue
+        if arg == "--is-bare-repository":
+            _print("true" if R().bare else "false")
+            continue
+        if arg == "--verify":
+            verify = True
+            continue
+        if arg in ("-q", "--quiet"):
+            quiet = True
+            continue
+        if arg == "--short":
+            abbrev = 7
+            continue
+        if arg.startswith("--short="):
+            try:
+                abbrev = int(arg.split("=", 1)[1])
+            except ValueError:
+                abbrev = 7
+            continue
+        if arg == "--symbolic-full-name":
+            symbolic = "full"
+            continue
+        if arg == "--abbrev-ref" or arg.startswith("--abbrev-ref="):
+            symbolic = "abbrev"
+            continue
+        if arg.startswith("-") and arg != "-":
+            # Unrecognized dashed args are echoed verbatim, as C Git does.
+            _print(arg)
+            continue
+        # A revision argument.
+        r = R()
+        sha = refs_mod.rev_parse(r, arg)
+        if sha is None:
+            if verify:
+                if quiet:
+                    return 1
+                _err("fatal: Needed a single revision")
+                return 128
+            _print(arg)
+            if not quiet:
+                _err(f"fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.")
+                _err("Use '--' to separate paths from revisions, like this:")
+                _err("'git <command> [<revision>...] -- [<file>...]'")
+            return 128
+        if symbolic is not None:
+            full = refs_mod.dwim_full_name(r, arg) or arg
+            _print(refs_mod.shorten_ref(full) if symbolic == "abbrev" else full)
+        elif abbrev:
+            _print(sha[:abbrev])
+        else:
+            _print(sha)
     return 0
 
 
@@ -385,55 +551,235 @@ def cmd_mv(argv: list[str]) -> int:
     return 0
 
 
+def _wt_mode(full: Path) -> str:
+    import stat as _stat
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return "000000"
+    if _stat.S_ISLNK(st.st_mode):
+        return "120000"
+    if st.st_mode & 0o111:
+        return "100755"
+    return "100644"
+
+
+def _status_model(repo: Repository, s: dict) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Return (changes, untracked).
+
+    ``changes`` is a sorted list of ``(path, X, Y)`` where X is the index-vs-HEAD
+    status and Y the worktree-vs-index status; spaces mean unchanged.
+    """
+    index_status: dict[str, str] = {}
+    for p in s["staged_new"]:
+        index_status[p] = "A"
+    for p in s["staged_mod"]:
+        index_status[p] = "M"
+    for p in s["staged_del"]:
+        index_status[p] = "D"
+    worktree_status: dict[str, str] = {}
+    for p in s["modified"]:
+        worktree_status[p] = "M"
+    for p in s["missing"]:
+        worktree_status[p] = "D"
+    changes = []
+    for p in sorted(set(index_status) | set(worktree_status)):
+        changes.append((p, index_status.get(p, " "), worktree_status.get(p, " ")))
+    return changes, sorted(s["untracked"])
+
+
+def _status_branch_header_short(repo: Repository, head_sym, head_sha) -> str:
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+    if head_sym and head_sha is None:
+        return f"## No commits yet on {branch}"
+    if branch is None:
+        return "## HEAD (no branch)"
+    upstream, ahead, behind = _branch_tracking(repo, head_sym)
+    line = f"## {branch}"
+    if upstream:
+        line += f"...{upstream}"
+        markers = []
+        if ahead:
+            markers.append(f"ahead {ahead}")
+        if behind:
+            markers.append(f"behind {behind}")
+        if markers:
+            line += " [" + ", ".join(markers) + "]"
+    return line
+
+
+def _branch_tracking(repo: Repository, head_sym):
+    """Return (upstream_shortname_or_None, ahead, behind)."""
+    if not head_sym or not head_sym.startswith("refs/heads/"):
+        return None, 0, 0
+    branch = head_sym[len("refs/heads/"):]
+    from . import gitconfig
+    remote = gitconfig.get(repo, f"branch.{branch}.remote")
+    merge = gitconfig.get(repo, f"branch.{branch}.merge")
+    if not remote or not merge:
+        return None, 0, 0
+    merge_short = merge[len("refs/heads/"):] if merge.startswith("refs/heads/") else merge
+    if remote == ".":
+        upstream = merge_short
+        upstream_ref = merge
+    else:
+        upstream = f"{remote}/{merge_short}"
+        upstream_ref = f"refs/remotes/{remote}/{merge_short}"
+    local = refs_mod.read_ref(repo, head_sym)
+    up = refs_mod.read_ref(repo, upstream_ref)
+    ahead = behind = 0
+    if local and up:
+        ahead = _count_commits(repo, local, up)
+        behind = _count_commits(repo, up, local)
+    return upstream, ahead, behind
+
+
+def _count_commits(repo: Repository, tip: str, exclude: str) -> int:
+    """Count commits reachable from tip but not from exclude."""
+    excluded: set[str] = set()
+    stack = deque([exclude])
+    while stack:
+        sha = stack.popleft()
+        if sha in excluded:
+            continue
+        excluded.add(sha)
+        info = _commit_tree_parents(repo, sha)
+        if info:
+            stack.extend(info[1])
+    count = 0
+    seen: set[str] = set()
+    stack = deque([tip])
+    while stack:
+        sha = stack.popleft()
+        if sha in seen or sha in excluded:
+            continue
+        seen.add(sha)
+        info = _commit_tree_parents(repo, sha)
+        if info is None:
+            continue
+        count += 1
+        stack.extend(info[1])
+    return count
+
+
 def cmd_status(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit status")
+    ap = argparse.ArgumentParser(prog="pygit status", add_help=False)
     ap.add_argument("-s", "--short", action="store_true")
     ap.add_argument("-b", "--branch", action="store_true")
+    ap.add_argument("--long", dest="long", action="store_true")
+    ap.add_argument("--porcelain", nargs="?", const="v1", default=None)
+    ap.add_argument("-u", "--untracked-files", nargs="?", const="all", default="all")
+    ap.add_argument("-z", dest="nul", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
     s = workdir.status(repo)
     head_sym, head_sha = refs_mod.read_head(repo)
-    branch = head_sym[len("refs/heads/") :] if head_sym and head_sym.startswith("refs/heads/") else "(detached)"
-    if args.short:
+    branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+    changes, untracked = _status_model(repo, s)
+
+    porcelain = args.porcelain
+    short_mode = args.short and not args.long and porcelain is None
+    eol = "\0" if args.nul else "\n"
+
+    def emit(line: str):
+        sys.stdout.write(line + eol)
+
+    if porcelain == "v2":
+        return _status_porcelain_v2(repo, s, changes, untracked, args.branch, head_sym, head_sha, eol)
+
+    if porcelain is not None or short_mode:
         if args.branch:
-            if head_sym and head_sha is None:
-                _print(f"## No commits yet on {branch}")
-            else:
-                _print(f"## {branch}")
-        for p in s["staged_new"]:
-            _print(f"A  {p}")
-        for p in s["staged_mod"]:
-            _print(f"M  {p}")
-        for p in s["staged_del"]:
-            _print(f"D  {p}")
-        for p in s["modified"]:
-            _print(f" M {p}")
-        for p in s["missing"]:
-            _print(f" D {p}")
-        for p in s["untracked"]:
-            _print(f"?? {p}")
+            emit(_status_branch_header_short(repo, head_sym, head_sha))
+        for p, x, y in changes:
+            emit(f"{x}{y} {p}")
+        for p in untracked:
+            emit(f"?? {p}")
         return 0
-    _print(f"On branch {branch}")
-    if s["staged_new"] or s["staged_mod"] or s["staged_del"]:
-        _print("\nChanges to be committed:")
-        for p in s["staged_new"]:
-            _print(f"\tnew file:   {p}")
-        for p in s["staged_mod"]:
-            _print(f"\tmodified:   {p}")
-        for p in s["staged_del"]:
-            _print(f"\tdeleted:    {p}")
-    if s["modified"] or s["missing"]:
-        _print("\nChanges not staged for commit:")
-        for p in s["modified"]:
-            _print(f"\tmodified:   {p}")
-        for p in s["missing"]:
-            _print(f"\tdeleted:    {p}")
-    if s["untracked"]:
-        _print("\nUntracked files:")
-        for p in s["untracked"]:
+
+    # Long (default) format.
+    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha)
+
+
+def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha) -> int:
+    unborn = head_sym is not None and head_sha is None
+    if branch is not None:
+        _print(f"On branch {branch}")
+    else:
+        _print("HEAD detached")
+    if unborn:
+        _print("\nNo commits yet\n")
+
+    staged = [(p, x) for p, x, y in changes if x != " "]
+    unstaged = [(p, y) for p, x, y in changes if y != " "]
+    label = {"A": "new file:   ", "M": "modified:   ", "D": "deleted:    "}
+
+    if staged:
+        _print("Changes to be committed:")
+        if unborn:
+            _print('  (use "git rm --cached <file>..." to unstage)')
+        else:
+            _print('  (use "git restore --staged <file>..." to unstage)')
+        for p, x in staged:
+            _print(f"\t{label[x]}{p}")
+        _print("")
+    if unstaged:
+        _print("Changes not staged for commit:")
+        if any(y == "D" for _, y in unstaged):
+            _print('  (use "git add/rm <file>..." to update what will be committed)')
+        else:
+            _print('  (use "git add <file>..." to update what will be committed)')
+        _print('  (use "git restore <file>..." to discard changes in working directory)')
+        for p, y in unstaged:
+            _print(f"\t{label[y]}{p}")
+        _print("")
+    if untracked:
+        _print("Untracked files:")
+        _print('  (use "git add <file>..." to include in what will be committed)')
+        for p in untracked:
             _print(f"\t{p}")
-    if not any(s.values()):
+        _print("")
+
+    if not staged and not unstaged and not untracked:
         _print("nothing to commit, working tree clean")
+    elif not staged and not unstaged and untracked:
+        _print('nothing added to commit but untracked files present (use "git add" to track)')
+    elif not staged and unstaged:
+        _print('no changes added to commit (use "git add" and/or "git commit -a")')
+    return 0
+
+
+def _status_porcelain_v2(repo, s, changes, untracked, want_branch, head_sym, head_sha, eol) -> int:
+    def emit(line: str):
+        sys.stdout.write(line + eol)
+    if want_branch:
+        oid = head_sha or "(initial)"
+        emit(f"# branch.oid {oid}")
+        emit(f"# branch.head {head_sym[len('refs/heads/'):] if head_sym and head_sym.startswith('refs/heads/') else '(detached)'}")
+        upstream, ahead, behind = _branch_tracking(repo, head_sym)
+        if upstream:
+            emit(f"# branch.upstream {upstream}")
+            emit(f"# branch.ab +{ahead} -{behind}")
+    idx = read_index(repo).by_path()
+    head_modes: dict[str, str] = {}
+    head_shas: dict[str, str] = {}
+    if head_sha:
+        _, hdata = objs.read_object(repo, head_sha)
+        htree = objs.parse_commit(hdata).tree
+        for path, mode, sha in workdir.iter_tree_files(repo, htree):
+            head_modes[path] = mode
+            head_shas[path] = sha
+    zero = "0" * 40
+    for p, x, y in changes:
+        xv = x if x != " " else "."
+        yv = y if y != " " else "."
+        mH = head_modes.get(p, "000000")
+        mI = idx[p].mode_str() if p in idx else "000000"
+        mW = "000000" if y == "D" else _wt_mode(repo.path / p)
+        hH = head_shas.get(p, zero)
+        hI = idx[p].sha if p in idx else zero
+        emit(f"1 {xv}{yv} N... {mH} {mI} {mW} {hH} {hI} {p}")
+    for p in untracked:
+        emit(f"? {p}")
     return 0
 
 
@@ -468,20 +814,64 @@ def cmd_commit(argv: list[str]) -> int:
             if pc.tree == tree:
                 _err("nothing to commit, working tree clean")
                 return 1
-    name, email = repo.user()
-    when = int(time.time())
-    sig = objs.format_signature(name, email, when=when)
+    author_sig = objs.build_signature(repo, "author")
+    committer_sig = objs.build_signature(repo, "committer")
     msg = args.message if args.message.endswith("\n") else args.message + "\n"
-    c = objs.Commit(tree=tree, parents=parents, author=sig, committer=sig, message=msg)
+    c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
     sha = objs.write_object(repo, "commit", c.encode())
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha)
     else:
         refs_mod.set_head(repo, sha)
     short = sha[:7]
-    branch = head_sym[len("refs/heads/") :] if head_sym and head_sym.startswith("refs/heads/") else "HEAD"
-    _print(f"[{branch} {short}] {args.message.splitlines()[0]}")
+    if head_sym and head_sym.startswith("refs/heads/"):
+        branch = head_sym[len("refs/heads/"):]
+    else:
+        branch = "detached HEAD"
+    root = " (root-commit)" if not parents else ""
+    _print(f"[{branch}{root} {short}] {args.message.splitlines()[0]}")
+    parent_tree = None
+    if parent:
+        _, pdata = objs.read_object(repo, parent)
+        parent_tree = objs.parse_commit(pdata).tree
+    _print_commit_summary(repo, parent_tree, tree)
     return 0
+
+
+def _blob_lines(repo: Repository, sha: str) -> list[str]:
+    try:
+        _, data = objs.read_object(repo, sha)
+    except KeyError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _print_commit_summary(repo: Repository, parent_tree: Optional[str], new_tree: str) -> None:
+    files = insertions = deletions = 0
+    mode_lines: list[tuple[str, str]] = []
+    for path, a, b in workdir.iter_tree_changes(repo, parent_tree, new_tree):
+        files += 1
+        old_lines = _blob_lines(repo, a.sha) if a is not None else []
+        new_lines = _blob_lines(repo, b.sha) if b is not None else []
+        for op in diff_mod.diff_lines(old_lines, new_lines):
+            if op[0] == "ins":
+                insertions += 1
+            elif op[0] == "del":
+                deletions += 1
+        if a is None and b is not None:
+            mode_lines.append((path, f" create mode {b.mode.zfill(6)} {path}"))
+        elif b is None and a is not None:
+            mode_lines.append((path, f" delete mode {a.mode.zfill(6)} {path}"))
+    if files == 0:
+        return
+    parts = [f"{files} file{'s' if files != 1 else ''} changed"]
+    if insertions:
+        parts.append(f"{insertions} insertion{'s' if insertions != 1 else ''}(+)")
+    if deletions:
+        parts.append(f"{deletions} deletion{'s' if deletions != 1 else ''}(-)")
+    _print(" " + ", ".join(parts))
+    for _, line in sorted(mode_lines):
+        _print(line)
 
 
 def cmd_log(argv: list[str]) -> int:
@@ -495,7 +885,14 @@ def cmd_log(argv: list[str]) -> int:
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
-        _err("fatal: bad revision")
+        head_sym, _ = refs_mod.read_head(repo)
+        if args.rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
+            branch = head_sym[len("refs/heads/"):]
+            _err(f"fatal: your current branch '{branch}' does not have any commits yet")
+            return 128
+        _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
+        _err("Use '--' to separate paths from revisions, like this:")
+        _err("'git <command> [<revision>...] -- [<file>...]'")
         return 128
     decorate = args.decorate is not None and not args.no_decorate
     decorations = _commit_decorations(repo) if decorate else {}
@@ -668,34 +1065,72 @@ def cmd_diff(argv: list[str]) -> int:
     return 0
 
 
+def _remote_branches(repo: Repository) -> list[str]:
+    found: list[str] = []
+    root = repo.gitdir / "refs" / "remotes"
+    if root.exists():
+        for f in sorted(root.rglob("*")):
+            if f.is_file():
+                rel = str(f.relative_to(repo.gitdir / "refs" / "remotes")).replace(os.sep, "/")
+                found.append(rel)
+    for ref in refs_mod.read_packed_refs(repo):
+        if ref.startswith("refs/remotes/"):
+            found.append(ref[len("refs/remotes/"):])
+    return sorted(set(found))
+
+
 def cmd_branch(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit branch")
+    ap = argparse.ArgumentParser(prog="pygit branch", add_help=False)
     ap.add_argument("-d", "--delete", action="store_true")
+    ap.add_argument("-D", dest="force_delete", action="store_true")
     ap.add_argument("-a", "--all", action="store_true")
+    ap.add_argument("-r", "--remotes", action="store_true")
+    ap.add_argument("-l", "--list", dest="list_mode", action="store_true")
+    ap.add_argument("--show-current", action="store_true")
+    ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
     ap.add_argument("start", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.name is None:
-        head_sym, _ = refs_mod.read_head(repo)
-        cur = head_sym[len("refs/heads/") :] if head_sym and head_sym.startswith("refs/heads/") else None
-        for b in refs_mod.list_branches(repo):
-            mark = "*" if b == cur else " "
-            _print(f"{mark} {b}")
-        if args.all:
-            root = repo.gitdir / "refs" / "remotes"
-            if root.exists():
-                for f in sorted(root.rglob("*")):
-                    if f.is_file():
-                        rel = str(f.relative_to(repo.gitdir / "refs")).replace(os.sep, "/")
-                        _print(f"  remotes/{rel[len('remotes/') :]}")
+    head_sym, _ = refs_mod.read_head(repo)
+    cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+
+    if args.show_current:
+        if cur:
+            _print(cur)
         return 0
-    if args.delete:
-        refs_mod.delete_ref(repo, f"refs/heads/{args.name}")
+
+    if args.delete or args.force_delete:
+        if args.name is None:
+            _err("fatal: branch name required")
+            return 128
+        full = f"refs/heads/{args.name}"
+        if refs_mod.read_ref(repo, full) is None:
+            _err(f"error: branch '{args.name}' not found")
+            return 1
+        sha = refs_mod.read_ref(repo, full)
+        refs_mod.delete_ref(repo, full)
+        _print(f"Deleted branch {args.name} (was {sha[:7]}).")
         return 0
+
+    if args.name is None or args.list_mode:
+        import fnmatch
+        pattern = args.name
+        names: list[tuple[str, str]] = []  # (display, head-compare-name)
+        if not args.remotes:
+            names.extend((b, b) for b in refs_mod.list_branches(repo))
+        if args.remotes or args.all:
+            names.extend((f"remotes/{b}", None) for b in _remote_branches(repo))
+        for display, plain in names:
+            if pattern and not fnmatch.fnmatch(display, pattern):
+                continue
+            mark = "*" if plain is not None and plain == cur else " "
+            _print(f"{mark} {display}")
+        return 0
+
     start = refs_mod.rev_parse(repo, args.start) if args.start else refs_mod.rev_parse(repo, "HEAD")
     if not start:
-        _err("fatal: no starting point")
+        _err(f"fatal: Not a valid object name: '{args.start or 'HEAD'}'.")
         return 128
     refs_mod.update_ref(repo, f"refs/heads/{args.name}", start)
     return 0
@@ -830,43 +1265,123 @@ def cmd_reset(argv: list[str]) -> int:
     return 0
 
 
+def _config_list_pairs(repo: Optional[Repository]) -> list[tuple[str, str]]:
+    from . import gitconfig
+    return gitconfig.list_all(repo)
+
+
 def cmd_config(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit config")
-    ap.add_argument("--global", dest="is_global", action="store_true")
-    ap.add_argument("--unset", action="store_true")
-    ap.add_argument("--unset-all", dest="unset_all", action="store_true")
-    ap.add_argument("--add", action="store_true")
-    ap.add_argument("--replace-all", action="store_true")
-    ap.add_argument("name")
-    ap.add_argument("value", nargs="?")
-    args = ap.parse_args(argv)
-    if args.is_global:
-        cfg_path = Path.home() / ".gitconfig"
-    else:
-        cfg_path = _repo().gitdir / "config"
-    import configparser
-    cp = configparser.ConfigParser(interpolation=None)
-    if cfg_path.exists():
-        cp.read(cfg_path, encoding="utf-8")
-    sect, key = _config_section_key(args.name)
-    if not key:
-        return 1
-    if args.unset or args.unset_all:
-        if cp.has_option(sect, key):
-            cp.remove_option(sect, key)
-            with cfg_path.open("w", encoding="utf-8") as f:
-                cp.write(f)
+    from . import gitconfig
+
+    is_global = False
+    is_local = False
+    file_path: Optional[str] = None
+    action: Optional[str] = None   # get | get_all | list | unset | unset_all | add | replace_all
+    positional: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--global":
+            is_global = True
+        elif a == "--local":
+            is_local = True
+        elif a == "--system":
+            pass
+        elif a in ("-f", "--file"):
+            i += 1
+            file_path = argv[i] if i < len(argv) else None
+        elif a.startswith("--file="):
+            file_path = a.split("=", 1)[1]
+        elif a in ("-l", "--list"):
+            action = "list"
+        elif a == "--get":
+            action = "get"
+        elif a == "--get-all":
+            action = "get_all"
+        elif a == "--unset":
+            action = "unset"
+        elif a == "--unset-all":
+            action = "unset_all"
+        elif a == "--add":
+            action = "add"
+        elif a == "--replace-all":
+            action = "replace_all"
+        elif a == "--":
+            i += 1
+            positional.extend(argv[i:])
+            break
+        elif a.startswith("-") and a != "-":
+            # Unknown flags are ignored for now; common value-type flags
+            # (--bool, --int) don't change which value is stored.
+            pass
+        else:
+            positional.append(a)
+        i += 1
+
+    repo: Optional[Repository] = None
+
+    def get_repo() -> Repository:
+        nonlocal repo
+        if repo is None:
+            repo = _repo()
+        return repo
+
+    if action == "list" or (action is None and not positional):
+        if action is None and not positional:
+            action = "list"
+    if action == "list":
+        try:
+            repo = _repo()
+        except RepositoryError:
+            repo = None
+        for key, value in gitconfig.list_all(repo):
+            _print(f"{key}={value}")
         return 0
-    if args.value is None:
-        if cp.has_option(sect, key):
-            _print(cp.get(sect, key))
-            return 0
+
+    if not positional:
+        _err("error: wrong number of arguments, should be from 1 to 3")
+        return 129
+    name = positional[0]
+    value = positional[1] if len(positional) > 1 else None
+
+    parts = gitconfig.split_key(name)
+    if parts is None:
+        _err(f"error: key does not contain a section: {name}")
         return 1
-    if not cp.has_section(sect):
-        cp.add_section(sect)
-    cp.set(sect, key, args.value)
-    with cfg_path.open("w", encoding="utf-8") as f:
-        cp.write(f)
+    section, subsection, key = parts
+
+    # Reads
+    if action in ("get", "get_all") or (action is None and value is None):
+        try:
+            repo = _repo()
+        except RepositoryError:
+            repo = None
+        values = gitconfig.get_all(repo, name)
+        if not values:
+            return 1
+        if action == "get_all":
+            for v in values:
+                _print(v)
+        else:
+            _print(values[-1])
+        return 0
+
+    # Writes (and unsets) operate on a single file.
+    if file_path is not None:
+        cfg_path = Path(file_path)
+    elif is_global:
+        cfg_path = Path(os.environ.get("GIT_CONFIG_GLOBAL") or (Path.home() / ".gitconfig"))
+    else:
+        cfg_path = get_repo().gitdir / "config"
+
+    if action in ("unset", "unset_all"):
+        rc = gitconfig.unset_value(cfg_path, section, subsection, key, all_values=(action == "unset_all"))
+        return 0 if rc == 0 else rc
+    if value is None:
+        _err("error: wrong number of arguments, should be from 1 to 3")
+        return 129
+    mode = {"add": "add", "replace_all": "replace_all"}.get(action, "set")
+    gitconfig.write_value(cfg_path, section, subsection, key, value, mode=mode)
     return 0
 
 
@@ -892,34 +1407,38 @@ def cmd_remote(argv: list[str]) -> int:
     p_rm.add_argument("name")
     args = ap.parse_args(argv or ["show"])
     repo = _repo()
-    cp = repo.config()
+    from . import gitconfig
+    pairs = gitconfig.list_all(repo)
     if args.action in (None, "show"):
-        for s in cp.sections():
-            if s.startswith('remote "'):
-                name = s[len('remote "') : -1]
-                if args.verbose:
-                    url = cp.get(s, "url", fallback="")
-                    pushurl = cp.get(s, "pushurl", fallback=url)
-                    _print(f"{name}\t{url} (fetch)")
-                    _print(f"{name}\t{pushurl} (push)")
-                else:
-                    _print(name)
+        seen: list[str] = []
+        urls: dict[str, str] = {}
+        pushurls: dict[str, str] = {}
+        for key, value in pairs:
+            if key.startswith("remote.") and key.endswith(".url"):
+                name = key[len("remote."):-len(".url")]
+                if name not in seen:
+                    seen.append(name)
+                urls[name] = value
+            elif key.startswith("remote.") and key.endswith(".pushurl"):
+                pushurls[key[len("remote."):-len(".pushurl")]] = value
+        for name in seen:
+            if args.verbose:
+                url = urls.get(name, "")
+                pushurl = pushurls.get(name, url)
+                _print(f"{name}\t{url} (fetch)")
+                _print(f"{name}\t{pushurl} (push)")
+            else:
+                _print(name)
         return 0
     cfg_path = repo.gitdir / "config"
     if args.action == "add":
-        sect = f'remote "{args.name}"'
-        if not cp.has_section(sect):
-            cp.add_section(sect)
-        cp.set(sect, "url", args.url)
-        cp.set(sect, "fetch", f"+refs/heads/*:refs/remotes/{args.name}/*")
-        with cfg_path.open("w", encoding="utf-8") as f:
-            cp.write(f)
+        gitconfig.write_value(cfg_path, "remote", args.name, "url", args.url, mode="set")
+        gitconfig.write_value(
+            cfg_path, "remote", args.name, "fetch",
+            f"+refs/heads/*:refs/remotes/{args.name}/*", mode="set",
+        )
     elif args.action == "remove":
-        sect = f'remote "{args.name}"'
-        if cp.has_section(sect):
-            cp.remove_section(sect)
-            with cfg_path.open("w", encoding="utf-8") as f:
-                cp.write(f)
+        gitconfig.remove_section(cfg_path, "remote", args.name)
     return 0
 
 
@@ -1881,27 +2400,66 @@ def cmd_bundle(argv: list[str]) -> int:
     return 1
 
 
-def cmd_show_ref(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit show-ref")
-    ap.add_argument("--tags", action="store_true")
-    ap.add_argument("--heads", action="store_true")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    for name in ("refs/heads", "refs/tags", "refs/remotes"):
-        if args.tags and name != "refs/tags":
-            continue
-        if args.heads and name != "refs/heads":
-            continue
-        root = repo.gitdir / name
-        if not root.exists():
-            continue
+def _enumerate_refs(repo: Repository) -> list[tuple[str, str]]:
+    """All refs under refs/ (loose + packed) as (refname, sha), sorted by name."""
+    refs: dict[str, str] = {}
+    for name, sha in refs_mod.read_packed_refs(repo).items():
+        if name.startswith("refs/"):
+            refs[name] = sha
+    root = repo.gitdir / "refs"
+    if root.exists():
         for f in sorted(root.rglob("*")):
             if f.is_file():
                 rel = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
                 s = refs_mod.read_ref(repo, rel)
                 if s:
-                    _print(f"{s} {rel}")
-    return 0
+                    refs[rel] = s
+    return sorted(refs.items())
+
+
+def cmd_show_ref(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="pygit show-ref", add_help=False)
+    ap.add_argument("--head", action="store_true")
+    ap.add_argument("--tags", action="store_true")
+    ap.add_argument("--heads", action="store_true")
+    ap.add_argument("--verify", action="store_true")
+    ap.add_argument("-d", "--dereference", action="store_true")
+    ap.add_argument("patterns", nargs="*")
+    args = ap.parse_args(argv)
+    repo = _repo()
+
+    if args.verify:
+        printed = 0
+        for pat in args.patterns:
+            sha = refs_mod.read_ref(repo, pat) if pat.startswith("refs/") or pat == "HEAD" else None
+            if sha is None:
+                _err(f"fatal: '{pat}' - not a valid ref")
+                return 128
+            _print(f"{sha} {pat}")
+            printed += 1
+        return 0 if printed else 1
+
+    def matches(refname: str) -> bool:
+        if not args.patterns:
+            return True
+        return any(refname == pat or refname.endswith("/" + pat) for pat in args.patterns)
+
+    printed = 0
+    if args.head:
+        _, headsha = refs_mod.read_head(repo)
+        if headsha:
+            _print(f"{headsha} HEAD")
+            printed += 1
+    for refname, sha in _enumerate_refs(repo):
+        if args.heads and not refname.startswith("refs/heads/"):
+            continue
+        if args.tags and not refname.startswith("refs/tags/"):
+            continue
+        if not matches(refname):
+            continue
+        _print(f"{sha} {refname}")
+        printed += 1
+    return 0 if printed else 1
 
 
 def cmd_mktree(argv: list[str]) -> int:
@@ -2866,33 +3424,71 @@ def cmd_name_rev(argv: list[str]) -> int:
     return 0
 
 
+def _var_ident(repo: Optional[Repository], role: str) -> str:
+    if repo is not None:
+        return objs.build_signature(repo, role)
+    env = os.environ
+    if role == "author":
+        name = env.get("GIT_AUTHOR_NAME") or "pythongit"
+        email = env.get("GIT_AUTHOR_EMAIL") or env.get("EMAIL") or "pythongit@example.invalid"
+        date = env.get("GIT_AUTHOR_DATE")
+    else:
+        name = env.get("GIT_COMMITTER_NAME") or "pythongit"
+        email = env.get("GIT_COMMITTER_EMAIL") or env.get("EMAIL") or "pythongit@example.invalid"
+        date = env.get("GIT_COMMITTER_DATE")
+    parsed = objs._parse_date_env(date) if date else None
+    if parsed is not None:
+        secs, tzmin = parsed
+    else:
+        secs = int(time.time())
+        tzmin = objs._local_tz_minutes(secs)
+    return objs.format_signature(name, email, when=secs, tz_minutes=tzmin)
+
+
+def _var_value(repo: Optional[Repository], name: str) -> Optional[str]:
+    if name == "GIT_AUTHOR_IDENT":
+        return _var_ident(repo, "author")
+    if name == "GIT_COMMITTER_IDENT":
+        return _var_ident(repo, "committer")
+    if name == "GIT_EDITOR":
+        return os.environ.get("GIT_EDITOR") or os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    if name == "GIT_SEQUENCE_EDITOR":
+        return os.environ.get("GIT_SEQUENCE_EDITOR") or _var_value(repo, "GIT_EDITOR")
+    if name == "GIT_PAGER":
+        return os.environ.get("GIT_PAGER") or os.environ.get("PAGER") or "less"
+    if name == "GIT_DEFAULT_BRANCH":
+        if repo is not None:
+            cp = repo.config()
+            if cp.has_section("init"):
+                val = cp.get("init", "defaultbranch", fallback=None)
+                if val:
+                    return val
+        return "master"
+    return None
+
+
 def cmd_var(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit var")
-    ap.add_argument("name")
-    args = ap.parse_args(argv)
     repo = None
     try:
         repo = _repo()
     except Exception:
         pass
-    name = args.name
-    if name in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
-        if repo:
-            n, e = repo.user()
-        else:
-            n = os.environ.get("GIT_AUTHOR_NAME", "pythongit")
-            e = os.environ.get("GIT_AUTHOR_EMAIL", "pythongit@example.invalid")
-        import time as _t
-        _print(f"{n} <{e}> {int(_t.time())} +0000")
+    if len(argv) != 1 or argv[0].startswith("-") and argv[0] != "-l":
+        _err("usage: git var (-l | <variable>)")
+        return 129
+    name = argv[0]
+    if name == "-l":
+        for key, value in _config_list_pairs(repo):
+            _print(f"{key}={value}")
+        for logical in ("GIT_COMMITTER_IDENT", "GIT_AUTHOR_IDENT", "GIT_DEFAULT_BRANCH"):
+            _print(f"{logical}={_var_value(repo, logical)}")
         return 0
-    if name == "GIT_EDITOR":
-        _print(os.environ.get("GIT_EDITOR") or os.environ.get("EDITOR") or "vi")
-        return 0
-    if name == "GIT_PAGER":
-        _print(os.environ.get("GIT_PAGER") or os.environ.get("PAGER") or "less")
-        return 0
-    _err(f"unknown variable: {name}")
-    return 1
+    value = _var_value(repo, name)
+    if value is None:
+        _err("usage: git var (-l | <variable>)")
+        return 129
+    _print(value)
+    return 0
 
 
 def cmd_stripspace(argv: list[str]) -> int:

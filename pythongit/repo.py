@@ -12,6 +12,30 @@ class RepositoryError(Exception):
     pass
 
 
+def _probe_filemode(gitdir: Path) -> bool:
+    """Whether the filesystem honors the executable bit, like C Git's probe.
+
+    Git creates a file, flips the user-execute bit, and checks whether the
+    change survives a stat; filesystems such as those on Windows do not.
+    """
+    probe = gitdir / "config.filemode.probe"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.chmod(0o644)
+        if probe.stat().st_mode & 0o100:
+            return False
+        probe.chmod(0o744)
+        result = bool(probe.stat().st_mode & 0o100)
+        return result
+    except (OSError, NotImplementedError):
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
 class Repository:
     """A git repository on disk.
 
@@ -71,9 +95,11 @@ class Repository:
             config = (
                 "[core]\n"
                 f"\trepositoryformatversion = {1 if object_format == 'sha256' else 0}\n"
-                "\tfilemode = false\n"
+                f"\tfilemode = {'true' if _probe_filemode(gitdir) else 'false'}\n"
                 f"\tbare = {'true' if bare else 'false'}\n"
             )
+            if not bare:
+                config += "\tlogallrefupdates = true\n"
             if object_format != "sha1":
                 config += "[extensions]\n\tobjectformat = sha256\n"
             cfg.write_text(config, encoding="utf-8")
@@ -81,6 +107,20 @@ class Repository:
             "Unnamed repository; edit this file 'description' to name the repository.\n",
             encoding="utf-8",
         )
+        (gitdir / "hooks").mkdir(exist_ok=True)
+        info = gitdir / "info"
+        info.mkdir(exist_ok=True)
+        exclude = info / "exclude"
+        if not exclude.exists():
+            exclude.write_text(
+                "# git ls-files --others --exclude-from=.git/info/exclude\n"
+                "# Lines that start with '#' are comments.\n"
+                "# For a project mostly in C, the following would be a good set of\n"
+                "# exclude patterns (uncomment them if you want to use them):\n"
+                "# *.[oa]\n"
+                "# *~\n",
+                encoding="utf-8",
+            )
         return cls(path, gitdir=gitdir, bare=bare)
 
     # ---- config --------------------------------------------------------
@@ -93,8 +133,8 @@ class Repository:
         return cp
 
     def object_format(self) -> str:
-        cp = self.config()
-        fmt = cp.get("extensions", "objectformat", fallback="sha1").lower()
+        from . import gitconfig
+        fmt = (gitconfig.get(self, "extensions.objectformat") or "sha1").lower()
         if fmt not in ("sha1", "sha256"):
             raise RepositoryError(f"unsupported object format: {fmt}")
         return fmt
@@ -124,12 +164,10 @@ class Repository:
         return h.hexdigest()
 
     def user(self) -> tuple[str, str]:
-        cp = self.config()
-        name = email = None
-        if cp.has_section("user"):
-            name = cp.get("user", "name", fallback=None)
-            email = cp.get("user", "email", fallback=None)
+        from . import gitconfig
+        name = gitconfig.get(self, "user.name")
+        email = gitconfig.get(self, "user.email")
         # Fall back to environment, then a generic default.
         name = os.environ.get("GIT_AUTHOR_NAME") or name or "pythongit"
-        email = os.environ.get("GIT_AUTHOR_EMAIL") or email or "pythongit@example.invalid"
+        email = os.environ.get("GIT_AUTHOR_EMAIL") or email or os.environ.get("EMAIL") or "pythongit@example.invalid"
         return name, email

@@ -41,7 +41,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="pygit-p5-"))
     try:
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t"); run("config", "user.email", "t@e.com")
 
         (tmp / "a.py").write_text("def hello():\n    print('hi')\n")

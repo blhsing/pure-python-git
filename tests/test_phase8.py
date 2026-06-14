@@ -55,12 +55,12 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="pygit-p8-"))
     try:
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t"); run("config", "user.email", "t@e.com")
         (tmp / "a.txt").write_text("hello\n"); run("add", "a.txt"); run("commit", "-m", "c1")
 
         # init-db alias
-        rc = run("init-db", str(tmp / "alt"))
+        rc = run("init-db", "-b", "main", str(tmp / "alt"))
         check(rc == 0, "init-db (alias)")
 
         # annotate alias

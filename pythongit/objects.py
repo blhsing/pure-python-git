@@ -169,3 +169,83 @@ def format_signature(name: str, email: str, *, when: Optional[int] = None, tz_mi
     sign = "+" if tz_minutes >= 0 else "-"
     tz_abs = abs(tz_minutes)
     return f"{name} <{email}> {when} {sign}{tz_abs // 60:02d}{tz_abs % 60:02d}"
+
+
+def _parse_date_env(value: str) -> Optional[tuple[int, int]]:
+    """Parse a ``GIT_*_DATE`` value into ``(epoch_seconds, tz_minutes)``.
+
+    Handles the raw ``<seconds> <±HHMM>`` and ``@<seconds>`` forms that Git
+    emits and round-trips, plus common ISO-8601 spellings; returns None when
+    the value cannot be parsed so the caller can fall back to the current time.
+    """
+    import re
+    import datetime
+
+    value = value.strip()
+    if not value:
+        return None
+    m = re.match(r"^@?(-?\d+)\s+([+-])(\d{2})(\d{2})$", value)
+    if m:
+        secs = int(m.group(1))
+        tzmin = (1 if m.group(2) == "+" else -1) * (int(m.group(3)) * 60 + int(m.group(4)))
+        return secs, tzmin
+    m = re.match(r"^@(-?\d+)$", value)
+    if m:
+        return int(m.group(1)), 0
+    iso = value.replace("Z", "+00:00")
+    for fmt in (
+        None,  # datetime.fromisoformat
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            dt = datetime.datetime.fromisoformat(iso) if fmt is None else datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        off = dt.utcoffset()
+        tzmin = int(off.total_seconds()) // 60 if off is not None else 0
+        return int(dt.timestamp()), tzmin
+    return None
+
+
+def _local_tz_minutes(when: int) -> int:
+    import datetime
+    try:
+        local = datetime.datetime.fromtimestamp(when).astimezone()
+        off = local.utcoffset()
+        return int(off.total_seconds()) // 60 if off is not None else 0
+    except (OverflowError, OSError, ValueError):
+        return 0
+
+
+def build_signature(repo: Repository, role: str) -> str:
+    """Build an ``author`` or ``committer`` signature line.
+
+    Identity precedence matches C Git: the role-specific ``GIT_*`` env vars,
+    then ``user.name`` / ``user.email`` (``EMAIL`` for the address), then a
+    generic fallback. The date honors ``GIT_AUTHOR_DATE`` / ``GIT_COMMITTER_DATE``
+    and otherwise uses the current local time with the local UTC offset.
+    """
+    import time
+    from . import gitconfig
+
+    cfg_name = gitconfig.get(repo, "user.name")
+    cfg_email = gitconfig.get(repo, "user.email")
+    if role == "author":
+        name = os.environ.get("GIT_AUTHOR_NAME") or cfg_name
+        email = os.environ.get("GIT_AUTHOR_EMAIL") or os.environ.get("EMAIL") or cfg_email
+        date = os.environ.get("GIT_AUTHOR_DATE")
+    else:
+        name = os.environ.get("GIT_COMMITTER_NAME") or cfg_name
+        email = os.environ.get("GIT_COMMITTER_EMAIL") or os.environ.get("EMAIL") or cfg_email
+        date = os.environ.get("GIT_COMMITTER_DATE")
+    name = name or "pythongit"
+    email = email or "pythongit@example.invalid"
+    parsed = _parse_date_env(date) if date else None
+    if parsed is not None:
+        secs, tzmin = parsed
+    else:
+        secs = int(time.time())
+        tzmin = _local_tz_minutes(secs)
+    return format_signature(name, email, when=secs, tz_minutes=tzmin)

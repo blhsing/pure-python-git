@@ -37,7 +37,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="pygit-p6-"))
     try:
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t"); run("config", "user.email", "t@e.com")
         (tmp / "a.txt").write_text("a\n"); run("add", "a.txt"); run("commit", "-m", "c1")
         (tmp / "b.txt").write_text("b\n"); run("add", "b.txt"); run("commit", "-m", "c2")
@@ -69,7 +69,7 @@ def main() -> int:
         tmp2 = Path(tempfile.mkdtemp(prefix="pygit-p6b-"))
         try:
             os.chdir(tmp2)
-            run("init", str(tmp2))
+            run("init", "-b", "main", str(tmp2))
             old_stdin = sys.stdin
             sys.stdin = FakeStdin(out_buf.getvalue())
             try:

@@ -131,21 +131,23 @@ def list_tags(repo: Repository) -> list[str]:
     return sorted(found)
 
 
-def rev_parse(repo: Repository, name: str) -> Optional[str]:
-    """Resolve a rev-ish to a full SHA.
+def _resolve_base(repo: Repository, name: str) -> Optional[str]:
+    """Resolve a ref-ish with no ^/~ suffix operators to a full SHA.
 
-    Accepts: full sha, abbreviated sha (>=4), HEAD, branch, tag,
-    refs/heads/x, refs/tags/x, refs/remotes/x.
+    DWIM precedence follows C Git's ``ref_rev_parse_rules``: the literal name
+    under $GIT_DIR, then refs/, refs/tags/, refs/heads/, refs/remotes/, and
+    refs/remotes/<name>/HEAD. Note tags resolve *before* heads.
     """
     name = name.strip()
-    if name == "HEAD":
-        _, sha = read_head(repo)
-        return sha
+    if name == "@":
+        name = "HEAD"
     for candidate in (
         name,
-        f"refs/heads/{name}",
+        f"refs/{name}",
         f"refs/tags/{name}",
+        f"refs/heads/{name}",
         f"refs/remotes/{name}",
+        f"refs/remotes/{name}/HEAD",
     ):
         sha = read_ref(repo, candidate)
         if sha:
@@ -168,3 +170,239 @@ def rev_parse(repo: Repository, name: str) -> Optional[str]:
         if m:
             return m
     return None
+
+
+def _tag_target(data: bytes) -> Optional[str]:
+    head = data.decode("utf-8", "replace").split("\n\n", 1)[0]
+    for line in head.splitlines():
+        key, _, val = line.partition(" ")
+        if key == "object":
+            return val.strip()
+    return None
+
+
+def _commit_parents(repo: Repository, sha: str) -> list[str]:
+    from . import objects as objs
+    try:
+        obj_type, data = objs.read_object(repo, sha)
+    except KeyError:
+        return []
+    if obj_type != "commit":
+        return []
+    return list(objs.parse_commit(data).parents)
+
+
+def _peel_to_commit(repo: Repository, sha: str) -> Optional[str]:
+    from . import objects as objs
+    cur: Optional[str] = sha
+    for _ in range(32):
+        try:
+            obj_type, data = objs.read_object(repo, cur)
+        except KeyError:
+            return None
+        if obj_type == "commit":
+            return cur
+        if obj_type == "tag":
+            cur = _tag_target(data)
+            if cur is None:
+                return None
+            continue
+        return None
+    return None
+
+
+def _peel_to_type(repo: Repository, sha: str, spec: str) -> Optional[str]:
+    from . import objects as objs
+    if spec == "object":
+        return sha
+    if spec.startswith("/"):
+        # commit-message text search is not supported
+        return None
+    cur: Optional[str] = sha
+    for _ in range(32):
+        try:
+            obj_type, data = objs.read_object(repo, cur)
+        except KeyError:
+            return None
+        if spec == "" and obj_type != "tag":
+            return cur
+        if spec and obj_type == spec:
+            return cur
+        if obj_type == "tag":
+            cur = _tag_target(data)
+            if cur is None:
+                return None
+            continue
+        if obj_type == "commit" and spec == "tree":
+            return objs.parse_commit(data).tree
+        return None
+    return None
+
+
+def _split_revision(name: str) -> tuple[str, list[str]]:
+    """Split a revision into its base name and ordered suffix operators."""
+    i = 0
+    while i < len(name) and name[i] not in "^~":
+        i += 1
+    base, rest = name[:i], name[i:]
+    ops: list[str] = []
+    while rest:
+        ch = rest[0]
+        if ch == "~":
+            j = 1
+            while j < len(rest) and rest[j].isdigit():
+                j += 1
+            ops.append(rest[:j])
+            rest = rest[j:]
+        elif ch == "^":
+            if len(rest) > 1 and rest[1] == "{":
+                end = rest.find("}")
+                if end == -1:
+                    ops.append(rest)
+                    rest = ""
+                else:
+                    ops.append(rest[: end + 1])
+                    rest = rest[end + 1 :]
+            else:
+                j = 1
+                while j < len(rest) and rest[j].isdigit():
+                    j += 1
+                ops.append(rest[:j])
+                rest = rest[j:]
+        else:  # pragma: no cover - defensive
+            break
+    return base, ops
+
+
+def _apply_op(repo: Repository, sha: str, op: str) -> Optional[str]:
+    if op[0] == "~":
+        count = int(op[1:]) if len(op) > 1 else 1
+        cur: Optional[str] = _peel_to_commit(repo, sha)
+        for _ in range(count):
+            if cur is None:
+                return None
+            parents = _commit_parents(repo, cur)
+            cur = parents[0] if parents else None
+        return cur
+    # op[0] == "^"
+    arg = op[1:]
+    if arg.startswith("{"):
+        return _peel_to_type(repo, sha, arg[1:-1])
+    count = int(arg) if arg else 1
+    if count == 0:
+        return _peel_to_commit(repo, sha)
+    commit = _peel_to_commit(repo, sha)
+    if commit is None:
+        return None
+    parents = _commit_parents(repo, commit)
+    if count > len(parents):
+        return None
+    return parents[count - 1]
+
+
+def dwim_full_name(repo: Repository, name: str) -> Optional[str]:
+    """Return the full ref name ``name`` resolves to, or None.
+
+    Mirrors C Git's ``dwim_ref``: HEAD yields the branch it points at (or the
+    literal "HEAD" when detached), and other names follow the rev-parse rules.
+    """
+    name = name.strip()
+    if name == "@":
+        name = "HEAD"
+    if name == "HEAD":
+        sym, _ = read_head(repo)
+        return sym if sym else "HEAD"
+    for candidate in (
+        f"refs/{name}",
+        f"refs/tags/{name}",
+        f"refs/heads/{name}",
+        f"refs/remotes/{name}",
+        f"refs/remotes/{name}/HEAD",
+    ):
+        if read_ref(repo, candidate) is not None:
+            return candidate
+    if read_ref(repo, name) is not None and name.startswith("refs/"):
+        return name
+    return None
+
+
+def shorten_ref(full: str) -> str:
+    """Shorten a full ref name the way ``--abbrev-ref`` does for common cases."""
+    for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+        if full.startswith(prefix):
+            return full[len(prefix):]
+    if full.startswith("refs/"):
+        return full[len("refs/"):]
+    return full
+
+
+def _object_at_path(repo: Repository, start_sha: str, path: str) -> Optional[str]:
+    from . import objects as objs
+    cur = start_sha
+    try:
+        obj_type, data = objs.read_object(repo, cur)
+    except KeyError:
+        return None
+    if obj_type == "commit":
+        cur = objs.parse_commit(data).tree
+    elif obj_type == "tag":
+        cur = _peel_to_type(repo, cur, "tree")
+        if cur is None:
+            return None
+    if path == "":
+        return cur
+    for part in path.split("/"):
+        try:
+            obj_type, data = objs.read_object(repo, cur)
+        except KeyError:
+            return None
+        if obj_type != "tree":
+            return None
+        match = next((e for e in objs.parse_tree(data, repo.hash_len) if e.name == part), None)
+        if match is None:
+            return None
+        cur = match.sha
+    return cur
+
+
+def _resolve_revision(repo: Repository, name: str) -> Optional[str]:
+    base, ops = _split_revision(name)
+    sha = _resolve_base(repo, base)
+    if sha is None:
+        return None
+    for op in ops:
+        sha = _apply_op(repo, sha, op)
+        if sha is None:
+            return None
+    return sha
+
+
+def rev_parse(repo: Repository, name: str) -> Optional[str]:
+    """Resolve a rev-ish to a full SHA.
+
+    Accepts: full sha, abbreviated sha (>=4), HEAD, ``@``, branch, tag,
+    refs/heads/x, refs/tags/x, refs/remotes/x, the suffix operators
+    ``^``, ``^<n>``, ``~<n>``, ``^{}``, ``^{<type>}``, and the
+    ``<tree-ish>:<path>`` / ``:<path>`` path-in-tree syntax.
+    """
+    import re as _re
+
+    name = name.strip()
+    if not name:
+        return None
+    if ":" in name and not name.startswith("^{"):
+        left, _, path = name.partition(":")
+        if path.startswith("/"):
+            return None  # ``:/text`` commit-message search is unsupported
+        if left == "":
+            stage_match = _re.match(r"^(\d+):(.*)$", path)
+            if stage_match:
+                path = stage_match.group(2)
+            from .index import read_index
+            entry = read_index(repo).by_path().get(path)
+            return entry.sha if entry else None
+        base_sha = _resolve_revision(repo, left)
+        if base_sha is None:
+            return None
+        return _object_at_path(repo, base_sha, path)
+    return _resolve_revision(repo, name)
