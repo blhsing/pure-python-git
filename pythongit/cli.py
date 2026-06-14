@@ -509,27 +509,68 @@ def cmd_rev_list(argv: list[str]) -> int:
 # porcelain
 
 
+def _pathspec_matches(repo: Repository, pathspec: str, tracked: set[str]) -> bool:
+    full = repo.path / pathspec
+    if full.exists() or full.is_symlink():
+        return True
+    norm = pathspec.rstrip("/")
+    if norm in (".", ""):
+        return True
+    return any(t == norm or t.startswith(norm + "/") for t in tracked)
+
+
 def cmd_add(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit add")
+    ap = argparse.ArgumentParser(prog="pygit add", add_help=False)
     ap.add_argument("-A", "--all", action="store_true")
+    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.all or (not args.paths):
-        paths = ["."]
-    else:
-        paths = args.paths
-    workdir.add_paths(repo, paths)
+    explicit = bool(args.paths) and not args.all
+    targets = args.paths if explicit else ["."]
+    if explicit:
+        tracked = workdir.tracked_paths(repo)
+        for ps in targets:
+            if not _pathspec_matches(repo, ps, tracked):
+                _err(f"fatal: pathspec '{ps}' did not match any files")
+                return 128
+    if args.dry_run or args.verbose:
+        report = workdir.would_add(repo, targets)
+        if args.dry_run:
+            for rel in report:
+                _print(f"add '{rel}'")
+            return 0
+    workdir.add_paths(repo, targets)
+    if args.verbose:
+        for rel in report:
+            _print(f"add '{rel}'")
     return 0
 
 
 def cmd_rm(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit rm")
+    ap = argparse.ArgumentParser(prog="pygit rm", add_help=False)
     ap.add_argument("--cached", action="store_true")
+    ap.add_argument("-f", "--force", action="store_true")
+    ap.add_argument("-r", dest="recursive", action="store_true")
+    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
-    workdir.rm_paths(repo, args.paths, cached=args.cached)
+    tracked = workdir.tracked_paths(repo)
+    for ps in args.paths:
+        norm = ps.rstrip("/")
+        if not (norm in tracked or any(t.startswith(norm + "/") for t in tracked)):
+            _err(f"fatal: pathspec '{ps}' did not match any files")
+            return 128
+    if args.dry_run:
+        for ps in args.paths:
+            _print(f"rm '{ps}'")
+        return 0
+    removed = workdir.rm_paths(repo, args.paths, cached=args.cached)
+    for rel in removed:
+        _print(f"rm '{rel}'")
     return 0
 
 
@@ -916,15 +957,16 @@ def cmd_log(argv: list[str]) -> int:
             deco = _format_decoration(decorations.get(s, []))
             _print(f"{s[:7]}{deco} {first}")
         else:
+            if count > 0:
+                _print("")
             _print(f"commit {s}{_format_decoration(decorations.get(s, []))}")
             if len(c.parents) > 1:
                 _print("Merge: " + " ".join(p[:7] for p in c.parents))
-            _print(f"Author: {c.author}")
-            _print(f"Date:   {c.committer}")
+            _print(f"Author: {_split_ident(c.author)[0]}")
+            _print(f"Date:   {_format_ident_date(c.author)}")
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
-            _print("")
         cur.extend(c.parents)
         count += 1
         if args.max_count and count >= args.max_count:
@@ -966,36 +1008,91 @@ def _format_decoration(names: list[str]) -> str:
     return f" ({', '.join(names)})" if names else ""
 
 
+def _split_ident(sig: str) -> tuple[str, Optional[int], Optional[str]]:
+    """Split ``Name <email> <unixtime> <tz>`` into (who, unixtime, tz)."""
+    import re
+    m = re.match(r"^(.*) (\d+) ([+-]\d{4})$", sig)
+    if m:
+        return m.group(1), int(m.group(2)), m.group(3)
+    return sig, None, None
+
+
+def _format_ident_date(sig: str) -> str:
+    """Format a signature's timestamp like C Git's default ``Date:`` line."""
+    import datetime
+    who, ts, tz = _split_ident(sig)
+    if ts is None or tz is None:
+        return sig
+    sign = 1 if tz[0] == "+" else -1
+    off_min = sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=off_min)
+    return dt.strftime("%a %b ") + f"{dt.day:>2}" + dt.strftime(" %H:%M:%S %Y ") + tz
+
+
 def cmd_show(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit show")
+    ap = argparse.ArgumentParser(prog="pygit show", add_help=False)
+    ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
+    ap.add_argument("--stat", action="store_true")
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
+        _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
         return 128
     t, data = objs.read_object(repo, sha)
+    if t == "tag":
+        # Peel an annotated tag to its target and show that.
+        target = refs_mod._tag_target(data)
+        if target:
+            sha = target
+            t, data = objs.read_object(repo, sha)
     if t == "commit":
         c = objs.parse_commit(data)
         _print(f"commit {sha}")
-        _print(f"Author: {c.author}")
-        _print(f"Date:   {c.committer}")
+        if len(c.parents) > 1:
+            _print("Merge: " + " ".join(p[:7] for p in c.parents))
+        _print(f"Author: {_split_ident(c.author)[0]}")
+        _print(f"Date:   {_format_ident_date(c.author)}")
         _print("")
         for line in c.message.rstrip("\n").splitlines():
             _print(f"    {line}")
-        _print("")
-        # diff vs first parent
+        parent_tree = None
         if c.parents:
-            pt, pd = objs.read_object(repo, c.parents[0])
+            _, pd = objs.read_object(repo, c.parents[0])
             parent_tree = objs.parse_commit(pd).tree
-            _print_tree_diff(repo, parent_tree, c.tree)
+        if args.stat:
+            _print("")
+            _diff_stat(_tree_changes(repo, parent_tree, c.tree))
+        elif not args.no_patch:
+            _print("")
+            _emit_tree_patch(repo, parent_tree, c.tree)
     elif t == "tree":
         for e in objs.parse_tree(data, repo.hash_len):
             obj_t = "tree" if e.is_dir() else "blob"
-            _print(f"{int(e.mode):06o} {obj_t} {e.sha}\t{e.name}")
+            _print(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{e.name}")
     else:
         sys.stdout.buffer.write(data)
+        if not data.endswith(b"\n"):
+            sys.stdout.write("\n")
     return 0
+
+
+def _tree_changes(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]) -> list[tuple[str, "_Side", "_Side"]]:
+    a_map = _tree_map_full(repo, a_tree)
+    b_map = _tree_map_full(repo, b_tree)
+    changes: list[tuple[str, _Side, _Side]] = []
+    for p in sorted(set(a_map) | set(b_map)):
+        a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+        b = _side_from_object(repo, *b_map[p]) if p in b_map else _ABSENT
+        if a.sha != b.sha or a.mode != b.mode:
+            changes.append((p, a, b))
+    return changes
+
+
+def _emit_tree_patch(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]) -> None:
+    for path, a, b in _tree_changes(repo, a_tree, b_tree):
+        _emit_file_diff(path, a, b)
 
 
 def _print_tree_diff(repo: Repository, a_tree: str, b_tree: str) -> None:
@@ -1018,50 +1115,213 @@ def _print_tree_diff(repo: Repository, a_tree: str, b_tree: str) -> None:
             _print(out.rstrip("\n"))
 
 
-def cmd_diff(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit diff")
-    ap.add_argument("--cached", "--staged", dest="cached", action="store_true")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    idx = read_index(repo).by_path()
-    if args.cached:
-        head_tree = workdir._head_tree_map(repo)
-        paths = sorted(set(idx) | set(head_tree))
-        for p in paths:
-            a = head_tree.get(p)
-            b = idx[p].sha if p in idx else None
-            if a == b:
-                continue
-            at = bt = ""
-            if a:
-                _, d = objs.read_object(repo, a)
-                at = d.decode("utf-8", errors="replace")
-            if b:
-                _, d = objs.read_object(repo, b)
-                bt = d.decode("utf-8", errors="replace")
-            out = diff_mod.unified_diff(at, bt, f"a/{p}", f"b/{p}")
-            if out:
-                _print(f"diff --git a/{p} b/{p}")
-                _print(out.rstrip("\n"))
+class _Side:
+    __slots__ = ("mode", "sha", "data")
+
+    def __init__(self, mode: Optional[str], sha: Optional[str], data: Optional[bytes]):
+        self.mode = mode
+        self.sha = sha
+        self.data = data
+
+    @property
+    def present(self) -> bool:
+        return self.mode is not None
+
+
+_ABSENT = _Side(None, None, None)
+
+
+def _side_from_object(repo: Repository, mode: Optional[str], sha: Optional[str]) -> _Side:
+    if sha is None:
+        return _ABSENT
+    try:
+        _, data = objs.read_object(repo, sha)
+    except KeyError:
+        data = b""
+    return _Side(mode, sha, data)
+
+
+def _side_from_worktree(repo: Repository, path: str) -> _Side:
+    full = repo.path / path
+    if not (full.exists() or full.is_symlink()):
+        return _ABSENT
+    import stat as _stat
+    if full.is_symlink():
+        data = os.readlink(full).encode("utf-8")
     else:
-        for p, e in idx.items():
-            full = repo.path / p
-            if not full.exists():
-                continue
-            blob = full.read_bytes()
-            new_sha, _ = objs.hash_bytes("blob", blob, repo)
-            if new_sha == e.sha:
-                continue
-            _, old_data = objs.read_object(repo, e.sha)
-            out = diff_mod.unified_diff(
-                old_data.decode("utf-8", errors="replace"),
-                blob.decode("utf-8", errors="replace"),
-                f"a/{p}",
-                f"b/{p}",
-            )
-            if out:
-                _print(f"diff --git a/{p} b/{p}")
-                _print(out.rstrip("\n"))
+        data = full.read_bytes()
+    sha, _ = objs.hash_bytes("blob", data, repo)
+    return _Side(_wt_mode(full), sha, data)
+
+
+def _tree_map_full(repo: Repository, tree_sha: Optional[str]) -> dict[str, tuple[str, str]]:
+    out: dict[str, tuple[str, str]] = {}
+    if tree_sha:
+        for path, mode, sha in workdir.iter_tree_files(repo, tree_sha):
+            out[path] = (mode, sha)
+    return out
+
+
+def _commit_tree(repo: Repository, sha: str) -> Optional[str]:
+    try:
+        t, data = objs.read_object(repo, sha)
+    except KeyError:
+        return None
+    if t == "commit":
+        return objs.parse_commit(data).tree
+    if t == "tree":
+        return sha
+    if t == "tag":
+        return refs_mod._peel_to_type(repo, sha, "tree")
+    return None
+
+
+def _is_binary(data: Optional[bytes]) -> bool:
+    return bool(data) and b"\x00" in data[:8000]
+
+
+def _emit_file_diff(path: str, a: _Side, b: _Side) -> None:
+    if a.sha == b.sha and a.mode == b.mode:
+        return
+    _print(f"diff --git a/{path} b/{path}")
+    if not a.present:
+        _print(f"new file mode {b.mode}")
+    elif not b.present:
+        _print(f"deleted file mode {a.mode}")
+    elif a.mode != b.mode:
+        _print(f"old mode {a.mode}")
+        _print(f"new mode {b.mode}")
+    a_abbrev = (a.sha or "0" * 40)[:7]
+    b_abbrev = (b.sha or "0" * 40)[:7]
+    if a.sha != b.sha:
+        suffix = f" {a.mode}" if a.present and b.present and a.mode == b.mode else ""
+        _print(f"index {a_abbrev}..{b_abbrev}{suffix}")
+        if _is_binary(a.data) or _is_binary(b.data):
+            _print(f"Binary files {'a/' + path if a.present else '/dev/null'} and "
+                   f"{'b/' + path if b.present else '/dev/null'} differ")
+            return
+        a_text = (a.data or b"").decode("utf-8", errors="replace")
+        b_text = (b.data or b"").decode("utf-8", errors="replace")
+        _print(f"--- {'a/' + path if a.present else '/dev/null'}")
+        _print(f"+++ {'b/' + path if b.present else '/dev/null'}")
+        body = diff_mod.format_hunks(
+            a_text.splitlines(), b_text.splitlines(),
+            a_no_newline=bool(a_text) and not a_text.endswith("\n"),
+            b_no_newline=bool(b_text) and not b_text.endswith("\n"),
+        )
+        for line in body:
+            _print(line)
+
+
+def _diff_stat(changes: list[tuple[str, _Side, _Side]]) -> None:
+    rows: list[tuple[str, int, int, int]] = []  # path, ins, del, total
+    total_ins = total_del = 0
+    for path, a, b in changes:
+        if a.sha == b.sha and a.mode == b.mode:
+            continue
+        if _is_binary(a.data) or _is_binary(b.data):
+            rows.append((path, -1, -1, -1))
+            continue
+        a_lines = (a.data or b"").decode("utf-8", errors="replace").splitlines()
+        b_lines = (b.data or b"").decode("utf-8", errors="replace").splitlines()
+        ins = dele = 0
+        for op in diff_mod.diff_lines(a_lines, b_lines):
+            if op[0] == "ins":
+                ins += 1
+            elif op[0] == "del":
+                dele += 1
+        rows.append((path, ins, dele, ins + dele))
+        total_ins += ins
+        total_del += dele
+    if not rows:
+        return
+    name_w = max(len(p) for p, *_ in rows)
+    count_w = max(len(str(t if t >= 0 else 0)) for *_, t in rows)
+    for path, ins, dele, total in rows:
+        if total < 0:
+            _print(f" {path:<{name_w}} | Bin")
+            continue
+        bar = "+" * ins + "-" * dele
+        _print(f" {path:<{name_w}} | {total:>{count_w}} {bar}")
+    files = len(rows)
+    parts = [f"{files} file{'s' if files != 1 else ''} changed"]
+    if total_ins:
+        parts.append(f"{total_ins} insertion{'s' if total_ins != 1 else ''}(+)")
+    if total_del:
+        parts.append(f"{total_del} deletion{'s' if total_del != 1 else ''}(-)")
+    _print(" " + ", ".join(parts))
+
+
+def cmd_diff(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="pygit diff", add_help=False)
+    ap.add_argument("--cached", "--staged", dest="cached", action="store_true")
+    ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    args, rest = ap.parse_known_args(argv)
+    repo = _repo()
+    revs: list[str] = []
+    paths: list[str] = []
+    after_dd = False
+    for tok in rest:
+        if after_dd:
+            paths.append(tok)
+        elif tok == "--":
+            after_dd = True
+        elif tok.startswith("-"):
+            continue
+        else:
+            revs.append(tok)
+
+    idx = read_index(repo).by_path()
+    changes: list[tuple[str, _Side, _Side]] = []
+
+    def add_change(path, a, b):
+        if a.sha != b.sha or a.mode != b.mode:
+            changes.append((path, a, b))
+
+    if len(revs) >= 2:
+        a_map = _tree_map_full(repo, _commit_tree(repo, refs_mod.rev_parse(repo, revs[0]) or ""))
+        b_map = _tree_map_full(repo, _commit_tree(repo, refs_mod.rev_parse(repo, revs[1]) or ""))
+        for p in sorted(set(a_map) | set(b_map)):
+            a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+            b = _side_from_object(repo, *b_map[p]) if p in b_map else _ABSENT
+            add_change(p, a, b)
+    elif len(revs) == 1:
+        a_map = _tree_map_full(repo, _commit_tree(repo, refs_mod.rev_parse(repo, revs[0]) or ""))
+        if args.cached:
+            for p in sorted(set(a_map) | set(idx)):
+                a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+                b = _side_from_object(repo, idx[p].mode_str(), idx[p].sha) if p in idx else _ABSENT
+                add_change(p, a, b)
+        else:
+            for p in sorted(set(a_map) | set(idx)):
+                a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+                b = _side_from_worktree(repo, p)
+                add_change(p, a, b)
+    elif args.cached:
+        head_map = _tree_map_full(repo, _commit_tree(repo, refs_mod.rev_parse(repo, "HEAD") or ""))
+        for p in sorted(set(head_map) | set(idx)):
+            a = _side_from_object(repo, *head_map[p]) if p in head_map else _ABSENT
+            b = _side_from_object(repo, idx[p].mode_str(), idx[p].sha) if p in idx else _ABSENT
+            add_change(p, a, b)
+    else:
+        for p in sorted(idx):
+            a = _side_from_object(repo, idx[p].mode_str(), idx[p].sha)
+            b = _side_from_worktree(repo, p)
+            add_change(p, a, b)
+
+    if paths:
+        wanted = set(paths)
+        changes = [c for c in changes if c[0] in wanted or any(c[0].startswith(w.rstrip("/") + "/") for w in paths)]
+
+    if args.stat:
+        _diff_stat(changes)
+    elif args.name_only:
+        for path, _, _ in changes:
+            _print(path)
+    else:
+        for path, a, b in changes:
+            _emit_file_diff(path, a, b)
     return 0
 
 
@@ -1137,24 +1397,56 @@ def cmd_branch(argv: list[str]) -> int:
 
 
 def cmd_tag(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit tag")
+    ap = argparse.ArgumentParser(prog="pygit tag", add_help=False)
     ap.add_argument("-d", "--delete", action="store_true")
     ap.add_argument("-l", "--list", action="store_true")
+    ap.add_argument("-a", "--annotate", action="store_true")
+    ap.add_argument("-s", "--sign", action="store_true")
+    ap.add_argument("-f", "--force", action="store_true")
+    ap.add_argument("-m", "--message", default=None)
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.list or args.name is None:
+    if args.list or (args.name is None and not args.delete):
         for t in refs_mod.list_tags(repo):
             _print(t)
         return 0
     if args.delete:
-        refs_mod.delete_ref(repo, f"refs/tags/{args.name}")
+        ref = f"refs/tags/{args.name}"
+        sha = refs_mod.read_ref(repo, ref)
+        if sha is None:
+            _err(f"error: tag '{args.name}' not found.")
+            return 1
+        refs_mod.delete_ref(repo, ref)
+        _print(f"Deleted tag '{args.name}' (was {sha[:7]})")
         return 0
+    ref = f"refs/tags/{args.name}"
+    if refs_mod.read_ref(repo, ref) is not None and not args.force:
+        _err(f"fatal: tag '{args.name}' already exists")
+        return 128
     target = refs_mod.rev_parse(repo, args.target) if args.target else refs_mod.rev_parse(repo, "HEAD")
     if not target:
+        _err(f"fatal: Failed to resolve '{args.target or 'HEAD'}' as a valid ref.")
         return 128
-    refs_mod.update_ref(repo, f"refs/tags/{args.name}", target)
+    annotated = args.annotate or args.sign or args.message is not None
+    if annotated:
+        target_type, _ = objs.read_object(repo, target)
+        message = args.message or ""
+        if not message.endswith("\n"):
+            message += "\n"
+        tagger = objs.build_signature(repo, "committer")
+        body = (
+            f"object {target}\n"
+            f"type {target_type}\n"
+            f"tag {args.name}\n"
+            f"tagger {tagger}\n"
+            f"\n{message}"
+        )
+        tag_sha = objs.write_object(repo, "tag", body.encode("utf-8"))
+        refs_mod.update_ref(repo, ref, tag_sha)
+    else:
+        refs_mod.update_ref(repo, ref, target)
     return 0
 
 
@@ -1165,24 +1457,35 @@ def cmd_checkout(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     if args.new_branch:
+        if refs_mod.read_ref(repo, f"refs/heads/{args.new_branch}") is not None:
+            _err(f"fatal: a branch named '{args.new_branch}' already exists")
+            return 128
         start = refs_mod.rev_parse(repo, args.target) if args.target else refs_mod.rev_parse(repo, "HEAD")
         if not start:
+            _err(f"fatal: '{args.target}' is not a commit and a branch '{args.new_branch}' cannot be created from it")
             return 128
         refs_mod.update_ref(repo, f"refs/heads/{args.new_branch}", start)
         refs_mod.set_head(repo, f"refs/heads/{args.new_branch}")
+        _err(f"Switched to a new branch '{args.new_branch}'")
         return 0
     if not args.target:
         ap.error("target required")
+    head_sym, _ = refs_mod.read_head(repo)
+    cur_branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+    is_branch = refs_mod.read_ref(repo, f"refs/heads/{args.target}") is not None
     sha = refs_mod.rev_parse(repo, args.target)
     if not sha:
-        _err(f"error: pathspec '{args.target}' did not match")
+        _err(f"error: pathspec '{args.target}' did not match any file(s) known to git")
         return 1
     t, data = objs.read_object(repo, sha)
     tree = objs.parse_commit(data).tree if t == "commit" else sha
     workdir.checkout_tree(repo, tree)
-    # set HEAD: branch if it exists, otherwise detached
-    if refs_mod.read_ref(repo, f"refs/heads/{args.target}"):
-        refs_mod.set_head(repo, f"refs/heads/{args.target}")
+    if is_branch:
+        if cur_branch == args.target:
+            _err(f"Already on '{args.target}'")
+        else:
+            refs_mod.set_head(repo, f"refs/heads/{args.target}")
+            _err(f"Switched to branch '{args.target}'")
     else:
         refs_mod.set_head(repo, sha)
     return 0
@@ -1260,6 +1563,9 @@ def cmd_reset(argv: list[str]) -> int:
     tree = objs.parse_commit(data).tree if t == "commit" else sha
     if args.hard:
         workdir.checkout_tree(repo, tree)
+        if t == "commit":
+            subject = objs.parse_commit(data).message.splitlines()[0] if data else ""
+            _print(f"HEAD is now at {sha[:7]} {subject}")
     else:
         workdir.read_tree(repo, tree)
     return 0

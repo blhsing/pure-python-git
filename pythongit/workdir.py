@@ -122,9 +122,7 @@ def tree_path_entry(repo: Repository, tree_sha: str, path: str) -> Optional[objs
 # add / rm
 
 
-def add_paths(repo: Repository, paths: Iterable[str]) -> None:
-    idx = read_index(repo)
-    tracked = set(idx.by_path())
+def _gather_add_candidates(repo: Repository, paths: Iterable[str], tracked: set[str]) -> list[str]:
     ignores = ignore_mod.load(repo.path)
     to_add: list[str] = []
     for p in paths:
@@ -140,6 +138,38 @@ def add_paths(repo: Repository, paths: Iterable[str]) -> None:
             rel = _norm(os.path.relpath(ap, repo.path))
             if rel in tracked or not ignores.is_ignored(rel, is_dir=_is_dir_no_follow(ap)):
                 to_add.append(rel)
+        # Include tracked paths under the pathspec so that deletions and
+        # modifications of vanished files are staged, matching `git add`.
+        rel_spec = _norm(os.path.relpath(ap, repo.path))
+        if rel_spec in (".", ""):
+            to_add.extend(tracked)
+        else:
+            for t in tracked:
+                if t == rel_spec or t.startswith(rel_spec + "/"):
+                    to_add.append(t)
+    return to_add
+
+
+def would_add(repo: Repository, paths: Iterable[str]) -> list[str]:
+    """Paths whose index entry ``add`` would create or change (for -n/-v)."""
+    idx = read_index(repo).by_path()
+    out: list[str] = []
+    for rel in sorted(set(_gather_add_candidates(repo, paths, set(idx)))):
+        full = repo.path / rel
+        if not full.exists() and not full.is_symlink():
+            if rel in idx:
+                out.append(rel)
+            continue
+        sha, _ = objs.hash_bytes("blob", _blob_data(full), repo)
+        if rel not in idx or idx[rel].sha != sha:
+            out.append(rel)
+    return out
+
+
+def add_paths(repo: Repository, paths: Iterable[str]) -> None:
+    idx = read_index(repo)
+    tracked = set(idx.by_path())
+    to_add = _gather_add_candidates(repo, paths, tracked)
     for rel in sorted(set(to_add)):
         full = repo.path / rel
         if not full.exists() and not full.is_symlink():
@@ -157,16 +187,23 @@ def add_paths(repo: Repository, paths: Iterable[str]) -> None:
     write_index(repo, idx)
 
 
-def rm_paths(repo: Repository, paths: Iterable[str], *, cached: bool = False) -> None:
+def rm_paths(repo: Repository, paths: Iterable[str], *, cached: bool = False) -> list[str]:
     idx = read_index(repo)
+    removed: list[str] = []
     for p in paths:
         rel = _norm(p)
         idx.remove(rel)
+        removed.append(rel)
         if not cached:
             f = repo.path / rel
             if f.exists() or f.is_symlink():
                 f.unlink()
     write_index(repo, idx)
+    return removed
+
+
+def tracked_paths(repo: Repository) -> set[str]:
+    return set(read_index(repo).by_path())
 
 
 # ---------------------------------------------------------------------------

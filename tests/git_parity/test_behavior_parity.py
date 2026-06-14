@@ -131,6 +131,37 @@ CASES: list[tuple] = [
     ("commit-second", BASE + [("write", "c.txt", "c\n"), ["add", "c.txt"]], ["commit", "-m", "two"]),
     # init
     ("init-default-branch", [], ["init", "fresh"]),
+    # diff
+    ("diff-modify", BASE + [("write", "a.txt", "alpha\nmore\n")], ["diff"]),
+    ("diff-cached-new", BASE + [("write", "c.txt", "c\n"), ["add", "c.txt"]], ["diff", "--cached"]),
+    ("diff-delete", BASE + [("rm", "b.txt")], ["diff"]),
+    ("diff-no-newline", BASE + [("write", "a.txt", "x")], ["diff", "--", "a.txt"]),
+    ("diff-two-rev", TAGGED, ["diff", "HEAD~1", "HEAD"]),
+    ("diff-stat", BASE + [("write", "a.txt", "alpha\nmore\n"), ("rm", "b.txt")], ["diff", "--stat"]),
+    ("diff-name-only", BASE + [("write", "a.txt", "X\n")], ["diff", "--name-only"]),
+    # show / log medium format (Author/Date)
+    ("show-patch", TAGGED, ["show"]),
+    ("show-no-patch", TAGGED, ["show", "-s"]),
+    ("show-stat", TAGGED, ["show", "--stat"]),
+    ("show-root", BASE, ["show"]),
+    ("log-medium", TAGGED, ["log"]),
+    ("log-n1", TAGGED, ["log", "-1"]),
+    # tag
+    ("tag-annotated", BASE, ["tag", "-a", "v1", "-m", "release one"]),
+    ("tag-message-implies-annotated", BASE, ["tag", "v2", "-m", "msg"]),
+    ("tag-delete", BASE + [["tag", "v1"]], ["tag", "-d", "v1"]),
+    ("tag-cat-annotated", BASE + [["tag", "-a", "v1", "-m", "ann"]], ["cat-file", "-p", "v1"]),
+    # rm / add / mv
+    ("rm-tracked", BASE, ["rm", "a.txt"]),
+    ("rm-cached", BASE, ["rm", "--cached", "a.txt"]),
+    ("rm-missing", BASE, ["rm", "nope.txt"]),
+    ("add-missing", BASE, ["add", "nope.txt"]),
+    ("add-dry-run", BASE + [("write", "n.txt", "n\n")], ["add", "-n", "n.txt"]),
+    # checkout / switch / reset
+    ("checkout-new-branch", BASE, ["checkout", "-b", "feature"]),
+    ("switch-create", BASE, ["switch", "-c", "feature"]),
+    ("checkout-existing", BASE + [["branch", "feature"]], ["checkout", "feature"]),
+    ("reset-hard", BASE + [("write", "a.txt", "changed\n")], ["reset", "--hard", "HEAD"]),
 ]
 
 

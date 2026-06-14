@@ -58,51 +58,82 @@ def diff_lines(a: list[str], b: list[str]) -> list[tuple[str, int, int]]:
     return ops
 
 
+_NO_NEWLINE = "\\ No newline at end of file"
+
+
+def _group_hunks(ops: list[tuple[str, int, int]], context: int) -> list[list[tuple[str, int, int]]]:
+    """Split the edit script into hunks with up to ``context`` lines of
+    surrounding context, merging hunks separated by <= 2*context equal lines."""
+    change_idx = [i for i, op in enumerate(ops) if op[0] != "eq"]
+    if not change_idx:
+        return []
+    hunks: list[list[tuple[str, int, int]]] = []
+    i = 0
+    while i < len(change_idx):
+        j = i
+        while j + 1 < len(change_idx) and change_idx[j + 1] - change_idx[j] - 1 <= 2 * context:
+            j += 1
+        start = max(0, change_idx[i] - context)
+        end = min(len(ops), change_idx[j] + 1 + context)
+        hunks.append(ops[start:end])
+        i = j + 1
+    return hunks
+
+
+def _hunk_range(start: int, count: int) -> str:
+    if count == 1:
+        return str(start)
+    return f"{start},{count}"
+
+
+def format_hunks(
+    a: list[str],
+    b: list[str],
+    context: int = 3,
+    *,
+    a_no_newline: bool = False,
+    b_no_newline: bool = False,
+) -> list[str]:
+    """Render git-style unified hunks (``@@`` headers + body) for two line
+    lists, including ``\\ No newline at end of file`` markers."""
+    ops = diff_lines(a, b)
+    out: list[str] = []
+    last_a = len(a) - 1
+    last_b = len(b) - 1
+    for hunk in _group_hunks(ops, context):
+        a_idx = [ai for k, ai, _ in hunk if k in ("eq", "del")]
+        b_idx = [bi for k, _, bi in hunk if k in ("eq", "ins")]
+        a_count = len(a_idx)
+        b_count = len(b_idx)
+        a_start = a_idx[0] + 1 if a_idx else 0
+        b_start = b_idx[0] + 1 if b_idx else 0
+        out.append(f"@@ -{_hunk_range(a_start, a_count)} +{_hunk_range(b_start, b_count)} @@")
+        for kind, ai, bi in hunk:
+            if kind == "eq":
+                out.append(" " + a[ai])
+                if a_no_newline and ai == last_a:
+                    out.append(_NO_NEWLINE)
+            elif kind == "del":
+                out.append("-" + a[ai])
+                if a_no_newline and ai == last_a:
+                    out.append(_NO_NEWLINE)
+            else:
+                out.append("+" + b[bi])
+                if b_no_newline and bi == last_b:
+                    out.append(_NO_NEWLINE)
+    return out
+
+
 def unified_diff(a_text: str, b_text: str, a_label: str = "a", b_label: str = "b", context: int = 3) -> str:
     a = a_text.splitlines()
     b = b_text.splitlines()
-    ops = diff_lines(a, b)
-    if not ops:
+    if a == b:
         return ""
-    if not any(k != "eq" for k, *_ in ops):
+    body = format_hunks(
+        a, b, context,
+        a_no_newline=bool(a_text) and not a_text.endswith("\n"),
+        b_no_newline=bool(b_text) and not b_text.endswith("\n"),
+    )
+    if not body:
         return ""
-
-    # group into hunks
-    hunks: list[list[tuple[str, int, int]]] = []
-    cur: list[tuple[str, int, int]] = []
-    last_change = -1
-    for i, op in enumerate(ops):
-        if op[0] != "eq":
-            if not cur:
-                start = max(0, i - context)
-                cur = list(ops[start:i])
-            cur.append(op)
-            last_change = i
-        else:
-            if cur and i - last_change <= context:
-                cur.append(op)
-            elif cur and i - last_change == context + 1:
-                cur.append(op)
-                hunks.append(cur)
-                cur = []
-    if cur:
-        # add trailing context
-        end = min(len(ops), last_change + 1 + context)
-        cur.extend(ops[last_change + 1 : end])
-        hunks.append(cur)
-
-    out = [f"--- {a_label}", f"+++ {b_label}"]
-    for h in hunks:
-        a_start = next((x for k, x, _ in h if k in ("eq", "del")), 0)
-        b_start = next((y for k, _, y in h if k in ("eq", "ins")), 0)
-        a_count = sum(1 for k, *_ in h if k in ("eq", "del"))
-        b_count = sum(1 for k, *_ in h if k in ("eq", "ins"))
-        out.append(f"@@ -{a_start + 1},{a_count} +{b_start + 1},{b_count} @@")
-        for kind, ai, bi in h:
-            if kind == "eq":
-                out.append(" " + a[ai])
-            elif kind == "del":
-                out.append("-" + a[ai])
-            else:
-                out.append("+" + b[bi])
-    return "\n".join(out) + "\n"
+    return "\n".join([f"--- {a_label}", f"+++ {b_label}", *body]) + "\n"
