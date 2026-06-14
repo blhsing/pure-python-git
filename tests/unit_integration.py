@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import configparser
 from pathlib import Path
 
 import pytest
@@ -577,6 +578,15 @@ def test_check_ignore_honors_directory_only_pattern(tmprepo, capsys):
 
     assert cli_run("check-ignore", "build") == 0
     assert "build" in capsys.readouterr().out
+
+
+def test_config_replace_all_writes_subsection_keys(tmprepo):
+    repo, _path = tmprepo
+    assert cli_run("config", "--replace-all", "credential.https://github.com.helper", "!gh auth git-credential") == 0
+
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(repo.gitdir / "config", encoding="utf-8")
+    assert cp.get('credential "https://github.com"', "helper") == "!gh auth git-credential"
 
 
 def test_format_patch_then_apply_roundtrip(tmprepo, tmp_path_factory):

@@ -8,6 +8,7 @@ from pythongit import ignore as ignore_mod
 from pythongit import rerere as rerere_mod
 from pythongit import bridges as bridges_mod
 from pythongit import cli as cli_mod
+from pythongit import protocol as protocol_mod
 
 
 # --- diff -----------------------------------------------------------------
@@ -193,6 +194,15 @@ def test_ignore_trailing_space_requires_escape(tmp_path):
     assert not ig.is_ignored("plain   ")
     assert ig.is_ignored("with ")
     assert not ig.is_ignored("with")
+
+
+def test_protocol_auth_header_uses_github_token_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GIT_USERNAME", raising=False)
+    monkeypatch.delenv("GIT_PASSWORD", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    header = protocol_mod._auth_header_for_url("https://github.com/owner/repo.git")
+    assert header == "Basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0LXRva2Vu"
 
 
 # --- rerere ---------------------------------------------------------------

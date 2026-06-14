@@ -10,8 +10,10 @@ Sequence:
 from __future__ import annotations
 
 import http.client
+import base64
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
@@ -63,8 +65,68 @@ def _iter_pkt_stream(source) -> Iterator[bytes]:
         yield payload
 
 
+def _request_headers(url: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {"User-Agent": "pythongit/0.1"}
+    if extra:
+        headers.update(extra)
+    auth = _auth_header_for_url(url)
+    if auth:
+        headers["Authorization"] = auth
+    return headers
+
+
+def _auth_header_for_url(url: str) -> str | None:
+    user, password = _credentials_for_url(url)
+    if not user or not password:
+        return None
+    raw = f"{user}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def _credentials_for_url(url: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme
+    host = parsed.hostname or ""
+    user = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    if user and password:
+        return user, password
+
+    try:
+        from . import bridges
+        fields = {"protocol": scheme, "host": host}
+        creds = bridges.credential_fill(fields, use_external=False)
+    except Exception:
+        creds = {}
+    user = user or creds.get("username", "")
+    password = password or creds.get("password", "")
+    if user and password:
+        return user, password
+
+    if scheme == "https" and host in {"github.com", "www.github.com"}:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or _gh_auth_token(host)
+        if token:
+            return user or "x-access-token", token
+    return "", ""
+
+
+def _gh_auth_token(host: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "token", "--hostname", host],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
 def _get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "pythongit/0.1"})
+    req = urllib.request.Request(url, headers=_request_headers(url))
     with urllib.request.urlopen(req) as r:
         return r.read()
 
@@ -74,11 +136,7 @@ def _post(url: str, body: bytes, content_type: str, accept: str) -> bytes:
         url,
         data=body,
         method="POST",
-        headers={
-            "User-Agent": "pythongit/0.1",
-            "Content-Type": content_type,
-            "Accept": accept,
-        },
+        headers=_request_headers(url, {"Content-Type": content_type, "Accept": accept}),
     )
     with urllib.request.urlopen(req) as r:
         return r.read()
@@ -89,11 +147,7 @@ def _post_stream(url: str, body: bytes, content_type: str, accept: str):
         url,
         data=body,
         method="POST",
-        headers={
-            "User-Agent": "pythongit/0.1",
-            "Content-Type": content_type,
-            "Accept": accept,
-        },
+        headers=_request_headers(url, {"Content-Type": content_type, "Accept": accept}),
     )
     return urllib.request.urlopen(req)
 
@@ -118,9 +172,8 @@ def _post_with_pack_file(
     try:
         conn.putrequest("POST", target)
         conn.putheader("Host", host_header)
-        conn.putheader("User-Agent", "pythongit/0.1")
-        conn.putheader("Content-Type", content_type)
-        conn.putheader("Accept", accept)
+        for key, value in _request_headers(url, {"Content-Type": content_type, "Accept": accept}).items():
+            conn.putheader(key, value)
         conn.putheader("Content-Length", str(len(prefix) + pack_size))
         conn.endheaders()
         if prefix:

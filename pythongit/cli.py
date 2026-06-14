@@ -789,6 +789,9 @@ def cmd_config(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit config")
     ap.add_argument("--global", dest="is_global", action="store_true")
     ap.add_argument("--unset", action="store_true")
+    ap.add_argument("--unset-all", dest="unset_all", action="store_true")
+    ap.add_argument("--add", action="store_true")
+    ap.add_argument("--replace-all", action="store_true")
     ap.add_argument("name")
     ap.add_argument("value", nargs="?")
     args = ap.parse_args(argv)
@@ -797,13 +800,13 @@ def cmd_config(argv: list[str]) -> int:
     else:
         cfg_path = _repo().gitdir / "config"
     import configparser
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(interpolation=None)
     if cfg_path.exists():
         cp.read(cfg_path, encoding="utf-8")
-    sect, _, key = args.name.partition(".")
+    sect, key = _config_section_key(args.name)
     if not key:
         return 1
-    if args.unset:
+    if args.unset or args.unset_all:
         if cp.has_option(sect, key):
             cp.remove_option(sect, key)
             with cfg_path.open("w", encoding="utf-8") as f:
@@ -820,6 +823,16 @@ def cmd_config(argv: list[str]) -> int:
     with cfg_path.open("w", encoding="utf-8") as f:
         cp.write(f)
     return 0
+
+
+def _config_section_key(name: str) -> tuple[str, str]:
+    prefix, sep, key = name.rpartition(".")
+    if not sep or not prefix or not key:
+        return "", ""
+    section, dot, subsection = prefix.partition(".")
+    if dot:
+        return f'{section} "{subsection}"', key
+    return section, key
 
 
 def cmd_remote(argv: list[str]) -> int:
