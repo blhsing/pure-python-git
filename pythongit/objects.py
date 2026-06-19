@@ -219,13 +219,14 @@ def _local_tz_minutes(when: int) -> int:
         return 0
 
 
-def build_signature(repo: Repository, role: str) -> str:
+def build_signature(repo: Repository, role: str, date_override: Optional[str] = None) -> str:
     """Build an ``author`` or ``committer`` signature line.
 
     Identity precedence matches C Git: the role-specific ``GIT_*`` env vars,
     then ``user.name`` / ``user.email`` (``EMAIL`` for the address), then a
-    generic fallback. The date honors ``GIT_AUTHOR_DATE`` / ``GIT_COMMITTER_DATE``
-    and otherwise uses the current local time with the local UTC offset.
+    generic fallback. The date honors an explicit ``date_override`` (as from
+    ``commit --date``), then ``GIT_AUTHOR_DATE`` / ``GIT_COMMITTER_DATE``, and
+    otherwise uses the current local time with the local UTC offset.
     """
     import time
     from . import gitconfig
@@ -240,6 +241,8 @@ def build_signature(repo: Repository, role: str) -> str:
         name = os.environ.get("GIT_COMMITTER_NAME") or cfg_name
         email = os.environ.get("GIT_COMMITTER_EMAIL") or os.environ.get("EMAIL") or cfg_email
         date = os.environ.get("GIT_COMMITTER_DATE")
+    if date_override is not None:
+        date = date_override
     name = name or "pythongit"
     email = email or "pythongit@example.invalid"
     parsed = _parse_date_env(date) if date else None

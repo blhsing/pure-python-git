@@ -374,7 +374,7 @@ The suite passes:
 | `test_ort_parity.py`    | byte-for-byte `ort` parity vs `git merge-tree --write-tree` across every conflict type (content, modify/delete, add/add, rename/rename, rename/delete, directory rename, distinct-types, exec-bit) |
 | `unit_phase_scripts.py` | wraps the script-style phase tests |
 | `tests/git_parity`      | C Git 2.54.0 manifest coverage, exact built-in registry coverage, and oracle behavior comparisons |
-| `tests/git_parity/test_behavior_parity.py` | 140+ byte-for-byte behavior cases (return code, stdout, stderr) run against the real 2.54.0 oracle in a hermetic, deterministic environment — covers rev-parse, config, status, diff, log/show, commit, merge, branch, tag, checkout, ls-files, and more |
+| `tests/git_parity/test_behavior_parity.py` | 400+ byte-for-byte behavior cases (return code, stdout, stderr) run against the real 2.54.0 oracle in a hermetic, deterministic environment — covers rev-parse, rev-list, config, status, diff/diff-tree/diff-index/diff-files, log/show (all `--pretty`/`--format` placeholders, every `--date=<mode>`, `--graph`, `--topo-order`, `--grep`/`--author`/`-S`/`-G` filters), describe, name-rev, ls-tree/ls-files, for-each-ref, commit, merge, merge-tree, branch, tag, reflog, checkout, and more |
 
 Tests that require the real `git` binary are silently skipped when it's not on
 PATH, so the normal suite runs cleanly in containers without one. The dedicated

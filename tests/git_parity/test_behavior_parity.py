@@ -32,6 +32,52 @@ TAGGED = BASE + [
     ["tag", "v1"],
 ]
 
+# A non-linear history with a real merge commit (byte-identical SHAs because
+# author/committer identity and dates are pinned by the deterministic env).
+MERGED = BASE + [
+    ["checkout", "-b", "feat"],
+    ("write", "g.txt", "feature\n"),
+    ["add", "-A"],
+    ["commit", "-m", "feat-commit"],
+    ["checkout", "main"],
+    ("write", "h.txt", "mainline\n"),
+    ["add", "-A"],
+    ["commit", "-m", "main-commit"],
+    ["merge", "--no-ff", "-m", "merge feat", "feat"],
+]
+
+# History with an annotated tag below a merge, for describe/name-rev/points-at.
+DESC = BASE + [
+    ["tag", "-a", "-m", "rel one", "v1"],
+    ["checkout", "-b", "feat"], ("write", "g.txt", "x\n"), ["add", "-A"], ["commit", "-m", "fc"],
+    ["checkout", "main"], ("write", "h.txt", "y\n"), ["add", "-A"], ["commit", "-m", "mc"],
+    ["merge", "--no-ff", "-m", "merge feat", "feat"],
+]
+# A committed file modified in the working tree, plus a separately-staged file.
+DIRTYIDX = BASE + [("write", "a.txt", "changed in wt\n"), ("write", "n.txt", "n\n"), ["add", "n.txt"]]
+# Several branches and version-like tags, for --sort coverage.
+REFSET = BASE + [["branch", "zzz"], ["branch", "aaa"], ["tag", "v2"], ["tag", "v10"], ["tag", "v1"]]
+# A subdirectory with multiple entries, for ls-tree pathspec coverage.
+SUBTREE = BASE + [("write", "sub/c.txt", "s\n"), ("write", "sub/d.txt", "s2\n"),
+                  ["add", "-A"], ["commit", "-m", "c2"]]
+# Linear history touching different paths, for rev-list pathspec coverage.
+PATHHIST = BASE + [("write", "a.txt", "mod\n"), ["add", "-A"], ["commit", "-m", "c2"],
+                   ("write", "c.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c3"]]
+
+# A commit with a single-digit day of month and a non-UTC offset, to exercise
+# date rendering (unpadded day, ``+05:30`` style strict-ISO offsets).
+DATED = [
+    ("write", "a.txt", "alpha\n"), ["add", "-A"],
+    ["commit", "-m", "dated", "--date", "2005-04-07T22:13:13 +0530"],
+]
+
+# A commit with a multi-paragraph message and punctuation, for the %b/%B/%f
+# (body / raw body / sanitized subject) placeholders.
+BODY = [
+    ("write", "a.txt", "alpha\n"), ["add", "-A"],
+    ["commit", "-m", "Subject: with punctuation!", "-m", "body para1\nbody para2"],
+]
+
 # Every kind of pending change at once.
 DIRTY = [
     ("write", "tracked.txt", "committed\n"),
@@ -424,6 +470,295 @@ CASES: list[tuple] = [
      BASE + [("write", "d/x.txt", "y\n"), ["add", "-A"], ["commit", "-m", "c2"]],
      ["ls-tree", "--full-tree", "-r", "HEAD"]),
     ("rev-parse-git-path", BASE, ["rev-parse", "--git-path", "objects"]),
+    # ls-tree --abbrev: bare flag leaves the treeish alone; '=' attaches a width.
+    ("ls-tree-abbrev", BASE, ["ls-tree", "--abbrev", "HEAD"]),
+    ("ls-tree-abbrev-n", BASE, ["ls-tree", "--abbrev=4", "HEAD"]),
+    ("ls-tree-abbrev-long", BASE, ["ls-tree", "--abbrev", "-l", "HEAD"]),
+    # rev-parse with a caret-prefixed revision is echoed with the '^'.
+    ("rev-parse-caret", TAGGED, ["rev-parse", "^HEAD"]),
+    # rev-list ranges and explicit exclusions.
+    ("rev-list-range", TAGGED, ["rev-list", "HEAD~1..HEAD"]),
+    ("rev-list-exclude", TAGGED, ["rev-list", "HEAD", "^v1~1"]),
+    # show --raw
+    ("show-raw", TAGGED, ["show", "--raw", "HEAD"]),
+    # log --raw and --no-merges
+    ("log-raw", TAGGED, ["log", "--raw"]),
+    # whatchanged is removed in 2.54 without an explicit opt-in.
+    ("whatchanged-refused", TAGGED, ["whatchanged"]),
+    ("whatchanged-opt-in", TAGGED, ["whatchanged", "--i-still-use-this"]),
+    # commit --date: single-digit day exercises the unpadded Date: formatting.
+    ("commit-date-single-digit-day",
+     [("write", "f.txt", "x\n"), ["add", "-A"],
+      ["commit", "-m", "dated", "--date", "2005-04-07T22:13:13 +0000"]],
+     ["log", "-1"]),
+    ("commit-amend-date",
+     BASE + [["commit", "--amend", "--no-edit", "--date", "2005-04-07T22:13:13 +0000"]],
+     ["log", "-1", "--format=%ad|%cd"]),
+    # RFC2822 dates (format-patch) also leave the day of month unpadded.
+    ("format-patch-single-digit-day",
+     [("write", "f.txt", "x\n"), ["add", "-A"],
+      ["commit", "-m", "dated", "--date", "2005-04-07T22:13:13 +0000"]],
+     ["format-patch", "-1", "--stdout"]),
+    # log --format date placeholders (fixed styles + --date-driven %ad/%cd).
+    ("log-fmt-aD", DATED, ["log", "-1", "--format=%aD"]),
+    ("log-fmt-ai", DATED, ["log", "-1", "--format=%ai"]),
+    ("log-fmt-aI", DATED, ["log", "-1", "--format=%aI"]),
+    ("log-fmt-at", DATED, ["log", "-1", "--format=%at"]),
+    ("log-fmt-cI", DATED, ["log", "-1", "--format=%cI"]),
+    # log --date=<mode> drives both %ad and the medium "Date:" line.
+    ("log-date-iso", DATED, ["log", "-1", "--date=iso", "--format=%ad"]),
+    ("log-date-iso-strict", DATED, ["log", "-1", "--date=iso-strict", "--format=%ad"]),
+    ("log-date-rfc", DATED, ["log", "-1", "--date=rfc", "--format=%ad"]),
+    ("log-date-short", DATED, ["log", "-1", "--date=short", "--format=%ad"]),
+    ("log-date-raw", DATED, ["log", "-1", "--date=raw", "--format=%ad"]),
+    ("log-date-unix", DATED, ["log", "-1", "--date=unix", "--format=%ad"]),
+    ("log-date-short-medium", DATED, ["log", "-1", "--date=short"]),
+    # Body/raw-body/sanitized-subject placeholders.
+    ("log-fmt-body", BODY, ["log", "-1", "--format=%b"]),
+    ("log-fmt-rawbody", BODY, ["log", "-1", "--format=%B"]),
+    ("log-fmt-sanitized", BODY, ["log", "-1", "--format=%f"]),
+    ("log-fmt-subject-body", BODY, ["log", "-1", "--format=%s%n%b"]),
+    # format: separates entries; tformat:/--format terminate each entry.
+    ("log-pretty-format-sep", TAGGED, ["log", "--pretty=format:%s"]),
+    ("log-pretty-tformat", TAGGED, ["log", "--pretty=tformat:%s"]),
+    # full/fuller pretty styles (Author/Commit; AuthorDate/CommitDate).
+    ("log-pretty-full", DATED, ["log", "-1", "--pretty=full"]),
+    ("log-pretty-fuller", DATED, ["log", "-1", "--pretty=fuller"]),
+    ("show-pretty-fuller", DATED, ["show", "-s", "--pretty=fuller", "HEAD"]),
+    ("show-pretty-full", DATED, ["show", "-s", "--pretty=full", "HEAD"]),
+    ("show-date-short", DATED, ["show", "-s", "--date=short", "HEAD"]),
+    ("show-fuller-date-iso", DATED, ["show", "-s", "--pretty=fuller", "--date=iso", "HEAD"]),
+    # Remaining --date=<mode> styles (relative is time-based but both binaries
+    # evaluate it within the same second, so the rendered string still matches).
+    ("log-date-relative", DATED, ["log", "-1", "--date=relative", "--format=%ad"]),
+    ("log-date-relative-ar", DATED, ["log", "-1", "--format=%ar"]),
+    ("log-date-human", DATED, ["log", "-1", "--date=human", "--format=%ad"]),
+    ("log-date-local", DATED, ["log", "-1", "--date=local", "--format=%ad"]),
+    ("log-date-iso-local", DATED, ["log", "-1", "--date=iso-local", "--format=%ad"]),
+    ("log-date-format", DATED, ["log", "-1", "--date=format:%Y/%m/%d %H:%M", "--format=%ad"]),
+    # short/raw/reference pretty styles.
+    ("log-pretty-short", DATED, ["log", "-1", "--pretty=short"]),
+    ("log-pretty-raw", DATED, ["log", "-1", "--pretty=raw"]),
+    ("log-pretty-reference", TAGGED, ["log", "--pretty=reference"]),
+    ("show-pretty-raw", DATED, ["show", "-s", "--pretty=raw", "HEAD"]),
+    # diff --summary (create/delete/mode-change).
+    ("diff-summary",
+     BASE + [("write", "n.txt", "new\n"), ("rm", "b.txt"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "--summary", "HEAD~1", "HEAD"]),
+    ("diff-stat-summary",
+     BASE + [("write", "n.txt", "new\n"), ("rm", "b.txt"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "--stat", "--summary", "HEAD~1", "HEAD"]),
+    # --all walks every ref; --topo-order / --graph reorder topologically.
+    ("log-all-oneline", MERGED + [["tag", "v1", "HEAD~1"]], ["log", "--all", "--oneline"]),
+    ("log-topo-order", MERGED, ["log", "--topo-order", "--oneline"]),
+    ("log-graph-linear", TAGGED, ["log", "--graph", "--oneline"]),
+    ("log-graph-linear-medium", TAGGED, ["log", "--graph"]),
+    ("log-graph-merge", MERGED, ["log", "--graph", "--oneline"]),
+    ("log-graph-merge-medium", MERGED, ["log", "--graph"]),
+    ("log-graph-merge-all", MERGED, ["log", "--graph", "--oneline", "--all"]),
+    ("log-graph-reverse-error", TAGGED, ["log", "--graph", "--reverse"]),
+    # Unsigned commits report %G? as "N" with empty detail fields.
+    ("log-fmt-sig", TAGGED, ["log", "-1", "--format=%G?|%GG|%GS|%GK"]),
+    # shortlog -s pads the per-author count to a 6-column field.
+    ("shortlog-summary", TAGGED, ["shortlog", "-s", "-n", "HEAD"]),
+    # log --shortstat, --no-color (accepted/ignored), --abbrev-commit.
+    ("log-shortstat", TAGGED, ["log", "--shortstat"]),
+    ("log-no-color", TAGGED, ["log", "-1", "--no-color"]),
+    ("log-abbrev-commit-oneline", TAGGED, ["log", "--abbrev-commit", "--pretty=oneline"]),
+    ("log-abbrev-commit-medium", TAGGED, ["log", "-1", "--abbrev-commit"]),
+    # Decorations: annotated tags peel to the commit; git orders them
+    # reverse-alphabetically with the HEAD branch hoisted to the front. %d/%D
+    # expand even without --decorate.
+    ("log-decorate-annotated-tag",
+     BASE + [["tag", "-a", "-m", "rel", "v1"], ["branch", "zeta"], ["branch", "alpha"]],
+     ["log", "-1", "--oneline", "--decorate"]),
+    ("log-fmt-decoration",
+     BASE + [["tag", "-a", "-m", "rel", "v1"], ["branch", "zeta"]],
+     ["log", "-1", "--format=%d"]),
+    ("log-fmt-decoration-bare",
+     BASE + [["tag", "v1"], ["branch", "zeta"]],
+     ["log", "-1", "--format=%D"]),
+    # --format=<builtin> is an alias for --pretty=<builtin>, not a literal.
+    ("log-format-builtin-fuller", DATED, ["log", "-1", "--format=fuller"]),
+    ("log-format-builtin-oneline", TAGGED, ["log", "--format=oneline"]),
+    # Merge-commit rendering: combined diff is empty for a clean merge, so the
+    # default patch/raw output is suppressed; --stat reports vs the first parent.
+    ("merge-log-raw", MERGED, ["log", "--raw"]),
+    ("merge-log-patch", MERGED, ["log", "-p"]),
+    ("merge-log-stat", MERGED, ["log", "--stat"]),
+    ("merge-log-no-merges", MERGED, ["log", "--oneline", "--no-merges"]),
+    ("merge-show", MERGED, ["show", "HEAD"]),
+    ("merge-show-stat", MERGED, ["show", "--stat", "HEAD"]),
+    ("merge-show-raw", MERGED, ["show", "--raw", "HEAD"]),
+    ("merge-whatchanged", MERGED, ["whatchanged", "--i-still-use-this"]),
+    # Merge commit object is byte-identical (rev-parse exposes the SHA).
+    ("merge-head-sha", MERGED, ["rev-parse", "HEAD"]),
+    ("merge-default-message", BASE + [
+        ["checkout", "-b", "feat"], ("write", "g.txt", "f\n"), ["add", "-A"],
+        ["commit", "-m", "fc"], ["checkout", "main"], ("write", "h.txt", "m\n"),
+        ["add", "-A"], ["commit", "-m", "mc"], ["merge", "--no-ff", "feat"],
+    ], ["log", "-1", "--format=%s"]),
+    # Default merge subject names a tag and appends "into <dest>" for non-default
+    # destination branches (main/master are suppressed).
+    ("merge-tag-message", BASE + [
+        ["checkout", "-b", "feat"], ("write", "g.txt", "f\n"), ["add", "-A"],
+        ["commit", "-m", "fc"], ["tag", "tg"],
+        ["checkout", "main"], ("write", "h.txt", "m\n"),
+        ["add", "-A"], ["commit", "-m", "mc"], ["merge", "--no-ff", "tg"],
+    ], ["log", "-1", "--format=%s"]),
+    # checkout -b from an unborn HEAD repoints HEAD without creating a ref.
+    ("checkout-b-unborn", [["checkout", "-b", "develop"]],
+     ["rev-parse", "--abbrev-ref", "HEAD"]),
+    ("checkout-b-unborn-status", [["checkout", "-b", "develop"]],
+     ["status", "--porcelain=v2", "--branch"]),
+    ("switch-c-unborn", [["switch", "-c", "topic"]],
+     ["symbolic-ref", "HEAD"]),
+    # An explicit invalid start-point still fails.
+    ("checkout-b-bad-start", BASE, ["checkout", "-b", "x", "nope"]),
+    ("merge-into-nondefault", BASE + [
+        ["checkout", "-b", "develop"],
+        ["checkout", "-b", "feat"], ("write", "g.txt", "f\n"), ["add", "-A"],
+        ["commit", "-m", "fc"], ["checkout", "develop"], ("write", "h.txt", "m\n"),
+        ["add", "-A"], ["commit", "-m", "mc"], ["merge", "--no-ff", "feat"],
+    ], ["log", "-1", "--format=%s"]),
+    # describe counts every commit since the tag (including a merge's 2nd parent).
+    ("describe", DESC, ["describe"]),
+    ("describe-tags", DESC, ["describe", "--tags"]),
+    ("describe-exact", DESC, ["describe", "v1"]),
+    ("describe-always", DESC, ["describe", "--always", "v1"]),
+    ("describe-bad-rev", DESC, ["describe", "nonexistent"]),
+    ("describe-no-tags", BASE, ["describe"]),
+    # name-rev tip selection and --tags labelling.
+    ("name-rev-head", DESC, ["name-rev", "HEAD"]),
+    ("name-rev-tags", DESC, ["name-rev", "--tags", "HEAD~1"]),
+    ("name-rev-tags-nameonly", DESC, ["name-rev", "--tags", "--name-only", "HEAD~1"]),
+    ("name-rev-bad", BASE, ["name-rev", "nope"]),
+    # verify-commit/verify-tag fail on unsigned/non-tag objects.
+    ("verify-commit-unsigned", BASE, ["verify-commit", "HEAD"]),
+    ("verify-tag-unsigned", BASE + [["tag", "-a", "-m", "x", "v1"]], ["verify-tag", "v1"]),
+    ("verify-tag-lightweight", BASE + [["tag", "lw"]], ["verify-tag", "lw"]),
+    # diff-tree suppresses a merge's (combined) diff entirely.
+    ("diff-tree-merge", MERGED, ["diff-tree", "HEAD"]),
+    ("diff-tree-nonmerge",
+     BASE + [("write", "a.txt", "z\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff-tree", "-r", "HEAD"]),
+    # diff-index compares the tree to the work tree (dirty blob ids zeroed).
+    ("diff-index-worktree", DIRTYIDX, ["diff-index", "HEAD"]),
+    ("diff-index-cached", DIRTYIDX, ["diff-index", "--cached", "HEAD"]),
+    ("diff-index-name-only", DIRTYIDX, ["diff-index", "--name-only", "HEAD"]),
+    # for-each-ref --sort (refname, reverse, version).
+    ("fer-sort-refname", REFSET, ["for-each-ref", "--sort=refname"]),
+    ("fer-sort-rev", REFSET, ["for-each-ref", "--sort=-refname"]),
+    ("fer-sort-version", REFSET, ["for-each-ref", "--sort=v:refname", "refs/tags"]),
+    # ls-tree pathspec filtering.
+    ("ls-tree-path-dir", SUBTREE, ["ls-tree", "HEAD", "sub"]),
+    ("ls-tree-path-recurse", SUBTREE, ["ls-tree", "-r", "HEAD", "sub/"]),
+    ("ls-tree-path-file", SUBTREE, ["ls-tree", "HEAD", "sub/c.txt"]),
+    # rev-list pathspec, dates, and pretty/oneline/format output.
+    ("rev-list-path", PATHHIST, ["rev-list", "HEAD", "--", "a.txt"]),
+    ("rev-list-pretty-oneline", TAGGED, ["rev-list", "--pretty=oneline", "HEAD"]),
+    ("rev-list-oneline", TAGGED, ["rev-list", "--oneline", "HEAD"]),
+    ("rev-list-format", TAGGED, ["rev-list", "--format=%H", "HEAD"]),
+    ("rev-list-since", TAGGED, ["rev-list", "--since=2000-01-01", "HEAD"]),
+    # rev-parse output filters.
+    ("rev-parse-no-revs", BASE, ["rev-parse", "--no-revs", "HEAD"]),
+    ("rev-parse-revs-only", BASE, ["rev-parse", "--revs-only", "--foo", "HEAD"]),
+    # log --pretty=<format-with-%> and --parents.
+    ("log-pretty-pct", TAGGED, ["log", "-1", "--pretty=%H %s"]),
+    ("log-parents-oneline", MERGED, ["log", "--oneline", "--parents"]),
+    ("log-parents-medium", MERGED, ["log", "-1", "--parents"]),
+    # tag --points-at and branch --sort.
+    ("tag-points-at", DESC, ["tag", "--points-at", "HEAD~1"]),
+    ("branch-sort", BASE + [["branch", "zzz"], ["branch", "aaa"]], ["branch", "--sort=refname"]),
+    ("branch-sort-rev", BASE + [["branch", "zzz"], ["branch", "aaa"]], ["branch", "--sort=-refname"]),
+    # log commit filters: --grep/--author/-i/--merges/--min-parents/-S/-G/--since.
+    ("log-grep", TAGGED, ["log", "--grep=second", "--oneline"]),
+    ("log-grep-none", TAGGED, ["log", "--grep=zzzznope", "--oneline"]),
+    ("log-grep-ignorecase", TAGGED, ["log", "-i", "--grep=SECOND", "--oneline"]),
+    ("log-author", TAGGED, ["log", "--author=Parity", "--oneline"]),
+    ("log-author-none", TAGGED, ["log", "--author=nobody", "--oneline"]),
+    ("log-merges", MERGED, ["log", "--merges", "--oneline"]),
+    ("log-min-parents", MERGED, ["log", "--min-parents=2", "--oneline"]),
+    ("log-max-parents", MERGED, ["log", "--max-parents=1", "--oneline"]),
+    ("log-grep-maxcount", TAGGED, ["log", "-n", "1", "--no-merges", "--oneline"]),
+    ("log-pickaxe-s", PATHHIST, ["log", "-S", "mod", "--oneline"]),
+    ("log-pickaxe-g", PATHHIST, ["log", "-G", "mod", "--oneline"]),
+    ("log-since", TAGGED, ["log", "--since=2000-01-01", "--oneline"]),
+    ("log-until", TAGGED, ["log", "--until=2000-01-01", "--oneline"]),
+    # rev-list shares the commit filters (but not the -S/-G diff options).
+    ("rev-list-grep", TAGGED, ["rev-list", "--grep=second", "HEAD"]),
+    ("rev-list-author", TAGGED, ["rev-list", "--author=Parity", "HEAD"]),
+    ("rev-list-merges", MERGED, ["rev-list", "--merges", "HEAD"]),
+    ("rev-list-max-parents-0", MERGED, ["rev-list", "--max-parents=0", "HEAD"]),
+    # show file-list and oneline output.
+    ("show-name-only",
+     BASE + [("write", "a.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["show", "--name-only", "HEAD"]),
+    ("show-name-status",
+     BASE + [("write", "a.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["show", "--name-status", "HEAD"]),
+    ("show-oneline", TAGGED, ["show", "--oneline", "-s", "HEAD"]),
+    # status -uno notes hidden untracked files when staged changes exist.
+    ("status-uno-staged",
+     BASE + [("write", "a.txt", "st\n"), ["add", "a.txt"], ("write", "u.txt", "x\n")],
+     ["status", "-uno"]),
+    ("status-uno-unstaged",
+     BASE + [("write", "a.txt", "wt\n"), ("write", "u.txt", "x\n")],
+     ["status", "-uno"]),
+    ("status-uno-clean", BASE + [("write", "u.txt", "x\n")], ["status", "-uno"]),
+    # rev-parse output filter for a flag with no value.
+    ("rev-parse-shared-index", BASE, ["rev-parse", "--shared-index-path"]),
+    # rev-list symmetric difference and --left-right marking.
+    ("rev-list-symmetric", MERGED, ["rev-list", "HEAD...HEAD~1"]),
+    ("rev-list-left-right", MERGED, ["rev-list", "--left-right", "HEAD...HEAD~1"]),
+    # %xHH byte escapes in format strings.
+    ("log-format-hex", TAGGED, ["log", "-1", "--format=%h%x09%s"]),
+    # config --default / --type.
+    ("config-default", BASE, ["config", "--default", "X", "--get", "no.such"]),
+    ("config-default-int", BASE, ["config", "--default", "5", "--type=int", "--get", "no.such"]),
+    ("config-type-bool",
+     BASE + [["config", "core.somebool", "yes"]],
+     ["config", "--type=bool", "--get", "core.somebool"]),
+    # describe --long / --abbrev.
+    ("describe-long", DESC, ["describe", "--long"]),
+    ("describe-abbrev4", DESC, ["describe", "--abbrev=4"]),
+    ("describe-abbrev0", DESC, ["describe", "--abbrev=0"]),
+    # ls-files --full-name / -t / --abbrev.
+    ("ls-files-full-name", SUBTREE, ["ls-files", "--full-name"]),
+    ("ls-files-t", SUBTREE, ["ls-files", "-t"]),
+    ("ls-files-abbrev", BASE, ["ls-files", "-s", "--abbrev=8"]),
+    # reflog default/oneline and per-branch.
+    ("reflog-oneline", TAGGED, ["reflog", "--oneline"]),
+    ("reflog-show-branch", TAGGED, ["reflog", "show", "main"]),
+    # check-ref-format --normalize.
+    ("crf-normalize", BASE, ["check-ref-format", "--normalize", "refs/heads//x"]),
+    ("crf-normalize-lead", BASE, ["check-ref-format", "--normalize", "//refs/heads/x"]),
+    ("crf-normalize-bad", BASE, ["check-ref-format", "--normalize", "refs/heads/x/"]),
+    # diff-files --stat / --numstat / --shortstat (index vs work tree).
+    ("diff-files-stat", BASE + [("write", "a.txt", "x\ny\n")], ["diff-files", "--stat"]),
+    ("diff-files-numstat", BASE + [("write", "a.txt", "x\ny\n")], ["diff-files", "--numstat"]),
+    # merge-tree (modern 2-arg real merge prints the result tree id).
+    ("merge-tree-2arg", MERGED, ["merge-tree", "HEAD~1", "HEAD"]),
+    ("merge-tree-branches", MERGED, ["merge-tree", "main", "feat"]),
+    # rev-parse repo-introspection flags.
+    ("rev-parse-is-shallow", BASE, ["rev-parse", "--is-shallow-repository"]),
+    ("rev-parse-path-format-abs", BASE, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+    # symbolic-ref on a real (non-symbolic) ref.
+    ("symbolic-ref-nonsym", BASE, ["symbolic-ref", "refs/heads/main"]),
+    ("symbolic-ref-nonsym-q", BASE, ["symbolic-ref", "-q", "refs/heads/main"]),
+    # log --abbrev sets the %h / oneline abbreviation length.
+    ("log-abbrev-len", TAGGED, ["log", "--format=%h", "--abbrev=10"]),
+    ("log-abbrev-oneline", TAGGED, ["log", "--oneline", "--abbrev=12"]),
+    # diff -R reverses the diff (content and a//b prefixes).
+    ("diff-reverse",
+     BASE + [("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "-R", "HEAD~1", "HEAD"]),
+    ("diff-reverse-stat",
+     BASE + [("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "-R", "--stat", "HEAD~1", "HEAD"]),
+    ("diff-reverse-newfile",
+     BASE + [("write", "n.txt", "fresh\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "-R", "HEAD~1", "HEAD"]),
 ]
 
 
@@ -437,6 +772,8 @@ CASES_WITH_STDIN: list[tuple] = [
     ("stripspace", BASE, ["stripspace"], "  hello  \n\n\n\nworld\n\n"),
     ("stripspace-comments", BASE, ["stripspace", "-s"], "# comment\nkeep\n"),
     ("hash-object-stdin-paths", BASE, ["hash-object", "--stdin-paths"], "a.txt\n"),
+    ("cat-file-batch-command", BASE, ["cat-file", "--batch-command"],
+     "info HEAD\ncontents HEAD:a.txt\n"),
 ]
 
 

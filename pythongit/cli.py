@@ -62,6 +62,142 @@ def _commit_tree_parents(repo: Repository, sha: str, graph=None) -> Optional[tup
     return commit.tree, tuple(commit.parents)
 
 
+def _commit_date(repo: Repository, sha: str) -> int:
+    """Committer timestamp of a commit (0 if unparseable), for log ordering."""
+    try:
+        commit = objs.parse_commit(objs.read_object(repo, sha)[1])
+    except KeyError:
+        return 0
+    import re
+    m = re.search(r" (\d+) [+-]\d{4}\s*$", commit.committer)
+    return int(m.group(1)) if m else 0
+
+
+def _approxidate(s: str) -> int:
+    """Parse a --since/--until date into epoch seconds (UTC for bare dates)."""
+    import datetime
+    s = s.strip()
+    parsed = objs._parse_date_env(s)
+    if parsed is not None:
+        return parsed[0]
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
+def _pickaxe_match(repo: Repository, c, args, flags) -> bool:
+    """True if the commit matches -S (occurrence count changed) or -G (a diff
+    line matches), comparing against the first parent."""
+    import re
+    # The combined diff of a merge is suppressed by default, so pickaxe never
+    # matches a merge commit.
+    if len(c.parents) > 1:
+        return False
+    parent_tree = None
+    if c.parents:
+        parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
+    changes = _tree_changes(repo, parent_tree, c.tree)
+    if args.pickaxe_s is not None:
+        needle = args.pickaxe_s
+        for _p, a, b in changes:
+            ca = (a.data or b"").decode("utf-8", "replace").count(needle) if a.present else 0
+            cb = (b.data or b"").decode("utf-8", "replace").count(needle) if b.present else 0
+            if ca != cb:
+                return True
+        return False
+    rx = re.compile(args.pickaxe_g, flags)
+    for _p, a, b in changes:
+        a_lines = (a.data or b"").decode("utf-8", "replace").splitlines() if a.present else []
+        b_lines = (b.data or b"").decode("utf-8", "replace").splitlines() if b.present else []
+        for op in diff_mod.diff_lines(a_lines, b_lines):
+            if op[0] == "ins" and rx.search(b_lines[op[2]]):
+                return True
+            if op[0] == "del" and rx.search(a_lines[op[1]]):
+                return True
+    return False
+
+
+def _filter_commits(repo: Repository, commits: list, args) -> list:
+    """Apply log/rev-list commit-level filters: merge/parent count, date,
+    --grep/--author/--committer, and -S/-G pickaxe."""
+    import re
+    flags = re.IGNORECASE if getattr(args, "ignore_case", False) else 0
+    greps = [re.compile(p, flags) for p in (getattr(args, "grep", None) or [])]
+    authors = [re.compile(p, flags) for p in (getattr(args, "author", None) or [])]
+    committers = [re.compile(p, flags) for p in (getattr(args, "committer", None) or [])]
+    since = _approxidate(args.since) if getattr(args, "since", None) else None
+    until = _approxidate(args.until) if getattr(args, "until", None) else None
+    out = []
+    for s in commits:
+        c = objs.parse_commit(objs.read_object(repo, s)[1])
+        np = len(c.parents)
+        if getattr(args, "no_merges", False) and np >= 2:
+            continue
+        if getattr(args, "merges", False) and np < 2:
+            continue
+        if getattr(args, "min_parents", None) is not None and np < args.min_parents:
+            continue
+        if getattr(args, "max_parents", None) is not None and np > args.max_parents:
+            continue
+        if since is not None or until is not None:
+            d = _commit_date(repo, s)
+            if since is not None and d < since:
+                continue
+            if until is not None and d > until:
+                continue
+        if greps:
+            ok = (all if getattr(args, "all_match", False) else any)(g.search(c.message) for g in greps)
+            if not ok:
+                continue
+        if authors and not any(a.search(c.author) for a in authors):
+            continue
+        if committers and not any(a.search(c.committer) for a in committers):
+            continue
+        if getattr(args, "pickaxe_s", None) is not None or getattr(args, "pickaxe_g", None) is not None:
+            if not _pickaxe_match(repo, c, args, flags):
+                continue
+        out.append(s)
+    return out
+
+
+def _topo_order(repo: Repository, orig: list, first_parent: bool = False) -> list:
+    """Topologically order ``orig`` like C Git's REV_SORT_IN_GRAPH_ORDER
+    (commit.c:sort_in_topological_order): a stack-based walk that emits a commit
+    only after all its in-set children, with tips kept in traversal order."""
+    in_set = set(orig)
+
+    def parents(s):
+        info = _commit_tree_parents(repo, s)
+        if not info:
+            return []
+        return list(info[1][:1] if first_parent else info[1])
+
+    indegree = {s: 1 for s in orig}
+    for s in orig:
+        for p in parents(s):
+            if p in indegree:
+                indegree[p] += 1
+    # Tips have no in-set child (indegree 1); the NULL-compare prio_queue is a
+    # stack, and tips are reversed so they pop in original traversal order.
+    tips = [s for s in orig if indegree[s] == 1]
+    stack = list(reversed(tips))
+    out: list[str] = []
+    while stack:
+        s = stack.pop()
+        out.append(s)
+        for p in parents(s):
+            if indegree.get(p, 0) == 0:
+                continue
+            indegree[p] -= 1
+            if indegree[p] == 1:
+                stack.append(p)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # plumbing
 
@@ -179,6 +315,34 @@ def _cat_file_batch(repo: Repository, check_only: bool) -> int:
     return 0
 
 
+def _cat_file_batch_command(repo: Repository) -> int:
+    """cat-file --batch-command: per-line `info`/`contents`/`flush` requests."""
+    for line in sys.stdin:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        cmd, _, arg = line.partition(" ")
+        arg = arg.strip()
+        if cmd == "flush":
+            sys.stdout.flush()
+            sys.stdout.buffer.flush()
+            continue
+        sha = refs_mod.rev_parse(repo, arg)
+        if sha is None or not objs.object_exists(repo, sha):
+            sys.stdout.write(f"{arg} missing\n")
+            continue
+        t, data = objs.read_object(repo, sha)
+        if cmd == "info":
+            sys.stdout.write(f"{sha} {t} {len(data)}\n")
+        elif cmd == "contents":
+            sys.stdout.write(f"{sha} {t} {len(data)}\n")
+            sys.stdout.flush()
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
+    return 0
+
+
 def cmd_cat_file(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit cat-file", add_help=False)
     g = ap.add_mutually_exclusive_group()
@@ -188,9 +352,12 @@ def cmd_cat_file(argv: list[str]) -> int:
     g.add_argument("-e", dest="exists", action="store_true")
     g.add_argument("--batch", dest="batch", action="store_true")
     g.add_argument("--batch-check", dest="batch_check", action="store_true")
+    g.add_argument("--batch-command", dest="batch_command", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+    if args.batch_command:
+        return _cat_file_batch_command(repo)
     if args.batch or args.batch_check:
         return _cat_file_batch(repo, check_only=args.batch_check)
 
@@ -249,9 +416,13 @@ def cmd_ls_tree(argv: list[str]) -> int:
     ap.add_argument("--name-only", "--name-status", dest="name_only", action="store_true")
     ap.add_argument("--full-tree", action="store_true")
     ap.add_argument("--full-name", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("treeish")
     ap.add_argument("paths", nargs="*")
+    # Git only consumes a value for --abbrev when attached with '='; a bare
+    # --abbrev uses the default length, leaving the next token as the treeish.
+    argv = ["--abbrev=7" if a == "--abbrev" else a for a in argv]
     args = ap.parse_args(argv)
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.treeish)
@@ -267,6 +438,7 @@ def cmd_ls_tree(argv: list[str]) -> int:
 
     def emit(e, path):
         obj_t = "tree" if e.is_dir() else "blob"
+        sha = e.sha[:args.abbrev] if args.abbrev is not None else e.sha
         if args.name_only:
             sys.stdout.write(path + eol)
         elif args.long:
@@ -277,9 +449,24 @@ def cmd_ls_tree(argv: list[str]) -> int:
                     size = str(len(objs.read_object(repo, e.sha)[1]))
                 except KeyError:
                     size = "-"
-            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {e.sha} {size:>7}\t{path}" + eol)
+            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {sha} {size:>7}\t{path}" + eol)
         else:
-            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{path}" + eol)
+            sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {sha}\t{path}" + eol)
+
+    specs = [p.rstrip("/") for p in args.paths]
+
+    def matches(path: str) -> bool:
+        # The entry path is exactly a pathspec or lies under one.
+        if not specs:
+            return True
+        return any(path == s or path.startswith(s + "/") for s in specs)
+
+    def should_descend(path: str) -> bool:
+        # Descend a directory if it is selected, or contains a pathspec.
+        if not specs:
+            return True
+        return any(path == s or path.startswith(s + "/") or s.startswith(path + "/")
+                   for s in specs)
 
     def walk(tsha: str, prefix: str = "") -> None:
         _t, td = objs.read_object(repo, tsha)
@@ -287,13 +474,17 @@ def cmd_ls_tree(argv: list[str]) -> int:
             path = prefix + e.name
             if e.is_dir():
                 if args.r:
-                    if args.show_trees:
+                    if matches(path) and args.show_trees:
                         emit(e, path)
-                    walk(e.sha, path + "/")
+                    if matches(path) or should_descend(path):
+                        walk(e.sha, path + "/")
                 else:
-                    emit(e, path)
+                    if matches(path):
+                        emit(e, path)
+                    elif should_descend(path):
+                        walk(e.sha, path + "/")
             else:
-                if not args.dirs_only:
+                if not args.dirs_only and matches(path):
                     emit(e, path)
 
     walk(sha)
@@ -388,9 +579,11 @@ def cmd_symbolic_ref(argv: list[str]) -> int:
             target = txt[5:].strip()
             _print(refs_mod.shorten_ref(target) if args.short else target)
             return 0
-        if not args.quiet:
-            _err(f"fatal: ref {args.name} is not a symbolic ref")
-        return 1
+        # A real (non-symbolic) ref: quiet exits 1, otherwise fatal (128).
+        if args.quiet:
+            return 1
+        _err(f"fatal: ref {args.name} is not a symbolic ref")
+        return 128
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(f"ref: {args.target}\n", encoding="utf-8")
     return 0
@@ -426,6 +619,9 @@ def cmd_rev_parse(argv: list[str]) -> int:
     symbolic: Optional[str] = None   # None | "full" | "abbrev"
     verify = False
     quiet = False
+    no_revs = False
+    revs_only = False
+    path_format: Optional[str] = None
     verified_count = 0
     after_dashdash = False
     pending_git_path = False
@@ -440,7 +636,9 @@ def cmd_rev_parse(argv: list[str]) -> int:
         if arg == "--git-dir":
             r = R()
             cwd = Path(os.getcwd()).resolve()
-            if cwd == r.path and not r.bare:
+            if path_format == "absolute":
+                _print(str(r.gitdir))
+            elif cwd == r.path and not r.bare:
                 _print(os.path.relpath(r.gitdir, cwd))
             else:
                 _print(str(r.gitdir))
@@ -502,6 +700,15 @@ def cmd_rev_parse(argv: list[str]) -> int:
         if arg == "--is-bare-repository":
             _print("true" if R().bare else "false")
             continue
+        if arg == "--is-shallow-repository":
+            _print("true" if (R().gitdir / "shallow").exists() else "false")
+            continue
+        if arg == "--show-superproject-working-tree":
+            # pythongit has no submodule support; never inside a superproject.
+            continue
+        if arg.startswith("--path-format="):
+            path_format = arg.split("=", 1)[1]
+            continue
         if arg in ("--all", "--branches", "--tags", "--remotes"):
             prefix = {
                 "--all": "refs/",
@@ -528,8 +735,17 @@ def cmd_rev_parse(argv: list[str]) -> int:
             except ValueError:
                 abbrev = 7
             continue
-        if arg in ("--flags", "--no-flags", "--revs-only", "--no-revs", "--symbolic", "--local-env-vars"):
+        if arg == "--no-revs":
+            no_revs = True
+            continue
+        if arg == "--revs-only":
+            revs_only = True
+            continue
+        if arg in ("--flags", "--no-flags", "--symbolic", "--local-env-vars"):
             # Output filters; with no further args they produce nothing.
+            continue
+        if arg == "--shared-index-path":
+            # Only meaningful with a split index, which pythongit never writes.
             continue
         if arg == "--symbolic-full-name":
             symbolic = "full"
@@ -537,11 +753,21 @@ def cmd_rev_parse(argv: list[str]) -> int:
         if arg == "--abbrev-ref" or arg.startswith("--abbrev-ref="):
             symbolic = "abbrev"
             continue
+        if arg.startswith("^") and len(arg) > 1 and arg[1] != "{":
+            r = R()
+            sha = refs_mod.rev_parse(r, arg[1:])
+            if sha is not None:
+                _print("^" + (sha[:abbrev] if abbrev else sha))
+                continue
         if arg.startswith("-") and arg != "-":
-            # Unrecognized dashed args are echoed verbatim, as C Git does.
-            _print(arg)
+            # Unrecognized dashed args are echoed verbatim, as C Git does
+            # (suppressed under --revs-only).
+            if not revs_only:
+                _print(arg)
             continue
-        # A revision argument.
+        # A revision argument (suppressed under --no-revs).
+        if no_revs:
+            continue
         r = R()
         sha = refs_mod.rev_parse(r, arg)
         if sha is None:
@@ -582,8 +808,12 @@ def cmd_ls_files(argv: list[str]) -> int:
     ap.add_argument("-d", "--deleted", action="store_true")
     ap.add_argument("--exclude-standard", action="store_true")
     ap.add_argument("--error-unmatch", action="store_true")
+    ap.add_argument("--full-name", action="store_true")
+    ap.add_argument("-t", dest="tag", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("paths", nargs="*")
+    argv = ["--abbrev=7" if a == "--abbrev" else a for a in argv]
     args = ap.parse_args(argv)
     repo = _repo()
     idx = read_index(repo)
@@ -607,28 +837,32 @@ def cmd_ls_files(argv: list[str]) -> int:
     if not (want_cached or args.modified or args.others or args.deleted):
         want_cached = True
 
+    def _tag(prefix: str, text: str) -> str:
+        return (prefix + " " + text) if args.tag else text
+
     lines: list[tuple[str, str]] = []
     if want_cached:
         for e in idx.entries:
             if match(e.path):
                 if args.stage:
-                    lines.append((e.path, f"{e.mode_str()} {e.sha} {getattr(e, 'stage', 0)}\t{e.path}"))
+                    sha = e.sha[:args.abbrev] if args.abbrev is not None else e.sha
+                    lines.append((e.path, _tag("H", f"{e.mode_str()} {sha} {getattr(e, 'stage', 0)}\t{e.path}")))
                 else:
-                    lines.append((e.path, e.path))
+                    lines.append((e.path, _tag("H", e.path)))
     if args.modified or args.deleted or args.others:
         status = workdir.status(repo, include_ignored=args.others and not args.exclude_standard)
         if args.modified:
             for p in status["modified"] + status["missing"]:
                 if match(p):
-                    lines.append((p, p))
+                    lines.append((p, _tag("C", p)))
         if args.deleted:
             for p in status["missing"]:
                 if match(p):
-                    lines.append((p, p))
+                    lines.append((p, _tag("R", p)))
         if args.others:
             for p in status["untracked"]:
                 if match(p):
-                    lines.append((p, p))
+                    lines.append((p, _tag("?", p)))
 
     seen: set[str] = set()
     for _path, line in sorted(lines):
@@ -649,21 +883,102 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--parents", action="store_true")
     ap.add_argument("--no-walk", action="store_true")
     ap.add_argument("--first-parent", action="store_true")
+    ap.add_argument("--pretty", nargs="?", const="medium", default=None)
+    ap.add_argument("--format", default=None)
+    ap.add_argument("--oneline", action="store_true")
+    ap.add_argument("--since", "--after", dest="since", default=None)
+    ap.add_argument("--until", "--before", dest="until", default=None)
+    ap.add_argument("--merges", action="store_true")
+    ap.add_argument("--no-merges", dest="no_merges", action="store_true")
+    ap.add_argument("--min-parents", dest="min_parents", type=int, default=None)
+    ap.add_argument("--max-parents", dest="max_parents", type=int, default=None)
+    ap.add_argument("--grep", action="append", default=None)
+    ap.add_argument("--author", action="append", default=None)
+    ap.add_argument("--committer", action="append", default=None)
+    ap.add_argument("--all-match", dest="all_match", action="store_true")
+    ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
+    ap.add_argument("--left-right", dest="left_right", action="store_true")
     ap.add_argument("revs", nargs="*")
-    args = ap.parse_args(_expand_count_shorthand(argv))
+    # Split a trailing "-- <pathspec>..." off before argparse consumes the "--".
+    rl_paths: list[str] = []
+    pre = _expand_count_shorthand(argv)
+    if "--" in pre:
+        i = pre.index("--")
+        rl_paths = pre[i + 1:]
+        pre = pre[:i]
+    args = ap.parse_args(pre)
     repo = _repo()
+    rev_args = args.revs
     starts = []
+    excludes: list[str] = []
     if args.all:
         for _ref, sha in _enumerate_refs(repo):
             starts.append(sha)
-    for r in args.revs:
+    lr_left: set[str] = set()
+    lr_right: set[str] = set()
+
+    def _reach(start: str) -> set:
+        seen_r: set[str] = set()
+        st = [start]
+        while st:
+            x = st.pop()
+            if x in seen_r:
+                continue
+            seen_r.add(x)
+            info = _commit_tree_parents(repo, x)
+            if info:
+                st.extend(info[1])
+        return seen_r
+
+    for r in rev_args:
+        if r.startswith("^"):
+            sha = refs_mod.rev_parse(repo, r[1:])
+            if sha:
+                excludes.append(sha)
+            continue
+        if "..." in r:
+            # Symmetric difference: A...B = A B --not $(merge-base A B).
+            a, _, b = r.partition("...")
+            a_sha = refs_mod.rev_parse(repo, a or "HEAD")
+            b_sha = refs_mod.rev_parse(repo, b or "HEAD")
+            from . import merge as _m
+            if a_sha:
+                starts.append(a_sha)
+                lr_left |= _reach(a_sha)
+            if b_sha:
+                starts.append(b_sha)
+                lr_right |= _reach(b_sha)
+            if a_sha and b_sha:
+                excludes.extend(_m.merge_bases(repo, a_sha, b_sha))
+            continue
+        if ".." in r:
+            lo, _, hi = r.partition("..")
+            hi_sha = refs_mod.rev_parse(repo, hi or "HEAD")
+            lo_sha = refs_mod.rev_parse(repo, lo) if lo else None
+            if hi_sha:
+                starts.append(hi_sha)
+            if lo_sha:
+                excludes.append(lo_sha)
+            continue
         sha = refs_mod.rev_parse(repo, r)
         if sha:
             starts.append(sha)
     if not starts and not args.all:
         _err("usage: git rev-list [<options>] <commit>... [--] [<path>...]")
         return 128
-    if args.count and args.max_count is None and starts:
+
+    excluded: set[str] = set()
+    estack = deque(excludes)
+    while estack:
+        sha = estack.popleft()
+        if sha in excluded:
+            continue
+        excluded.add(sha)
+        info = _commit_tree_parents(repo, sha)
+        if info:
+            estack.extend(info[1])
+
+    if args.count and args.max_count is None and starts and not excludes:
         try:
             from . import pack as _p
 
@@ -679,19 +994,67 @@ def cmd_rev_list(argv: list[str]) -> int:
     stack = deque(starts)
     while stack:
         sha = stack.popleft()
-        if sha in visited:
+        if sha in visited or sha in excluded:
             continue
         visited.add(sha)
         info = _commit_tree_parents(repo, sha, graph)
         if info is None:
             continue
         out.append(sha)
-        if args.max_count and len(out) >= args.max_count:
+        # With path/commit filters, walk fully and trim after filtering.
+        _has_filter = (rl_paths or args.since or args.until or args.merges
+                       or args.no_merges or args.min_parents is not None
+                       or args.max_parents is not None or args.grep or args.author
+                       or args.committer)
+        if args.max_count and len(out) >= args.max_count and not _has_filter:
             break
         if args.no_walk:
             continue
         _tree, parents = info
         stack.extend(parents[:1] if args.first_parent else parents)
+
+    if rl_paths:
+        def _touches(s: str) -> bool:
+            info = _commit_tree_parents(repo, s, graph)
+            if info is None:
+                return False
+            tree, parents = info
+            ptree = _commit_tree_parents(repo, parents[0], graph)[0] if parents else None
+            for path in rl_paths:
+                before = workdir.tree_path_entry(repo, ptree, path) if ptree else None
+                after = workdir.tree_path_entry(repo, tree, path)
+                if (before.sha if before else None) != (after.sha if after else None):
+                    return True
+            return False
+        out = [s for s in out if _touches(s)]
+    out = _filter_commits(repo, out, args)
+    if args.max_count is not None:
+        out = out[:max(0, args.max_count)]
+
+    if args.pretty is not None or args.format is not None or args.oneline:
+        fmt = args.format
+        if fmt is None and args.pretty and (args.pretty.startswith("format:")
+                                            or args.pretty.startswith("tformat:")):
+            fmt = args.pretty.split(":", 1)[1]
+        elif fmt is None and args.pretty and "%" in args.pretty:
+            fmt = args.pretty
+        is_oneline = args.oneline or args.pretty == "oneline"
+        for s in out:
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            if is_oneline and fmt is None:
+                first = c.message.splitlines()[0] if c.message.strip() else ""
+                _print(f"{s[:7] if args.oneline else s} {first}")
+            elif fmt is not None:
+                # rev-list prefixes a "commit <oid>" line before the format.
+                _print(f"commit {s}")
+                _print(_expand_commit_format(repo, s, c, fmt, {}))
+            else:
+                _print(f"commit {s}")
+                _emit_commit_header(s, c, style=args.pretty, date_mode="default")
+                _print("")
+                for line in c.message.rstrip("\n").splitlines():
+                    _print(f"    {line}")
+        return 0
     if args.count:
         _print(str(len(out)))
     elif args.objects:
@@ -711,12 +1074,15 @@ def cmd_rev_list(argv: list[str]) -> int:
         if args.reverse:
             out = list(reversed(out))
         for s in out:
+            mark = ""
+            if args.left_right:
+                mark = "<" if s in lr_left else (">" if s in lr_right else "")
             if args.parents:
                 info = _commit_tree_parents(repo, s, graph)
                 parents = " ".join(info[1]) if info else ""
-                _print(f"{s} {parents}".rstrip())
+                _print(f"{mark}{s} {parents}".rstrip())
             else:
-                _print(s)
+                _print(f"{mark}{s}")
     return 0
 
 
@@ -1053,6 +1419,11 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untrac
         for p in untracked:
             _print(f"\t{p}")
         _print("")
+    elif untracked_hidden and (staged or rename_rows):
+        # With staged changes present (so no trailing summary), -uno still notes
+        # hidden untracked files. Without staged changes the summary line
+        # ("no changes added"/"nothing to commit, use -u") carries the hint.
+        _print("Untracked files not listed (use -u option to show untracked files)")
 
     has_staged = bool(staged) or bool(rename_rows)
     if not has_staged and not unstaged and not untracked:
@@ -1120,6 +1491,7 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("--amend", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--allow-empty", action="store_true")
+    ap.add_argument("--date", default=None)
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
     # Multiple -m values are joined into paragraphs, like C Git.
@@ -1154,6 +1526,12 @@ def cmd_commit(argv: list[str]) -> int:
         pc = objs.parse_commit(pdata)
         parents = list(pc.parents)
         author_sig = pc.author
+        if args.date is not None:
+            # --amend --date keeps the original author identity but resets the
+            # author date to the supplied value.
+            who, _ts, _tz = _split_ident(pc.author)
+            fresh = objs.build_signature(repo, "author", date_override=args.date)
+            author_sig = who + fresh[fresh.rindex(">") + 1:]
         message = args.message if args.message is not None else pc.message.rstrip("\n")
         compare_tree = None
         if pc.parents:
@@ -1169,7 +1547,7 @@ def cmd_commit(argv: list[str]) -> int:
             _err('error: empty commit message')
             return 1
         parents = [parent] if parent else []
-        author_sig = objs.build_signature(repo, "author")
+        author_sig = objs.build_signature(repo, "author", date_override=args.date)
         message = args.message
         if parent and not args.allow_empty:
             _, pdata = objs.read_object(repo, parent)
@@ -1242,23 +1620,48 @@ def _parse_who(who: str) -> tuple[str, str]:
     return who, ""
 
 
-def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict) -> str:
-    a_who, _, _ = _split_ident(c.author)
-    c_who, _, _ = _split_ident(c.committer)
+def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict,
+                          date_mode: str = "default", abbrev: int = 7) -> str:
+    a_who, a_ts, a_tz = _split_ident(c.author)
+    c_who, c_ts, c_tz = _split_ident(c.committer)
     an, ae = _parse_who(a_who)
     cn, ce = _parse_who(c_who)
     subject = c.message.splitlines()[0] if c.message.strip() else ""
-    deco = _format_decoration(decorations.get(sha, []))
+    # %B is the raw message; %b is the body after the subject's blank line; %f
+    # is the subject sanitized into a path-safe slug.
+    import re as _re
+    raw_body = c.message
+    _parts = c.message.split("\n\n", 1)
+    body = _parts[1] if len(_parts) > 1 else ""
+    sanitized = _re.sub(r"[^A-Za-z0-9]+", "-", subject).strip("-")
+    deco_names = decorations.get(sha, [])
+    deco = _format_decoration(deco_names)
+    deco_d = ", ".join(deco_names)
+    # Longer tokens must precede their prefixes (e.g. %ad before %a*) so a
+    # str.replace pass does not consume the prefix first.
     replacements = [
-        ("%H", sha), ("%h", sha[:7]),
-        ("%T", c.tree), ("%t", c.tree[:7]),
-        ("%P", " ".join(c.parents)), ("%p", " ".join(p[:7] for p in c.parents)),
+        ("%H", sha), ("%h", sha[:abbrev]),
+        ("%T", c.tree), ("%t", c.tree[:abbrev]),
+        ("%P", " ".join(c.parents)), ("%p", " ".join(p[:abbrev] for p in c.parents)),
         ("%an", an), ("%ae", ae), ("%cn", cn), ("%ce", ce),
-        ("%ad", _format_ident_date(c.author)), ("%cd", _format_ident_date(c.committer)),
-        ("%s", subject), ("%d", deco),
+        # Date placeholders: %ad/%cd honor --date; %aD/%ai/%aI (and committer
+        # equivalents) are fixed styles; %at/%ct are the raw unix timestamps.
+        ("%aD", _format_date(c.author, "rfc")), ("%cD", _format_date(c.committer, "rfc")),
+        ("%aI", _format_date(c.author, "iso-strict")), ("%cI", _format_date(c.committer, "iso-strict")),
+        ("%ai", _format_date(c.author, "iso")), ("%ci", _format_date(c.committer, "iso")),
+        ("%ad", _format_date(c.author, date_mode)), ("%cd", _format_date(c.committer, date_mode)),
+        ("%ar", _format_date(c.author, "relative")), ("%cr", _format_date(c.committer, "relative")),
+        ("%at", str(a_ts) if a_ts is not None else ""), ("%ct", str(c_ts) if c_ts is not None else ""),
+        ("%B", raw_body), ("%b", body), ("%f", sanitized),
+        # Signature placeholders: pythongit does not verify GPG signatures, so
+        # commits read as unsigned ("N", empty detail fields), like unsigned
+        # commits under C Git.
+        ("%G?", "N"), ("%GG", ""), ("%GS", ""), ("%GK", ""),
+        ("%s", subject), ("%D", deco_d), ("%d", deco),
         ("%n", "\n"), ("%%", "%"),
     ]
-    out = fmt
+    # %xHH expands to the literal byte (e.g. %x09 -> tab) before field tokens.
+    out = _re.sub(r"%x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), fmt)
     for token, value in replacements:
         out = out.replace(token, value)
     return out
@@ -1272,16 +1675,45 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--format", default=None)
     ap.add_argument("--abbrev-commit", action="store_true")
+    ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("-p", "--patch", action="store_true")
     ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--no-merges", dest="no_merges", action="store_true")
+    # pythongit never colorizes, so color controls are accepted and ignored.
+    ap.add_argument("--color", nargs="?", const="always", default=None)
+    ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--first-parent", dest="first_parent", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--graph", action="store_true")
+    ap.add_argument("--topo-order", dest="topo_order", action="store_true")
+    ap.add_argument("--date-order", dest="date_order", action="store_true")
+    ap.add_argument("--parents", action="store_true")
+    ap.add_argument("--merges", action="store_true")
+    ap.add_argument("--min-parents", dest="min_parents", type=int, default=None)
+    ap.add_argument("--max-parents", dest="max_parents", type=int, default=None)
+    ap.add_argument("--grep", action="append", default=None)
+    ap.add_argument("--author", action="append", default=None)
+    ap.add_argument("--committer", action="append", default=None)
+    ap.add_argument("--all-match", dest="all_match", action="store_true")
+    ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
+    ap.add_argument("-S", dest="pickaxe_s", default=None)
+    ap.add_argument("-G", dest="pickaxe_g", default=None)
+    ap.add_argument("--since", "--after", dest="since", default=None)
+    ap.add_argument("--until", "--before", dest="until", default=None)
+    ap.add_argument("--date", default=None)
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
+
+    if args.graph and args.reverse:
+        _err("fatal: options '--graph' and '--reverse' cannot be used together")
+        return 128
 
     # Split positionals into revisions and pathspecs.
     revs: list[str] = []
@@ -1318,7 +1750,7 @@ def cmd_log(argv: list[str]) -> int:
                         stack.extend(info[1])
     else:
         sha = refs_mod.rev_parse(repo, rev)
-    if not sha:
+    if not sha and not args.all:
         head_sym, _ = refs_mod.read_head(repo)
         if rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
             branch = head_sym[len("refs/heads/"):]
@@ -1328,42 +1760,112 @@ def cmd_log(argv: list[str]) -> int:
         _err("Use '--' to separate paths from revisions, like this:")
         _err("'git <command> [<revision>...] -- [<file>...]'")
         return 128
-    decorate = args.decorate is not None and not args.no_decorate
-    decorations = _commit_decorations(repo) if decorate else {}
-
-    # Determine output style.
+    # Determine output style. `--format`/`tformat:` terminate each entry with a
+    # newline; `format:` only separates entries (no trailing newline).
     fmt_string: Optional[str] = None
     style = "medium"
+    fmt_terminator = True
+    # `--format=<builtin>` is an alias for `--pretty=<builtin>`, not a literal.
+    if args.format in ("oneline", "short", "medium", "full", "fuller", "raw", "reference"):
+        args.pretty, args.format = args.format, None
     if args.format is not None:
         fmt_string = args.format
         style = "format"
     elif args.pretty is not None:
         if args.pretty == "oneline":
             style = "oneline_full"
-        elif args.pretty.startswith("format:") or args.pretty.startswith("tformat:"):
+        elif args.pretty.startswith("format:"):
+            fmt_terminator = False
             fmt_string = args.pretty.split(":", 1)[1]
+            style = "format"
+        elif args.pretty.startswith("tformat:") or "%" in args.pretty:
+            # A non-builtin value containing '%' is a tformat string.
+            fmt_terminator = True
+            fmt_string = (args.pretty.split(":", 1)[1]
+                          if args.pretty.startswith("tformat:") else args.pretty)
             style = "format"
         else:
             style = args.pretty
     if args.oneline:
         style = "oneline"
+    date_mode = args.date or "default"
+
+    decorate = args.decorate is not None and not args.no_decorate
+    # The %d/%D placeholders always expand decorations, even without --decorate.
+    if not decorate and fmt_string and ("%d" in fmt_string or "%D" in fmt_string):
+        decorate = True
+    decorations = _commit_decorations(repo) if decorate else {}
+
+    # `--graph` and `--topo-order` reorder commits topologically (unless
+    # `--date-order` is also given); collect the full set first, then sort.
+    want_topo = (args.graph or args.topo_order) and not args.date_order
+    # Commit-level filters mean the early --max-count cutoff during collection
+    # would truncate before filtering, so collect fully when any filter is set.
+    want_filter = any((
+        args.merges, args.no_merges, args.min_parents is not None,
+        args.max_parents is not None, args.grep, args.author, args.committer,
+        args.pickaxe_s is not None, args.pickaxe_g is not None,
+        args.since, args.until))
+    collect_full = want_topo or want_filter
 
     # Collect the ordered list of commit shas first so --reverse can flip it.
     seen: set[str] = set()
-    cur = deque([sha])
     commit_list: list[str] = []
-    while cur:
-        s = cur.popleft()
-        if s in seen or s in exclude:
-            continue
-        seen.add(s)
-        info = _commit_tree_parents(repo, s)
-        if info is None:
-            break
-        commit_list.append(s)
-        cur.extend(info[1][:1] if args.first_parent else info[1])
-        if not log_paths and args.max_count and len(commit_list) >= args.max_count:
-            break
+    if args.all:
+        # `--all` walks every ref. Match git's reverse-chronological order: a
+        # stable max-heap keyed on committer date, with ties broken by insertion
+        # order. Tips are seeded in ascending refname order, then HEAD.
+        import heapq
+        heap: list[tuple[int, int, str]] = []
+        pushed: set[str] = set()
+        counter = 0
+
+        def _push(csha: str) -> None:
+            nonlocal counter
+            if csha in pushed:
+                return
+            pushed.add(csha)
+            heapq.heappush(heap, (-_commit_date(repo, csha), counter, csha))
+            counter += 1
+
+        for refname, _rsha in _enumerate_refs(repo):
+            if refname.startswith(("refs/heads/", "refs/tags/", "refs/remotes/")):
+                csha = refs_mod.rev_parse(repo, refname + "^{commit}")
+                if csha:
+                    _push(csha)
+        _, head_sha = refs_mod.read_head(repo)
+        if head_sha:
+            _push(head_sha)
+        while heap:
+            _d, _c, s = heapq.heappop(heap)
+            if s in seen or s in exclude:
+                continue
+            seen.add(s)
+            info = _commit_tree_parents(repo, s)
+            if info is None:
+                continue
+            commit_list.append(s)
+            for p in (info[1][:1] if args.first_parent else info[1]):
+                _push(p)
+            if not log_paths and not collect_full and args.max_count and len(commit_list) >= args.max_count:
+                break
+    else:
+        cur = deque([sha])
+        while cur:
+            s = cur.popleft()
+            if s in seen or s in exclude:
+                continue
+            seen.add(s)
+            info = _commit_tree_parents(repo, s)
+            if info is None:
+                break
+            commit_list.append(s)
+            cur.extend(info[1][:1] if args.first_parent else info[1])
+            if not log_paths and not collect_full and args.max_count and len(commit_list) >= args.max_count:
+                break
+
+    if want_topo:
+        commit_list = _topo_order(repo, commit_list, args.first_parent)
 
     if log_paths:
         filtered: list[str] = []
@@ -1377,36 +1879,91 @@ def cmd_log(argv: list[str]) -> int:
                 if (before.sha if before else None) != (after.sha if after else None):
                     filtered.append(s)
                     break
-            if args.max_count and len(filtered) >= args.max_count:
+            if not collect_full and args.max_count and len(filtered) >= args.max_count:
                 break
         commit_list = filtered
+
+    # Commit-level filters (applied before --max-count truncation, like git).
+    commit_list = _filter_commits(repo, commit_list, args)
 
     if args.max_count is not None:
         commit_list = commit_list[:max(0, args.max_count)]
     if args.reverse:
         commit_list = list(reversed(commit_list))
 
-    for count, s in enumerate(commit_list):
-        c = objs.parse_commit(objs.read_object(repo, s)[1])
+    graph = None
+    if args.graph:
+        from . import graph as _graph_mod
+
+        def _parents_of(csha: str) -> list:
+            info = _commit_tree_parents(repo, csha)
+            return list(info[1]) if info else []
+
+        graph = _graph_mod.Graph(_parents_of)
+    # Styles whose commits are separated by a blank line (graph prefixes it).
+    multiline = style in ("medium", "full", "fuller", "short", "raw")
+    last_index = len(commit_list) - 1
+
+    def render(count, s, c):
         if style == "format":
-            _print(_expand_commit_format(repo, s, c, fmt_string, decorations))
+            expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev)
+            if fmt_terminator:
+                sys.stdout.write(expansion + "\n")
+            else:
+                if count > 0:
+                    sys.stdout.write("\n")
+                sys.stdout.write(expansion)
         elif style in ("oneline", "oneline_full"):
-            abbrev = s if style == "oneline_full" else s[:7]
+            short = style == "oneline" or args.abbrev_commit
+            abbrev = s[:args.abbrev] if short else s
             first = c.message.splitlines()[0] if c.message.strip() else ""
             deco = _format_decoration(decorations.get(s, []))
-            _print(f"{abbrev}{deco} {first}")
+            pre = abbrev
+            if args.parents:
+                pre += "".join(" " + (p[:7] if short else p) for p in c.parents)
+            _print(f"{pre}{deco} {first}")
+        elif style == "reference":
+            first = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"{s[:7]} ({first}, {_format_date(c.author, 'short')})")
+        elif style in ("short", "raw"):
+            if count > 0:
+                _print("")
+            sha_disp = s[:7] if args.abbrev_commit else s
+            psuf = ("".join(" " + (p[:7] if args.abbrev_commit else p) for p in c.parents)
+                    if args.parents else "")
+            _print(f"commit {sha_disp}{psuf}{_format_decoration(decorations.get(s, []))}")
+            if style == "raw":
+                _print(f"tree {c.tree}")
+                for p in c.parents:
+                    _print(f"parent {p}")
+                _print(f"author {c.author}")
+                _print(f"committer {c.committer}")
+                _print("")
+                for line in c.message.rstrip("\n").splitlines():
+                    _print(f"    {line}")
+            else:  # short
+                if len(c.parents) > 1:
+                    _print("Merge: " + " ".join(p[:7] for p in c.parents))
+                _print(f"Author: {_split_ident(c.author)[0]}")
+                _print("")
+                first = c.message.splitlines()[0] if c.message.strip() else ""
+                _print(f"    {first}")
         else:
             if count > 0:
                 _print("")
-            _print(f"commit {s}{_format_decoration(decorations.get(s, []))}")
-            if len(c.parents) > 1:
-                _print("Merge: " + " ".join(p[:7] for p in c.parents))
-            _print(f"Author: {_split_ident(c.author)[0]}")
-            _print(f"Date:   {_format_ident_date(c.author)}")
+            psuf = ("".join(" " + (p[:7] if args.abbrev_commit else p) for p in c.parents)
+                    if args.parents else "")
+            _emit_commit_header(s[:7] if args.abbrev_commit else s, c, style=style,
+                                date_mode=date_mode, parents_suffix=psuf,
+                                decoration=_format_decoration(decorations.get(s, [])))
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
-            if args.stat or args.patch or args.name_only or args.name_status:
+            # A merge commit has no default (non-combined) diff, so git emits
+            # neither a diff nor the blank line that would precede one.
+            is_merge = len(c.parents) > 1
+            if (args.stat or args.shortstat or args.patch or args.name_only
+                    or args.name_status or args.raw) and not is_merge:
                 parent_tree = None
                 if c.parents:
                     _, pd = objs.read_object(repo, c.parents[0])
@@ -1415,6 +1972,8 @@ def cmd_log(argv: list[str]) -> int:
                 _print("")
                 if args.stat:
                     _diff_stat(tchanges)
+                elif args.shortstat:
+                    _diff_shortstat(tchanges)
                 elif args.name_only:
                     for path, _a, _b in tchanges:
                         _print(path)
@@ -1422,8 +1981,19 @@ def cmd_log(argv: list[str]) -> int:
                     for path, a, b in tchanges:
                         st = "A" if not a.present else ("D" if not b.present else "M")
                         _print(f"{st}\t{path}")
+                elif args.raw:
+                    _emit_raw_diff(repo, parent_tree, c.tree)
                 else:
                     _emit_tree_patch(repo, parent_tree, c.tree)
+
+    for count, s in enumerate(commit_list):
+        c = objs.parse_commit(objs.read_object(repo, s)[1])
+        if graph is None:
+            render(count, s, c)
+        else:
+            text = _capture_output(lambda: render(0, s, c))
+            sys.stdout.write(graph.format_commit(
+                s, text, emit_separator=(multiline and count > 0)))
     return 0
 
 
@@ -1438,22 +2008,39 @@ def _expand_count_shorthand(argv: list[str]) -> list[str]:
 
 
 def _commit_decorations(repo: Repository) -> dict[str, list[str]]:
+    """Map commit sha -> ordered decoration labels, matching C Git.
+
+    Git iterates refs in ascending full-name order, *prepending* each label to
+    its target's list (so the result is reverse-alphabetical), peels annotated
+    tags to the commit they reference, and finally hoists the current branch to
+    the front as ``HEAD -> <branch>`` (or a bare ``HEAD`` when detached).
+    """
     out: dict[str, list[str]] = {}
+    for refname, sha in _enumerate_refs(repo):
+        if refname.startswith("refs/heads/"):
+            label = refname[len("refs/heads/"):]
+            target = sha
+        elif refname.startswith("refs/remotes/"):
+            label = refname[len("refs/remotes/"):]
+            target = sha
+        elif refname.startswith("refs/tags/"):
+            label = "tag: " + refname[len("refs/tags/"):]
+            # Annotated tags decorate the commit they ultimately point to.
+            target = refs_mod.rev_parse(repo, refname + "^{commit}") or sha
+        else:
+            continue
+        out.setdefault(target, []).insert(0, label)
+
     head_sym, head_sha = refs_mod.read_head(repo)
     if head_sha:
         if head_sym and head_sym.startswith("refs/heads/"):
-            out.setdefault(head_sha, []).append(f"HEAD -> {head_sym[len('refs/heads/') :]}")
+            short = head_sym[len("refs/heads/"):]
+            lst = out.setdefault(head_sha, [])
+            if short in lst:
+                lst.remove(short)
+            lst.insert(0, f"HEAD -> {short}")
         else:
-            out.setdefault(head_sha, []).append("HEAD")
-    for branch in refs_mod.list_branches(repo):
-        ref = f"refs/heads/{branch}"
-        sha = refs_mod.read_ref(repo, ref)
-        if sha and ref != head_sym:
-            out.setdefault(sha, []).append(branch)
-    for tag in refs_mod.list_tags(repo):
-        sha = refs_mod.read_ref(repo, f"refs/tags/{tag}")
-        if sha:
-            out.setdefault(sha, []).append(f"tag: {tag}")
+            out.setdefault(head_sha, []).insert(0, "HEAD")
     return out
 
 
@@ -1470,34 +2057,229 @@ def _split_ident(sig: str) -> tuple[str, Optional[int], Optional[str]]:
     return sig, None, None
 
 
-def _format_ident_date(sig: str) -> str:
-    """Format a signature's timestamp like C Git's default ``Date:`` line."""
+def _relative_date(ts: int, now: Optional[int] = None) -> str:
+    """C Git's ``--date=relative`` string (date.c:show_date_relative)."""
+    import time
+    if now is None:
+        now = int(time.time())
+    if now < ts:
+        return "in the future"
+    diff = now - ts
+
+    def ago(n: int, unit: str) -> str:
+        return f"{n} {unit}{'' if n == 1 else 's'} ago"
+
+    if diff < 90:
+        return ago(diff, "second")
+    diff = (diff + 30) // 60          # minutes
+    if diff < 90:
+        return ago(diff, "minute")
+    diff = (diff + 30) // 60          # hours
+    if diff < 36:
+        return ago(diff, "hour")
+    diff = (diff + 12) // 24          # days
+    if diff < 14:
+        return ago(diff, "day")
+    if diff < 70:
+        return ago((diff + 3) // 7, "week")
+    if diff < 365:
+        return ago((diff + 15) // 30, "month")
+    if diff < 1825:                   # under ~5 years: years and months
+        totalmonths = (diff * 12 * 2 + 365) // (365 * 2)
+        years, months = totalmonths // 12, totalmonths % 12
+        if months:
+            return (f"{years} year{'' if years == 1 else 's'}, "
+                    f"{months} month{'' if months == 1 else 's'} ago")
+        return f"{years} year{'' if years == 1 else 's'} ago"
+    return ago((diff + 183) // 365, "year")
+
+
+def _format_date(sig: str, mode: str = "default") -> str:
+    """Render a signature's timestamp in one of git's ``--date=<mode>`` styles.
+
+    The day of month is never zero-padded in the default and rfc styles,
+    matching C Git. ``relative`` is computed against the current time; a
+    ``-local`` suffix (or the bare ``local`` mode) renders in the system
+    timezone; ``format:<strftime>`` applies an explicit strftime template.
+    """
     import datetime
-    who, ts, tz = _split_ident(sig)
+    _who, ts, tz = _split_ident(sig)
     if ts is None or tz is None:
         return sig
+    mode = {"iso8601": "iso", "iso8601-strict": "iso-strict",
+            "rfc2822": "rfc", "default-local": "local"}.get(mode, mode)
+
+    if mode == "relative":
+        return _relative_date(ts)
+
+    # `format:` / `format-local:` apply a raw strftime template.
+    if mode.startswith("format:") or mode.startswith("format-local:"):
+        local = mode.startswith("format-local:")
+        template = mode.split(":", 1)[1]
+        d = datetime.datetime.fromtimestamp(ts) if local else (
+            datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+            + datetime.timedelta(minutes=_tz_minutes(tz)))
+        return d.strftime(template)
+
+    # A `-local` suffix renders in the system timezone; the bare `local` mode is
+    # `default` rendered locally. In local mode the displayed offset is the
+    # system offset (still shown by iso/iso-strict/rfc; hidden by default).
+    local = mode == "local" or mode.endswith("-local")
+    if mode == "local":
+        mode = "default"
+    elif mode.endswith("-local"):
+        mode = mode[: -len("-local")]
+    if local:
+        dt = datetime.datetime.fromtimestamp(ts)
+        tz_out = _git_tz_str(dt.astimezone().utcoffset())
+    else:
+        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=_tz_minutes(tz))
+        tz_out = tz
+
+    if mode == "iso":
+        return dt.strftime("%Y-%m-%d %H:%M:%S ") + tz_out
+    if mode == "iso-strict":
+        suffix = "Z" if tz_out == "+0000" else tz_out[:3] + ":" + tz_out[3:]
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + suffix
+    if mode == "rfc":
+        return dt.strftime("%a, ") + str(dt.day) + dt.strftime(" %b %Y %H:%M:%S ") + tz_out
+    if mode == "human":
+        return _human_date(dt, ts, tz, local)
+    if mode == "short":
+        return dt.strftime("%Y-%m-%d")
+    if mode == "raw":
+        return f"{ts} {tz_out}"
+    if mode == "unix":
+        return str(ts)
+    # The default format shows the offset, except in local mode (hide.tz).
+    tail = "" if local else (" " + tz_out)
+    return dt.strftime("%a %b ") + str(dt.day) + dt.strftime(" %H:%M:%S %Y") + tail
+
+
+def _tz_minutes(tz: str) -> int:
     sign = 1 if tz[0] == "+" else -1
-    off_min = sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
-    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=off_min)
-    return dt.strftime("%a %b ") + f"{dt.day:>2}" + dt.strftime(" %H:%M:%S %Y ") + tz
+    return sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
+
+
+def _git_tz_str(offset) -> str:
+    """Render a timedelta UTC offset as git's ``+HHMM`` / ``-HHMM`` form."""
+    mins = int(offset.total_seconds()) // 60 if offset else 0
+    sign = "+" if mins >= 0 else "-"
+    mins = abs(mins)
+    return f"{sign}{mins // 60:02d}{mins % 60:02d}"
+
+
+def _human_date(dt, ts: int, tz: str, local: bool) -> str:
+    """C Git's ``--date=human`` (date.c:show_date_normal with a human now).
+
+    Recent same-day timestamps fall back to a relative string; otherwise git
+    drops fields that are redundant relative to the current local time (the
+    year within this year, the date for the last few days, always seconds).
+    """
+    import datetime
+    import time
+    now = int(time.time())
+    now_local = datetime.datetime.fromtimestamp(now)
+    # git compares the integer +HHMM tz forms; for tests TZ is pinned so this
+    # only matters for the rarely-shown human tz field.
+    human_off = now_local.astimezone().utcoffset()
+    human_min = int(human_off.total_seconds()) // 60 if human_off else 0
+    human_tz_int = (1 if human_min >= 0 else -1) * ((abs(human_min) // 60) * 100 + abs(human_min) % 60)
+    tz_int = int(tz)
+
+    hide_tz = local or tz_int == human_tz_int
+    hide_year = dt.year == now_local.year
+    hide_date = hide_wday = False
+    if hide_year and dt.month == now_local.month:
+        if dt.day > now_local.day:
+            pass  # future date: think timezones
+        elif dt.day == now_local.day:
+            hide_date = hide_wday = True
+        elif dt.day + 5 > now_local.day:
+            hide_date = True
+
+    # "today" times collapse to a relative string.
+    if hide_wday:
+        return _relative_date(ts, now)
+
+    hide_tz = hide_tz or not hide_date
+    hide_wday = hide_time = not hide_year
+
+    buf = ""
+    if not hide_wday:
+        buf += dt.strftime("%a") + " "
+    if not hide_date:
+        buf += dt.strftime("%b") + " " + str(dt.day) + " "
+    if not hide_time:
+        buf += dt.strftime("%H:%M")
+    else:
+        buf = buf.rstrip()
+    if not hide_year:
+        buf += " " + str(dt.year)
+    if not hide_tz:
+        buf += " " + tz
+    return buf
+
+
+def _format_ident_date(sig: str) -> str:
+    """Format a signature's timestamp like C Git's default ``Date:`` line."""
+    return _format_date(sig, "default")
+
+
+def _emit_commit_header(sha: str, c, *, style: str = "medium",
+                        date_mode: str = "default", decoration: str = "",
+                        parents_suffix: str = "") -> None:
+    """Print the ``commit``/``Author``/``Date`` header block for medium, full,
+    and fuller pretty styles, shared by ``log`` and ``show``."""
+    _print(f"commit {sha}{parents_suffix}{decoration}")
+    if len(c.parents) > 1:
+        _print("Merge: " + " ".join(p[:7] for p in c.parents))
+    author_who = _split_ident(c.author)[0]
+    committer_who = _split_ident(c.committer)[0]
+    if style == "fuller":
+        _print(f"Author:     {author_who}")
+        _print(f"AuthorDate: {_format_date(c.author, date_mode)}")
+        _print(f"Commit:     {committer_who}")
+        _print(f"CommitDate: {_format_date(c.committer, date_mode)}")
+    elif style == "full":
+        _print(f"Author: {author_who}")
+        _print(f"Commit: {committer_who}")
+    else:
+        _print(f"Author: {author_who}")
+        _print(f"Date:   {_format_date(c.author, date_mode)}")
 
 
 def cmd_show(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit show", add_help=False)
     ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
     ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--oneline", action="store_true")
     ap.add_argument("--format", default=None)
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
+    ap.add_argument("--date", default=None)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
     repo = _repo()
+    # `--format=<builtin>` is an alias for `--pretty=<builtin>`.
+    if args.format in ("oneline", "short", "medium", "full", "fuller", "raw", "reference"):
+        args.pretty, args.format = args.format, None
+    pstyle = args.pretty if args.pretty in ("full", "fuller", "short", "raw", "reference") else "medium"
+    date_mode = args.date or "default"
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
         _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
         return 128
     fmt = args.format
-    if fmt is None and args.pretty and (args.pretty.startswith("format:") or args.pretty.startswith("tformat:")):
-        fmt = args.pretty.split(":", 1)[1]
+    if fmt is None and args.pretty:
+        if args.pretty.startswith("format:") or args.pretty.startswith("tformat:"):
+            fmt = args.pretty.split(":", 1)[1]
+        elif "%" in args.pretty:
+            fmt = args.pretty
+    if fmt is None and args.oneline:
+        fmt = "%h %s"
     if fmt is not None:
         peeled = refs_mod.rev_parse(repo, args.rev + "^{commit}") or sha
         c = objs.parse_commit(objs.read_object(repo, peeled)[1])
@@ -1526,7 +2308,7 @@ def cmd_show(argv: list[str]) -> int:
         _print(f"tag {tag_name}")
         if tagger:
             _print(f"Tagger: {_split_ident(tagger)[0]}")
-            _print(f"Date:   {_format_ident_date(tagger)}")
+            _print(f"Date:   {_format_date(tagger, date_mode)}")
         _print("")
         _print(tagmsg.rstrip("\n"))
         _print("")
@@ -1535,24 +2317,62 @@ def cmd_show(argv: list[str]) -> int:
             t, data = objs.read_object(repo, sha)
     if t == "commit":
         c = objs.parse_commit(data)
-        _print(f"commit {sha}")
-        if len(c.parents) > 1:
-            _print("Merge: " + " ".join(p[:7] for p in c.parents))
-        _print(f"Author: {_split_ident(c.author)[0]}")
-        _print(f"Date:   {_format_ident_date(c.author)}")
-        _print("")
-        for line in c.message.rstrip("\n").splitlines():
-            _print(f"    {line}")
+        if pstyle == "reference":
+            first = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"{sha[:7]} ({first}, {_format_date(c.author, 'short')})")
+        elif pstyle == "raw":
+            _print(f"commit {sha}")
+            _print(f"tree {c.tree}")
+            for p in c.parents:
+                _print(f"parent {p}")
+            _print(f"author {c.author}")
+            _print(f"committer {c.committer}")
+            _print("")
+            for line in c.message.rstrip("\n").splitlines():
+                _print(f"    {line}")
+        elif pstyle == "short":
+            _print(f"commit {sha}")
+            if len(c.parents) > 1:
+                _print("Merge: " + " ".join(p[:7] for p in c.parents))
+            _print(f"Author: {_split_ident(c.author)[0]}")
+            _print("")
+            first = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"    {first}")
+        else:
+            _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode)
+            _print("")
+            for line in c.message.rstrip("\n").splitlines():
+                _print(f"    {line}")
         parent_tree = None
         if c.parents:
             _, pd = objs.read_object(repo, c.parents[0])
             parent_tree = objs.parse_commit(pd).tree
+        # For a merge, the default (combined) patch and raw output collapse to
+        # empty for a clean merge, but git still prints the separating blank
+        # line. '--stat' is special: it reports against the first parent.
+        is_merge = len(c.parents) > 1
         if args.stat:
             _print("")
             _diff_stat(_tree_changes(repo, parent_tree, c.tree))
+        elif args.name_only:
+            _print("")
+            if not is_merge:
+                for path, _a, _b in _tree_changes(repo, parent_tree, c.tree):
+                    _print(path)
+        elif args.name_status:
+            _print("")
+            if not is_merge:
+                for path, a, b in _tree_changes(repo, parent_tree, c.tree):
+                    st = "A" if not a.present else ("D" if not b.present else "M")
+                    _print(f"{st}\t{path}")
+        elif args.raw:
+            _print("")
+            if not is_merge:
+                _emit_raw_diff(repo, parent_tree, c.tree)
         elif not args.no_patch:
             _print("")
-            _emit_tree_patch(repo, parent_tree, c.tree)
+            if not is_merge:
+                _emit_tree_patch(repo, parent_tree, c.tree)
     elif t == "tree":
         for e in objs.parse_tree(data, repo.hash_len):
             obj_t = "tree" if e.is_dir() else "blob"
@@ -1574,6 +2394,17 @@ def _tree_changes(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]
         if a.sha != b.sha or a.mode != b.mode:
             changes.append((p, a, b))
     return changes
+
+
+def _emit_raw_diff(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]) -> None:
+    """Emit ``git log --raw`` style lines: ``:<amode> <bmode> <asha> <bsha> <st>\\t<path>``."""
+    for path, a, b in _tree_changes(repo, a_tree, b_tree):
+        status = "A" if not a.present else ("D" if not b.present else "M")
+        a_sha = a.sha[:7] if a.present else "0000000"
+        b_sha = b.sha[:7] if b.present else "0000000"
+        a_mode = (a.mode or "000000").zfill(6)
+        b_mode = (b.mode or "000000").zfill(6)
+        _print(f":{a_mode} {b_mode} {a_sha} {b_sha} {status}\t{path}")
 
 
 def _emit_tree_patch(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]) -> None:
@@ -1667,10 +2498,12 @@ def _is_binary(data: Optional[bytes]) -> bool:
     return bool(data) and b"\x00" in data[:8000]
 
 
-def _emit_file_diff(path: str, a: _Side, b: _Side) -> None:
+def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
-    _print(f"diff --git a/{path} b/{path}")
+    # Under -R the working-side prefixes are swapped (b/<path> a/<path>).
+    pa, pb = ("b", "a") if reverse else ("a", "b")
+    _print(f"diff --git {pa}/{path} {pb}/{path}")
     if not a.present:
         _print(f"new file mode {b.mode}")
     elif not b.present:
@@ -1684,13 +2517,13 @@ def _emit_file_diff(path: str, a: _Side, b: _Side) -> None:
         suffix = f" {a.mode}" if a.present and b.present and a.mode == b.mode else ""
         _print(f"index {a_abbrev}..{b_abbrev}{suffix}")
         if _is_binary(a.data) or _is_binary(b.data):
-            _print(f"Binary files {'a/' + path if a.present else '/dev/null'} and "
-                   f"{'b/' + path if b.present else '/dev/null'} differ")
+            _print(f"Binary files {pa + '/' + path if a.present else '/dev/null'} and "
+                   f"{pb + '/' + path if b.present else '/dev/null'} differ")
             return
         a_text = (a.data or b"").decode("utf-8", errors="replace")
         b_text = (b.data or b"").decode("utf-8", errors="replace")
-        _print(f"--- {'a/' + path if a.present else '/dev/null'}")
-        _print(f"+++ {'b/' + path if b.present else '/dev/null'}")
+        _print(f"--- {pa + '/' + path if a.present else '/dev/null'}")
+        _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
         body = diff_mod.format_hunks(
             a_text.splitlines(), b_text.splitlines(),
             a_no_newline=bool(a_text) and not a_text.endswith("\n"),
@@ -1745,6 +2578,43 @@ def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None) -> None:
     _print(_stat_summary_line(len(rows), total_ins, total_del))
 
 
+def _diff_shortstat(changes: list[tuple[str, _Side, _Side]]) -> None:
+    """Print only C Git's ``--shortstat`` summary line for a set of changes."""
+    files = total_ins = total_del = 0
+    for _path, a, b in changes:
+        if a.sha == b.sha and a.mode == b.mode:
+            continue
+        files += 1
+        if _is_binary(a.data) or _is_binary(b.data):
+            continue
+        a_lines = (a.data or b"").decode("utf-8", errors="replace").splitlines()
+        b_lines = (b.data or b"").decode("utf-8", errors="replace").splitlines()
+        for op in diff_mod.diff_lines(a_lines, b_lines):
+            if op[0] == "ins":
+                total_ins += 1
+            elif op[0] == "del":
+                total_del += 1
+    if files == 0:
+        return
+    _print(_stat_summary_line(files, total_ins, total_del))
+
+
+def _diff_summary(changes: list[tuple[str, _Side, _Side]], renames=None) -> None:
+    """Print C Git's ``--summary`` lines (create/delete/mode-change/rename)."""
+    lines: list[tuple[str, str]] = []
+    for src, dst, sim, _sa, _db in (renames or []):
+        lines.append((dst, f" rename {src} => {dst} ({sim}%)"))
+    for path, a, b in changes:
+        if not a.present and b.present:
+            lines.append((path, f" create mode {(b.mode or '000000').zfill(6)} {path}"))
+        elif a.present and not b.present:
+            lines.append((path, f" delete mode {(a.mode or '000000').zfill(6)} {path}"))
+        elif a.present and b.present and a.mode != b.mode:
+            lines.append((path, f" mode change {a.mode} => {b.mode} {path}"))
+    for _key, line in sorted(lines):
+        _print(line)
+
+
 def _stat_summary_line(files: int, insertions: int, deletions: int) -> str:
     """Render C Git's ' N files changed, X insertions(+), Y deletions(-)' line,
     showing the zero parts only when both counts are zero."""
@@ -1762,12 +2632,15 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--numstat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
+    ap.add_argument("--summary", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--exit-code", dest="exit_code", action="store_true")
-    ap.add_argument("-M", "--find-renames", dest="find_renames", nargs="?", const=True, default=None)
+    ap.add_argument("-R", dest="reverse", action="store_true")
+    # -M/-C (with optional attached values) are accepted but never consume a
+    # following token; rename detection is on by default (diff.renames=true).
     ap.add_argument("--no-renames", dest="no_renames", action="store_true")
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
@@ -1826,6 +2699,10 @@ def cmd_diff(argv: list[str]) -> int:
         wanted = set(paths)
         changes = [c for c in changes if c[0] in wanted or any(c[0].startswith(w.rstrip("/") + "/") for w in paths)]
 
+    if args.reverse:
+        # -R swaps the two sides of every change.
+        changes = [(p, b, a) for p, a, b in changes]
+
     if args.quiet:
         return 1 if changes else 0
     if args.exit_code:
@@ -1844,10 +2721,17 @@ def cmd_diff(argv: list[str]) -> int:
         if not args.no_renames:
             stat_renames, changes = _detect_changes_renames(repo, changes)
         _diff_stat(changes, stat_renames)
+        if args.summary:
+            _diff_summary(changes, stat_renames)
     elif args.numstat:
         _diff_numstat(changes)
     elif args.shortstat:
         _diff_shortstat(changes)
+    elif args.summary:
+        renames = []
+        if not args.no_renames:
+            renames, changes = _detect_changes_renames(repo, changes)
+        _diff_summary(changes, renames)
     elif args.name_only:
         for path, _, _ in changes:
             _print(path)
@@ -1867,7 +2751,7 @@ def cmd_diff(argv: list[str]) -> int:
             renames, changes = _detect_changes_renames(repo, changes)
         emit = [(dst, lambda s=src, d=dst, sm=sim, sa=sa, db=db: _emit_rename_patch(s, d, sm, sa, db))
                 for src, dst, sim, sa, db in renames]
-        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b)) for path, a, b in changes]
+        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b, args.reverse)) for path, a, b in changes]
         for _key, fn in sorted(emit, key=lambda e: e[0]):
             fn()
     return 0
@@ -1988,6 +2872,7 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("-C", dest="force_copy", action="store_true")
     ap.add_argument("--show-current", action="store_true")
     ap.add_argument("--contains", default=None)
+    ap.add_argument("--sort", default=None)
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
     ap.add_argument("start", nargs="?")
@@ -2079,6 +2964,23 @@ def cmd_branch(argv: list[str]) -> int:
             if not (pattern and not fnmatch.fnmatch(d, pattern))
             and (p is None or _branch_contains(p))
         ]
+        if args.sort:
+            spec = args.sort
+            reverse = spec.startswith("-")
+            key = spec[1:] if reverse else spec
+            def _bkey(item):
+                display, plain = item
+                ref = (f"refs/heads/{display}" if plain is not None
+                       else f"refs/remotes/{display[len('remotes/'):]}")
+                if key in ("version:refname", "v:refname"):
+                    return _version_sort_key(display)
+                if key in ("committerdate", "creatordate", "authordate", "taggerdate"):
+                    sha = refs_mod.read_ref(repo, ref)
+                    return _ref_sort_date(repo, sha, key) if sha else 0
+                if key == "objectname":
+                    return refs_mod.read_ref(repo, ref) or ""
+                return display
+            shown.sort(key=_bkey, reverse=reverse)
         width = max((len(d) for d, _ in shown), default=0)
         for display, plain in shown:
             mark = "*" if plain is not None and plain == cur else " "
@@ -2135,14 +3037,21 @@ def cmd_tag(argv: list[str]) -> int:
     ap.add_argument("-m", "--message", default=None)
     ap.add_argument("-n", nargs="?", const=1, type=int, default=None, dest="num")
     ap.add_argument("--sort", default=None)
+    ap.add_argument("--points-at", default=None)
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
-    if args.list or args.num is not None or args.sort is not None or (args.name is None and not args.delete):
+    if (args.list or args.num is not None or args.sort is not None
+            or args.points_at is not None or (args.name is None and not args.delete)):
         import fnmatch
         pattern = args.name
         tags = list(refs_mod.list_tags(repo))
+        if args.points_at is not None:
+            target = refs_mod.rev_parse(repo, args.points_at)
+            tags = [t for t in tags
+                    if (refs_mod.rev_parse(repo, f"refs/tags/{t}" + "^{commit}")
+                        or refs_mod.read_ref(repo, f"refs/tags/{t}")) == target]
         if args.sort:
             key = args.sort.lstrip("-")
             reverse = args.sort.startswith("-")
@@ -2265,7 +3174,13 @@ def cmd_checkout(argv: list[str]) -> int:
             return 128
         start = refs_mod.rev_parse(repo, revs[0]) if revs else refs_mod.rev_parse(repo, "HEAD")
         if not start:
-            _err(f"fatal: '{revs[0] if revs else 'HEAD'}' is not a commit and a branch '{new_branch}' cannot be created from it")
+            if not revs:
+                # Branching from an unborn HEAD just repoints HEAD at the new
+                # branch; no ref is written until the first commit, like git.
+                refs_mod.set_head(repo, f"refs/heads/{new_branch}")
+                _err(f"Switched to a new branch '{new_branch}'")
+                return 0
+            _err(f"fatal: '{revs[0]}' is not a commit and a branch '{new_branch}' cannot be created from it")
             return 128
         refs_mod.update_ref(repo, f"refs/heads/{new_branch}", start)
         refs_mod.set_head(repo, f"refs/heads/{new_branch}")
@@ -2452,6 +3367,28 @@ def _config_list_pairs(repo: Optional[Repository]) -> list[tuple[str, str]]:
     return gitconfig.list_all(repo)
 
 
+def _config_typed(value: str, type_: Optional[str]) -> str:
+    """Apply git config --type normalization (bool / int / bool-or-int)."""
+    if not type_:
+        return value
+    v = value.strip()
+    if type_ == "bool":
+        low = v.lower()
+        if low in ("true", "yes", "on", "1") or v == "":
+            return "true"
+        if low in ("false", "no", "off", "0"):
+            return "false"
+        return value
+    if type_ in ("int", "bool-or-int"):
+        m = __import__("re").match(r"^(-?\d+)([kKmMgG]?)$", v)
+        if m:
+            n = int(m.group(1))
+            mult = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}.get(m.group(2).lower(), 1)
+            return str(n * mult)
+        return value
+    return value
+
+
 def cmd_config(argv: list[str]) -> int:
     from . import gitconfig
 
@@ -2459,12 +3396,24 @@ def cmd_config(argv: list[str]) -> int:
     is_local = False
     name_only = False
     file_path: Optional[str] = None
+    default_val: Optional[str] = None
+    type_: Optional[str] = None
     action: Optional[str] = None   # get | get_all | get_regexp | list | unset | unset_all | add | replace_all
     positional: list[str] = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--global":
+        if a == "--default":
+            i += 1
+            default_val = argv[i] if i < len(argv) else None
+        elif a.startswith("--default="):
+            default_val = a.split("=", 1)[1]
+        elif a == "--type":
+            i += 1
+            type_ = argv[i] if i < len(argv) else None
+        elif a.startswith("--type="):
+            type_ = a.split("=", 1)[1]
+        elif a == "--global":
             is_global = True
         elif a == "--local":
             is_local = True
@@ -2562,12 +3511,15 @@ def cmd_config(argv: list[str]) -> int:
             repo = None
         values = gitconfig.get_all(repo, name)
         if not values:
+            if default_val is not None:
+                _print(_config_typed(default_val, type_))
+                return 0
             return 1
         if action == "get_all":
             for v in values:
-                _print(v)
+                _print(_config_typed(v, type_))
         else:
-            _print(values[-1])
+            _print(_config_typed(values[-1], type_))
         return 0
 
     # Writes (and unsets) operate on a single file.
@@ -3097,6 +4049,7 @@ def cmd_rebase(argv: list[str]) -> int:
 def cmd_reflog(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit reflog", add_help=False)
     ap.add_argument("-n", "--max-count", type=int, default=None)
+    ap.add_argument("--oneline", action="store_true")  # default format is already oneline
     ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -3106,7 +4059,10 @@ def cmd_reflog(argv: list[str]) -> int:
         ref = args.action
     repo = _repo()
     from . import reflog
-    entries = reflog.read(repo, ref)
+    # The reflog is stored under logs/<full-ref>; resolve short names like
+    # "main" to refs/heads/main (HEAD keeps its top-level log).
+    full_ref = ref if ref == "HEAD" else (refs_mod.dwim_full_name(repo, ref) or ref)
+    entries = reflog.read(repo, full_ref)
     for i, (old, new, ident, msg) in enumerate(reversed(entries)):
         if args.max_count is not None and i >= args.max_count:
             break
@@ -3177,30 +4133,61 @@ def cmd_push(argv: list[str]) -> int:
 
 
 def cmd_merge_tree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge-tree")
-    ap.add_argument("base")
-    ap.add_argument("branch1")
-    ap.add_argument("branch2")
+    ap = argparse.ArgumentParser(prog="pygit merge-tree", add_help=False)
+    ap.add_argument("--trivial-merge", action="store_true")
+    ap.add_argument("--write-tree", action="store_true")
+    ap.add_argument("pos", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import sequencer
-    b = refs_mod.rev_parse(repo, args.base)
-    one = refs_mod.rev_parse(repo, args.branch1)
-    two = refs_mod.rev_parse(repo, args.branch2)
+
+    def _tree_of(name):
+        s = refs_mod.rev_parse(repo, name)
+        if not s:
+            return None, None
+        t, data = objs.read_object(repo, s)
+        if t == "commit":
+            return s, objs.parse_commit(data).tree
+        if t == "tag":
+            return s, refs_mod._peel_to_type(repo, s, "tree")
+        return s, s
+
+    # Modern (git >= 2.38) form: `merge-tree <branch1> <branch2>` performs a real
+    # 3-way merge against the computed merge base and prints the result tree.
+    if len(args.pos) == 2 and not args.trivial_merge:
+        one, one_tree = _tree_of(args.pos[0])
+        two, two_tree = _tree_of(args.pos[1])
+        if not (one and two):
+            return 128
+        from . import merge as _m
+        bases = _m.merge_bases(repo, one, two)
+        base = bases[0] if bases else None
+        base_tree = (objs.parse_commit(objs.read_object(repo, base)[1]).tree
+                     if base else objs.hash_bytes("tree", b"", repo)[0])
+        tree, confs, _ci = sequencer._apply_patch(
+            repo, base_tree, two_tree, one_tree,
+            ort_base=base, ort_ours=one, ort_theirs=two)
+        _print(tree)
+        if confs:
+            _print("")
+            _print("Conflicting files:")
+            for p in confs:
+                _print(p)
+            return 1
+        return 0
+
+    # Legacy trivial-merge form: `merge-tree <base> <branch1> <branch2>`.
+    if len(args.pos) != 3:
+        _err("usage: pygit merge-tree <branch1> <branch2>")
+        return 128
+    b, b_tree = _tree_of(args.pos[0])
+    one, one_tree = _tree_of(args.pos[1])
+    two, two_tree = _tree_of(args.pos[2])
     if not (b and one and two):
         return 128
-    b_tree = objs.parse_commit(objs.read_object(repo, b)[1]).tree
-    one_tree = objs.parse_commit(objs.read_object(repo, one)[1]).tree
-    two_tree = objs.parse_commit(objs.read_object(repo, two)[1]).tree
     tree, confs, _conflict_idx = sequencer._apply_patch(
-        repo,
-        b_tree,
-        two_tree,
-        one_tree,
-        ort_base=b,
-        ort_ours=one,
-        ort_theirs=two,
-    )
+        repo, b_tree, two_tree, one_tree,
+        ort_base=b, ort_ours=one, ort_theirs=two)
     _print(tree)
     for p in confs:
         _print(f"CONFLICT {p}")
@@ -3392,14 +4379,7 @@ def _capture_output(fn) -> str:
 
 
 def _format_rfc2822_date(sig: str) -> str:
-    import datetime
-    _who, ts, tz = _split_ident(sig)
-    if ts is None or tz is None:
-        return sig
-    sign = 1 if tz[0] == "+" else -1
-    off_min = sign * (int(tz[1:3]) * 60 + int(tz[3:5]))
-    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(minutes=off_min)
-    return dt.strftime("%a, %d %b %Y %H:%M:%S ") + tz
+    return _format_date(sig, "rfc")
 
 
 def cmd_am(argv: list[str]) -> int:
@@ -3553,18 +4533,25 @@ def cmd_describe(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit describe")
     ap.add_argument("--tags", action="store_true")
     ap.add_argument("--always", action="store_true")
+    ap.add_argument("--long", action="store_true")
+    ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
     repo = _repo()
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
+        _err(f"fatal: Not a valid object name {args.rev}")
         return 128
+    # Peel the target down to a commit (an annotated tag resolves to its object).
+    sha = refs_mod.rev_parse(repo, args.rev + "^{commit}") or sha
     tag_for: dict[str, str] = {}
-    have_unannotated = False
+    unann_commits: set[str] = set()
+    any_tags = False
     for tag in refs_mod.list_tags(repo):
         ts = refs_mod.read_ref(repo, f"refs/tags/{tag}")
         if not ts:
             continue
+        any_tags = True
         annotated = False
         try:
             t, d = objs.read_object(repo, ts)
@@ -3577,36 +4564,54 @@ def cmd_describe(argv: list[str]) -> int:
         except KeyError:
             pass
         if not annotated:
-            have_unannotated = True
+            unann_commits.add(ts)
             if not args.tags:
                 continue
         tag_for[ts] = tag
-    seen: set[str] = set()
     graph = _graph_for_repo(repo)
-    queue = deque([(0, sha)])
-    while queue:
-        depth, s = queue.popleft()
-        if s in seen:
-            continue
-        seen.add(s)
-        if s in tag_for:
-            if depth == 0:
-                _print(tag_for[s])
-            else:
-                _print(f"{tag_for[s]}-{depth}-g{sha[:7]}")
-            return 0
-        info = _commit_tree_parents(repo, s, graph)
-        if info is None:
-            continue
-        _tree, parents = info
-        for p in parents:
-            queue.append((depth + 1, p))
-    if args.always:
-        _print(sha[:7])
+
+    def _reachable(start: str) -> set:
+        out: set[str] = set()
+        stack = [start]
+        while stack:
+            x = stack.pop()
+            if x in out:
+                continue
+            out.add(x)
+            info = _commit_tree_parents(repo, x, graph)
+            if info:
+                stack.extend(info[1])
+        return out
+
+    reach_sha = _reachable(sha)
+    # Candidate tags whose commit is an ancestor of the target. git's depth is
+    # the number of commits reachable from the target but not from the tag; the
+    # best tag minimizes that depth (an exact match has depth 0).
+    candidates = [(tc, name) for tc, name in tag_for.items() if tc in reach_sha]
+    if candidates:
+        best = None  # (depth, tag_commit, name)
+        for tc, name in candidates:
+            depth = len(reach_sha - _reachable(tc))
+            if best is None or depth < best[0]:
+                best = (depth, tc, name)
+        depth, tc, name = best
+        ab = max(4, args.abbrev) if args.abbrev else 0
+        if args.abbrev == 0:
+            _print(name)
+        elif depth == 0 and not args.long:
+            _print(name)
+        else:
+            _print(f"{name}-{depth}-g{sha[:ab]}")
         return 0
-    if not args.tags and have_unannotated:
+    if args.always:
+        _print(sha[:max(4, args.abbrev)] if args.abbrev else sha[:7])
+        return 0
+    if not args.tags and (unann_commits & reach_sha):
         _err(f"fatal: No annotated tags can describe '{sha}'.")
         _err("However, there were unannotated tags: try --tags.")
+    elif any_tags:
+        _err(f"fatal: No tags can describe '{sha}'.")
+        _err("Try --always, or create some tags.")
     else:
         _err("fatal: No names found, cannot describe anything.")
     return 128
@@ -3709,10 +4714,35 @@ def _format_blame_date(sig: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S ") + tz
 
 
+def _ref_sort_date(repo: Repository, sha: str, key: str) -> int:
+    """Timestamp used by for-each-ref date sort keys (0 if unavailable)."""
+    import re
+    try:
+        t, data = objs.read_object(repo, sha)
+    except KeyError:
+        return 0
+    text = data.decode("utf-8", errors="replace")
+    if t == "tag":
+        m = re.search(r"^tagger .* (\d+) [+-]\d{4}$", text, re.M)
+        if m:
+            return int(m.group(1))
+        # creatordate of a tag with no tagger falls back to the target.
+        for line in text.splitlines():
+            if line.startswith("object "):
+                return _ref_sort_date(repo, line[len("object "):].strip(), key)
+        return 0
+    if t == "commit":
+        field = "author" if key == "authordate" else "committer"
+        m = re.search(rf"^{field} .* (\d+) [+-]\d{{4}}$", text, re.M)
+        return int(m.group(1)) if m else 0
+    return 0
+
+
 def cmd_for_each_ref(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit for-each-ref", add_help=False)
     ap.add_argument("--format", default="%(objectname) %(objecttype)\t%(refname)")
     ap.add_argument("--count", type=int, default=None)
+    ap.add_argument("--sort", action="append", default=None)
     ap.add_argument("pattern", nargs="*", default=None)
     args = ap.parse_args(argv)
     repo = _repo()
@@ -3728,9 +4758,30 @@ def cmd_for_each_ref(argv: list[str]) -> int:
                         all_refs[rel] = s
     for ref, s in refs_mod.read_packed_refs(repo).items():
         all_refs.setdefault(ref, s)
+
+    def _sort_value(ref: str, key: str):
+        if key in ("refname", "refname:short"):
+            return ref if key == "refname" else refs_mod.shorten_ref(ref)
+        if key in ("version:refname", "v:refname"):
+            import re as _re
+            return [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", ref)]
+        if key == "objectname":
+            return all_refs[ref]
+        # Date keys: peel to the underlying commit/tag and read its timestamp.
+        if key in ("creatordate", "committerdate", "taggerdate", "authordate"):
+            return _ref_sort_date(repo, all_refs[ref], key)
+        return ref
+
+    order = sorted(all_refs)
+    if args.sort:
+        # Multiple --sort keys: the last is most significant, so apply in reverse.
+        for spec in reversed(args.sort):
+            rev = spec.startswith("-")
+            key = spec[1:] if rev else spec
+            order = sorted(order, key=lambda r: _sort_value(r, key), reverse=rev)
     patterns = args.pattern or []
     emitted = 0
-    for ref in sorted(all_refs):
+    for ref in order:
         if patterns and not any(ref == p or ref.startswith(p.rstrip("/") + "/") for p in patterns):
             continue
         if args.count is not None and emitted >= args.count:
@@ -3784,7 +4835,7 @@ def cmd_shortlog(argv: list[str]) -> int:
         items.sort()
     for author, msgs in items:
         if args.summary:
-            _print(f"{len(msgs):>5}\t{author}")
+            _print(f"{len(msgs):>6}\t{author}")
         else:
             _print(f"{author} ({len(msgs)}):")
             for m in msgs:
@@ -4929,39 +5980,39 @@ def cmd_show_branch(argv: list[str]) -> int:
     return 0
 
 
+_WHATCHANGED_DEPRECATION = (
+    "'git whatchanged' is nominated for removal.\n"
+    "\n"
+    "hint: You can replace 'git whatchanged <opts>' with:\n"
+    "hint:\tgit log <opts> --raw --no-merges\n"
+    "hint: Or make an alias:\n"
+    "hint:\tgit config set --global alias.whatchanged 'log --raw --no-merges'\n"
+    "\n"
+    "If you still use this command, here's what you can do:\n"
+    "\n"
+    "- read https://git-scm.com/docs/BreakingChanges.html\n"
+    "- check if anyone has discussed this on the mailing\n"
+    "  list and if they came up with something that can\n"
+    "  help you: https://lore.kernel.org/git/?q=git%20whatchanged\n"
+    "- send an email to <git@vger.kernel.org> to let us\n"
+    "  know that you still use this command and were unable\n"
+    "  to determine a suitable replacement\n"
+    "\n"
+)
+
+
 def cmd_whatchanged(argv: list[str]) -> int:
-    # Mostly an alias for log with file-list output.
-    ap = argparse.ArgumentParser(prog="pygit whatchanged")
-    ap.add_argument("rev", nargs="?", default="HEAD")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    sha = refs_mod.rev_parse(repo, args.rev)
-    if not sha:
+    # As of Git 2.54 this command refuses to run without an explicit opt-in.
+    if "--i-still-use-this" not in argv:
+        sys.stderr.write(_WHATCHANGED_DEPRECATION)
+        _err("fatal: refusing to run without --i-still-use-this")
         return 128
-    while sha:
-        c = objs.parse_commit(objs.read_object(repo, sha)[1])
-        _print(f"commit {sha}")
-        _print(f"Author: {c.author}")
-        _print("")
-        for line in c.message.rstrip("\n").splitlines():
-            _print(f"    {line}")
-        _print("")
-        if c.parents:
-            parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-            for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree, c.tree):
-                a_sha = a_entry.sha if a_entry else None
-                b_sha = b_entry.sha if b_entry else None
-                if a_sha == b_sha:
-                    continue
-                if a_sha is None and b_sha is not None:
-                    _print(f":000000 100644 0000000 {b_sha[:7]} A\t{p}")
-                elif b_sha is None and a_sha is not None:
-                    _print(f":100644 000000 {a_sha[:7]} 0000000 D\t{p}")
-                elif a_sha is not None and b_sha is not None:
-                    _print(f":100644 100644 {a_sha[:7]} {b_sha[:7]} M\t{p}")
-            _print("")
-        sha = c.parents[0] if c.parents else None
-    return 0
+    argv = [a for a in argv if a != "--i-still-use-this"]
+    # 'whatchanged' is 'log --no-merges' whose default diff format is --raw
+    # rather than a patch (this is exactly the suggested replacement command).
+    if not any(a in ("-p", "--patch", "--stat", "--raw", "--name-only", "--name-status") for a in argv):
+        argv = ["--raw", *argv]
+    return cmd_log(["--no-merges", *argv])
 
 
 def cmd_mktag(argv: list[str]) -> int:
@@ -4993,14 +6044,18 @@ def cmd_name_rev(argv: list[str]) -> int:
     # Build a map sha -> closest ref name by BFS from each ref tip.
     name_for: dict[str, tuple[str, int]] = {}
     tips: list[tuple[str, str]] = []
-    for b in refs_mod.list_branches(repo):
-        s = refs_mod.read_ref(repo, f"refs/heads/{b}")
-        if s:
-            tips.append((b, s))
+    # Tags are seeded first so that, at equal depth, a tag name is preferred
+    # over a branch name (matching git's name-rev tie-break). Annotated tags are
+    # peeled to the commit they reference.
     for tag in refs_mod.list_tags(repo):
-        s = refs_mod.read_ref(repo, f"refs/tags/{tag}")
+        s = refs_mod.rev_parse(repo, f"refs/tags/{tag}" + "^{commit}") or refs_mod.read_ref(repo, f"refs/tags/{tag}")
         if s:
             tips.append((f"tags/{tag}", s))
+    if not args.tags:
+        for b in refs_mod.list_branches(repo):
+            s = refs_mod.read_ref(repo, f"refs/heads/{b}")
+            if s:
+                tips.append((b, s))
     graph = _graph_for_repo(repo)
     for label, tip in tips:
         seen: set[str] = set()
@@ -5019,23 +6074,30 @@ def cmd_name_rev(argv: list[str]) -> int:
                 _tree, parents = info
                 for p in parents:
                     stack.append((p, depth + 1))
+    def _display(name: str) -> str:
+        # With --name-only, --tags strips the "tags/" prefix from tag names.
+        if args.name_only and args.tags and name.startswith("tags/"):
+            return name[len("tags/"):]
+        return name
+
     if args.all:
         for sha, (name, _) in sorted(name_for.items()):
             if args.name_only:
-                _print(name)
+                _print(_display(name))
             else:
-                _print(f"{sha} {name}")
+                _print(f"{sha} {_display(name)}")
         return 0
     if args.rev:
         s = refs_mod.rev_parse(repo, args.rev)
         if not s:
-            return 128
+            _err(f"Could not get sha1 for {args.rev}. Skipping.")
+            return 0
         name = name_for[s][0] if s in name_for else "undefined"
         if args.name_only:
-            _print(name)
+            _print(_display(name))
         else:
             _print(f"{args.rev} {name}")
-        return 0 if s in name_for else 1
+        return 0
     return 0
 
 
@@ -5703,7 +6765,9 @@ def cmd_interpret_trailers(argv: list[str]) -> int:
 
 
 def cmd_verify_commit(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit verify-commit")
+    ap = argparse.ArgumentParser(prog="pygit verify-commit", add_help=False)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--raw", action="store_true")
     ap.add_argument("revs", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -5711,31 +6775,25 @@ def cmd_verify_commit(argv: list[str]) -> int:
     for r in args.revs:
         s = refs_mod.rev_parse(repo, r)
         if not s:
-            _err(f"fatal: bad rev: {r}")
+            _err(f"error: {r}: no such commit")
             rc = 1
             continue
-        try:
-            t, data = objs.read_object(repo, s)
-            if t != "commit":
-                _err(f"error: {r} is not a commit")
-                rc = 1
-                continue
-            actual, _ = objs.hash_bytes("commit", data, repo)
-            if actual != s:
-                _err(f"error: {r} sha mismatch")
-                rc = 1
-            else:
-                _err(f"object {s}")
-                _err(f"type commit")
-                _err(f"ok")
-        except KeyError:
-            _err(f"error: missing {s}")
+        t, data = objs.read_object(repo, s)
+        if t != "commit":
+            _err(f"error: {r}: cannot verify a non-commit object of type {t}.")
             rc = 1
+            continue
+        # pythongit cannot verify GPG signatures, so a commit is treated as
+        # unverifiable — matching git's exit status for unsigned commits, which
+        # produce no output and a failure code.
+        rc = 1
     return rc
 
 
 def cmd_verify_tag(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit verify-tag")
+    ap = argparse.ArgumentParser(prog="pygit verify-tag", add_help=False)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--raw", action="store_true")
     ap.add_argument("tags", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -5743,24 +6801,20 @@ def cmd_verify_tag(argv: list[str]) -> int:
     for r in args.tags:
         s = refs_mod.rev_parse(repo, r) or refs_mod.read_ref(repo, f"refs/tags/{r}")
         if not s:
-            _err(f"error: bad tag: {r}")
+            _err(f"error: tag '{r}' not found.")
             rc = 1
             continue
-        try:
-            t, data = objs.read_object(repo, s)
-            if t != "tag":
-                _err(f"error: {r} is not an annotated tag")
-                rc = 1
-                continue
-            actual, _ = objs.hash_bytes("tag", data, repo)
-            if actual != s:
-                _err(f"error: {r} sha mismatch")
-                rc = 1
-            else:
-                _err(f"ok {r}")
-        except KeyError:
-            _err(f"error: missing {s}")
+        t, data = objs.read_object(repo, s)
+        if t != "tag":
+            _err(f"error: {r}: cannot verify a non-tag object of type {t}.")
             rc = 1
+            continue
+        if b"-----BEGIN PGP SIGNATURE-----" not in data and b"-----BEGIN SSH SIGNATURE-----" not in data:
+            _err("error: no signature found")
+            rc = 1
+            continue
+        # A signature is present but pythongit cannot verify it.
+        rc = 1
     return rc
 
 
@@ -6310,6 +7364,10 @@ def cmd_diff_tree(argv: list[str]) -> int:
         if not s:
             return 128
         c = objs.parse_commit(objs.read_object(repo, s)[1])
+        # A merge has only a combined diff, which is empty for a clean merge and
+        # suppressed by default — git emits nothing at all (not even the id).
+        if len(c.parents) > 1:
+            return 0
         b_tree = c.tree
         a_tree = (objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
                   if c.parents else None)
@@ -6352,10 +7410,28 @@ def cmd_diff_files(argv: list[str]) -> int:
     """Show diff between index and worktree (raw format)."""
     ap = argparse.ArgumentParser(prog="pygit diff-files")
     ap.add_argument("--name-only", action="store_true")
+    ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--numstat", action="store_true")
+    ap.add_argument("--shortstat", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
     from .index import read_index
     idx = read_index(repo)
+    if args.stat or args.numstat or args.shortstat:
+        changes = []
+        for e in idx.entries:
+            full = repo.path / e.path
+            a = _side_from_object(repo, e.mode_str(), e.sha)
+            b = _side_from_worktree(repo, e.path) if full.exists() else _ABSENT
+            if a.sha != b.sha or a.mode != b.mode:
+                changes.append((e.path, a, b))
+        if args.stat:
+            _diff_stat(changes)
+        elif args.numstat:
+            _diff_numstat(changes)
+        else:
+            _diff_shortstat(changes)
+        return 0
     for e in idx.entries:
         full = repo.path / e.path
         if not full.exists():
@@ -6373,7 +7449,7 @@ def cmd_diff_files(argv: list[str]) -> int:
 
 
 def cmd_diff_index(argv: list[str]) -> int:
-    """Show diff between a tree and the index."""
+    """Show diff between a tree and the index (--cached) or the working tree."""
     ap = argparse.ArgumentParser(prog="pygit diff-index")
     ap.add_argument("--cached", action="store_true")
     ap.add_argument("--name-only", action="store_true")
@@ -6386,20 +7462,36 @@ def cmd_diff_index(argv: list[str]) -> int:
     t, data = objs.read_object(repo, tsha)
     if t == "commit":
         tsha = objs.parse_commit(data).tree
-    tree_map = {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, tsha)}
+    a_map = _tree_map_full(repo, tsha)
     from .index import read_index
     idx = read_index(repo).by_path()
-    for p in sorted(set(tree_map) | set(idx)):
-        a = tree_map.get(p)
-        b = idx[p].sha if p in idx else None
-        if a == b:
+    zero = "0" * 40
+    for p in sorted(set(a_map) | set(idx)):
+        a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+        # The "b" side comes from the index. Without --cached, its blob id is
+        # zeroed when the working tree is dirty relative to the index (matching
+        # git, which can't name an uncommitted worktree blob).
+        b_present = p in idx
+        b_mode = idx[p].mode_str() if b_present else None
+        b_sha = idx[p].sha if b_present else None
+        b_dirty = False
+        if b_present and not args.cached:
+            wt = _side_from_worktree(repo, p)
+            if not wt.present:
+                b_present, b_mode, b_sha = False, None, None
+            else:
+                b_dirty = wt.sha != idx[p].sha
+        if a.present and b_present and a.sha == b_sha and not b_dirty and a.mode == b_mode:
+            continue
+        if not a.present and not b_present:
             continue
         if args.name_only:
             _print(p)
-        else:
-            ln = _raw_diff_status("100644", "100644", a, b, p)
-            if ln:
-                _print(ln)
+            continue
+        status = "A" if not a.present else ("D" if not b_present else "M")
+        out_a = a.sha if a.present else zero
+        out_b = zero if (b_dirty or not b_present) else b_sha
+        _print(f":{(a.mode or '000000')} {(b_mode or '000000')} {out_a} {out_b} {status}\t{p}")
     return 0
 
 
@@ -6464,9 +7556,15 @@ def cmd_check_attr(argv: list[str]) -> int:
 def cmd_check_ref_format(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit check-ref-format")
     ap.add_argument("--branch", action="store_true")
+    ap.add_argument("--normalize", action="store_true")
     ap.add_argument("name")
     args = ap.parse_args(argv)
     name = args.name
+    if args.normalize:
+        # Squash runs of slashes and strip leading ones; a trailing slash is
+        # left in place so it still fails validation, as in C Git.
+        import re as _re
+        name = _re.sub("/+", "/", name).lstrip("/")
     # Rules (subset of Documentation/git-check-ref-format.adoc):
     # 1. No slash-separated component begins with .
     # 2. No double-dot ..
@@ -6502,8 +7600,8 @@ def cmd_check_ref_format(argv: list[str]) -> int:
             break
     if bad:
         return 1
-    # A plain valid ref name produces no output; --branch echoes the name.
-    if args.branch:
+    # A plain valid ref name produces no output; --branch/--normalize echo it.
+    if args.branch or args.normalize:
         _print(full)
     return 0
 

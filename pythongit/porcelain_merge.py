@@ -1,7 +1,6 @@
 """High-level merge: fast-forward and three-way."""
 from __future__ import annotations
 
-import time
 from typing import Optional
 
 from . import merge as merge_mod
@@ -9,6 +8,29 @@ from . import objects as objs
 from . import refs as refs_mod
 from . import workdir
 from .repo import Repository
+
+
+def _default_merge_message(repo: Repository, other_rev: str, head_sym: Optional[str]) -> str:
+    """Compose the default merge commit subject the way ``git merge`` names it.
+
+    The merged ref is classified (local branch / tag / remote-tracking branch /
+    bare commit) and, unless the destination branch is the default (main or
+    master), an `` into <branch>`` suffix is appended.
+    """
+    name = other_rev
+    if refs_mod.read_ref(repo, f"refs/heads/{other_rev}"):
+        subject = f"Merge branch '{name}'"
+    elif refs_mod.read_ref(repo, f"refs/tags/{other_rev}"):
+        subject = f"Merge tag '{name}'"
+    elif refs_mod.read_ref(repo, f"refs/remotes/{other_rev}"):
+        subject = f"Merge remote-tracking branch '{name}'"
+    else:
+        subject = f"Merge commit '{name}'"
+    if head_sym and head_sym.startswith("refs/heads/"):
+        dest = head_sym[len("refs/heads/"):]
+        if dest not in ("main", "master"):
+            subject += f" into {dest}"
+    return subject + "\n"
 
 
 def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
@@ -60,10 +82,10 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
         (repo.gitdir / "MERGE_MSG").write_text(message or f"Merge: {other_rev}\n", encoding="utf-8")
         return "", conflicts
 
-    msg = message or f"Merge branch '{other_rev}'\n"
-    name, email = repo.user()
-    sig = objs.format_signature(name, email, when=int(time.time()))
-    c = objs.Commit(tree=new_tree, parents=[head, other], author=sig, committer=sig,
+    msg = message or _default_merge_message(repo, other_rev, head_sym)
+    author_sig = objs.build_signature(repo, "author")
+    committer_sig = objs.build_signature(repo, "committer")
+    c = objs.Commit(tree=new_tree, parents=[head, other], author=author_sig, committer=committer_sig,
                     message=msg if msg.endswith("\n") else msg + "\n")
     sha = objs.write_object(repo, "commit", c.encode())
     if head_sym:

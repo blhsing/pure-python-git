@@ -66,9 +66,11 @@ def main() -> int:
         rc = run("show-branch")
         check(rc == 0, "show-branch")
 
-        # whatchanged
+        # whatchanged: removed in Git 2.54 without an explicit opt-in.
         rc = run("whatchanged")
-        check(rc == 0, "whatchanged")
+        check(rc == 128, "whatchanged refused without opt-in")
+        rc = run("whatchanged", "--i-still-use-this")
+        check(rc == 0, "whatchanged --i-still-use-this")
 
         # name-rev
         run("tag", "v1")

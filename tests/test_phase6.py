@@ -95,9 +95,9 @@ def main() -> int:
             sys.stdin = sys.__stdin__
         check(rc == 0 and "Signed-off-by:" in out_buf.getvalue(), "interpret-trailers appended")
 
-        # verify-commit
+        # verify-commit: an unsigned commit cannot be verified (git returns 1).
         rc = run("verify-commit", "HEAD")
-        check(rc == 0, "verify-commit")
+        check(rc == 1, "verify-commit (unsigned fails)")
 
         # commit-graph
         rc = run("commit-graph", "write")
