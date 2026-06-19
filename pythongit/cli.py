@@ -3855,6 +3855,40 @@ def _remote_branches(repo: Repository) -> list[str]:
     return sorted(set(found))
 
 
+_SET_UPSTREAM_HINT = (
+    "hint:\n"
+    "hint: If you are planning on basing your work on an upstream\n"
+    "hint: branch that already exists at the remote, you may need to\n"
+    "hint: run \"git fetch\" to retrieve it.\n"
+    "hint:\n"
+    "hint: If you are planning to push out a new local branch that\n"
+    "hint: will track its remote counterpart, you may want to use\n"
+    "hint: \"git push -u\" to set the upstream config as you push.\n"
+    "hint: Disable this message with \"git config set advice.setUpstreamFailure false\"\n"
+)
+
+
+def _set_branch_upstream(repo: Repository, branch: str, upstream: str, quiet: bool) -> int:
+    """Configure branch.<branch>.{remote,merge} to track <upstream>, matching
+    C Git's behaviour for local (remote='.') and remote-tracking upstreams."""
+    if refs_mod.read_ref(repo, f"refs/heads/{upstream}") is not None:
+        remote, merge = ".", f"refs/heads/{upstream}"
+    elif refs_mod.read_ref(repo, f"refs/remotes/{upstream}") is not None:
+        rname, _, rest = upstream.partition("/")
+        remote, merge = rname, f"refs/heads/{rest}"
+    else:
+        _err(f"fatal: the requested upstream branch '{upstream}' does not exist")
+        sys.stderr.write(_SET_UPSTREAM_HINT)
+        return 128
+    from . import gitconfig
+    cfg = repo.gitdir / "config"
+    gitconfig.write_value(cfg, "branch", branch, "remote", remote)
+    gitconfig.write_value(cfg, "branch", branch, "merge", merge)
+    if not quiet:
+        _print(f"branch '{branch}' set up to track '{upstream}'.")
+    return 0
+
+
 def cmd_branch(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit branch", add_help=False)
     ap.add_argument("-d", "--delete", action="store_true")
@@ -3868,21 +3902,34 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("-C", dest="force_copy", action="store_true")
     ap.add_argument("--show-current", action="store_true")
     ap.add_argument("--contains", default=None)
+    ap.add_argument("--no-contains", dest="no_contains", default=None)
+    ap.add_argument("--points-at", dest="points_at", default=None)
     ap.add_argument("--merged", nargs="?", const="HEAD", default=None)
     ap.add_argument("--no-merged", dest="no_merged", nargs="?", const="HEAD", default=None)
     ap.add_argument("--sort", default=None)
     ap.add_argument("--format", default=None)
+    ap.add_argument("-f", "--force", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-i", "--ignore-case", dest="ignore_case", action="store_true")
+    ap.add_argument("-t", "--track", nargs="?", const="direct", default=None)
+    ap.add_argument("-u", "--set-upstream-to", dest="set_upstream_to", default=None)
+    ap.add_argument("--recurse-submodules", dest="recurse_submodules", action="store_true")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
     ap.add_argument("start", nargs="?")
-    args = ap.parse_args(argv)
+    # -t/--track takes an optional attached value only; a following token is the
+    # branch name, so rewrite the bare forms.
+    pre = ["--track=direct" if t in ("-t", "--track") else t for t in argv]
+    args = ap.parse_args(pre)
     repo = _repo()
     head_sym, _ = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
 
     contains_sha = refs_mod.rev_parse(repo, args.contains) if args.contains else None
+    no_contains_sha = refs_mod.rev_parse(repo, args.no_contains) if args.no_contains else None
     merged_sha = refs_mod.rev_parse(repo, args.merged) if args.merged else None
     no_merged_sha = refs_mod.rev_parse(repo, args.no_merged) if args.no_merged else None
+    points_at_sha = refs_mod.rev_parse(repo, args.points_at) if args.points_at else None
 
     def _reachable_from(start: str, target: str) -> bool:
         stack = deque([start])
@@ -3906,11 +3953,27 @@ def cmd_branch(argv: list[str]) -> int:
         # --contains C: branch tip can reach C. --merged C: C can reach the tip.
         if contains_sha is not None and not _reachable_from(tip, contains_sha):
             return False
+        if no_contains_sha is not None and _reachable_from(tip, no_contains_sha):
+            return False
         if merged_sha is not None and not _reachable_from(merged_sha, tip):
             return False
         if no_merged_sha is not None and _reachable_from(no_merged_sha, tip):
             return False
+        if points_at_sha is not None and tip != points_at_sha:
+            return False
         return True
+
+    # -u/--set-upstream-to changes the upstream of an existing branch (the named
+    # one, else the current branch).
+    if args.set_upstream_to is not None:
+        branch = args.name or cur
+        if branch is None:
+            _err("fatal: HEAD not found below refs/heads!")
+            return 128
+        if refs_mod.read_ref(repo, f"refs/heads/{branch}") is None:
+            _err(f"error: branch '{branch}' does not exist")
+            return 1
+        return _set_branch_upstream(repo, branch, args.set_upstream_to, args.quiet)
 
     if args.move or args.force_move or args.copy or args.force_copy:
         if args.name is not None and args.start is not None:
@@ -3977,10 +4040,16 @@ def cmd_branch(argv: list[str]) -> int:
             names.extend((b, b) for b in refs_mod.list_branches(repo))
         if args.remotes or args.all:
             names.extend((f"remotes/{b}", None) for b in _remote_branches(repo))
+        def _pat_ok(d: str) -> bool:
+            if not pattern:
+                return True
+            if args.ignore_case:
+                import re as _re
+                return bool(_re.match(fnmatch.translate(pattern), d, _re.IGNORECASE))
+            return fnmatch.fnmatch(d, pattern)
         shown = [
             (d, p) for d, p in names
-            if not (pattern and not fnmatch.fnmatch(d, pattern))
-            and (p is None or _branch_contains(p))
+            if _pat_ok(d) and (p is None or _branch_contains(p))
         ]
         if args.sort:
             spec = args.sort
@@ -4022,11 +4091,18 @@ def cmd_branch(argv: list[str]) -> int:
                 _print(f"{mark} {display}")
         return 0
 
+    full = f"refs/heads/{args.name}"
+    if refs_mod.read_ref(repo, full) is not None and not args.force:
+        _err(f"fatal: a branch named '{args.name}' already exists")
+        return 128
     start = refs_mod.rev_parse(repo, args.start) if args.start else refs_mod.rev_parse(repo, "HEAD")
     if not start:
         _err(f"fatal: Not a valid object name: '{args.start or 'HEAD'}'.")
         return 128
-    refs_mod.update_ref(repo, f"refs/heads/{args.name}", start)
+    refs_mod.update_ref(repo, full, start)
+    # -t/--track sets the new branch to track its (local or remote) start point.
+    if args.track is not None and args.start is not None:
+        _set_branch_upstream(repo, args.name, args.start, args.quiet)
     return 0
 
 

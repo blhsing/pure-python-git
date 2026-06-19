@@ -1248,6 +1248,19 @@ CASES: list[tuple] = [
      ["cat-file", "-p", "tr"]),
     ("tag-multi-m", BASE + [["tag", "-a", "-m", "line1", "-m", "line2", "mm"]],
      ["cat-file", "-p", "mm"]),
+    # branch listing filters (--points-at/--no-contains/-i) and the creation /
+    # tracking flags (-f, -q, -t/--track, -u/--set-upstream-to).
+    ("branch-points-at", REFSET, ["branch", "--points-at=HEAD"]),
+    ("branch-no-contains", SB_FORK, ["branch", "--no-contains=feat"]),
+    ("branch-ignore-case", REFSET, ["branch", "-i", "-l", "A*"]),
+    ("branch-exists-error", BASE + [["branch", "dup"]], ["branch", "dup"]),
+    ("branch-force", BASE + [["branch", "dup"]], ["branch", "-f", "dup", "HEAD"]),
+    ("branch-track", REFSET, ["branch", "-t", "trk", "main"]),
+    ("branch-track-quiet", REFSET, ["branch", "-q", "-t", "trkq", "main"]),
+    ("branch-track-config", REFSET + [["branch", "-t", "trk", "main"]],
+     ["config", "--get-regexp", r"branch\.trk\."]),
+    ("branch-set-upstream", REFSET + [["branch", "ups"]], ["branch", "-u", "main", "ups"]),
+    ("branch-set-upstream-bad", BASE, ["branch", "-u", "origin/nope"]),
 ]
 
 
