@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 550 flags across 57 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 535 flags across 56 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -66,9 +66,6 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 
 ## fmt-merge-msg (4)
   -m --log --no-log -F
-
-## for-each-ref (15)
-  --shell --perl --python --tcl --include-root-refs --points-at --merged --no-merged --contains --no-contains --exclude --start-after --stdin -s -p
 
 ## hash-object (1)
   --filters

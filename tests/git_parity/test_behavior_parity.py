@@ -1202,6 +1202,24 @@ CASES: list[tuple] = [
     ("rev-list-no-abbrev", TAGGED, ["rev-list", "--abbrev-commit", "--no-abbrev", "HEAD"]),
     ("rev-list-max-age", TAGGED, ["rev-list", "--max-age=1700000000", "HEAD"]),
     ("rev-list-min-age", TAGGED, ["rev-list", "--min-age=1700000000", "HEAD"]),
+    # for-each-ref quoting modes (--shell/--perl/--python/--tcl), ref-namespace
+    # filters, root refs, exclusion, pagination and object-arg error formats.
+    ("fer-shell", REFSET, ["for-each-ref", "--shell", "--format=%(refname) %(objecttype)"]),
+    ("fer-perl", REFSET, ["for-each-ref", "--perl", "--format=%(refname)"]),
+    ("fer-python", REFSET, ["for-each-ref", "--python", "--format=%(refname)"]),
+    ("fer-tcl", REFSET, ["for-each-ref", "--tcl", "--format=%(refname)"]),
+    ("fer-points-at", DESC, ["for-each-ref", "--points-at=HEAD", "--format=%(refname)"]),
+    ("fer-merged", MERGED, ["for-each-ref", "--merged=HEAD", "--format=%(refname)"]),
+    ("fer-no-merged", MERGED, ["for-each-ref", "--no-merged=HEAD", "--format=%(refname)"]),
+    ("fer-contains", DESC, ["for-each-ref", "--contains=v1", "--format=%(refname)"]),
+    ("fer-no-contains", DESC, ["for-each-ref", "--no-contains=v1", "--format=%(refname)"]),
+    ("fer-merged-lastarg", MERGED, ["for-each-ref", "--format=%(refname)", "--merged"]),
+    ("fer-exclude", REFSET, ["for-each-ref", "--exclude=refs/tags/*", "--format=%(refname)"]),
+    ("fer-include-root", REFSET, ["for-each-ref", "--include-root-refs", "--format=%(refname)"]),
+    ("fer-start-after", REFSET, ["for-each-ref", "--start-after=refs/heads/main", "--format=%(refname)"]),
+    ("fer-points-at-bad", REFSET, ["for-each-ref", "--points-at=nope"]),
+    ("fer-merged-bad", REFSET, ["for-each-ref", "--merged=nope"]),
+    ("fer-contains-bad", REFSET, ["for-each-ref", "--contains=nope"]),
 ]
 
 
@@ -1219,6 +1237,9 @@ CASES_WITH_STDIN: list[tuple] = [
     ("hash-object-stdin-paths", BASE, ["hash-object", "--stdin-paths"], "a.txt\n"),
     ("cat-file-batch-command", BASE, ["cat-file", "--batch-command"],
      "info HEAD\ncontents HEAD:a.txt\n"),
+    # for-each-ref --stdin reads ref patterns from stdin.
+    ("fer-stdin", REFSET, ["for-each-ref", "--stdin", "--format=%(refname)"],
+     "refs/heads/*\n"),
     # name-rev --annotate-stdin / --stdin annotate oids on stdin in place.
     ("name-rev-annotate-stdin", BASE + [["tag", "-a", "-m", "r", "v1"]],
      ["name-rev", "--annotate-stdin"], "a158a009e0dde60c7a948f10fd523b2bf897d3ad\n"),

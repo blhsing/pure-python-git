@@ -6109,8 +6109,31 @@ def _ref_sort_date(repo: Repository, sha: str, key: str) -> int:
     return 0
 
 
-def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Optional[str]) -> str:
-    """Expand a for-each-ref --format string's %(atom) placeholders."""
+def _fer_quote(mode: str, v: str) -> str:
+    """Quote an atom value for --shell/--perl/--python/--tcl (quote.c)."""
+    if mode == "shell":
+        return "'" + v.replace("'", "'\\''") + "'"
+    if mode == "perl":
+        return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    if mode == "python":
+        return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    if mode == "tcl":
+        out = []
+        for ch in v:
+            if ch in '$[]{}"\\':
+                out.append("\\" + ch)
+            elif ch == "\n":
+                out.append("\\n")
+            else:
+                out.append(ch)
+        return '"' + "".join(out) + '"'
+    return v
+
+
+def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Optional[str],
+                quote: Optional[str] = None) -> str:
+    """Expand a for-each-ref --format string's %(atom) placeholders. With
+    ``quote`` set (shell/perl/python/tcl) each atom value is quoted in output."""
     import re
     try:
         t, data = objs.read_object(repo, sha)
@@ -6187,7 +6210,9 @@ def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Option
                 return ident_part(role, name[len(role):] or "")
         return ""
 
-    def subst(s: str) -> str:
+    def subst(s: str, do_quote: bool = False) -> str:
+        if do_quote and quote:
+            return re.sub(r"%\(([^)]*)\)", lambda m: _fer_quote(quote, atom(m.group(1))), s)
         return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), s)
 
     # Resolve %(if)...%(then)...[%(else)...]%(end) conditionals innermost-first,
@@ -6213,7 +6238,7 @@ def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Option
             truthy = bool(cond_val.strip())
         fmt = fmt[:start] + (then_s if truthy else else_s) + fmt[end + len("%(end)"):]
 
-    return subst(fmt)
+    return subst(fmt, do_quote=True)
 
 
 def cmd_for_each_ref(argv: list[str]) -> int:
@@ -6221,8 +6246,41 @@ def cmd_for_each_ref(argv: list[str]) -> int:
     ap.add_argument("--format", default="%(objectname) %(objecttype)\t%(refname)")
     ap.add_argument("--count", type=int, default=None)
     ap.add_argument("--sort", action="append", default=None)
+    ap.add_argument("-s", "--shell", action="store_const", const="shell", dest="quote", default=None)
+    ap.add_argument("-p", "--perl", action="store_const", const="perl", dest="quote")
+    ap.add_argument("--python", action="store_const", const="python", dest="quote")
+    ap.add_argument("--tcl", action="store_const", const="tcl", dest="quote")
+    ap.add_argument("--points-at", dest="points_at", default=None)
+    ap.add_argument("--merged", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--no-merged", dest="no_merged", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--contains", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--no-contains", dest="no_contains", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--exclude", action="append", default=None)
+    ap.add_argument("--start-after", dest="start_after", default=None)
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--include-root-refs", dest="include_root_refs", action="store_true")
+    ap.add_argument("--omit-empty", dest="omit_empty", action="store_true")
+    ap.add_argument("--ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("pattern", nargs="*", default=None)
-    args = ap.parse_args(argv)
+    # --merged/--contains (and negations) use PARSE_OPT_LASTARG_DEFAULT: they
+    # consume the following token as the commit, but default to HEAD when given
+    # as the last argument. Rewrite to the attached "=value" form for argparse.
+    consume = ("--merged", "--no-merged", "--contains", "--no-contains")
+    pre: list[str] = []
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t in consume:
+            if i + 1 < len(argv):
+                pre.append(f"{t}={argv[i + 1]}")
+                i += 2
+            else:
+                pre.append(f"{t}=HEAD")
+                i += 1
+            continue
+        pre.append(t)
+        i += 1
+    args = ap.parse_args(pre)
     repo = _repo()
     all_refs: dict[str, str] = {}
     for name in ("refs/heads", "refs/tags", "refs/remotes"):
@@ -6236,7 +6294,9 @@ def cmd_for_each_ref(argv: list[str]) -> int:
                         all_refs[rel] = s
     for ref, s in refs_mod.read_packed_refs(repo).items():
         all_refs.setdefault(ref, s)
-    head_sym, _ = refs_mod.read_head(repo)
+    head_sym, head_sha = refs_mod.read_head(repo)
+    if args.include_root_refs and head_sha:
+        all_refs.setdefault("HEAD", head_sha)
 
     def _sort_value(ref: str, key: str):
         if key in ("refname", "refname:short"):
@@ -6258,14 +6318,103 @@ def cmd_for_each_ref(argv: list[str]) -> int:
             rev = spec.startswith("-")
             key = spec[1:] if rev else spec
             order = sorted(order, key=lambda r: _sort_value(r, key), reverse=rev)
-    patterns = args.pattern or []
+
+    # --merged/--contains reachability over the ref's peeled commit.
+    def _reachable_from(start: str, target: str) -> bool:
+        stack = deque([start])
+        seen_c: set[str] = set()
+        while stack:
+            x = stack.popleft()
+            if x == target:
+                return True
+            if x in seen_c:
+                continue
+            seen_c.add(x)
+            info = _commit_tree_parents(repo, x)
+            if info:
+                stack.extend(info[1])
+        return False
+
+    def _peel_commit(ref: str) -> Optional[str]:
+        return refs_mod.rev_parse(repo, ref + "^{commit}")
+
+    # Unresolvable object args fail differently per option (matching C Git):
+    # --merged/--no-merged die() (fatal:, rc 128); --points-at/--contains/
+    # --no-contains return a usage error (error:, rc 129) and --points-at quotes.
+    resolved: dict[str, Optional[str]] = {}
+    for key, msg, code in (
+        ("points_at", "error: malformed object name '{}'", 129),
+        ("merged", "fatal: malformed object name {}", 128),
+        ("no_merged", "fatal: malformed object name {}", 128),
+        ("contains", "error: malformed object name {}", 129),
+        ("no_contains", "error: malformed object name {}", 129),
+    ):
+        val = getattr(args, key)
+        if not val:
+            resolved[key] = None
+            continue
+        sha = refs_mod.rev_parse(repo, val)
+        if sha is None:
+            _err(msg.format(val))
+            return code
+        # Reachability args are peeled to a commit (e.g. --contains=<annotated-tag>);
+        # --points-at compares against the object as-is.
+        if key != "points_at":
+            sha = refs_mod.rev_parse(repo, val + "^{commit}") or sha
+        resolved[key] = sha
+    points_at = resolved["points_at"]
+    merged = resolved["merged"]
+    no_merged = resolved["no_merged"]
+    contains = resolved["contains"]
+    no_contains = resolved["no_contains"]
+
+    def _ref_ok(ref: str) -> bool:
+        sha = all_refs[ref]
+        tip = _peel_commit(ref) if (merged or no_merged or contains or no_contains) else None
+        if points_at is not None and sha != points_at and _peel_commit(ref) != points_at:
+            return False
+        if merged is not None and not (tip and _reachable_from(merged, tip)):
+            return False
+        if no_merged is not None and (tip and _reachable_from(no_merged, tip)):
+            return False
+        if contains is not None and not (tip and _reachable_from(tip, contains)):
+            return False
+        if no_contains is not None and tip and _reachable_from(tip, no_contains):
+            return False
+        return True
+
+    patterns = list(args.pattern or [])
+    if args.stdin:
+        patterns += [ln.rstrip("\n") for ln in sys.stdin.read().splitlines() if ln.strip()]
+    excludes = args.exclude or []
+
+    def _match(ref: str, pats: list[str]) -> bool:
+        import fnmatch
+        for p in pats:
+            if ref == p or ref.startswith(p.rstrip("/") + "/") or fnmatch.fnmatch(ref, p):
+                return True
+        return False
+
+    # --start-after: emit only refs positioned after the marker in iteration order.
+    started = args.start_after is None
     emitted = 0
     for ref in order:
-        if patterns and not any(ref == p or ref.startswith(p.rstrip("/") + "/") for p in patterns):
+        if not started:
+            if ref == args.start_after:
+                started = True
+            continue
+        if patterns and not _match(ref, patterns):
+            continue
+        if excludes and _match(ref, excludes):
+            continue
+        if not _ref_ok(ref):
             continue
         if args.count is not None and emitted >= args.count:
             break
-        _print(_fer_expand(repo, ref, all_refs[ref], args.format, head_sym))
+        line = _fer_expand(repo, ref, all_refs[ref], args.format, head_sym, quote=args.quote)
+        if args.omit_empty and line == "":
+            continue
+        _print(line)
         emitted += 1
     return 0
 
