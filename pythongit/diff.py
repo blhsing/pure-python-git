@@ -174,25 +174,34 @@ def _split_words(text: str) -> list[tuple[int, int]]:
     return res
 
 
-def _ww(text: str, prefix: str, suffix: str) -> str:
-    """Mirror diff.c:fn_out_diff_words_write_helper for plain mode (newline
-    style "\\n"): wrap each non-empty newline-delimited segment with the
-    prefix/suffix, leaving the newlines themselves bare."""
+# Word-diff styles: (ctx, old, new) each (prefix, suffix), plus the newline.
+_WD_STYLES = {
+    "plain": {"ctx": ("", ""), "old": ("[-", "-]"), "new": ("{+", "+}"), "nl": "\n"},
+    "porcelain": {"ctx": (" ", "\n"), "old": ("-", "\n"), "new": ("+", "\n"), "nl": "~\n"},
+}
+
+
+def _ww(text: str, prefix: str, suffix: str, newline: str = "\n") -> str:
+    """Mirror diff.c:fn_out_diff_words_write_helper: wrap each non-empty
+    newline-delimited segment with the prefix/suffix, emitting ``newline`` for
+    each embedded newline."""
     out: list[str] = []
     parts = text.split("\n")
     for idx, seg in enumerate(parts):
         if seg != "":
             out.append(prefix + seg + suffix)
         if idx < len(parts) - 1:
-            out.append("\n")
+            out.append(newline)
     return "".join(out)
 
 
-def _word_render(minus_text: str, plus_text: str) -> str:
+def _word_render(minus_text: str, plus_text: str, style: dict) -> str:
     """Render one hunk's word-level diff. Common text (and all whitespace) comes
-    from the plus side; removed words are wrapped [-..-], added words {+..+}."""
+    from the plus side; removed words are wrapped with the old-word style, added
+    words with the new-word style."""
+    ctx_p, old_p, new_p, nl = style["ctx"], style["old"], style["new"], style["nl"]
     if not plus_text:
-        return _ww(minus_text, "[-", "-]")
+        return _ww(minus_text, old_p[0], old_p[1], nl)
     wm = _split_words(minus_text)
     wp = _split_words(plus_text)
     ops = diff_lines([minus_text[b:e] for b, e in wm],
@@ -218,41 +227,27 @@ def _word_render(minus_text: str, plus_text: str) -> str:
                 ins_idx.append(pi)
                 pi += 1
             i += 1
-        minus_end_off = minus_text[wm[del_idx[-1]][1]:wm[del_idx[-1]][1] + 1] if del_idx else ""
         if ins_idx:
             plus_begin = wp[ins_idx[0]][0]
             plus_end = wp[ins_idx[-1]][1]
-            del_lo = wm[del_idx[0]][0] if del_idx else 0
-            del_hi = wm[del_idx[-1]][1] if del_idx else 0
         else:
-            # Pure deletion. A *whole-line* deletion (the removed words are
-            # bounded by newlines on both sides in the minus side) takes its
-            # trailing newline and consumes the next plus word's leading newline
-            # as context, so it lands on its own line — matching git. An in-line
-            # deletion keeps the removed words on the surviving line.
-            d0 = wm[del_idx[0]][0]
-            dn = wm[del_idx[-1]][1]
-            before = minus_text[d0 - 1] if d0 > 0 else "\n"
-            after = minus_text[dn] if dn < len(minus_text) else "\n"
-            del_lo, del_hi = d0, dn
-            if before == "\n" and after == "\n":
-                del_hi = dn + 1  # include the deleted line's newline
-                plus_begin = plus_end = (wp[pi][0] if pi < len(wp) else len(plus_text))
-            else:
-                plus_begin = plus_end = (wp[pi - 1][1] if pi > 0 else 0)
-        out.append(_ww(plus_text[current_plus:plus_begin], "", ""))
+            # Pure deletion: the plus position is the end of the previous plus
+            # word (orig[plus_first].end with git's POSIX len==0 decrement).
+            plus_begin = plus_end = (wp[pi - 1][1] if pi > 0 else 0)
+        out.append(_ww(plus_text[current_plus:plus_begin], ctx_p[0], ctx_p[1], nl))
         if del_idx:
-            out.append(_ww(minus_text[del_lo:del_hi], "[-", "-]"))
+            out.append(_ww(minus_text[wm[del_idx[0]][0]:wm[del_idx[-1]][1]], old_p[0], old_p[1], nl))
         if ins_idx:
-            out.append(_ww(plus_text[wp[ins_idx[0]][0]:wp[ins_idx[-1]][1]], "{+", "+}"))
+            out.append(_ww(plus_text[wp[ins_idx[0]][0]:wp[ins_idx[-1]][1]], new_p[0], new_p[1], nl))
         current_plus = plus_end
-    out.append(_ww(plus_text[current_plus:], "", ""))
+    out.append(_ww(plus_text[current_plus:], ctx_p[0], ctx_p[1], nl))
     return "".join(out)
 
 
-def word_diff_hunks(a: list[str], b: list[str], context: int = 3) -> str:
-    """Return the git ``--word-diff=plain`` body (``@@`` headers + word-diffed
-    content) for two line lists."""
+def word_diff_hunks(a: list[str], b: list[str], context: int = 3, mode: str = "plain") -> str:
+    """Return the git ``--word-diff`` body (``@@`` headers + word-diffed content)
+    for two line lists, in plain or porcelain mode."""
+    style = _WD_STYLES[mode]
     ops = diff_lines(a, b)
     a_cons = [0] * (len(ops) + 1)
     b_cons = [0] * (len(ops) + 1)
@@ -273,9 +268,33 @@ def word_diff_hunks(a: list[str], b: list[str], context: int = 3) -> str:
         hdr = f"@@ -{_hunk_range(a_start, a_count)} +{_hunk_range(b_start, b_count)} @@"
         if heading:
             hdr += " " + heading
-        minus_text = "".join(a[ai] + "\n" for k, ai, _bi in hunk if k in ("eq", "del"))
-        plus_text = "".join(b[bi] + "\n" for k, _ai, bi in hunk if k in ("eq", "ins"))
-        chunks.append(hdr + "\n" + _word_render(minus_text, plus_text))
+        # git word-diffs only consecutive -/+ line groups; context lines flush
+        # the pending group and are emitted verbatim (diff.c:fn_out_consume).
+        parts = [hdr + "\n"]
+        minus_acc: list[str] = []
+        plus_acc: list[str] = []
+
+        def _flush():
+            if minus_acc or plus_acc:
+                parts.append(_word_render("".join(minus_acc), "".join(plus_acc), style))
+                minus_acc.clear()
+                plus_acc.clear()
+
+        for k, ai, bi in hunk:
+            if k == "eq":
+                _flush()
+                # Context: plain skips the prefix char; porcelain keeps a leading
+                # space and appends a "~" newline marker.
+                if mode == "porcelain":
+                    parts.append(" " + a[ai] + "\n~\n")
+                else:
+                    parts.append(a[ai] + "\n")
+            elif k == "del":
+                minus_acc.append(a[ai] + "\n")
+            else:
+                plus_acc.append(b[bi] + "\n")
+        _flush()
+        chunks.append("".join(parts))
     return "".join(chunks)
 
 

@@ -2798,7 +2798,7 @@ def _diff_check(repo: Repository, changes: list) -> int:
 
 
 def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3,
-                    word_diff: bool = False) -> None:
+                    word_diff=None) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
     # Under -R the working-side prefixes are swapped (b/<path> a/<path>).
@@ -2826,7 +2826,7 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
         _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
         if word_diff:
             sys.stdout.write(diff_mod.word_diff_hunks(
-                a_text.splitlines(), b_text.splitlines(), context))
+                a_text.splitlines(), b_text.splitlines(), context, mode=word_diff))
             return
         body = diff_mod.format_hunks(
             a_text.splitlines(), b_text.splitlines(),
@@ -3079,9 +3079,9 @@ def cmd_diff(argv: list[str]) -> int:
             entries.append((path, f"{status}\t{path}"))
         for _key, line in sorted(entries):
             _print(line)
-    elif args.word_diff == "plain":
+    elif args.word_diff in ("plain", "porcelain"):
         for path, a, b in changes:
-            _emit_file_diff(path, a, b, args.reverse, args.unified, word_diff=True)
+            _emit_file_diff(path, a, b, args.reverse, args.unified, word_diff=args.word_diff)
     else:
         renames = []
         if not args.no_renames:

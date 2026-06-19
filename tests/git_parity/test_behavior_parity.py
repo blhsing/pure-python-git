@@ -117,6 +117,12 @@ WORDDIFF = [("write", "p.txt", "the quick brown fox\nsecond line here\nunchanged
             ["add", "-A"], ["commit", "-m", "c1"],
             ("write", "p.txt", "the slow brown fox jumps\nsecond line here\nunchanged\nnew tail\n"),
             ["add", "-A"], ["commit", "-m", "c2"]]
+# A whole-line deletion immediately adjacent to a modified line — the case where
+# the inter-line newline placement is subtle in word-diff.
+WORDDIFF2 = [("write", "p.txt", "L1 a\nL2 b\nL3 c\nL4 d\n"),
+             ["add", "-A"], ["commit", "-m", "c1"],
+             ("write", "p.txt", "L1 a\nL3 changed\nL4 d\nL5 e\n"),
+             ["add", "-A"], ["commit", "-m", "c2"]]
 
 # A file renamed across commits, for `log --follow`.
 RENAME = [("write", "orig.txt", "alpha\n"), ["add", "-A"], ["commit", "-m", "c1"],
@@ -957,6 +963,12 @@ CASES: list[tuple] = [
     ("word-diff-plain", WORDDIFF, ["diff", "--word-diff=plain", "HEAD~1", "HEAD"]),
     ("word-diff-reverse", WORDDIFF, ["diff", "--word-diff", "HEAD", "HEAD~1"]),
     ("word-diff-path", WORDDIFF, ["diff", "--word-diff", "HEAD~1", "HEAD", "--", "p.txt"]),
+    ("word-diff-porcelain", WORDDIFF, ["diff", "--word-diff=porcelain", "HEAD~1", "HEAD"]),
+    ("word-diff-porcelain-rev", WORDDIFF, ["diff", "--word-diff=porcelain", "HEAD", "HEAD~1"]),
+    # whole-line deletion adjacent to a modification (the tricky newline case).
+    ("word-diff-del-adjacent", WORDDIFF2, ["diff", "--word-diff", "HEAD~1", "HEAD"]),
+    ("word-diff-del-adjacent-rev", WORDDIFF2, ["diff", "--word-diff", "HEAD", "HEAD~1"]),
+    ("word-diff-del-adjacent-porc", WORDDIFF2, ["diff", "--word-diff=porcelain", "HEAD~1", "HEAD"]),
     # diff --check reports whitespace errors on added lines (rc 2), else nothing.
     ("diff-check", WSERR, ["diff", "--check", "HEAD~1", "HEAD"]),
     ("diff-check-clean", SUBTREE, ["diff", "--check", "HEAD~1", "HEAD"]),
