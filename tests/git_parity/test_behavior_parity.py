@@ -871,6 +871,19 @@ CASES: list[tuple] = [
      ["reflog", "show", "trunk"]),
     ("log-g-after-rename", BASE + [["branch", "-m", "main", "trunk"]],
      ["log", "-g", "--oneline"]),
+    # reflog --date=<mode> formats the @{...} selector with the entry's time.
+    ("reflog-date-iso", MERGED, ["reflog", "--date=iso"]),
+    ("reflog-date-short", MERGED, ["reflog", "--date=short"]),
+    ("reflog-date-relative", MERGED, ["reflog", "show", "--date=relative"]),
+    # log -g reflog placeholders and date-form selectors.
+    ("log-g-date-iso", MERGED, ["log", "-g", "--date=iso", "-1"]),
+    ("log-g-fmt-gd", MERGED, ["log", "-g", "--format=%gd", "-2"]),
+    ("log-g-fmt-gD", MERGED, ["log", "-g", "--format=%gD", "-2"]),
+    ("log-g-fmt-gs", MERGED, ["log", "-g", "--format=%gs", "-2"]),
+    ("log-g-fmt-gn-ge", MERGED, ["log", "-g", "--format=%gn <%ge>", "-1"]),
+    ("log-g-fmt-gd-date", MERGED, ["log", "-g", "--format=%gd", "--date=iso", "-1"]),
+    # %gd/%gD are empty outside a reflog walk.
+    ("log-fmt-gd-empty", BASE, ["log", "-1", "--format=[%gd][%gD][%gs]"]),
 ]
 
 

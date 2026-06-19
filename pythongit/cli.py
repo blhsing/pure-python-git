@@ -1631,7 +1631,8 @@ def _parse_who(who: str) -> tuple[str, str]:
 
 
 def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict,
-                          date_mode: str = "default", abbrev: int = 7) -> str:
+                          date_mode: str = "default", abbrev: int = 7,
+                          reflog=None, date_given: bool = False) -> str:
     a_who, a_ts, a_tz = _split_ident(c.author)
     c_who, c_ts, c_tz = _split_ident(c.committer)
     an, ae = _parse_who(a_who)
@@ -1674,6 +1675,17 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         ("%s", subject), ("%D", deco_d), ("%d", deco),
         ("%n", "\n"), ("%%", "%"),
     ]
+    # Reflog placeholders (only meaningful under `log -g`): %gD/%gd selector
+    # (full/short ref), %gs subject, %gn/%ge identity name/email. They expand to
+    # empty when not walking reflogs, matching git.
+    if reflog is not None:
+        gd = _reflog_selector(reflog, full=False, date_mode=date_mode, date_given=date_given)
+        gD = _reflog_selector(reflog, full=True, date_mode=date_mode, date_given=date_given)
+        gn, ge = _parse_who(_reflog_who(reflog["ident"]))
+        replacements[:0] = [("%gD", gD), ("%gd", gd), ("%gs", reflog["msg"]),
+                            ("%gn", gn), ("%ge", ge)]
+    else:
+        replacements[:0] = [("%gD", ""), ("%gd", ""), ("%gs", ""), ("%gn", ""), ("%ge", "")]
     # %xHH expands to the literal byte (e.g. %x09 -> tab) before field tokens.
     out = _re.sub(r"%x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), fmt)
     for token, value in replacements:
@@ -1809,6 +1821,7 @@ def cmd_log(argv: list[str]) -> int:
     if args.oneline:
         style = "oneline"
     date_mode = args.date or "default"
+    date_given = args.date is not None
 
     decorate = args.decorate is not None and not args.no_decorate
     # The %d/%D placeholders always expand decorations, even without --decorate.
@@ -1834,25 +1847,27 @@ def cmd_log(argv: list[str]) -> int:
     # `-g`/`--walk-reflogs`: enumerate the named ref's reflog (newest first)
     # instead of walking commit ancestry. Each entry carries its own selector,
     # committer identity and message, which the renderer injects per commit.
-    reflog_meta: Optional[list[tuple[str, str, str]]] = None
+    reflog_meta: Optional[list[dict]] = None
     if args.walk_reflogs:
         from . import reflog as _reflog
         full_ref = rev if rev == "HEAD" else (refs_mod.dwim_full_name(repo, rev) or rev)
         entries = _reflog.read(repo, full_ref)
         reflog_meta = []
         zero = repo.null_oid()
+        # git's selector keeps the ref *as given on the command line* for %gD;
+        # %gd shortens it by stripping the well-known ref namespaces.
+        short_rev = rev
+        for pre in ("refs/heads/", "refs/remotes/", "refs/tags/"):
+            if short_rev.startswith(pre):
+                short_rev = short_rev[len(pre):]
+                break
         for i, (_old, new, ident, msg) in enumerate(reversed(entries)):
             # Deletion markers (zero new-oid) consume an @{N} slot but aren't shown.
             if new == zero:
                 continue
             commit_list.append(new)
-            # The reflog identity is "Name <email> <secs> <tz>"; the header keeps
-            # only the "Name <email>" portion.
-            who = ident
-            parts = ident.rsplit(" ", 2)
-            if len(parts) == 3 and parts[1].lstrip("-").isdigit():
-                who = parts[0]
-            reflog_meta.append((f"{rev}@{{{i}}}", who, msg))
+            reflog_meta.append({"sref": short_rev, "fref": rev, "i": i,
+                                "ident": ident, "msg": msg})
         want_topo = collect_full = False
     elif args.no_walk is not None:
         # --no-walk shows only the named revisions, no ancestry traversal. The
@@ -1966,7 +1981,8 @@ def cmd_log(argv: list[str]) -> int:
 
     def render(count, s, c, meta=None):
         if style == "format":
-            expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev)
+            expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev,
+                                              reflog=meta, date_given=date_given)
             if fmt_terminator:
                 sys.stdout.write(expansion + "\n")
             else:
@@ -1977,8 +1993,8 @@ def cmd_log(argv: list[str]) -> int:
             short = style == "oneline" or args.abbrev_commit
             abbrev = s[:args.abbrev] if short else s
             if meta is not None:
-                sel, _who, rmsg = meta
-                _print(f"{abbrev} {sel}: {rmsg}")
+                sel = _reflog_selector(meta, full=False, date_mode=date_mode, date_given=date_given)
+                _print(f"{abbrev} {sel}: {meta['msg']}")
                 return
             first = c.message.splitlines()[0] if c.message.strip() else ""
             deco = _format_decoration(decorations.get(s, []))
@@ -2020,7 +2036,7 @@ def cmd_log(argv: list[str]) -> int:
             _emit_commit_header(s[:7] if args.abbrev_commit else s, c, style=style,
                                 date_mode=date_mode, parents_suffix=psuf,
                                 decoration=_format_decoration(decorations.get(s, [])),
-                                reflog=meta)
+                                reflog=meta, date_given=date_given)
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
@@ -2161,6 +2177,24 @@ def _relative_date(ts: int, now: Optional[int] = None) -> str:
     return ago((diff + 183) // 365, "year")
 
 
+def _reflog_who(ident: str) -> str:
+    """Strip the trailing ``<secs> <tz>`` from a reflog ident, leaving
+    ``Name <email>`` (the portion git shows in ``Reflog:``/``%gn``/``%ge``)."""
+    parts = ident.rsplit(" ", 2)
+    if len(parts) == 3 and parts[1].lstrip("-").isdigit():
+        return parts[0]
+    return ident
+
+
+def _reflog_selector(meta: dict, *, full: bool, date_mode: str, date_given: bool) -> str:
+    """Build a reflog selector ``<ref>@{<index-or-date>}``. ``full`` chooses the
+    full ref name (``%gD``) over the short one (``%gd``); with an explicit
+    ``--date`` the brace holds the formatted entry time instead of the index."""
+    ref = meta["fref"] if full else meta["sref"]
+    inner = _format_date(meta["ident"], date_mode) if date_given else str(meta["i"])
+    return f"{ref}@{{{inner}}}"
+
+
 def _format_date(sig: str, mode: str = "default") -> str:
     """Render a signature's timestamp in one of git's ``--date=<mode>`` styles.
 
@@ -2295,14 +2329,14 @@ def _format_ident_date(sig: str) -> str:
 
 def _emit_commit_header(sha: str, c, *, style: str = "medium",
                         date_mode: str = "default", decoration: str = "",
-                        parents_suffix: str = "", reflog=None) -> None:
+                        parents_suffix: str = "", reflog=None, date_given: bool = False) -> None:
     """Print the ``commit``/``Author``/``Date`` header block for medium, full,
     and fuller pretty styles, shared by ``log`` and ``show``."""
     _print(f"commit {sha}{parents_suffix}{decoration}")
     if reflog is not None:
-        sel, who, rmsg = reflog
-        _print(f"Reflog: {sel} ({who})")
-        _print(f"Reflog message: {rmsg}")
+        sel = _reflog_selector(reflog, full=False, date_mode=date_mode, date_given=date_given)
+        _print(f"Reflog: {sel} ({_reflog_who(reflog['ident'])})")
+        _print(f"Reflog message: {reflog['msg']}")
     if len(c.parents) > 1:
         _print("Merge: " + " ".join(p[:7] for p in c.parents))
     author_who = _split_ident(c.author)[0]
@@ -4194,6 +4228,7 @@ def cmd_reflog(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit reflog", add_help=False)
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("--oneline", action="store_true")  # default format is already oneline
+    ap.add_argument("--date", default=None)
     ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -4216,7 +4251,8 @@ def cmd_reflog(argv: list[str]) -> int:
             continue
         if args.max_count is not None and shown >= args.max_count:
             break
-        _print(f"{new[:7]} {ref}@{{{i}}}: {msg}")
+        inner = _format_date(ident, args.date) if args.date else str(i)
+        _print(f"{new[:7]} {ref}@{{{inner}}}: {msg}")
         shown += 1
     return 0
 
