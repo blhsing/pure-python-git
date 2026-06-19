@@ -956,6 +956,11 @@ CASES: list[tuple] = [
     # format pretty styles also append --stat/--name-only/-p diff output.
     ("log-format-stat", SUBTREE, ["log", "--format=%s", "--stat"]),
     ("log-format-nameonly", SUBTREE, ["log", "--name-only", "--format=%s"]),
+    # A pathspec restricts the per-commit diff to matching files.
+    ("log-p-path", PATHHIST, ["log", "-p", "a.txt"]),
+    ("log-stat-path", PATHHIST, ["log", "--stat", "a.txt"]),
+    ("log-name-only-path", PATHHIST, ["log", "--name-only", "a.txt"]),
+    ("log-raw-path", PATHHIST, ["log", "--raw", "c.txt"]),
     # log --oneline with diff output (stat/patch/shortstat/name-only).
     ("log-oneline-stat", SUBTREE, ["log", "--oneline", "--stat"]),
     ("log-oneline-patch", SUBTREE, ["log", "--oneline", "-p"]),

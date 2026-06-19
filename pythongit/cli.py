@@ -2076,6 +2076,13 @@ def cmd_log(argv: list[str]) -> int:
             _, pd = objs.read_object(repo, c.parents[0])
             parent_tree = objs.parse_commit(pd).tree
         tchanges = _tree_changes(repo, parent_tree, c.tree)
+        # A pathspec restricts the per-commit diff to the matching files (git
+        # shows only changes touching the pathspec). --follow varies the name
+        # per commit, so leave it unrestricted there.
+        if log_paths and not args.follow:
+            def _pm(p):
+                return any(p == w or p.startswith(w.rstrip("/") + "/") for w in log_paths)
+            tchanges = [ch for ch in tchanges if _pm(ch[0])]
         if lead_blank:
             _print("")
         if args.stat:
@@ -2090,9 +2097,15 @@ def cmd_log(argv: list[str]) -> int:
                 st = "A" if not a.present else ("D" if not b.present else "M")
                 _print(f"{st}\t{path}")
         elif args.raw:
-            _emit_raw_diff(repo, parent_tree, c.tree)
+            for path, a, b in tchanges:
+                status = "A" if not a.present else ("D" if not b.present else "M")
+                a_sha = a.sha[:7] if a.present else "0000000"
+                b_sha = b.sha[:7] if b.present else "0000000"
+                _print(f":{(a.mode or '000000').zfill(6)} {(b.mode or '000000').zfill(6)} "
+                       f"{a_sha} {b_sha} {status}\t{path}")
         else:
-            _emit_tree_patch(repo, parent_tree, c.tree, args.unified)
+            for path, a, b in tchanges:
+                _emit_file_diff(path, a, b, context=args.unified)
 
     def render(count, s, c, meta=None):
         if style == "format":
