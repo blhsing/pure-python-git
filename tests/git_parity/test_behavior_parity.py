@@ -1025,6 +1025,21 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # tag --contains/--no-contains filters; tag --format ref-filter atoms.
+    ("tag-contains", DESC, ["tag", "--contains", "HEAD~1"]),
+    ("tag-format", REFSET, ["tag", "-l", "--format=%(refname:short) %(objecttype)"]),
+    # log --no-abbrev / --no-abbrev-commit force full oids.
+    ("log-no-abbrev", TAGGED, ["log", "-1", "--format=%h", "--no-abbrev"]),
+    ("log-no-abbrev-commit", TAGGED, ["log", "--abbrev-commit", "--no-abbrev-commit", "-1"]),
+    # shortlog lists each author's commits oldest-first; -e adds the email.
+    ("shortlog-default", PATHHIST, ["shortlog", "HEAD"]),
+    ("shortlog-email", PATHHIST, ["shortlog", "-e", "HEAD"]),
+    ("shortlog-summary-email", PATHHIST, ["shortlog", "-se", "HEAD"]),
+    # diff-tree -t emits changed tree (directory) nodes; without -r it lists
+    # only the top-level changed entries.
+    ("diff-tree-t", SUBTREE, ["diff-tree", "-t", "-r", "HEAD"]),
+    ("diff-tree-t-nor", SUBTREE, ["diff-tree", "-t", "HEAD"]),
+    ("diff-tree-nor", SUBTREE, ["diff-tree", "HEAD"]),
     # log --branches/--tags/--remotes walk selected ref namespaces.
     ("log-branches", MERGED, ["log", "--format=%H", "--branches"]),
     ("log-tags", DESC, ["log", "--format=%H", "--tags"]),

@@ -1923,7 +1923,9 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--format", default=None)
     ap.add_argument("--abbrev-commit", action="store_true")
+    ap.add_argument("--no-abbrev-commit", dest="no_abbrev_commit", action="store_true")
     ap.add_argument("--abbrev", type=int, default=7)
+    ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
     ap.add_argument("-p", "--patch", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--stat", action="store_true")
@@ -1966,6 +1968,11 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
+    # --no-abbrev[-commit] override the abbreviation: full oids everywhere.
+    if args.no_abbrev:
+        args.abbrev = repo.hex_len
+    if args.no_abbrev_commit:
+        args.abbrev_commit = False
 
     if args.graph and args.reverse:
         _err("fatal: options '--graph' and '--reverse' cannot be used together")
@@ -3582,12 +3589,17 @@ def cmd_tag(argv: list[str]) -> int:
     ap.add_argument("-n", nargs="?", const=1, type=int, default=None, dest="num")
     ap.add_argument("--sort", default=None)
     ap.add_argument("--points-at", default=None)
+    ap.add_argument("--format", default=None)
+    ap.add_argument("--contains", default=None)
+    ap.add_argument("--no-contains", dest="no_contains", default=None)
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     if (args.list or args.num is not None or args.sort is not None
-            or args.points_at is not None or (args.name is None and not args.delete)):
+            or args.points_at is not None or args.format is not None
+            or args.contains is not None or args.no_contains is not None
+            or (args.name is None and not args.delete)):
         import fnmatch
         pattern = args.name
         tags = list(refs_mod.list_tags(repo))
@@ -3596,6 +3608,31 @@ def cmd_tag(argv: list[str]) -> int:
             tags = [t for t in tags
                     if (refs_mod.rev_parse(repo, f"refs/tags/{t}" + "^{commit}")
                         or refs_mod.read_ref(repo, f"refs/tags/{t}")) == target]
+        if args.contains is not None or args.no_contains is not None:
+            graph = _graph_for_repo(repo)
+
+            def _reaches(tip: str, target: str) -> bool:
+                stack, seen_c = [tip], set()
+                while stack:
+                    x = stack.pop()
+                    if x == target:
+                        return True
+                    if x in seen_c:
+                        continue
+                    seen_c.add(x)
+                    info = _commit_tree_parents(repo, x, graph)
+                    if info:
+                        stack.extend(info[1])
+                return False
+
+            def _tag_commit(t):
+                return refs_mod.rev_parse(repo, f"refs/tags/{t}^{{commit}}")
+            if args.contains is not None:
+                cs = refs_mod.rev_parse(repo, args.contains)
+                tags = [t for t in tags if (_tag_commit(t) and cs and _reaches(_tag_commit(t), cs))]
+            if args.no_contains is not None:
+                cs = refs_mod.rev_parse(repo, args.no_contains)
+                tags = [t for t in tags if not (_tag_commit(t) and cs and _reaches(_tag_commit(t), cs))]
         if args.sort:
             key = args.sort.lstrip("-")
             reverse = args.sort.startswith("-")
@@ -3603,10 +3640,14 @@ def cmd_tag(argv: list[str]) -> int:
                 tags.sort(key=_version_sort_key, reverse=reverse)
             else:
                 tags.sort(reverse=reverse)
+        head_sym, _ = refs_mod.read_head(repo)
         for t in tags:
             if pattern and not fnmatch.fnmatch(t, pattern):
                 continue
-            if args.num is not None:
+            if args.format is not None:
+                ref = f"refs/tags/{t}"
+                _print(_fer_expand(repo, ref, refs_mod.read_ref(repo, ref) or "", args.format, head_sym))
+            elif args.num is not None:
                 _print(f"{t:<15} {_tag_annotation(repo, refs_mod.read_ref(repo, f'refs/tags/{t}'))}")
             else:
                 _print(t)
@@ -5737,9 +5778,10 @@ def cmd_for_each_ref(argv: list[str]) -> int:
 
 
 def cmd_shortlog(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit shortlog")
+    ap = argparse.ArgumentParser(prog="pygit shortlog", add_help=False)
     ap.add_argument("-n", "--numbered", action="store_true")
     ap.add_argument("-s", "--summary", action="store_true")
+    ap.add_argument("-e", "--email", action="store_true")
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -5758,10 +5800,15 @@ def cmd_shortlog(argv: list[str]) -> int:
             c = objs.parse_commit(objs.read_object(repo, s)[1])
         except KeyError:
             continue
-        author = c.author.rsplit("<", 1)[0].strip()
+        who, _ts, _tz = _split_ident(c.author)
+        name, email = _parse_who(who)
+        author = f"{name} <{email}>" if args.email else name
         first = c.message.splitlines()[0] if c.message.strip() else ""
         by_author.setdefault(author, []).append(first)
         stack.extend(c.parents)
+    # git lists each author's commits oldest-first (we collected newest-first).
+    for msgs in by_author.values():
+        msgs.reverse()
     items = list(by_author.items())
     if args.numbered:
         items.sort(key=lambda x: -len(x[1]))
@@ -8796,6 +8843,40 @@ _register_phase6()
 #           merge-index / get-tar-commit-id / hook / credential
 
 
+def _diff_tree_changes_with_dirs(repo: Repository, a_tree, b_tree, prefix: str = "", recurse: bool = True):
+    """Like workdir.iter_tree_changes but also yields changed directory (tree)
+    nodes (parent before children). With recurse=False, yields only the
+    top-level changed entries (dirs shown as tree nodes) — git's diff-tree
+    default without -r; recurse=True is the `diff-tree -t -r` form."""
+    if a_tree == b_tree:
+        return
+    from . import workdir as _wd
+    a_entries = {e.name: e for e in _wd._tree_entries(repo, a_tree)} if a_tree else {}
+    b_entries = {e.name: e for e in _wd._tree_entries(repo, b_tree)} if b_tree else {}
+    for name in sorted(set(a_entries) | set(b_entries)):
+        a = a_entries.get(name)
+        b = b_entries.get(name)
+        path = f"{prefix}{name}"
+        if a is not None and b is not None and a.sha == b.sha and a.mode == b.mode:
+            continue
+        a_dir = a is not None and a.is_dir()
+        b_dir = b is not None and b.is_dir()
+        if not recurse:
+            yield path, a, b
+            continue
+        if a_dir and b_dir:
+            yield path, a, b
+            yield from _diff_tree_changes_with_dirs(repo, a.sha, b.sha, path + "/")
+        elif b_dir and a is None:
+            yield path, None, b
+            yield from _diff_tree_changes_with_dirs(repo, None, b.sha, path + "/")
+        elif a_dir and b is None:
+            yield path, a, None
+            yield from _diff_tree_changes_with_dirs(repo, a.sha, None, path + "/")
+        else:
+            yield path, a, b
+
+
 def _raw_diff_status(a_mode: str, b_mode: str, a_sha: Optional[str], b_sha: Optional[str], path: str) -> str:
     """Emit a 'raw diff' format line: ':MODE_A MODE_B SHA_A SHA_B STATUS\\tpath'."""
     null_oid = "0" * max(len(a_sha or ""), len(b_sha or ""), 40)
@@ -8811,6 +8892,7 @@ def _raw_diff_status(a_mode: str, b_mode: str, a_sha: Optional[str], b_sha: Opti
 def cmd_diff_tree(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit diff-tree", add_help=False)
     ap.add_argument("-r", action="store_true", help="recurse")
+    ap.add_argument("-t", dest="show_trees", action="store_true")
     ap.add_argument("-p", "--patch", action="store_true")
     ap.add_argument("--root", action="store_true")
     ap.add_argument("--no-commit-id", dest="no_commit_id", action="store_true")
@@ -8854,12 +8936,20 @@ def cmd_diff_tree(argv: list[str]) -> int:
         b_tree = _resolve_to_tree(args.rev2)
     if not b_tree:
         return 128
-    changes = list(workdir.iter_tree_changes(repo, a_tree, b_tree))
+    if args.show_trees:
+        # -t recurses into changed trees (even without -r), showing tree nodes.
+        changes = list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=True))
+    elif not args.r:
+        # Without -r, diff-tree lists only the top-level changed entries
+        # (directories shown as tree nodes), not their contents.
+        changes = list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=False))
+    else:
+        changes = list(workdir.iter_tree_changes(repo, a_tree, b_tree))
     for p, a_entry, b_entry in changes:
         a_sha = a_entry.sha if a_entry else None
         b_sha = b_entry.sha if b_entry else None
-        a_mode = a_entry.mode if a_entry else "100644"
-        b_mode = b_entry.mode if b_entry else "100644"
+        a_mode = (a_entry.mode if a_entry else "100644").zfill(6)
+        b_mode = (b_entry.mode if b_entry else "100644").zfill(6)
         if a_sha == b_sha and a_mode == b_mode:
             continue
         if args.name_only:
