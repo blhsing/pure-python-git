@@ -559,18 +559,38 @@ def cmd_read_tree(argv: list[str]) -> int:
 
 
 def cmd_commit_tree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit commit-tree")
+    ap = argparse.ArgumentParser(prog="pygit commit-tree", add_help=False)
     ap.add_argument("tree")
     ap.add_argument("-p", "--parent", action="append", default=[])
-    ap.add_argument("-m", "--message", required=True)
+    ap.add_argument("-m", "--message", action="append", default=[])
+    ap.add_argument("-F", "--file", default=None)
     args = ap.parse_args(argv)
     repo = _repo()
+    # Resolve the tree-ish (e.g. HEAD^{tree}, a commit, or a raw oid) to a tree.
+    tree_sha = refs_mod.rev_parse(repo, args.tree + "^{tree}") or refs_mod.rev_parse(repo, args.tree)
+    if not tree_sha:
+        _err(f"fatal: not a valid object name {args.tree}")
+        return 128
+    parents = []
+    for p in args.parent:
+        ps = refs_mod.rev_parse(repo, p)
+        if not ps:
+            _err(f"fatal: not a valid object name {p}")
+            return 128
+        parents.append(ps)
+    # Message: -m paragraphs joined by a blank line, or -F <file>, or stdin.
+    if args.message:
+        msg = "\n\n".join(args.message) + "\n"
+    elif args.file:
+        msg = open(args.file, encoding="utf-8").read()
+    else:
+        msg = sys.stdin.read()
     c = objs.Commit(
-        tree=args.tree,
-        parents=list(args.parent),
+        tree=tree_sha,
+        parents=parents,
         author=objs.build_signature(repo, "author"),
         committer=objs.build_signature(repo, "committer"),
-        message=args.message if args.message.endswith("\n") else args.message + "\n",
+        message=msg if msg.endswith("\n") else msg + "\n",
     )
     sha = objs.write_object(repo, "commit", c.encode())
     _print(sha)
@@ -3777,6 +3797,7 @@ def cmd_config(argv: list[str]) -> int:
     is_global = False
     is_local = False
     name_only = False
+    show_origin = False
     file_path: Optional[str] = None
     default_val: Optional[str] = None
     type_: Optional[str] = None
@@ -3803,6 +3824,8 @@ def cmd_config(argv: list[str]) -> int:
             pass
         elif a == "--name-only":
             name_only = True
+        elif a == "--show-origin":
+            show_origin = True
         elif a in ("-f", "--file"):
             i += 1
             file_path = argv[i] if i < len(argv) else None
@@ -3852,8 +3875,12 @@ def cmd_config(argv: list[str]) -> int:
             repo = _repo()
         except RepositoryError:
             repo = None
+        origin = ""
+        if show_origin and repo is not None:
+            origin = "file:" + os.path.relpath(repo.gitdir / "config") + "\t"
         for key, value in gitconfig.list_all(repo):
-            _print(key if name_only else f"{key}={value}")
+            line = key if name_only else f"{key}={value}"
+            _print(origin + line)
         return 0
 
     if action == "get_regexp":
@@ -3981,11 +4008,53 @@ def cmd_remote(argv: list[str]) -> int:
 
 
 def cmd_ls_remote(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit ls-remote")
-    ap.add_argument("url")
+    ap = argparse.ArgumentParser(prog="pygit ls-remote", add_help=False)
+    ap.add_argument("-t", "--tags", action="store_true")
+    ap.add_argument("--heads", action="store_true")
+    ap.add_argument("url", nargs="?", default=None)
     args = ap.parse_args(argv)
+    url = args.url
+    if url is None:
+        # No <repository> given: git uses the current branch's remote (or
+        # origin), erroring when none is configured.
+        from . import gitconfig
+        try:
+            r = _repo()
+            url = gitconfig.get(r, "remote.origin.url")
+        except RepositoryError:
+            url = None
+        if not url:
+            _err("fatal: No remote configured to list refs from.")
+            return 128
+    src = url[7:] if url.startswith("file://") else url
+    # A local repository path is read directly: HEAD, then refs in sorted order,
+    # with annotated tags followed by their peeled ``^{}`` line — like git.
+    if not url.startswith(("http://", "https://", "git://", "ssh://")) and Path(src).exists():
+        repo = Repository.discover(src)
+        _, head_sha = refs_mod.read_head(repo)
+        # --heads/--tags restrict to that namespace; HEAD shows only when neither
+        # (or no namespace filter) is given.
+        if head_sha and not (args.tags or args.heads):
+            _print(f"{head_sha}\tHEAD")
+        for name, sha in sorted(_enumerate_refs(repo)):
+            if args.heads or args.tags:
+                # When namespace filters are given, include the union of them.
+                if not ((args.heads and name.startswith("refs/heads/"))
+                        or (args.tags and name.startswith("refs/tags/"))):
+                    continue
+            _print(f"{sha}\t{name}")
+            if name.startswith("refs/tags/"):
+                try:
+                    t, _ = objs.read_object(repo, sha)
+                    if t == "tag":
+                        peeled = refs_mod.rev_parse(repo, name + "^{commit}")
+                        if peeled:
+                            _print(f"{peeled}\t{name}^{{}}")
+                except KeyError:
+                    pass
+        return 0
     from . import protocol
-    refs = protocol.discover_refs(args.url)
+    refs = protocol.discover_refs(url)
     for name, sha in refs.items():
         _print(f"{sha}\t{name}")
     return 0

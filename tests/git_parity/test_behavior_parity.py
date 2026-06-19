@@ -995,6 +995,15 @@ CASES: list[tuple] = [
     # rev-list --children lists in-set children after each commit.
     ("rev-list-children", PATHHIST, ["rev-list", "--children", "HEAD"]),
     ("rev-list-children-parents-err", PATHHIST, ["rev-list", "--children", "--parents", "HEAD"]),
+    # commit-tree resolves the tree-ish argument (not used verbatim).
+    ("commit-tree", SUBTREE, ["commit-tree", "-m", "msg", "HEAD^{tree}"]),
+    # ls-remote against a local path: HEAD + sorted refs + peeled annotated tags.
+    ("ls-remote-local", TAGGED, ["ls-remote", "."]),
+    ("ls-remote-tags", TAGGED, ["ls-remote", "--tags", "."]),
+    ("ls-remote-heads", REFSET, ["ls-remote", "--heads", "."]),
+    ("ls-remote-no-remote", BASE, ["ls-remote"]),
+    # config --show-origin prefixes each entry with its source file.
+    ("config-show-origin", REMOTE, ["config", "--list", "--show-origin"]),
     # git merge -q suppresses the summary; ensure the flag is accepted and silent.
     ("merge-quiet",
      BASE + [["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"],
