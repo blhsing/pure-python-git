@@ -166,14 +166,21 @@ def would_add(repo: Repository, paths: Iterable[str]) -> list[str]:
     return out
 
 
-def add_paths(repo: Repository, paths: Iterable[str]) -> None:
+def add_paths(repo: Repository, paths: Iterable[str], *,
+              ignore_removal: bool = False, update_only: bool = False) -> None:
+    """Stage worktree paths into the index. ``update_only`` (git add -u) limits
+    to already-tracked files; ``ignore_removal`` (git add --no-all) keeps the
+    index entries of files removed from the worktree."""
     idx = read_index(repo)
     tracked = set(idx.by_path())
     to_add = _gather_add_candidates(repo, paths, tracked)
+    if update_only:
+        to_add = [r for r in to_add if r in tracked]
     for rel in sorted(set(to_add)):
         full = repo.path / rel
         if not full.exists() and not full.is_symlink():
-            idx.remove(rel)
+            if not ignore_removal:
+                idx.remove(rel)
             continue
         data = _blob_data(full)
         sha = objs.write_object(repo, "blob", data)

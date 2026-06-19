@@ -171,6 +171,11 @@ REMOTE = BASE + [
 LSIGNORE = [("write", "a.txt", "a\n"), ("write", ".gitignore", "*.log\n"), ["add", "-A"],
             ["commit", "-m", "c1"],
             ("write", "b.txt", "b\n"), ("write", "debug.log", "x\n"), ("write", "other.txt", "y\n")]
+# A committed pair, then a modified tracked file, a deleted tracked file, and an
+# untracked file — for `add -u`/`--no-all`/`--pathspec-from-file` staging modes.
+ADDSETUP = [("write", "a.txt", "a\n"), ("write", "b.txt", "b\n"), ["add", "-A"],
+            ["commit", "-m", "c1"],
+            ("write", "a.txt", "MOD\n"), ("rm", "b.txt"), ("write", "c.txt", "NEW\n")]
 # A merge conflict leaving unmerged (stage 1/2/3) index entries, for ls-files -u.
 LSCONFLICT = [("write", "f.txt", "base\n"), ["add", "-A"], ["commit", "-m", "c1"],
               ["checkout", "-b", "feat"], ("write", "f.txt", "feat\n"), ["add", "-A"], ["commit", "-m", "c2"],
@@ -1291,6 +1296,16 @@ CASES: list[tuple] = [
     ("lsf-unmerged-stage", LSCONFLICT, ["ls-files", "-s"]),
     ("lsf-unmerged-tag", LSCONFLICT, ["ls-files", "-t"]),
     ("lsf-unmerged-default", LSCONFLICT, ["ls-files"]),
+    # add staging modes: -u (tracked only), --no-all/--ignore-removal (skip
+    # removals), --pathspec-from-file. Each is probed via the resulting status.
+    ("add-update", ADDSETUP + [["add", "-u"]], ["status", "--short"]),
+    ("add-update-path", ADDSETUP + [["add", "-u", "a.txt"]], ["status", "--short"]),
+    ("add-no-all", ADDSETUP + [["add", "--no-all", "."]], ["status", "--short"]),
+    ("add-ignore-removal", ADDSETUP + [["add", "--ignore-removal", "."]], ["status", "--short"]),
+    ("add-no-all-paths", ADDSETUP + [["add", "--no-all", "a.txt", "b.txt"]], ["status", "--short"]),
+    ("add-pathspec-from-file",
+     ADDSETUP + [("write", "ps.txt", "a.txt\nc.txt\n"), ["add", "--pathspec-from-file", "ps.txt"]],
+     ["status", "--short"]),
 ]
 
 

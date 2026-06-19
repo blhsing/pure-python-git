@@ -1680,11 +1680,21 @@ def cmd_add(argv: list[str]) -> int:
     ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-f", "--force", action="store_true")
+    ap.add_argument("-u", "--update", action="store_true")
+    ap.add_argument("--no-all", "--ignore-removal", dest="no_all", action="store_true")
+    ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
+    ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+    # --pathspec-from-file supplies the pathspecs instead of the command line.
+    if args.pathspec_from_file is not None:
+        raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
+               else open(args.pathspec_from_file, "rb").read())
+        sep = "\0" if args.pathspec_file_nul else "\n"
+        args.paths = [p for p in raw.decode("utf-8").split(sep) if p]
     explicit = bool(args.paths) and not args.all
-    targets = args.paths if explicit else ["."]
+    targets = args.paths if (args.paths) else ["."]
     if explicit:
         tracked = workdir.tracked_paths(repo)
         for ps in targets:
@@ -1697,7 +1707,7 @@ def cmd_add(argv: list[str]) -> int:
             for rel in report:
                 _print(f"add '{rel}'")
             return 0
-    workdir.add_paths(repo, targets)
+    workdir.add_paths(repo, targets, ignore_removal=args.no_all, update_only=args.update)
     if args.verbose:
         for rel in report:
             _print(f"add '{rel}'")
