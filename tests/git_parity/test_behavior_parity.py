@@ -809,6 +809,18 @@ CASES: list[tuple] = [
     ("archive-tar", TAGGED, ["archive", "--format=tar", "HEAD"]),
     ("archive-prefix", TAGGED, ["archive", "--format=tar", "--prefix=x/", "HEAD"]),
     ("archive-prefix-multi", TAGGED, ["archive", "--format=tar", "--prefix=a/b/", "HEAD"]),
+    # Short/human date atoms and empty encoding/notes atoms.
+    ("log-fmt-as", DATED, ["log", "-1", "--format=%as"]),
+    ("log-fmt-cs", DATED, ["log", "-1", "--format=%cs"]),
+    ("log-fmt-ah", DATED, ["log", "-1", "--format=%ah"]),
+    ("log-fmt-encoding", TAGGED, ["log", "-1", "--format=[%e]"]),
+    ("log-fmt-notes", TAGGED, ["log", "-1", "--format=[%N]"]),
+    # show --abbrev threads into %h.
+    ("show-abbrev-len", TAGGED, ["show", "-s", "--abbrev=10", "--format=%h", "HEAD"]),
+    # log --decorate=full keeps full ref names.
+    ("log-decorate-full",
+     BASE + [["tag", "-a", "-m", "r", "v1"], ["branch", "feat"]],
+     ["log", "-1", "--oneline", "--decorate=full"]),
     # mv --dry-run, and format-patch numbering.
     ("mv-dry-run", BASE, ["mv", "-n", "a.txt", "c.txt"]),
     ("format-patch-numbered", TAGGED, ["format-patch", "-1", "--stdout", "--numbered"]),

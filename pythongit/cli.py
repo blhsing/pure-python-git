@@ -1661,8 +1661,12 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         ("%ai", _format_date(c.author, "iso")), ("%ci", _format_date(c.committer, "iso")),
         ("%ad", _format_date(c.author, date_mode)), ("%cd", _format_date(c.committer, date_mode)),
         ("%ar", _format_date(c.author, "relative")), ("%cr", _format_date(c.committer, "relative")),
+        ("%as", _format_date(c.author, "short")), ("%cs", _format_date(c.committer, "short")),
+        ("%ah", _format_date(c.author, "human")), ("%ch", _format_date(c.committer, "human")),
         ("%at", str(a_ts) if a_ts is not None else ""), ("%ct", str(c_ts) if c_ts is not None else ""),
         ("%B", raw_body), ("%b", body), ("%f", sanitized),
+        # %e (encoding) and %N (notes) are empty for unencoded, un-noted commits.
+        ("%e", ""), ("%N", ""),
         # Signature placeholders: pythongit does not verify GPG signatures, so
         # commits read as unsigned ("N", empty detail fields), like unsigned
         # commits under C Git.
@@ -1805,7 +1809,7 @@ def cmd_log(argv: list[str]) -> int:
     # The %d/%D placeholders always expand decorations, even without --decorate.
     if not decorate and fmt_string and ("%d" in fmt_string or "%D" in fmt_string):
         decorate = True
-    decorations = _commit_decorations(repo) if decorate else {}
+    decorations = _commit_decorations(repo, full=(args.decorate == "full")) if decorate else {}
 
     # `--graph` and `--topo-order` reorder commits topologically (unless
     # `--date-order` is also given); collect the full set first, then sort.
@@ -2030,24 +2034,25 @@ def _expand_count_shorthand(argv: list[str]) -> list[str]:
     return out
 
 
-def _commit_decorations(repo: Repository) -> dict[str, list[str]]:
+def _commit_decorations(repo: Repository, full: bool = False) -> dict[str, list[str]]:
     """Map commit sha -> ordered decoration labels, matching C Git.
 
     Git iterates refs in ascending full-name order, *prepending* each label to
     its target's list (so the result is reverse-alphabetical), peels annotated
     tags to the commit they reference, and finally hoists the current branch to
     the front as ``HEAD -> <branch>`` (or a bare ``HEAD`` when detached).
+    With ``full`` the labels keep their full ``refs/...`` names.
     """
     out: dict[str, list[str]] = {}
     for refname, sha in _enumerate_refs(repo):
         if refname.startswith("refs/heads/"):
-            label = refname[len("refs/heads/"):]
+            label = refname if full else refname[len("refs/heads/"):]
             target = sha
         elif refname.startswith("refs/remotes/"):
-            label = refname[len("refs/remotes/"):]
+            label = refname if full else refname[len("refs/remotes/"):]
             target = sha
         elif refname.startswith("refs/tags/"):
-            label = "tag: " + refname[len("refs/tags/"):]
+            label = "tag: " + (refname if full else refname[len("refs/tags/"):])
             # Annotated tags decorate the commit they ultimately point to.
             target = refs_mod.rev_parse(repo, refname + "^{commit}") or sha
         else:
@@ -2057,11 +2062,11 @@ def _commit_decorations(repo: Repository) -> dict[str, list[str]]:
     head_sym, head_sha = refs_mod.read_head(repo)
     if head_sha:
         if head_sym and head_sym.startswith("refs/heads/"):
-            short = head_sym[len("refs/heads/"):]
+            disp = head_sym if full else head_sym[len("refs/heads/"):]
             lst = out.setdefault(head_sha, [])
-            if short in lst:
-                lst.remove(short)
-            lst.insert(0, f"HEAD -> {short}")
+            if disp in lst:
+                lst.remove(disp)
+            lst.insert(0, f"HEAD -> {disp}")
         else:
             out.setdefault(head_sha, []).insert(0, "HEAD")
     return out
@@ -2283,6 +2288,7 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--format", default=None)
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--date", default=None)
+    ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -2310,7 +2316,7 @@ def cmd_show(argv: list[str]) -> int:
         if fmt is not None:
             peeled = refs_mod.rev_parse(repo, the_rev + "^{commit}") or sha
             c = objs.parse_commit(objs.read_object(repo, peeled)[1])
-            _print(_expand_commit_format(repo, peeled, c, fmt, {}))
+            _print(_expand_commit_format(repo, peeled, c, fmt, {}, abbrev=args.abbrev))
             if not args.no_patch and not args.stat:
                 ptree = None
                 if c.parents:
