@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 586 flags across 57 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 572 flags across 57 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -37,8 +37,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## column (1)
   --raw-mode
 
-## commit (33)
-  --interactive --patch -s -v -u --dry-run -c -C --squash --fixup -F --reset-author --allow-empty-message --no-verify -e --author --cleanup -i -o --pathspec-from-file --pathspec-file-nul --trailer -S -t -p -U --unified --inter-hunk-context -n --verify -z --no-post-rewrite --post-rewrite
+## commit (19)
+  --interactive --patch -u --dry-run -c -C --squash --fixup --pathspec-from-file --pathspec-file-nul -S -t -p -U --unified --inter-hunk-context --verify -z --post-rewrite
 
 ## describe (1)
   --dirty

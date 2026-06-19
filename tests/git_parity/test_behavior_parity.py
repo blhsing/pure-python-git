@@ -119,6 +119,10 @@ RANGEDIFF = BASE + [
     ["checkout", "main"],
 ]
 
+# A base commit plus a modified tracked file and a new staged file, for
+# exercising commit's flag set (author/signoff/trailer/only/include/...).
+COMMITSTAGE = BASE + [("write", "a.txt", "alpha\nMOD\n"), ("write", "n.txt", "new\n"), ["add", "-A"]]
+
 # A commit that introduces whitespace errors (trailing space, space-before-tab),
 # for `diff --check`.
 WSERR = BASE + [("write", "a.txt", "clean\ntrailing \n\tgood\n \tspacetab\n"),
@@ -1025,6 +1029,25 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # commit flag behaviors (output line + resulting commit verified via show).
+    ("commit-author", COMMITSTAGE, ["commit", "-m", "msg", "--author=Bob <bob@x>"]),
+    ("commit-author-show", COMMITSTAGE + [["commit", "-m", "msg", "--author=Bob <bob@x>"]],
+     ["show", "-s", "--format=%an <%ae> / %cn <%ce>"]),
+    ("commit-signoff", COMMITSTAGE + [["commit", "-s", "-m", "msg"]],
+     ["show", "-s", "--format=%B"]),
+    ("commit-trailer", COMMITSTAGE + [["commit", "-m", "msg", "--trailer", "Acked-by: A <a@b>"]],
+     ["show", "-s", "--format=%B"]),
+    # show --format terminator newline is unconditional (trailing blank for %B).
+    ("show-format-B-newline", COMMITSTAGE + [["commit", "-s", "-m", "msg"]],
+     ["show", "-s", "--format=%B"]),
+    ("commit-only", COMMITSTAGE + [["commit", "-o", "a.txt", "-m", "only"]],
+     ["status", "--short"]),
+    ("commit-only-tree", COMMITSTAGE + [["commit", "-o", "a.txt", "-m", "only"]],
+     ["ls-tree", "-r", "--name-only", "HEAD"]),
+    ("commit-include", COMMITSTAGE + [["commit", "-i", "n.txt", "-m", "inc"]],
+     ["status", "--short"]),
+    ("commit-amend-reset-author",
+     BASE + [["commit", "--amend", "--reset-author", "--no-edit"]], ["log", "-1"]),
     # log %N expands the commit note; checkout -q suppresses switch messages.
     ("log-fmt-note", BASE + [["notes", "add", "-m", "a note", "HEAD"]],
      ["log", "-1", "--format=[%N]"]),

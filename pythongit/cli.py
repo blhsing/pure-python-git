@@ -1621,19 +1621,103 @@ def _commit_status_report(repo: Repository) -> int:
     return 1
 
 
+def _partial_commit_tree(repo: Repository, parent: Optional[str], only_paths: list[str]) -> str:
+    """Build the tree for a partial commit: HEAD's tree with only ``only_paths``
+    updated from the index (added/modified/removed), the rest left as in HEAD."""
+    entries: dict[str, tuple[str, str]] = {}  # path -> (mode_str, sha)
+    if parent:
+        ptree = objs.parse_commit(objs.read_object(repo, parent)[1]).tree
+        for path, mode, sha in workdir.iter_tree_files(repo, ptree):
+            entries[path] = (mode, sha)
+    idx = read_index(repo).by_path()
+    wanted = set(only_paths)
+    for p in only_paths:
+        if p in idx:
+            entries[p] = (idx[p].mode_str(), idx[p].sha)
+        else:
+            entries.pop(p, None)  # path removed in this partial commit
+    # Build nested trees from the flat entry map.
+    root: dict = {}
+    for path, (mode, sha) in entries.items():
+        parts = path.split("/")
+        cur = root
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[parts[-1]] = (mode, sha)
+
+    def emit(node: dict) -> str:
+        te: list[objs.TreeEntry] = []
+        for name, val in node.items():
+            if isinstance(val, dict):
+                te.append(objs.TreeEntry("40000", name, emit(val)))
+            else:
+                mode, sha = val
+                te.append(objs.TreeEntry(mode.lstrip("0") or "0", name, sha))
+        return objs.write_object(repo, "tree", objs.encode_tree(te))
+
+    return emit(root)
+
+
+def _cleanup_commit_message(msg: str, mode: Optional[str]) -> str:
+    """Apply git's commit-message cleanup. 'verbatim' is a no-op; the default
+    for -m/-F ('whitespace') strips trailing whitespace per line and collapses
+    leading/trailing/consecutive blank lines."""
+    if mode == "verbatim":
+        return msg
+    lines = [ln.rstrip() for ln in msg.split("\n")]
+    out: list[str] = []
+    for ln in lines:
+        if ln == "" and (not out or out[-1] == ""):
+            continue
+        out.append(ln)
+    while out and out[-1] == "":
+        out.pop()
+    while out and out[0] == "":
+        out.pop(0)
+    return "\n".join(out)
+
+
+def _apply_trailers(msg: str, trailers: list[str]) -> str:
+    """Append a trailer block (Signed-off-by etc.) to a commit message, after a
+    blank line separating it from the body — matching git's simple case."""
+    if not trailers:
+        return msg
+    body = msg.rstrip("\n")
+    block = "\n".join(trailers)
+    return (body + "\n\n" + block) if body else block
+
+
 def cmd_commit(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit commit", add_help=False)
     ap.add_argument("-m", "--message", action="append", default=None)
+    ap.add_argument("-F", "--file", default=None)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--amend", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
+    ap.add_argument("-e", "--edit", action="store_true")
     ap.add_argument("--allow-empty", action="store_true")
+    ap.add_argument("--allow-empty-message", dest="allow_empty_message", action="store_true")
     ap.add_argument("--date", default=None)
+    ap.add_argument("--author", default=None)
+    ap.add_argument("-s", "--signoff", action="store_true", default=False)
+    ap.add_argument("--no-signoff", dest="signoff", action="store_false")
+    ap.add_argument("--trailer", action="append", default=None)
+    ap.add_argument("--reset-author", dest="reset_author", action="store_true")
+    ap.add_argument("--cleanup", default=None)
+    ap.add_argument("-o", "--only", action="store_true")
+    ap.add_argument("-i", "--include", action="store_true")
+    ap.add_argument("-n", "--no-verify", dest="no_verify", action="store_true")
+    ap.add_argument("--no-post-rewrite", dest="no_post_rewrite", action="store_true")
+    ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("pathspec", nargs="*")
     args = ap.parse_args(argv)
     # Multiple -m values are joined into paragraphs, like C Git.
     if args.message is not None:
         args.message = "\n\n".join(args.message)
+    elif args.file is not None:
+        args.message = (sys.stdin.read() if args.file == "-"
+                        else open(args.file, encoding="utf-8").read())
     repo = _repo()
     try:
         from . import rerere as _rr
@@ -1643,6 +1727,9 @@ def cmd_commit(argv: list[str]) -> int:
 
     if args.all:
         workdir.add_paths(repo, sorted(workdir.tracked_paths(repo)))
+    elif args.include and args.pathspec:
+        # -i/--include: stage the named paths, then commit the whole index.
+        workdir.add_paths(repo, args.pathspec)
 
     cur_idx = read_index(repo)
     if cur_idx.has_conflicts():
@@ -1652,8 +1739,15 @@ def cmd_commit(argv: list[str]) -> int:
         _err("hint: stage the resolved files with `pygit add` then commit again.")
         return 1
 
-    tree = workdir.write_tree(repo)
     head_sym, parent = refs_mod.read_head(repo)
+    # A pathspec (or -o/--only) makes a partial commit: HEAD's tree with just the
+    # named paths updated from the working tree, leaving the rest of the index out.
+    only_mode = not args.all and not args.include and args.pathspec
+    if only_mode:
+        workdir.add_paths(repo, args.pathspec)  # refresh the named index entries
+        tree = _partial_commit_tree(repo, parent, args.pathspec)
+    else:
+        tree = workdir.write_tree(repo)
 
     if args.amend:
         if parent is None:
@@ -1695,6 +1789,26 @@ def cmd_commit(argv: list[str]) -> int:
             return _commit_status_report(repo)
 
     committer_sig = objs.build_signature(repo, "committer")
+    # --author overrides the author identity (date stays from env/--date);
+    # --reset-author (with --amend) resets it to the current committer identity.
+    if args.author is not None:
+        base = objs.build_signature(repo, "author", date_override=args.date)
+        author_sig = args.author + base[base.rindex(">") + 1:]
+    elif args.amend and args.reset_author:
+        author_sig = objs.build_signature(repo, "author", date_override=args.date)
+    # Message cleanup (default 'whitespace' for -m/-F; 'verbatim' keeps as-is),
+    # then any --signoff / --trailer trailers.
+    message = _cleanup_commit_message(message, args.cleanup)
+    trailers: list[str] = []
+    if args.signoff:
+        cwho, _t, _z = _split_ident(committer_sig)
+        cn, ce = _parse_who(cwho)
+        trailers.append(f"Signed-off-by: {cn} <{ce}>")
+    trailers.extend(args.trailer or [])
+    message = _apply_trailers(message, trailers)
+    if (not message.strip()) and not args.allow_empty_message:
+        _err("Aborting commit due to empty commit message.")
+        return 1
     msg = message if message.endswith("\n") else message + "\n"
     c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
     sha = objs.write_object(repo, "commit", c.encode())
@@ -1708,8 +1822,17 @@ def cmd_commit(argv: list[str]) -> int:
         return 0
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else "detached HEAD"
     root = " (root-commit)" if not parents and not args.amend else ""
-    _print(f"[{branch}{root} {sha[:7]}] {msg.splitlines()[0]}")
-    if args.amend:
+    _print(f"[{branch}{root} {sha[:7]}] {msg.splitlines()[0].rstrip()}")
+    # git prints " Author:" when the author identity differs from the committer,
+    # and " Date:" when the author date differs from the committer date.
+    a_who, a_ts, _atz = _split_ident(author_sig)
+    c_who, c_ts, _ctz = _split_ident(committer_sig)
+    if a_who != c_who:
+        _print(f" Author: {a_who}")
+    # The author date is "interesting" (shown) when preserved on --amend or set
+    # via --date — not when freshly defaulted (normal commit / --reset-author).
+    date_interesting = (args.amend and not args.reset_author) or args.date is not None or a_ts != c_ts
+    if date_interesting:
         _print(f" Date: {_format_ident_date(author_sig)}")
     parent_tree = None
     if parents:
@@ -1808,7 +1931,8 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
     c_who, c_ts, c_tz = _split_ident(c.committer)
     an, ae = _parse_who(a_who)
     cn, ce = _parse_who(c_who)
-    subject = c.message.splitlines()[0] if c.message.strip() else ""
+    # The subject (%s) is the first line with trailing whitespace stripped.
+    subject = c.message.splitlines()[0].rstrip() if c.message.strip() else ""
     # %B is the raw message; %b is the body after the subject's blank line; %f
     # is the subject sanitized into a path-safe slug.
     import re as _re
@@ -2721,7 +2845,10 @@ def cmd_show(argv: list[str]) -> int:
         if fmt is not None:
             peeled = refs_mod.rev_parse(repo, the_rev + "^{commit}") or sha
             c = objs.parse_commit(objs.read_object(repo, peeled)[1])
-            _print(_expand_commit_format(repo, peeled, c, fmt, {}, date_mode=date_mode, abbrev=args.abbrev))
+            # The --format terminator newline is unconditional (so %B, which ends
+            # in a newline, yields a trailing blank line) — matching git.
+            sys.stdout.write(_expand_commit_format(repo, peeled, c, fmt, {},
+                                                   date_mode=date_mode, abbrev=args.abbrev) + "\n")
             if not args.no_patch and not args.stat:
                 ptree = None
                 if c.parents:
