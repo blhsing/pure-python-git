@@ -1571,7 +1571,7 @@ def cmd_commit(argv: list[str]) -> int:
     msg = message if message.endswith("\n") else message + "\n"
     c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
     sha = objs.write_object(repo, "commit", c.encode())
-    verb = "commit (initial)" if not parents else ("commit (amend)" if args.amend else "commit")
+    verb = "commit (amend)" if args.amend else ("commit (initial)" if not parents else "commit")
     reflog_msg = f"{verb}: {msg.splitlines()[0]}"
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha, message=reflog_msg)
@@ -1840,7 +1840,11 @@ def cmd_log(argv: list[str]) -> int:
         full_ref = rev if rev == "HEAD" else (refs_mod.dwim_full_name(repo, rev) or rev)
         entries = _reflog.read(repo, full_ref)
         reflog_meta = []
+        zero = repo.null_oid()
         for i, (_old, new, ident, msg) in enumerate(reversed(entries)):
+            # Deletion markers (zero new-oid) consume an @{N} slot but aren't shown.
+            if new == zero:
+                continue
             commit_list.append(new)
             # The reflog identity is "Name <email> <secs> <tz>"; the header keeps
             # only the "Name <email>" portion.
@@ -3039,7 +3043,16 @@ def cmd_branch(argv: list[str]) -> int:
                 new_log.parent.mkdir(parents=True, exist_ok=True)
                 old_log.replace(new_log)
             refs_mod.delete_ref(repo, f"refs/heads/{src}")
+            # git records the rename in the reflog: a no-op (old==new) entry on
+            # the renamed branch's own log, plus a delete/create pair on HEAD
+            # when the current branch is the one being renamed.
+            from . import reflog as _reflog
+            rename_msg = f"Branch: renamed refs/heads/{src} to refs/heads/{dst}"
+            zero = repo.null_oid()
+            _reflog.append(repo, f"refs/heads/{dst}", sha, sha, rename_msg)
             if cur == src:
+                _reflog.append(repo, "HEAD", sha, zero, rename_msg)
+                _reflog.append(repo, "HEAD", zero, sha, rename_msg)
                 refs_mod.set_head(repo, f"refs/heads/{dst}")
         return 0
 
@@ -3474,7 +3487,7 @@ def cmd_reset(argv: list[str]) -> int:
         return 128
     head_sym, _ = refs_mod.read_head(repo)
     if head_sym:
-        refs_mod.update_ref(repo, head_sym, sha)
+        refs_mod.update_ref(repo, head_sym, sha, message=f"reset: moving to {treeish}")
     else:
         refs_mod.set_head(repo, sha)
     if args.soft:
@@ -4194,10 +4207,17 @@ def cmd_reflog(argv: list[str]) -> int:
     # "main" to refs/heads/main (HEAD keeps its top-level log).
     full_ref = ref if ref == "HEAD" else (refs_mod.dwim_full_name(repo, ref) or ref)
     entries = reflog.read(repo, full_ref)
+    zero = repo.null_oid()
+    shown = 0
     for i, (old, new, ident, msg) in enumerate(reversed(entries)):
-        if args.max_count is not None and i >= args.max_count:
+        # git skips deletion markers (zero new-oid, e.g. a branch rename's
+        # delete half) in the display, but they still consume an @{N} slot.
+        if new == zero:
+            continue
+        if args.max_count is not None and shown >= args.max_count:
             break
         _print(f"{new[:7]} {ref}@{{{i}}}: {msg}")
+        shown += 1
     return 0
 
 

@@ -6,7 +6,6 @@ File format (per Documentation/gitformat-reflog):
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,9 +18,11 @@ def _reflog_path(repo: Repository, ref: str) -> Path:
 
 def append(repo: Repository, ref: str, old_sha: str, new_sha: str, message: str, *, ident: Optional[str] = None) -> None:
     if ident is None:
-        name, email = repo.user()
-        when = int(time.time())
-        ident = f"{name} <{email}> {when} +0000"
+        # The reflog entry is stamped with the committer identity, honoring
+        # GIT_COMMITTER_NAME/EMAIL/DATE and the local timezone, exactly like the
+        # signature on the commit the update points to.
+        from . import objects as _objs
+        ident = _objs.build_signature(repo, "committer")
     p = _reflog_path(repo, ref)
     p.parent.mkdir(parents=True, exist_ok=True)
     line = f"{old_sha} {new_sha} {ident}\t{message}\n"

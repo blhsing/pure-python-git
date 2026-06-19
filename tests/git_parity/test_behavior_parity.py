@@ -849,6 +849,28 @@ CASES: list[tuple] = [
      ["name-rev", "--tags", "--name-only", "HEAD~1"]),
     # notes show on an object with no note: stderr message + rc 1.
     ("notes-show-missing", BASE, ["notes", "show", "HEAD"]),
+    # Reflog messages match git across history-mutating operations.
+    ("reflog-reset",
+     BASE + [("write", "a.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ["reset", "--hard", "HEAD~1"]],
+     ["reflog"]),
+    ("reflog-amend", BASE + [["commit", "--amend", "-m", "amended"]], ["reflog"]),
+    ("reflog-cherry-pick",
+     BASE + [["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"],
+             ["commit", "-m", "gc"], ["checkout", "main"], ["cherry-pick", "feat"]],
+     ["reflog"]),
+    ("reflog-revert",
+     BASE + [("write", "a.txt", "x\n"), ["add", "-A"], ["commit", "-m", "c2"],
+             ["revert", "--no-edit", "HEAD"]],
+     ["reflog"]),
+    # branch -m of the current branch writes a HEAD delete/create pair (the
+    # zero-oid delete half is hidden but still consumes an @{N} slot) plus a
+    # no-op entry on the renamed branch's own log.
+    ("reflog-branch-move", BASE + [["branch", "-m", "main", "trunk"]], ["reflog"]),
+    ("reflog-branch-move-branch", BASE + [["branch", "-m", "main", "trunk"]],
+     ["reflog", "show", "trunk"]),
+    ("log-g-after-rename", BASE + [["branch", "-m", "main", "trunk"]],
+     ["log", "-g", "--oneline"]),
 ]
 
 

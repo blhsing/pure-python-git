@@ -113,7 +113,8 @@ def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[
     msg = target.message
     sha = _make_commit(repo, new_tree, [head_sha], msg, author=target.author)
     if head_sym:
-        refs_mod.update_ref(repo, head_sym, sha, message="cherry-pick")
+        refs_mod.update_ref(repo, head_sym, sha,
+                            message=f"cherry-pick: {msg.splitlines()[0]}")
     else:
         refs_mod.set_head(repo, sha)
     return sha, []
@@ -149,7 +150,8 @@ def revert(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]
     msg = f'Revert "{target.message.splitlines()[0]}"\n\nThis reverts commit {target_sha}.\n'
     sha = _make_commit(repo, new_tree, [head_sha], msg)
     if head_sym:
-        refs_mod.update_ref(repo, head_sym, sha, message="revert")
+        refs_mod.update_ref(repo, head_sym, sha,
+                            message=f"revert: {msg.splitlines()[0]}")
     else:
         refs_mod.set_head(repo, sha)
     return sha, []
