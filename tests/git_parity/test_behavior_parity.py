@@ -95,6 +95,14 @@ DIRTY = [
     ("write", "untracked.txt", "hi\n"),
 ]
 
+# A stash created from a modified tracked file plus a separately-staged new
+# file, for stash commit/show/selector parity.
+STASH = BASE + [("write", "a.txt", "alpha\nmod\n"), ("write", "n.txt", "new\n"),
+                ["add", "n.txt"], ["stash", "push", "-m", "wip"]]
+# Two stacked stashes, for stash@{N} selector ordering.
+MULTISTASH = BASE + [("write", "a.txt", "alpha\nx\n"), ["stash", "push", "-m", "first"],
+                     ("write", "a.txt", "alpha\ny\n"), ["stash", "push", "-m", "second"]]
+
 REMOTE = BASE + [
     ["remote", "add", "origin", "https://example.com/r.git"],
     ["config", "--add", "foo.bar", "one"],
@@ -884,6 +892,16 @@ CASES: list[tuple] = [
     ("log-g-fmt-gd-date", MERGED, ["log", "-g", "--format=%gd", "--date=iso", "-1"]),
     # %gd/%gD are empty outside a reflog walk.
     ("log-fmt-gd-empty", BASE, ["log", "-1", "--format=[%gd][%gD][%gs]"]),
+    # stash: commit is byte-identical (so rev-parse matches), plus show/selectors.
+    ("stash-list", STASH, ["stash", "list"]),
+    ("stash-show", STASH, ["stash", "show"]),
+    ("stash-show-p", STASH, ["stash", "show", "-p"]),
+    ("stash-revparse", STASH, ["rev-parse", "stash@{0}"]),
+    ("stash-revparse-index", STASH, ["rev-parse", "stash@{0}^2"]),
+    ("stash-reflog", STASH, ["reflog", "stash"]),
+    ("stash-log-g", STASH, ["log", "-g", "stash", "--oneline"]),
+    ("stash-list-2", MULTISTASH, ["stash", "list"]),
+    ("stash-show-1", MULTISTASH, ["stash", "show", "stash@{1}"]),
 ]
 
 

@@ -4267,6 +4267,10 @@ def cmd_stash(argv: list[str]) -> int:
     p_apply.add_argument("index", nargs="?", type=int, default=0)
     p_pop = sub.add_parser("pop")
     p_pop.add_argument("index", nargs="?", type=int, default=0)
+    p_show = sub.add_parser("show")
+    p_show.add_argument("-p", "--patch", action="store_true")
+    p_show.add_argument("-U", "--unified", type=int, default=3)
+    p_show.add_argument("stash", nargs="?", default="stash@{0}")
     args = ap.parse_args(argv or ["push"])
     repo = _repo()
     from . import stash
@@ -4288,6 +4292,20 @@ def cmd_stash(argv: list[str]) -> int:
     elif action == "pop":
         ok = stash.apply(repo, args.index, pop=True)
         return 0 if ok else 1
+    elif action == "show":
+        ref = getattr(args, "stash", None) or "stash@{0}"
+        sha = refs_mod.rev_parse(repo, ref)
+        if not sha:
+            _err(f"fatal: ambiguous argument '{ref}': unknown revision or path not in the working tree.")
+            _err("Use '--' to separate paths from revisions, like this:")
+            _err("'git <command> [<revision>...] -- [<file>...]'")
+            return 128
+        c = objs.parse_commit(objs.read_object(repo, sha)[1])
+        base_tree = _commit_tree(repo, c.parents[0]) if c.parents else None
+        if args.patch:
+            _emit_tree_patch(repo, base_tree, c.tree, args.unified)
+        else:
+            _diff_stat(_tree_changes(repo, base_tree, c.tree))
     return 0
 
 

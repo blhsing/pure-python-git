@@ -390,6 +390,24 @@ def rev_parse(repo: Repository, name: str) -> Optional[str]:
     name = name.strip()
     if not name:
         return None
+    # <ref>@{<n>}: the n-th prior value of <ref> from its reflog (0 = current).
+    # A bare @{<n>} refers to HEAD. The index counts reflog positions directly,
+    # so it stays consistent with `reflog`/`log -g` selector numbering. Any
+    # trailing ^/~ suffix operators are applied to the resolved commit.
+    at_match = _re.match(r"^(.*?)@\{(\d+)\}(.*)$", name)
+    if at_match and not name.startswith("^{"):
+        refname = at_match.group(1) or "HEAD"
+        n = int(at_match.group(2))
+        rest = at_match.group(3)
+        from . import reflog as _reflog
+        full = refname if refname == "HEAD" else (dwim_full_name(repo, refname) or refname)
+        entries = _reflog.read(repo, full)
+        if n >= len(entries):
+            return None
+        base_sha = entries[-(n + 1)][1]
+        if rest:
+            return _resolve_revision(repo, base_sha + rest)
+        return base_sha
     if ":" in name and not name.startswith("^{"):
         left, _, path = name.partition(":")
         if path.startswith("/"):
