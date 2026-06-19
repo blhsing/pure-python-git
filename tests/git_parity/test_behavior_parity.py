@@ -1025,6 +1025,20 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # log/show pretty column alignment %<()/%>()/%><() and truncation.
+    ("log-col-left", BODY, ["log", "-1", "--pretty=format:[%<(12)%s]"]),
+    ("log-col-right", BODY, ["log", "-1", "--pretty=format:[%>(12)%s]"]),
+    ("log-col-center", BODY, ["log", "-1", "--pretty=format:[%><(12)%s]"]),
+    ("log-col-trunc", BODY, ["log", "-1", "--pretty=format:[%<(6,trunc)%s]"]),
+    ("log-col-mtrunc", BODY, ["log", "-1", "--pretty=format:[%<(6,mtrunc)%s]"]),
+    ("log-col-literal", BODY, ["log", "-1", "--pretty=format:[%<(10)X%s]"]),
+    ("log-col-multi", BODY, ["log", "-1", "--pretty=format:%<(20)%an %ae"]),
+    # cat-file --textconv / --filters stream blob content (identity, no driver).
+    ("cat-file-textconv", BASE, ["cat-file", "--textconv", "HEAD:a.txt"]),
+    ("cat-file-filters", BASE, ["cat-file", "--filters", "HEAD:a.txt"]),
+    # ls-tree --object-only prints only object ids.
+    ("ls-tree-object-only", SUBTREE, ["ls-tree", "--object-only", "HEAD"]),
+    ("ls-tree-object-only-r", SUBTREE, ["ls-tree", "--object-only", "-r", "HEAD"]),
     # rev-parse --symbolic prints ref names (full for --all, short otherwise).
     ("revparse-symbolic-all", REFSET, ["rev-parse", "--symbolic", "--all"]),
     ("revparse-symbolic-branches", REFSET, ["rev-parse", "--symbolic", "--branches"]),

@@ -384,7 +384,10 @@ def cmd_cat_file(argv: list[str]) -> int:
     g.add_argument("--batch", dest="batch", action="store_true")
     g.add_argument("--batch-check", dest="batch_check", action="store_true")
     g.add_argument("--batch-command", dest="batch_command", action="store_true")
+    g.add_argument("--textconv", action="store_true")
+    g.add_argument("--filters", action="store_true")
     ap.add_argument("--batch-all-objects", dest="batch_all", action="store_true")
+    ap.add_argument("--path", default=None)
     ap.add_argument("pos", nargs="*")
     # `--batch[-check]=<format>` takes the format attached with '='; pull it out
     # so the store_true flags still parse, then thread it into the formatter.
@@ -406,6 +409,19 @@ def cmd_cat_file(argv: list[str]) -> int:
     if args.batch or args.batch_check:
         names = _all_object_shas(repo) if args.batch_all else None
         return _cat_file_batch(repo, check_only=args.batch_check, names=names, fmt=batch_fmt)
+
+    # --textconv / --filters: with no configured drivers these are the identity
+    # transform, so just stream the blob content (resolving <rev>:<path>).
+    if args.textconv or args.filters:
+        obj = args.pos[0] if args.pos else None
+        if obj is None and args.path:
+            obj = args.path
+        sha = refs_mod.rev_parse(repo, obj) if obj else None
+        if sha is None or not objs.object_exists(repo, sha):
+            _err(f"fatal: Not a valid object name {obj}")
+            return 128
+        sys.stdout.buffer.write(objs.read_object(repo, sha)[1])
+        return 0
 
     # The `cat-file <type> <object>` form prints the raw object content.
     has_flag = args.show_type or args.show_size or args.pretty or args.exists
@@ -460,6 +476,7 @@ def cmd_ls_tree(argv: list[str]) -> int:
     ap.add_argument("-t", dest="show_trees", action="store_true")
     ap.add_argument("-l", "--long", dest="long", action="store_true")
     ap.add_argument("--name-only", "--name-status", dest="name_only", action="store_true")
+    ap.add_argument("--object-only", dest="object_only", action="store_true")
     ap.add_argument("--full-tree", action="store_true")
     ap.add_argument("--full-name", action="store_true")
     ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
@@ -485,7 +502,9 @@ def cmd_ls_tree(argv: list[str]) -> int:
     def emit(e, path):
         obj_t = "tree" if e.is_dir() else "blob"
         sha = e.sha[:args.abbrev] if args.abbrev is not None else e.sha
-        if args.name_only:
+        if args.object_only:
+            sys.stdout.write(sha + eol)
+        elif args.name_only:
             sys.stdout.write(path + eol)
         elif args.long:
             if e.is_dir():
@@ -1722,6 +1741,34 @@ def _parse_who(who: str) -> tuple[str, str]:
     return who, ""
 
 
+def _pad_column(text: str, spec) -> str:
+    """Apply a git pretty-format column spec (align, width, trunc) to text.
+    Text wider than width is left untouched unless a truncation mode is set
+    (trunc=right with '..', ltrunc=left, mtrunc=middle)."""
+    align, width, trunc = spec
+    n = len(text)
+    if n > width:
+        if not trunc:
+            return text
+        if width <= 2:
+            return text[:width]
+        if trunc == "ltrunc":
+            return ".." + text[n - (width - 2):]
+        if trunc == "mtrunc":
+            keep = width - 2
+            start = keep // 2
+            end = keep - start
+            return text[:start] + ".." + (text[n - end:] if end else "")
+        return text[:width - 2] + ".."
+    pad = width - n
+    if align == "right":
+        return " " * pad + text
+    if align == "center":
+        left = pad // 2
+        return " " * left + text + " " * (pad - left)
+    return text + " " * pad
+
+
 def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict,
                           date_mode: str = "default", abbrev: int = 7,
                           reflog=None, date_given: bool = False) -> str:
@@ -1778,11 +1825,65 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
                             ("%gn", gn), ("%ge", ge)]
     else:
         replacements[:0] = [("%gD", ""), ("%gd", ""), ("%gs", ""), ("%gn", ""), ("%ge", "")]
-    # %xHH expands to the literal byte (e.g. %x09 -> tab) before field tokens.
-    out = _re.sub(r"%x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), fmt)
-    for token, value in replacements:
-        out = out.replace(token, value)
-    return out
+    def expand_seg(s: str) -> str:
+        # %xHH expands to the literal byte (e.g. %x09 -> tab) before field tokens.
+        s = _re.sub(r"%x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+        for token, value in replacements:
+            s = s.replace(token, value)
+        return s
+
+    # Column padding/truncation: %<(N[,trunc]) left-align, %>(N) right-align,
+    # %><(N) center. The spec pads the text from the marker through the next
+    # single placeholder, then is flushed (git pads nothing if no placeholder
+    # follows before the format ends).
+    col_re = _re.compile(r"%(<\(|>\(|><\(|>>\()(\d+)(?:,(trunc|ltrunc|mtrunc))?\)")
+
+    tok_sorted = sorted({t for t, _ in replacements}, key=len, reverse=True)
+
+    def _first_ph(s: str, start: int):
+        # Return (placeholder_start, placeholder_end) of the next %-placeholder,
+        # matching the longest known token (so %an/%ad/%G? aren't split).
+        j = s.find("%", start)
+        if j < 0:
+            return None
+        if s[j:j + 2] == "%(":
+            k = s.find(")", j)
+            return (j, k + 1 if k >= 0 else len(s))
+        if s[j:j + 2] == "%x":
+            return (j, j + 4)
+        for tok in tok_sorted:
+            if s.startswith(tok, j):
+                return (j, j + len(tok))
+        return (j, j + 2)
+
+    if col_re.search(fmt):
+        out_parts: list[str] = []
+        i = 0
+        while i < len(fmt):
+            m = col_re.match(fmt, i)
+            if m:
+                kind = m.group(1)
+                align = {"<(": "left", ">(": "right", "><(": "center", ">>(": "right"}[kind]
+                spec = (align, int(m.group(2)), m.group(3))
+                i = m.end()
+                ph = _first_ph(fmt, i)
+                if ph is None:
+                    out_parts.append(expand_seg(fmt[i:]))
+                    break
+                ph_start, ph_end = ph
+                # Literals between the marker and the placeholder are emitted
+                # unpadded; only the placeholder's output is padded to width.
+                if ph_start > i:
+                    out_parts.append(expand_seg(fmt[i:ph_start]))
+                out_parts.append(_pad_column(expand_seg(fmt[ph_start:ph_end]), spec))
+                i = ph_end
+            else:
+                nm = col_re.search(fmt, i)
+                end = nm.start() if nm else len(fmt)
+                out_parts.append(expand_seg(fmt[i:end]))
+                i = end
+        return "".join(out_parts)
+    return expand_seg(fmt)
 
 
 def cmd_log(argv: list[str]) -> int:
