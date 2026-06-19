@@ -316,7 +316,17 @@ def _all_object_shas(repo: Repository) -> list[str]:
     return sorted(shas)
 
 
-def _cat_file_batch(repo: Repository, check_only: bool, names=None) -> int:
+def _expand_batch_atoms(fmt: str, sha: str, t: str, size: int) -> str:
+    """Expand the `cat-file --batch[-check]=<format>` %(atom) placeholders."""
+    return (fmt.replace("%(objectname)", sha)
+               .replace("%(objecttype)", t)
+               .replace("%(objectsize:disk)", str(size))
+               .replace("%(objectsize)", str(size)))
+
+
+def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None) -> int:
+    if fmt is None:
+        fmt = "%(objectname) %(objecttype) %(objectsize)"
     source = names if names is not None else (line.strip() for line in sys.stdin)
     for name in source:
         if not name:
@@ -326,10 +336,9 @@ def _cat_file_batch(repo: Repository, check_only: bool, names=None) -> int:
             sys.stdout.write(f"{name} missing\n")
             continue
         t, data = objs.read_object(repo, sha)
-        if check_only:
-            sys.stdout.write(f"{sha} {t} {len(data)}\n")
-        else:
-            sys.stdout.write(f"{sha} {t} {len(data)}\n")
+        info = _expand_batch_atoms(fmt, sha, t, len(data))
+        sys.stdout.write(info + "\n")
+        if not check_only:
             sys.stdout.flush()
             sys.stdout.buffer.write(data)
             sys.stdout.buffer.write(b"\n")
@@ -377,13 +386,26 @@ def cmd_cat_file(argv: list[str]) -> int:
     g.add_argument("--batch-command", dest="batch_command", action="store_true")
     ap.add_argument("--batch-all-objects", dest="batch_all", action="store_true")
     ap.add_argument("pos", nargs="*")
-    args = ap.parse_args(argv)
+    # `--batch[-check]=<format>` takes the format attached with '='; pull it out
+    # so the store_true flags still parse, then thread it into the formatter.
+    batch_fmt = None
+    pre_argv = []
+    for a in argv:
+        if a.startswith("--batch-check="):
+            batch_fmt = a.split("=", 1)[1]
+            pre_argv.append("--batch-check")
+        elif a.startswith("--batch="):
+            batch_fmt = a.split("=", 1)[1]
+            pre_argv.append("--batch")
+        else:
+            pre_argv.append(a)
+    args = ap.parse_args(pre_argv)
     repo = _repo()
     if args.batch_command:
         return _cat_file_batch_command(repo)
     if args.batch or args.batch_check:
         names = _all_object_shas(repo) if args.batch_all else None
-        return _cat_file_batch(repo, check_only=args.batch_check, names=names)
+        return _cat_file_batch(repo, check_only=args.batch_check, names=names, fmt=batch_fmt)
 
     # The `cat-file <type> <object>` form prints the raw object content.
     has_flag = args.show_type or args.show_size or args.pretty or args.exists
@@ -906,6 +928,7 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--objects", action="store_true")
     ap.add_argument("--parents", action="store_true")
     ap.add_argument("--no-walk", action="store_true")
+    ap.add_argument("--children", action="store_true")
     ap.add_argument("--first-parent", action="store_true")
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--format", default=None)
@@ -931,6 +954,9 @@ def cmd_rev_list(argv: list[str]) -> int:
         rl_paths = pre[i + 1:]
         pre = pre[:i]
     args = ap.parse_args(pre)
+    if args.parents and args.children:
+        _err("fatal: options '--parents' and '--children' cannot be used together")
+        return 128
     repo = _repo()
     rev_args = args.revs
     starts = []
@@ -1097,16 +1123,28 @@ def cmd_rev_list(argv: list[str]) -> int:
     else:
         if args.reverse:
             out = list(reversed(out))
+        # --children: map each commit to the in-set commits that name it parent.
+        children_map: dict[str, list[str]] = {}
+        if args.children:
+            for s in out:
+                info = _commit_tree_parents(repo, s, graph)
+                if info:
+                    for p in info[1]:
+                        children_map.setdefault(p, []).append(s)
         for s in out:
             mark = ""
             if args.left_right:
                 mark = "<" if s in lr_left else (">" if s in lr_right else "")
+            extra = ""
             if args.parents:
                 info = _commit_tree_parents(repo, s, graph)
-                parents = " ".join(info[1]) if info else ""
-                _print(f"{mark}{s} {parents}".rstrip())
-            else:
-                _print(f"{mark}{s}")
+                if info and info[1]:
+                    extra += " " + " ".join(info[1])
+            if args.children:
+                kids = children_map.get(s, [])
+                if kids:
+                    extra += " " + " ".join(kids)
+            _print(f"{mark}{s}{extra}")
     return 0
 
 
@@ -2003,6 +2041,38 @@ def cmd_log(argv: list[str]) -> int:
     multiline = style in ("medium", "full", "fuller", "short", "raw")
     last_index = len(commit_list) - 1
 
+    def emit_commit_diff(s, c, lead_blank):
+        # The stat/patch/raw/name listing that --stat/-p/--raw/--name-* append
+        # to each commit. A merge has no default (non-combined) diff, so git
+        # emits nothing (not even the leading blank line).
+        if not (args.stat or args.shortstat or args.patch or args.name_only
+                or args.name_status or args.raw):
+            return
+        if len(c.parents) > 1:
+            return
+        parent_tree = None
+        if c.parents:
+            _, pd = objs.read_object(repo, c.parents[0])
+            parent_tree = objs.parse_commit(pd).tree
+        tchanges = _tree_changes(repo, parent_tree, c.tree)
+        if lead_blank:
+            _print("")
+        if args.stat:
+            _diff_stat(tchanges)
+        elif args.shortstat:
+            _diff_shortstat(tchanges)
+        elif args.name_only:
+            for path, _a, _b in tchanges:
+                _print(path)
+        elif args.name_status:
+            for path, a, b in tchanges:
+                st = "A" if not a.present else ("D" if not b.present else "M")
+                _print(f"{st}\t{path}")
+        elif args.raw:
+            _emit_raw_diff(repo, parent_tree, c.tree)
+        else:
+            _emit_tree_patch(repo, parent_tree, c.tree, args.unified)
+
     def render(count, s, c, meta=None):
         if style == "format":
             expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev,
@@ -2026,6 +2096,7 @@ def cmd_log(argv: list[str]) -> int:
             if args.parents:
                 pre += "".join(" " + (p[:7] if short else p) for p in c.parents)
             _print(f"{pre}{deco} {first}")
+            emit_commit_diff(s, c, lead_blank=False)
         elif style == "reference":
             first = c.message.splitlines()[0] if c.message.strip() else ""
             _print(f"{s[:7]} ({first}, {_format_date(c.author, 'short')})")
@@ -2064,32 +2135,7 @@ def cmd_log(argv: list[str]) -> int:
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
-            # A merge commit has no default (non-combined) diff, so git emits
-            # neither a diff nor the blank line that would precede one.
-            is_merge = len(c.parents) > 1
-            if (args.stat or args.shortstat or args.patch or args.name_only
-                    or args.name_status or args.raw) and not is_merge:
-                parent_tree = None
-                if c.parents:
-                    _, pd = objs.read_object(repo, c.parents[0])
-                    parent_tree = objs.parse_commit(pd).tree
-                tchanges = _tree_changes(repo, parent_tree, c.tree)
-                _print("")
-                if args.stat:
-                    _diff_stat(tchanges)
-                elif args.shortstat:
-                    _diff_shortstat(tchanges)
-                elif args.name_only:
-                    for path, _a, _b in tchanges:
-                        _print(path)
-                elif args.name_status:
-                    for path, a, b in tchanges:
-                        st = "A" if not a.present else ("D" if not b.present else "M")
-                        _print(f"{st}\t{path}")
-                elif args.raw:
-                    _emit_raw_diff(repo, parent_tree, c.tree)
-                else:
-                    _emit_tree_patch(repo, parent_tree, c.tree, args.unified)
+            emit_commit_diff(s, c, lead_blank=True)
 
     for count, s in enumerate(commit_list):
         c = objs.parse_commit(objs.read_object(repo, s)[1])
@@ -8047,6 +8093,7 @@ def cmd_diff_tree(argv: list[str]) -> int:
     ap.add_argument("-r", action="store_true", help="recurse")
     ap.add_argument("-p", "--patch", action="store_true")
     ap.add_argument("--root", action="store_true")
+    ap.add_argument("--no-commit-id", dest="no_commit_id", action="store_true")
     ap.add_argument("--name-only", action="store_true")
     ap.add_argument("--name-status", action="store_true")
     ap.add_argument("rev1")
@@ -8080,7 +8127,8 @@ def cmd_diff_tree(argv: list[str]) -> int:
         b_tree = c.tree
         a_tree = (objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
                   if c.parents else None)
-        _print(s)
+        if not args.no_commit_id:
+            _print(s)
     else:
         a_tree = _resolve_to_tree(args.rev1)
         b_tree = _resolve_to_tree(args.rev2)

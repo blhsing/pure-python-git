@@ -937,6 +937,17 @@ CASES: list[tuple] = [
     ("show-branch-reflog", TAGGED, ["show-branch", "--reflog"]),
     ("show-branch-reflog-n", TAGGED, ["show-branch", "--reflog=2"]),
     ("show-branch-reflog-ref", TAGGED, ["show-branch", "--reflog", "main"]),
+    # log --oneline with diff output (stat/patch/shortstat/name-only).
+    ("log-oneline-stat", SUBTREE, ["log", "--oneline", "--stat"]),
+    ("log-oneline-patch", SUBTREE, ["log", "--oneline", "-p"]),
+    ("log-oneline-shortstat", SUBTREE, ["log", "--oneline", "--shortstat"]),
+    ("log-oneline-nameonly", SUBTREE, ["log", "--oneline", "--name-only"]),
+    # diff-tree --no-commit-id suppresses the leading object id line.
+    ("diff-tree-no-commit-id", SUBTREE, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]),
+    ("diff-tree-no-commit-id-raw", SUBTREE, ["diff-tree", "--no-commit-id", "-r", "HEAD"]),
+    # rev-list --children lists in-set children after each commit.
+    ("rev-list-children", PATHHIST, ["rev-list", "--children", "HEAD"]),
+    ("rev-list-children-parents-err", PATHHIST, ["rev-list", "--children", "--parents", "HEAD"]),
     # git merge -q suppresses the summary; ensure the flag is accepted and silent.
     ("merge-quiet",
      BASE + [["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"],
@@ -948,6 +959,8 @@ CASES: list[tuple] = [
 
 CASES_WITH_STDIN: list[tuple] = [
     ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
+    ("cat-file-batch-check-fmt", BASE,
+     ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], "HEAD\nHEAD:a.txt\n"),
     ("cat-file-batch", BASE, ["cat-file", "--batch-check"], "HEAD\nmissingobj\n"),
     ("cat-file-batch-content", BASE, ["cat-file", "--batch"], "HEAD:a.txt\n"),
     ("patch-id", BASE, ["patch-id"],
