@@ -1938,6 +1938,9 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--first-parent", dest="first_parent", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--branches", nargs="?", const="*", default=None)
+    ap.add_argument("--tags", nargs="?", const="*", default=None)
+    ap.add_argument("--remotes", nargs="?", const="*", default=None)
     ap.add_argument("--no-walk", dest="no_walk", nargs="?", const="sorted", default=None)
     ap.add_argument("--graph", action="store_true")
     ap.add_argument("--topo-order", dest="topo_order", action="store_true")
@@ -2106,11 +2109,13 @@ def cmd_log(argv: list[str]) -> int:
                 commit_list.append(rsha)
         if args.no_walk != "unsorted":
             commit_list.sort(key=lambda s: -_commit_date(repo, s))
-    elif args.all:
-        # `--all` walks every ref. Match git's reverse-chronological order: a
-        # stable max-heap keyed on committer date, with ties broken by insertion
-        # order. Tips are seeded in ascending refname order, then HEAD.
+    elif args.all or args.branches is not None or args.tags is not None or args.remotes is not None:
+        # `--all`/`--branches`/`--tags`/`--remotes` walk the selected ref
+        # namespaces. Match git's reverse-chronological order: a stable max-heap
+        # keyed on committer date, ties broken by seed order (ascending refname,
+        # then HEAD for --all).
         import heapq
+        import fnmatch
         heap: list[tuple[int, int, str]] = []
         pushed: set[str] = set()
         counter = 0
@@ -2123,14 +2128,26 @@ def cmd_log(argv: list[str]) -> int:
             heapq.heappush(heap, (-_commit_date(repo, csha), counter, csha))
             counter += 1
 
+        wanted_ns = []
+        if args.all or args.branches is not None:
+            wanted_ns.append(("refs/heads/", args.branches if args.branches not in (None, "*") else None))
+        if args.all or args.tags is not None:
+            wanted_ns.append(("refs/tags/", args.tags if args.tags not in (None, "*") else None))
+        if args.all or args.remotes is not None:
+            wanted_ns.append(("refs/remotes/", args.remotes if args.remotes not in (None, "*") else None))
         for refname, _rsha in _enumerate_refs(repo):
-            if refname.startswith(("refs/heads/", "refs/tags/", "refs/remotes/")):
-                csha = refs_mod.rev_parse(repo, refname + "^{commit}")
-                if csha:
-                    _push(csha)
-        _, head_sha = refs_mod.read_head(repo)
-        if head_sha:
-            _push(head_sha)
+            for pre, pat in wanted_ns:
+                if refname.startswith(pre):
+                    if pat and not fnmatch.fnmatch(refname[len(pre):], pat):
+                        continue
+                    csha = refs_mod.rev_parse(repo, refname + "^{commit}")
+                    if csha:
+                        _push(csha)
+                    break
+        if args.all:
+            _, head_sha = refs_mod.read_head(repo)
+            if head_sha:
+                _push(head_sha)
         while heap:
             _d, _c, s = heapq.heappop(heap)
             if s in seen or s in exclude:
@@ -4256,8 +4273,7 @@ def cmd_fsck(argv: list[str]) -> int:
 
 
 def cmd_gc(argv: list[str]) -> int:
-    # Phase 1: no-op (no repack); just prune unreferenced refs and report.
-    _print("gc: no-op (phase 1)")
+    # No-op housekeeping; like a clean `git gc` it prints nothing on success.
     return 0
 
 
@@ -5836,11 +5852,19 @@ def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], arc
 def cmd_archive(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit archive", add_help=False)
     ap.add_argument("--format", default="tar", choices=["tar", "zip"])
+    ap.add_argument("-l", "--list", dest="list_formats", action="store_true")
     ap.add_argument("-o", "--output", default=None)
     ap.add_argument("--prefix", default="")
-    ap.add_argument("rev")
+    ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
+    if args.list_formats:
+        for f in ("tar", "tgz", "tar.gz", "zip"):
+            _print(f)
+        return 0
     repo = _repo()
+    if not args.rev:
+        _err("fatal: You must specify a tree-ish.")
+        return 128
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
         return 128

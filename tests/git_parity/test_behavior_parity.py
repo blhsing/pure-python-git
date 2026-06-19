@@ -1025,6 +1025,13 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # log --branches/--tags/--remotes walk selected ref namespaces.
+    ("log-branches", MERGED, ["log", "--format=%H", "--branches"]),
+    ("log-tags", DESC, ["log", "--format=%H", "--tags"]),
+    ("log-branches-glob", REFSET, ["log", "--oneline", "--branches=a*"]),
+    # archive --list and gc (silent on success).
+    ("archive-list", BASE, ["archive", "--list"]),
+    ("gc-silent", BASE, ["gc"]),
     # count-objects -H human-readable size; %m mark; %(decorate) atom.
     ("count-objects-H", TAGGED, ["count-objects", "-H"]),
     ("log-fmt-m", BASE, ["log", "-1", "--format=[%m]"]),
