@@ -1025,6 +1025,17 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # rev-parse --symbolic prints ref names (full for --all, short otherwise).
+    ("revparse-symbolic-all", REFSET, ["rev-parse", "--symbolic", "--all"]),
+    ("revparse-symbolic-branches", REFSET, ["rev-parse", "--symbolic", "--branches"]),
+    ("revparse-symbolic-tags", REFSET, ["rev-parse", "--symbolic", "--tags"]),
+    # for-each-ref refname:lstrip/rstrip and %(if)/%(then)/%(else)/%(end).
+    ("fer-lstrip", REFSET, ["for-each-ref", "--format=%(refname:lstrip=2)"]),
+    ("fer-rstrip", REFSET, ["for-each-ref", "--format=%(refname:rstrip=1)"]),
+    ("fer-if-head", REFSET,
+     ["for-each-ref", "--format=%(if)%(HEAD)%(then)* %(else)  %(end)%(refname:short)"]),
+    ("fer-if-equals", REFSET,
+     ["for-each-ref", "--format=%(if:equals=main)%(refname:short)%(then)CUR%(else)-%(end)"]),
     # blame porcelain formats.
     ("blame-porcelain", PATHHIST, ["blame", "-p", "a.txt"]),
     ("blame-line-porcelain", PATHHIST, ["blame", "--line-porcelain", "a.txt"]),

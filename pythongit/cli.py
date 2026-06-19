@@ -683,6 +683,7 @@ def cmd_rev_parse(argv: list[str]) -> int:
 
     abbrev = 0            # 0 = full hex; >0 = abbreviate to N chars
     symbolic: Optional[str] = None   # None | "full" | "abbrev"
+    sym_refs = False      # --symbolic: print ref names for --all/--branches/...
     verify = False
     quiet = False
     no_revs = False
@@ -784,7 +785,12 @@ def cmd_rev_parse(argv: list[str]) -> int:
             }[arg]
             for refname, refsha in _enumerate_refs(R()):
                 if refname.startswith(prefix):
-                    _print(refsha)
+                    if not sym_refs:
+                        _print(refsha)
+                    elif arg == "--all":
+                        _print(refname)   # --symbolic --all keeps full ref names
+                    else:
+                        _print(refname[len(prefix):])  # short name for the namespace
             continue
         if arg == "--verify":
             verify = True
@@ -807,7 +813,11 @@ def cmd_rev_parse(argv: list[str]) -> int:
         if arg == "--revs-only":
             revs_only = True
             continue
-        if arg in ("--flags", "--no-flags", "--symbolic", "--local-env-vars"):
+        if arg == "--symbolic":
+            # Make subsequent --all/--branches/--tags/--remotes print ref names.
+            sym_refs = True
+            continue
+        if arg in ("--flags", "--no-flags", "--local-env-vars"):
             # Output filters; with no further args they produce nothing.
             continue
         if arg == "--shared-index-path":
@@ -5456,6 +5466,12 @@ def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Option
             return ref
         if name == "refname:short":
             return refs_mod.shorten_ref(ref)
+        if name.startswith("refname:lstrip=") or name.startswith("refname:rstrip="):
+            n = int(name.split("=", 1)[1])
+            parts = ref.split("/")
+            if name.startswith("refname:lstrip="):
+                return "/".join(parts[n:] if n >= 0 else parts[len(parts) + n:])
+            return "/".join(parts[:-n] if n > 0 else parts[:len(parts) + n] if n < 0 else parts)
         if name == "objectname":
             return sha
         if name == "objectname:short":
@@ -5489,7 +5505,33 @@ def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Option
                 return ident_part(role, name[len(role):] or "")
         return ""
 
-    return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), fmt)
+    def subst(s: str) -> str:
+        return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), s)
+
+    # Resolve %(if)...%(then)...[%(else)...]%(end) conditionals innermost-first,
+    # before the plain atom substitution.
+    while True:
+        end = fmt.find("%(end)")
+        if end < 0:
+            break
+        start = fmt.rfind("%(if", 0, end)
+        if start < 0:
+            break
+        seg = fmt[start:end + len("%(end)")]
+        m = re.match(r"%\(if(:[^)]*)?\)(.*?)%\(then\)(.*?)(?:%\(else\)(.*))?%\(end\)$", seg, re.S)
+        if not m:
+            break
+        cond_spec, cond, then_s, else_s = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        cond_val = subst(cond)
+        if cond_spec and cond_spec.startswith(":equals="):
+            truthy = cond_val == cond_spec[len(":equals="):]
+        elif cond_spec and cond_spec.startswith(":notequals="):
+            truthy = cond_val != cond_spec[len(":notequals="):]
+        else:
+            truthy = bool(cond_val.strip())
+        fmt = fmt[:start] + (then_s if truthy else else_s) + fmt[end + len("%(end)"):]
+
+    return subst(fmt)
 
 
 def cmd_for_each_ref(argv: list[str]) -> int:
