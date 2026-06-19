@@ -219,6 +219,25 @@ def _local_tz_minutes(when: int) -> int:
         return 0
 
 
+def _system_ident() -> tuple[str, str]:
+    """Fallback identity matching C Git when nothing is configured: the GECOS
+    full name and ``<user>@<fqdn>`` (ident.c). Falls back to a generic value
+    only if the host lookup fails entirely."""
+    name = "pythongit"
+    email = "pythongit@example.invalid"
+    try:
+        import pwd
+        pw = pwd.getpwuid(os.getuid())
+        gecos = (pw.pw_gecos or "").split(",", 1)[0].strip()
+        name = gecos or pw.pw_name or name
+        import socket
+        host = socket.getfqdn()
+        email = f"{pw.pw_name}@{host}" if host else f"{pw.pw_name}@{socket.gethostname()}"
+    except Exception:
+        pass
+    return name, email
+
+
 def build_signature(repo: Repository, role: str, date_override: Optional[str] = None) -> str:
     """Build an ``author`` or ``committer`` signature line.
 
@@ -243,8 +262,9 @@ def build_signature(repo: Repository, role: str, date_override: Optional[str] = 
         date = os.environ.get("GIT_COMMITTER_DATE")
     if date_override is not None:
         date = date_override
-    name = name or "pythongit"
-    email = email or "pythongit@example.invalid"
+    sys_name, sys_email = _system_ident()
+    name = name or sys_name
+    email = email or sys_email
     parsed = _parse_date_env(date) if date else None
     if parsed is not None:
         secs, tzmin = parsed

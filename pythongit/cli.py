@@ -1723,12 +1723,16 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--until", "--before", dest="until", default=None)
     ap.add_argument("--date", default=None)
     ap.add_argument("-n", "--max-count", type=int, default=None)
+    ap.add_argument("-g", "--walk-reflogs", dest="walk_reflogs", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
 
     if args.graph and args.reverse:
         _err("fatal: options '--graph' and '--reverse' cannot be used together")
+        return 128
+    if args.walk_reflogs and args.reverse:
+        _err("fatal: options '--reverse' and '--walk-reflogs' cannot be used together")
         return 128
 
     # Split positionals into revisions and pathspecs.
@@ -1827,7 +1831,26 @@ def cmd_log(argv: list[str]) -> int:
     # Collect the ordered list of commit shas first so --reverse can flip it.
     seen: set[str] = set()
     commit_list: list[str] = []
-    if args.no_walk is not None:
+    # `-g`/`--walk-reflogs`: enumerate the named ref's reflog (newest first)
+    # instead of walking commit ancestry. Each entry carries its own selector,
+    # committer identity and message, which the renderer injects per commit.
+    reflog_meta: Optional[list[tuple[str, str, str]]] = None
+    if args.walk_reflogs:
+        from . import reflog as _reflog
+        full_ref = rev if rev == "HEAD" else (refs_mod.dwim_full_name(repo, rev) or rev)
+        entries = _reflog.read(repo, full_ref)
+        reflog_meta = []
+        for i, (_old, new, ident, msg) in enumerate(reversed(entries)):
+            commit_list.append(new)
+            # The reflog identity is "Name <email> <secs> <tz>"; the header keeps
+            # only the "Name <email>" portion.
+            who = ident
+            parts = ident.rsplit(" ", 2)
+            if len(parts) == 3 and parts[1].lstrip("-").isdigit():
+                who = parts[0]
+            reflog_meta.append((f"{rev}@{{{i}}}", who, msg))
+        want_topo = collect_full = False
+    elif args.no_walk is not None:
         # --no-walk shows only the named revisions, no ancestry traversal. The
         # default ("sorted") orders by committer date; "unsorted" keeps the
         # command-line order. Downstream filter/--max-count/--reverse still run.
@@ -1895,7 +1918,7 @@ def cmd_log(argv: list[str]) -> int:
     if want_topo:
         commit_list = _topo_order(repo, commit_list, args.first_parent)
 
-    if log_paths:
+    if log_paths and not args.walk_reflogs:
         filtered: list[str] = []
         for s in commit_list:
             info = _commit_tree_parents(repo, s)
@@ -1912,12 +1935,17 @@ def cmd_log(argv: list[str]) -> int:
         commit_list = filtered
 
     # Commit-level filters (applied before --max-count truncation, like git).
-    commit_list = _filter_commits(repo, commit_list, args)
+    if not args.walk_reflogs:
+        commit_list = _filter_commits(repo, commit_list, args)
 
     if args.max_count is not None:
         commit_list = commit_list[:max(0, args.max_count)]
+        if reflog_meta is not None:
+            reflog_meta = reflog_meta[:max(0, args.max_count)]
     if args.reverse:
         commit_list = list(reversed(commit_list))
+        if reflog_meta is not None:
+            reflog_meta = list(reversed(reflog_meta))
 
     graph = None
     if args.graph:
@@ -1932,7 +1960,7 @@ def cmd_log(argv: list[str]) -> int:
     multiline = style in ("medium", "full", "fuller", "short", "raw")
     last_index = len(commit_list) - 1
 
-    def render(count, s, c):
+    def render(count, s, c, meta=None):
         if style == "format":
             expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev)
             if fmt_terminator:
@@ -1944,6 +1972,10 @@ def cmd_log(argv: list[str]) -> int:
         elif style in ("oneline", "oneline_full"):
             short = style == "oneline" or args.abbrev_commit
             abbrev = s[:args.abbrev] if short else s
+            if meta is not None:
+                sel, _who, rmsg = meta
+                _print(f"{abbrev} {sel}: {rmsg}")
+                return
             first = c.message.splitlines()[0] if c.message.strip() else ""
             deco = _format_decoration(decorations.get(s, []))
             pre = abbrev
@@ -1983,7 +2015,8 @@ def cmd_log(argv: list[str]) -> int:
                     if args.parents else "")
             _emit_commit_header(s[:7] if args.abbrev_commit else s, c, style=style,
                                 date_mode=date_mode, parents_suffix=psuf,
-                                decoration=_format_decoration(decorations.get(s, [])))
+                                decoration=_format_decoration(decorations.get(s, [])),
+                                reflog=meta)
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
@@ -2016,10 +2049,11 @@ def cmd_log(argv: list[str]) -> int:
 
     for count, s in enumerate(commit_list):
         c = objs.parse_commit(objs.read_object(repo, s)[1])
+        meta = reflog_meta[count] if reflog_meta is not None else None
         if graph is None:
-            render(count, s, c)
+            render(count, s, c, meta)
         else:
-            text = _capture_output(lambda: render(0, s, c))
+            text = _capture_output(lambda: render(0, s, c, meta))
             sys.stdout.write(graph.format_commit(
                 s, text, emit_separator=(multiline and count > 0)))
     return 0
@@ -2257,10 +2291,14 @@ def _format_ident_date(sig: str) -> str:
 
 def _emit_commit_header(sha: str, c, *, style: str = "medium",
                         date_mode: str = "default", decoration: str = "",
-                        parents_suffix: str = "") -> None:
+                        parents_suffix: str = "", reflog=None) -> None:
     """Print the ``commit``/``Author``/``Date`` header block for medium, full,
     and fuller pretty styles, shared by ``log`` and ``show``."""
     _print(f"commit {sha}{parents_suffix}{decoration}")
+    if reflog is not None:
+        sel, who, rmsg = reflog
+        _print(f"Reflog: {sel} ({who})")
+        _print(f"Reflog message: {rmsg}")
     if len(c.parents) > 1:
         _print("Merge: " + " ".join(p[:7] for p in c.parents))
     author_who = _split_ident(c.author)[0]
@@ -3243,6 +3281,18 @@ def cmd_checkout(argv: list[str]) -> int:
         i += 1
     repo = _repo()
 
+    # Capture the pre-checkout HEAD so each branch switch can append the
+    # "checkout: moving from <old> to <new>" HEAD reflog entry git writes.
+    head_sym0, old_sha0 = refs_mod.read_head(repo)
+    old_name0 = (head_sym0[len("refs/heads/"):] if head_sym0 and head_sym0.startswith("refs/heads/")
+                 else (old_sha0[:7] if old_sha0 else None))
+
+    def _log_checkout(new_sha: Optional[str], new_name: str) -> None:
+        if old_sha0 and new_sha:
+            from . import reflog as _reflog
+            _reflog.append(repo, "HEAD", old_sha0, new_sha,
+                           f"checkout: moving from {old_name0} to {new_name}")
+
     if new_branch:
         if refs_mod.read_ref(repo, f"refs/heads/{new_branch}") is not None:
             _err(f"fatal: a branch named '{new_branch}' already exists")
@@ -3257,8 +3307,11 @@ def cmd_checkout(argv: list[str]) -> int:
                 return 0
             _err(f"fatal: '{revs[0]}' is not a commit and a branch '{new_branch}' cannot be created from it")
             return 128
-        refs_mod.update_ref(repo, f"refs/heads/{new_branch}", start)
+        start_name = revs[0] if revs else "HEAD"
+        refs_mod.update_ref(repo, f"refs/heads/{new_branch}", start,
+                            message=f"branch: Created from {start_name}")
         refs_mod.set_head(repo, f"refs/heads/{new_branch}")
+        _log_checkout(start, new_branch)
         _err(f"Switched to a new branch '{new_branch}'")
         return 0
 
@@ -3290,9 +3343,11 @@ def cmd_checkout(argv: list[str]) -> int:
             _err(f"Already on '{target}'")
         else:
             refs_mod.set_head(repo, f"refs/heads/{target}")
+            _log_checkout(sha, target)
             _err(f"Switched to branch '{target}'")
     else:
         refs_mod.set_head(repo, sha)
+        _log_checkout(sha, sha[:7])
         from . import gitconfig
         advice = (gitconfig.get(repo, "advice.detachedhead") or "").lower()
         if advice not in ("false", "0", "no", "off"):
@@ -4016,7 +4071,8 @@ def cmd_merge(argv: list[str]) -> int:
         _print(f"Updating {head_sha[:7]}..{other_sha[:7]}")
         _print("Fast-forward")
         if head_sym:
-            refs_mod.update_ref(repo, head_sym, other_sha)
+            refs_mod.update_ref(repo, head_sym, other_sha,
+                                message=f"merge {args.other}: Fast-forward")
         else:
             refs_mod.set_head(repo, other_sha)
         workdir.checkout_tree(repo, new_tree)
@@ -4609,9 +4665,46 @@ def cmd_clean(argv: list[str]) -> int:
     return 0
 
 
+def _describe_contains(repo: Repository, rev: str, sha: str) -> int:
+    """``git describe --contains``: name the commit relative to the tag that
+    contains it (a descendant tag), delegating to name-rev's tags-only naming.
+    Prints ``<tag>^0`` / ``<tag>~N`` or, when no tag contains it, a fatal."""
+    target = refs_mod.rev_parse(repo, rev + "^{commit}") or sha
+    name_for: dict[str, tuple[str, int]] = {}
+    tips: list[tuple[str, str, bool]] = []
+    for tag in refs_mod.list_tags(repo):
+        raw = refs_mod.read_ref(repo, f"refs/tags/{tag}")
+        s = refs_mod.rev_parse(repo, f"refs/tags/{tag}" + "^{commit}") or raw
+        if s:
+            tips.append((tag, s, s != raw))
+    graph = _graph_for_repo(repo)
+    for label, tip, deref in tips:
+        seen: set[str] = set()
+        stack = deque([(tip, 0)])
+        while stack:
+            csha, depth = stack.popleft()
+            if csha in seen:
+                continue
+            seen.add(csha)
+            cur = name_for.get(csha)
+            if cur is None or cur[1] > depth:
+                suffix = ("^0" if deref else "") if depth == 0 else f"~{depth}"
+                name_for[csha] = (label + suffix, depth)
+            info = _commit_tree_parents(repo, csha, graph)
+            if info is not None:
+                for p in info[1]:
+                    stack.append((p, depth + 1))
+    if target in name_for:
+        _print(name_for[target][0])
+        return 0
+    _err(f"fatal: cannot describe '{target}'")
+    return 128
+
+
 def cmd_describe(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit describe")
     ap.add_argument("--tags", action="store_true")
+    ap.add_argument("--contains", action="store_true")
     ap.add_argument("--always", action="store_true")
     ap.add_argument("--long", action="store_true")
     ap.add_argument("--abbrev", type=int, default=7)
@@ -4622,6 +4715,8 @@ def cmd_describe(argv: list[str]) -> int:
     if not sha:
         _err(f"fatal: Not a valid object name {args.rev}")
         return 128
+    if args.contains:
+        return _describe_contains(repo, args.rev, sha)
     # Peel the target down to a commit (an annotated tag resolves to its object).
     sha = refs_mod.rev_parse(repo, args.rev + "^{commit}") or sha
     tag_for: dict[str, str] = {}
@@ -5790,6 +5885,7 @@ def cmd_notes(argv: list[str]) -> int:
     key = target[:2] + "/" + target[2:]
     if action == "show":
         if key not in notes_map:
+            _err(f"error: no note found for object {target}.")
             return 1
         _, data = objs.read_object(repo, notes_map[key])
         sys.stdout.buffer.write(data)
@@ -6244,21 +6340,23 @@ def cmd_name_rev(argv: list[str]) -> int:
     repo = _repo()
     # Build a map sha -> closest ref name by BFS from each ref tip.
     name_for: dict[str, tuple[str, int]] = {}
-    tips: list[tuple[str, str]] = []
+    tips: list[tuple[str, str, bool]] = []
     # Tags are seeded first so that, at equal depth, a tag name is preferred
     # over a branch name (matching git's name-rev tie-break). Annotated tags are
-    # peeled to the commit they reference.
+    # peeled to the commit they reference; that peeling is recorded as `deref` so
+    # an exact match renders "<tag>^0" (the commit the tag dereferences to).
     for tag in refs_mod.list_tags(repo):
-        s = refs_mod.rev_parse(repo, f"refs/tags/{tag}" + "^{commit}") or refs_mod.read_ref(repo, f"refs/tags/{tag}")
+        raw = refs_mod.read_ref(repo, f"refs/tags/{tag}")
+        s = refs_mod.rev_parse(repo, f"refs/tags/{tag}" + "^{commit}") or raw
         if s:
-            tips.append((f"tags/{tag}", s))
+            tips.append((f"tags/{tag}", s, s != raw))
     if not args.tags:
         for b in refs_mod.list_branches(repo):
             s = refs_mod.read_ref(repo, f"refs/heads/{b}")
             if s:
-                tips.append((b, s))
+                tips.append((b, s, False))
     graph = _graph_for_repo(repo)
-    for label, tip in tips:
+    for label, tip, deref in tips:
         seen: set[str] = set()
         stack = deque([(tip, 0)])
         while stack:
@@ -6268,7 +6366,7 @@ def cmd_name_rev(argv: list[str]) -> int:
             seen.add(sha)
             cur = name_for.get(sha)
             if cur is None or cur[1] > depth:
-                suffix = "" if depth == 0 else f"~{depth}"
+                suffix = ("^0" if deref else "") if depth == 0 else f"~{depth}"
                 name_for[sha] = (label + suffix, depth)
             info = _commit_tree_parents(repo, sha, graph)
             if info is not None:
@@ -6306,13 +6404,14 @@ def _var_ident(repo: Optional[Repository], role: str) -> str:
     if repo is not None:
         return objs.build_signature(repo, role)
     env = os.environ
+    sys_name, sys_email = objs._system_ident()
     if role == "author":
-        name = env.get("GIT_AUTHOR_NAME") or "pythongit"
-        email = env.get("GIT_AUTHOR_EMAIL") or env.get("EMAIL") or "pythongit@example.invalid"
+        name = env.get("GIT_AUTHOR_NAME") or sys_name
+        email = env.get("GIT_AUTHOR_EMAIL") or env.get("EMAIL") or sys_email
         date = env.get("GIT_AUTHOR_DATE")
     else:
-        name = env.get("GIT_COMMITTER_NAME") or "pythongit"
-        email = env.get("GIT_COMMITTER_EMAIL") or env.get("EMAIL") or "pythongit@example.invalid"
+        name = env.get("GIT_COMMITTER_NAME") or sys_name
+        email = env.get("GIT_COMMITTER_EMAIL") or env.get("EMAIL") or sys_email
         date = env.get("GIT_COMMITTER_DATE")
     parsed = objs._parse_date_env(date) if date else None
     if parsed is not None:

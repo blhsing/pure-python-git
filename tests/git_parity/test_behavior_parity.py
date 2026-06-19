@@ -834,6 +834,21 @@ CASES: list[tuple] = [
     ("mv-dry-run", BASE, ["mv", "-n", "a.txt", "c.txt"]),
     ("format-patch-numbered", TAGGED, ["format-patch", "-1", "--stdout", "--numbered"]),
     ("format-patch-no-numbered", TAGGED, ["format-patch", "-1", "--stdout", "--no-numbered"]),
+    # log -g/--walk-reflogs: per-entry selector, identity, and message.
+    ("log-g-oneline", MERGED, ["log", "-g", "--oneline"]),
+    ("log-g-medium", MERGED, ["log", "-g"]),
+    ("log-g-count", MERGED, ["log", "-g", "-n", "2"]),
+    ("log-g-pretty-oneline", MERGED, ["log", "-g", "--pretty=oneline"]),
+    ("log-g-reverse-err", MERGED, ["log", "-g", "--reverse"]),
+    # describe --contains delegates to name-rev's tags-only naming.
+    ("describe-contains", DESC, ["describe", "--contains", "HEAD~1"]),
+    ("describe-contains-none", DESC, ["describe", "--contains", "HEAD"]),
+    # name-rev appends ^0 for an annotated tag's exact (dereferenced) commit.
+    ("name-rev-deref",
+     BASE + [["tag", "-a", "-m", "r", "v1"], ("write", "z.txt", "z\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["name-rev", "--tags", "--name-only", "HEAD~1"]),
+    # notes show on an object with no note: stderr message + rc 1.
+    ("notes-show-missing", BASE, ["notes", "show", "HEAD"]),
 ]
 
 

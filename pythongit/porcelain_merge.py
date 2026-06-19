@@ -56,7 +56,7 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
     # fast-forward
     if base == head and allow_ff and not no_ff:
         if head_sym:
-            refs_mod.update_ref(repo, head_sym, other, message=f"merge {other_rev}: fast-forward")
+            refs_mod.update_ref(repo, head_sym, other, message=f"merge {other_rev}: Fast-forward")
         else:
             refs_mod.set_head(repo, other)
         tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
@@ -89,7 +89,7 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
                     message=msg if msg.endswith("\n") else msg + "\n")
     sha = objs.write_object(repo, "commit", c.encode())
     if head_sym:
-        refs_mod.update_ref(repo, head_sym, sha, message=f"merge {other_rev}")
+        refs_mod.update_ref(repo, head_sym, sha, message=f"merge {other_rev}: Merge made by the 'ort' strategy.")
     else:
         refs_mod.set_head(repo, sha)
     return sha, []
