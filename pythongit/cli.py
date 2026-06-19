@@ -4673,7 +4673,9 @@ def cmd_describe(argv: list[str]) -> int:
 
 
 def cmd_blame(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit blame")
+    ap = argparse.ArgumentParser(prog="pygit blame", add_help=False)
+    ap.add_argument("-l", dest="long_sha", action="store_true")
+    ap.add_argument("-L", dest="line_range", default=None)
     ap.add_argument("path")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -4750,10 +4752,23 @@ def cmd_blame(argv: list[str]) -> int:
         info[s] = (name, _format_blame_date(c.author), not c.parents)
     author_w = max((len(v[0]) for v in info.values()), default=0)
     lineno_w = len(str(len(cur_lines)))
+    lo, hi = 1, len(cur_lines)
+    if args.line_range:
+        start, _, end = args.line_range.partition(",")
+        if start:
+            lo = int(start)
+        if end:
+            hi = int(end)
     for idx, line in enumerate(cur_lines):
+        if not (lo <= idx + 1 <= hi):
+            continue
         s = blame_sha[idx] or "0" * 40
         name, date, boundary = info.get(s, ("", "", False))
-        field = ("^" + s[:7]) if boundary else s[:8]
+        if args.long_sha:
+            # A boundary marker '^' drops the last hex digit to keep width.
+            field = ("^" + s[:-1]) if boundary else s
+        else:
+            field = ("^" + s[:7]) if boundary else s[:8]
         _print(f"{field} ({name:<{author_w}} {date} {idx + 1:>{lineno_w}}) {line}")
     return 0
 
@@ -4964,7 +4979,7 @@ def cmd_shortlog(argv: list[str]) -> int:
     return 0
 
 
-def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], archive_time: int) -> bytes:
+def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], archive_time: int, prefix: str = "") -> bytes:
     """Build a tar archive byte-for-byte identical to C Git's archive-tar.c."""
     BLOCKSIZE = 512 * 20
     TAR_UMASK = 0o002
@@ -5025,7 +5040,10 @@ def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], arc
                 emit_header(name, (mode | base) & ~TAR_UMASK, len(blob), "0")
                 emit_content(blob)
 
-    walk(tree, "")
+    if prefix.endswith("/"):
+        # git emits a single directory entry for the whole prefix.
+        emit_header(prefix, (0o40000 | 0o777) & ~TAR_UMASK, 0, "5")
+    walk(tree, prefix)
     out.extend(b"\0" * 1024)  # end-of-archive trailer
     if len(out) % BLOCKSIZE:
         out.extend(b"\0" * (BLOCKSIZE - len(out) % BLOCKSIZE))
@@ -5036,6 +5054,7 @@ def cmd_archive(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit archive", add_help=False)
     ap.add_argument("--format", default="tar", choices=["tar", "zip"])
     ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--prefix", default="")
     ap.add_argument("rev")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -5056,7 +5075,7 @@ def cmd_archive(argv: list[str]) -> int:
         archive_time = 0
 
     if args.format == "tar":
-        blob = _git_archive_tar(repo, tree, commit_oid, archive_time)
+        blob = _git_archive_tar(repo, tree, commit_oid, archive_time, args.prefix)
         if args.output:
             Path(args.output).write_bytes(blob)
         else:
@@ -5068,7 +5087,7 @@ def cmd_archive(argv: list[str]) -> int:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
             _, b = objs.read_object(repo, bsha)
-            zf.writestr(path, b)
+            zf.writestr(args.prefix + path, b)
     if args.output:
         Path(args.output).write_bytes(buf.getvalue())
     else:
@@ -6012,85 +6031,106 @@ def cmd_pull(argv: list[str]) -> int:
 
 
 def cmd_grep(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit grep")
+    ap = argparse.ArgumentParser(prog="pygit grep", add_help=False)
     ap.add_argument("-i", "--ignore-case", action="store_true")
     ap.add_argument("-n", "--line-number", action="store_true")
     ap.add_argument("-l", "--files-with-matches", action="store_true")
     ap.add_argument("-c", "--count", action="store_true")
+    ap.add_argument("-w", "--word-regexp", action="store_true")
+    ap.add_argument("-v", "--invert-match", dest="invert", action="store_true")
+    ap.add_argument("-F", "--fixed-strings", dest="fixed", action="store_true")
     ap.add_argument("-E", "--extended-regexp", action="store_true")
+    ap.add_argument("--color", nargs="?", const="always", default=None)  # ignored
+    ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--cached", action="store_true")
-    ap.add_argument("pattern")
-    ap.add_argument("paths", nargs="*")
-    args = ap.parse_args(argv)
+    args, rest = ap.parse_known_args(argv)
     repo = _repo()
     import re
-    flags = re.IGNORECASE if args.ignore_case else 0
-    pat = re.compile(args.pattern, flags)
 
-    if args.cached:
-        from .index import read_index
-        for e in read_index(repo).entries:
-            if args.paths and not any(e.path == p or e.path.startswith(p + "/") for p in args.paths):
+    paths: list[str] = []
+    if "--" in rest:
+        idx = rest.index("--")
+        pre, paths = rest[:idx], rest[idx + 1:]
+    else:
+        pre = rest
+    if not pre:
+        _err("fatal: no pattern given")
+        return 128
+    # After the pattern, a positional that resolves to a revision is a tree to
+    # search; anything else is a pathspec (git's heuristic without an explicit --).
+    pattern = pre[0]
+    rev_args = []
+    for tok in pre[1:]:
+        if refs_mod.rev_parse(repo, tok):
+            rev_args.append(tok)
+        else:
+            paths.append(tok)
+
+    needle = re.escape(pattern) if args.fixed else pattern
+    if args.word_regexp:
+        needle = r"\b(?:" + needle + r")\b"
+    pat = re.compile(needle, re.IGNORECASE if args.ignore_case else 0)
+
+    def matches(line: str) -> bool:
+        return bool(pat.search(line)) != args.invert
+
+    def want(path: str) -> bool:
+        return not paths or any(path == p or path.startswith(p.rstrip("/") + "/") for p in paths)
+
+    rc = 1
+
+    def emit(disp: str, text: str) -> None:
+        nonlocal rc
+        cnt = 0
+        any_m = False
+        for i, line in enumerate(text.splitlines(), 1):
+            if matches(line):
+                any_m = True
+                cnt += 1
+                rc = 0
+                if not args.count and not args.files_with_matches:
+                    prefix = f"{disp}:"
+                    if args.line_number:
+                        prefix += f"{i}:"
+                    _print(prefix + line)
+        if args.count:
+            if cnt:
+                _print(f"{disp}:{cnt}")
+                rc = 0
+        elif args.files_with_matches and any_m:
+            _print(disp)
+
+    from .index import read_index
+    if rev_args:
+        for rv in rev_args:
+            s = refs_mod.rev_parse(repo, rv)
+            if not s:
                 continue
+            tree = refs_mod._peel_to_type(repo, s, "tree") or s
+            for path, _mode, bsha in sorted(workdir.iter_tree_files(repo, tree)):
+                if not want(path):
+                    continue
+                try:
+                    text = objs.read_object(repo, bsha)[1].decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                emit(f"{rv}:{path}", text)
+        return rc
+
+    for e in read_index(repo).entries:
+        if not want(e.path):
+            continue
+        if args.cached:
             try:
-                _, data = objs.read_object(repo, e.sha)
-                text = data.decode("utf-8", errors="replace")
+                text = objs.read_object(repo, e.sha)[1].decode("utf-8", errors="replace")
             except Exception:
                 continue
-            matched_file = False
-            count = 0
-            for i, line in enumerate(text.splitlines(), 1):
-                if pat.search(line):
-                    matched_file = True
-                    count += 1
-                    if args.files_with_matches and not args.count:
-                        break
-                    if not args.count:
-                        prefix = f"{e.path}:"
-                        if args.line_number:
-                            prefix += f"{i}:"
-                        _print(prefix + line)
-            if args.count:
-                if count:
-                    _print(f"{e.path}:{count}")
-            elif matched_file and args.files_with_matches:
-                _print(e.path)
-        return 0
-
-    # search worktree (tracked files)
-    rc = 1
-    from .index import read_index
-    for e in read_index(repo).entries:
-        if args.paths and not any(e.path == p or e.path.startswith(p + "/") for p in args.paths):
-            continue
-        full = repo.path / e.path
-        if not full.exists():
-            continue
-        try:
-            fh = full.open("r", encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        matched = False
-        count = 0
-        with fh:
-            for i, line in enumerate(fh, 1):
-                line = line.rstrip("\n")
-                if pat.search(line):
-                    rc = 0
-                    matched = True
-                    count += 1
-                    if args.files_with_matches and not args.count:
-                        break
-                    if not args.count:
-                        prefix = f"{e.path}:"
-                        if args.line_number:
-                            prefix += f"{i}:"
-                        _print(prefix + line)
-        if args.count:
-            if count:
-                _print(f"{e.path}:{count}")
-        elif matched and args.files_with_matches:
-            _print(e.path)
+        else:
+            full = repo.path / e.path
+            if not full.exists():
+                continue
+            text = full.read_text(encoding="utf-8", errors="replace")
+        emit(e.path, text)
     return rc
 
 

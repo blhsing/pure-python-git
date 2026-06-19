@@ -792,6 +792,23 @@ CASES: list[tuple] = [
     # log --no-walk shows only the named revisions, no traversal.
     ("log-no-walk", MERGED, ["log", "--no-walk", "--oneline", "HEAD", "HEAD~1"]),
     ("log-no-walk-unsorted", MERGED, ["log", "--no-walk=unsorted", "--oneline", "HEAD~1", "HEAD"]),
+    # grep flags and tree-grep.
+    ("grep-basic", BASE, ["grep", "alpha"]),
+    ("grep-n", BASE, ["grep", "-n", "alpha"]),
+    ("grep-c", BASE, ["grep", "-c", "alpha"]),
+    ("grep-w", BASE, ["grep", "-w", "alpha"]),
+    ("grep-v", BASE, ["grep", "-v", "alpha", "a.txt"]),
+    ("grep-F", BASE, ["grep", "-F", "alpha"]),
+    ("grep-tree", TAGGED, ["grep", "more", "HEAD"]),
+    ("grep-tree-n", TAGGED, ["grep", "-n", "more", "HEAD"]),
+    ("grep-nomatch", BASE, ["grep", "zzznope"]),
+    # blame -L / -l.
+    ("blame-L", TAGGED, ["blame", "-L", "1,1", "a.txt"]),
+    ("blame-l", TAGGED, ["blame", "-l", "a.txt"]),
+    # archive --prefix (tar is byte-exact).
+    ("archive-tar", TAGGED, ["archive", "--format=tar", "HEAD"]),
+    ("archive-prefix", TAGGED, ["archive", "--format=tar", "--prefix=x/", "HEAD"]),
+    ("archive-prefix-multi", TAGGED, ["archive", "--format=tar", "--prefix=a/b/", "HEAD"]),
 ]
 
 
