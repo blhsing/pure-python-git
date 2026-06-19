@@ -265,6 +265,9 @@ def cmd_hash_object(argv: list[str]) -> int:
     ap.add_argument("-t", default="blob", choices=["blob", "tree", "commit", "tag"])
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--stdin-paths", action="store_true")
+    ap.add_argument("--literally", action="store_true")
+    ap.add_argument("--no-filters", dest="no_filters", action="store_true")
+    ap.add_argument("--path", default=None)
     ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
     repo = None
@@ -387,6 +390,7 @@ def cmd_cat_file(argv: list[str]) -> int:
     g.add_argument("--textconv", action="store_true")
     g.add_argument("--filters", action="store_true")
     ap.add_argument("--batch-all-objects", dest="batch_all", action="store_true")
+    ap.add_argument("--allow-unknown-type", dest="allow_unknown_type", action="store_true")
     ap.add_argument("--path", default=None)
     ap.add_argument("pos", nargs="*")
     # `--batch[-check]=<format>` takes the format attached with '='; pull it out
@@ -866,6 +870,14 @@ def cmd_rev_parse(argv: list[str]) -> int:
         r = R()
         sha = refs_mod.rev_parse(r, arg)
         if sha is None:
+            # `<rev>:<path>` where the rev resolves but the path is absent gets
+            # git's specific message rather than the generic ambiguous-arg one.
+            if ":" in arg and not arg.startswith(("^", "-", ":")):
+                left, _, path = arg.partition(":")
+                if left and not path.startswith("/") and refs_mod.rev_parse(r, left) is not None:
+                    _print(arg)
+                    _err(f"fatal: path '{path}' does not exist in '{left}'")
+                    return 128
             if verify:
                 if quiet:
                     return 1
@@ -6094,11 +6106,15 @@ def cmd_update_index(argv: list[str]) -> int:
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--chmod", choices=["+x", "-x"], default=None)
     ap.add_argument("--cacheinfo", nargs=3, metavar=("MODE", "SHA", "PATH"))
+    ap.add_argument("--show-index-version", dest="show_index_version", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     from .index import IndexEntry, read_index, write_index
     idx = read_index(repo)
+    if args.show_index_version:
+        _print(str(getattr(idx, "version", 2) or 2))
+        return 0
     if args.cacheinfo:
         mode_s, sha, path = args.cacheinfo
         idx.upsert(IndexEntry(mode=int(mode_s, 8), sha=sha, path=path))
@@ -9151,9 +9167,11 @@ def cmd_check_attr(argv: list[str]) -> int:
 
 
 def cmd_check_ref_format(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit check-ref-format")
+    ap = argparse.ArgumentParser(prog="pygit check-ref-format", add_help=False)
     ap.add_argument("--branch", action="store_true")
     ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--allow-onelevel", dest="allow_onelevel", action="store_true", default=False)
+    ap.add_argument("--no-allow-onelevel", dest="allow_onelevel", action="store_false")
     ap.add_argument("name")
     args = ap.parse_args(argv)
     name = args.name
@@ -9176,8 +9194,8 @@ def cmd_check_ref_format(argv: list[str]) -> int:
             return 1
     else:
         full = name
-        if name.count("/") < 1 and not name.startswith("refs/"):
-            # require category/name
+        if not args.allow_onelevel and name.count("/") < 1 and not name.startswith("refs/"):
+            # require category/name (unless --allow-onelevel)
             _err("ref name must contain '/'")
             return 1
     bad = False

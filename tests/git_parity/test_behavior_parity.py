@@ -1025,6 +1025,14 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # rev-parse <rev>:<missing-path> gives git's specific "does not exist" error.
+    ("revparse-missing-path", BASE, ["rev-parse", "HEAD:nonexistent"]),
+    # check-ref-format --allow-onelevel accepts a single-component name.
+    ("check-ref-onelevel", BASE, ["check-ref-format", "--allow-onelevel", "foo"]),
+    ("check-ref-onelevel-bad", BASE, ["check-ref-format", "--allow-onelevel", "bad..name"]),
+    # cat-file --allow-unknown-type and update-index --show-index-version.
+    ("cat-file-allow-unknown", BASE, ["cat-file", "--allow-unknown-type", "-t", "HEAD"]),
+    ("update-index-version", BASE, ["update-index", "--show-index-version"]),
     # rev-list --timestamp prefixes the committer epoch; merge-base --octopus
     # and tag-peeling; describe --candidates accepted.
     ("rev-list-timestamp", PATHHIST, ["rev-list", "--timestamp", "HEAD"]),
