@@ -1,0 +1,176 @@
+# pygit flag-parity gap manifest (vs git 2.54.0)
+
+Probed 147 commands; 1479 documented flags scanned; 586 flags across 57 commands are currently *rejected* by pygit.
+
+NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
+
+## add (10)
+  -i -p -U --unified --inter-hunk-context -e -u -N --no-all --pathspec-from-file
+
+## am (26)
+  --continue --skip --abort -i -n --no-verify --verify -q -s -u -k -b -m --keep-cr -c --quoted-cr -C -p -r --resolved --quit --show-current-patch --retry --allow-empty -S --empty
+
+## apply (15)
+  --exclude --include -p --no-add --add -N --intent-to-add --summary --ours --theirs --union -z -C -v -q
+
+## archive (4)
+  --remote --exec -v --mtime
+
+## backfill (1)
+  --min-batch-size
+
+## branch (8)
+  -f --recurse-submodules --points-at -q -t -u --no-contains -i
+
+## bugreport (4)
+  -s --suffix --no-suffix --diagnose
+
+## cat-file (5)
+  --buffer --follow-symlinks --unordered -Z --use-mailmap
+
+## checkout-index (7)
+  -q -n --no-create --create -u -z --stage
+
+## clean (5)
+  -i -q -e -X --exclude
+
+## column (1)
+  --raw-mode
+
+## commit (33)
+  --interactive --patch -s -v -u --dry-run -c -C --squash --fixup -F --reset-author --allow-empty-message --no-verify -e --author --cleanup -i -o --pathspec-from-file --pathspec-file-nul --trailer -S -t -p -U --unified --inter-hunk-context -n --verify -z --no-post-rewrite --post-rewrite
+
+## describe (1)
+  --dirty
+
+## diagnose (3)
+  -s --suffix --mode
+
+## diff-files (22)
+  -q -c --cc -z -p -u --patch-with-raw --patch-with-stat --name-status --full-index --abbrev -R -B -M -C --find-copies-harder -l -O -S --pickaxe-all -a --text
+
+## diff-pairs (83)
+  -z -p --patch -s --no-patch -u -U --unified -W --raw --patch-with-raw --patch-with-stat --stat --numstat --shortstat -X --dirstat --cumulative --dirstat-by-file --check --summary --name-only --name-status --stat-width --stat-name-width --stat-graph-width --stat-count --binary --ws-error-highlight --src-prefix --dst-prefix --line-prefix --no-prefix --default-prefix --inter-hunk-context --output-indicator-new --output-indicator-old --output-indicator-context -B --break-rewrites -M --find-renames -D --irreversible-delete -C --find-copies --no-renames -l --minimal -w --ignore-all-space -b --ignore-space-change --ignore-space-at-eol --ignore-cr-at-eol --ignore-blank-lines -I --patience --histogram --diff-algorithm --anchored --word-diff --word-diff-regex --color-words --color-moved -a -R --ignore-submodules --submodule --ita-invisible-in-index -N --ita-visible-in-index -S -G --pickaxe-all --pickaxe-regex -O --rotate-to --skip-to --find-object --diff-filter --max-depth --output
+
+## difftool (7)
+  -g -d -y --no-prompt -x --no-index --index
+
+## fast-export (3)
+  --no-data --data --anonymize-map
+
+## fast-import (6)
+  --date-format --max-pack-size --big-file-threshold --depth --active-branches --export-marks
+
+## fetch (22)
+  --multiple --all -v -q -a -f -m -t -n --no-tags -j -p -P -k -u --unshallow --refetch --refmap -o --ipv4 --ipv6 --auto
+
+## fmt-merge-msg (4)
+  -m --log --no-log -F
+
+## for-each-ref (15)
+  --shell --perl --python --tcl --include-root-refs --points-at --merged --no-merged --contains --no-contains --exclude --start-after --stdin -s -p
+
+## hash-object (1)
+  --filters
+
+## init (4)
+  --template --separate-git-dir --ref-format --shared
+
+## init-db (4)
+  --template --separate-git-dir --ref-format --shared
+
+## interpret-trailers (6)
+  --in-place --trim-empty --parse --unfold --no-divider --divider
+
+## log (4)
+  -q --use-mailmap --clear-decorations -L
+
+## ls-files (9)
+  -v -f -i -k -u -x -X --exclude-from --format
+
+## ls-remote (11)
+  --branches --refs --upload-pack -q --quiet --exit-code --get-url --sort --symref -b -o
+
+## merge (10)
+  -n --stat -e -s -X -F --file -S --no-verify --verify
+
+## merge-tree (6)
+  --quiet -z --name-only --allow-unrelated-histories --stdin -X
+
+## mktree (3)
+  -z --missing --batch
+
+## notes (15)
+  --ref -f --allow-empty --separator -m -F -c -C -e -v -q -s --commit --abort -n
+
+## pack-redundant (2)
+  --verbose --alt-odb
+
+## pack-refs (4)
+  --no-prune --auto --include --exclude
+
+## patch-id (2)
+  --unstable --verbatim
+
+## prune (3)
+  -v --progress --expire
+
+## prune-packed (2)
+  -q --quiet
+
+## pull (17)
+  -v -q -r -n --ff-only -s -X -S -a -f -t -p -j -k --unshallow --refmap -o
+
+## push (14)
+  -v -q --all -d --branches --mirror -n -f -u --no-verify --verify -o --ipv4 --ipv6
+
+## remote (17)
+  -t -m -f --tags --no-tags --mirror -a --auto -d --delete -n --dry-run -p --prune --add --push --all
+
+## repack (25)
+  -A -f -F -l -n -q -m --window --depth --threads --keep-pack --write-midx --name-hash-version --path-walk --cruft --combine-cruft-below-size --max-cruft-size --no-reuse-delta --no-reuse-object --local -i --delta-islands -k --max-pack-size -g
+
+## replace (7)
+  -f --edit --graft --convert-graft-file --format -e -g
+
+## reset (12)
+  --merge --keep --pathspec-from-file --pathspec-file-nul --patch --no-refresh --refresh -p -U --unified --inter-hunk-context -N
+
+## rev-list (25)
+  --max-age --min-age --sparse --no-min-parents --no-max-parents --remove-empty --branches --tags --remotes --stdin --exclude-hidden --quiet --topo-order --date-order --objects-edge --disk-usage --unpacked --header --abbrev --no-abbrev --abbrev-commit -z --bisect --bisect-vars --bisect-all
+
+## shortlog (3)
+  --pretty -c -w
+
+## show (4)
+  -q --use-mailmap --clear-decorations -L
+
+## show-branch (12)
+  -a --topo-order --date-order --current --color --no-color --more --list --no-name --sha1-name --topics --name
+
+## show-ref (6)
+  --abbrev --branches -q --quiet --exclude-existing --exists
+
+## stage (10)
+  -i -p -U --unified --inter-hunk-context -e -u -N --no-all --pathspec-from-file
+
+## stash (19)
+  -u --include-untracked --only-untracked -q --quiet --index -p --patch -S --staged -k -a --all -m --message --pathspec-from-file --pathspec-file-nul --print --to-ref
+
+## status (5)
+  -v --no-renames --renames -M --find-renames
+
+## switch (6)
+  -C -q -m -d -t -f
+
+## tag (12)
+  -u -F -e --trailer --column --no-column --create-reflog --merged --no-merged -v --verify -i
+
+## unpack-objects (4)
+  -n -q -r --strict
+
+## update-index (15)
+  -q --really-refresh --assume-unchanged --no-assume-unchanged --skip-worktree --no-skip-worktree -z --stdin --index-info --unresolve -g --again --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid
+
+## update-server-info (2)
+  -f --force
