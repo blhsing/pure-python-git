@@ -108,6 +108,15 @@ SB_THREE = BASE + [
     ["checkout", "main"]]
 SB_MERGE = MERGED  # a real merge commit, for the '-' merge marker column
 
+# A commit that introduces whitespace errors (trailing space, space-before-tab),
+# for `diff --check`.
+WSERR = BASE + [("write", "a.txt", "clean\ntrailing \n\tgood\n \tspacetab\n"),
+                ["add", "-A"], ["commit", "-m", "ws"]]
+# A file renamed across commits, for `log --follow`.
+RENAME = [("write", "orig.txt", "alpha\n"), ["add", "-A"], ["commit", "-m", "c1"],
+          ["mv", "orig.txt", "renamed.txt"], ["commit", "-m", "c2"],
+          ("write", "renamed.txt", "alpha\nbeta\n"), ["add", "-A"], ["commit", "-m", "c3"]]
+
 # A stash created from a modified tracked file plus a separately-staged new
 # file, for stash commit/show/selector parity.
 STASH = BASE + [("write", "a.txt", "alpha\nmod\n"), ("write", "n.txt", "new\n"),
@@ -937,6 +946,16 @@ CASES: list[tuple] = [
     ("show-branch-reflog", TAGGED, ["show-branch", "--reflog"]),
     ("show-branch-reflog-n", TAGGED, ["show-branch", "--reflog=2"]),
     ("show-branch-reflog-ref", TAGGED, ["show-branch", "--reflog", "main"]),
+    # diff --check reports whitespace errors on added lines (rc 2), else nothing.
+    ("diff-check", WSERR, ["diff", "--check", "HEAD~1", "HEAD"]),
+    ("diff-check-clean", SUBTREE, ["diff", "--check", "HEAD~1", "HEAD"]),
+    # log --follow tracks a file across a rename.
+    ("log-follow-oneline", RENAME, ["log", "--follow", "--oneline", "renamed.txt"]),
+    ("log-follow-format", RENAME, ["log", "--follow", "--format=%s", "renamed.txt"]),
+    ("log-follow-medium", RENAME, ["log", "--follow", "renamed.txt"]),
+    # format pretty styles also append --stat/--name-only/-p diff output.
+    ("log-format-stat", SUBTREE, ["log", "--format=%s", "--stat"]),
+    ("log-format-nameonly", SUBTREE, ["log", "--name-only", "--format=%s"]),
     # log --oneline with diff output (stat/patch/shortstat/name-only).
     ("log-oneline-stat", SUBTREE, ["log", "--oneline", "--stat"]),
     ("log-oneline-patch", SUBTREE, ["log", "--oneline", "-p"]),

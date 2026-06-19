@@ -1798,6 +1798,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--date", default=None)
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("-g", "--walk-reflogs", dest="walk_reflogs", action="store_true")
+    ap.add_argument("--follow", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -1999,7 +2000,27 @@ def cmd_log(argv: list[str]) -> int:
     if want_topo:
         commit_list = _topo_order(repo, commit_list, args.first_parent)
 
-    if log_paths and not args.walk_reflogs:
+    if args.follow and len(log_paths) == 1 and not args.walk_reflogs:
+        # --follow: include commits that touch the file, switching the followed
+        # name to the rename source whenever the file first appears via a rename.
+        followed = log_paths[0]
+        filtered = []
+        for s in commit_list:
+            info = _commit_tree_parents(repo, s)
+            tree, parents = info[0], info[1]
+            ptree = _commit_tree_parents(repo, parents[0])[0] if parents else None
+            before = workdir.tree_path_entry(repo, ptree, followed) if ptree else None
+            after = workdir.tree_path_entry(repo, tree, followed)
+            bsha = before.sha if before else None
+            asha = after.sha if after else None
+            if bsha != asha:
+                filtered.append(s)
+                if asha and not bsha and ptree:
+                    src = _follow_rename_source(repo, ptree, tree, followed)
+                    if src:
+                        followed = src
+        commit_list = filtered
+    elif log_paths and not args.walk_reflogs:
         filtered: list[str] = []
         for s in commit_list:
             info = _commit_tree_parents(repo, s)
@@ -2083,6 +2104,7 @@ def cmd_log(argv: list[str]) -> int:
                 if count > 0:
                     sys.stdout.write("\n")
                 sys.stdout.write(expansion)
+            emit_commit_diff(s, c, lead_blank=True)
         elif style in ("oneline", "oneline_full"):
             short = style == "oneline" or args.abbrev_commit
             abbrev = s[:args.abbrev] if short else s
@@ -2695,6 +2717,73 @@ def _is_binary(data: Optional[bytes]) -> bool:
     return bool(data) and b"\x00" in data[:8000]
 
 
+def _ws_check_line(line: str) -> str:
+    """Return git's whitespace-error message(s) for an added line, under the
+    default rule (blank-at-eol + space-before-tab), or "" if clean. Ported from
+    ws.c:ws_check_emit. (blank-at-eof is hunk-level and intentionally omitted.)"""
+    stripped = line.rstrip(" \t")
+    parts: list[str] = []
+    if len(stripped) < len(line):
+        parts.append("trailing whitespace")
+    # space-before-tab: a tab in the leading indent preceded by a space.
+    n = len(stripped)
+    i = 0
+    written = 0
+    sbt = False
+    while i < n:
+        ch = line[i]
+        if ch == " ":
+            i += 1
+            continue
+        if ch != "\t":
+            break
+        if written < i:
+            sbt = True
+        written = i + 1
+        i += 1
+    if sbt:
+        parts.append("space before tab in indent")
+    return ", ".join(parts)
+
+
+def _follow_rename_source(repo: Repository, ptree: Optional[str], tree: Optional[str], dst: str) -> Optional[str]:
+    """For `log --follow`: if ``dst`` was created in ``tree`` by renaming a file
+    that existed in ``ptree``, return that source path (else None)."""
+    changes = _tree_changes(repo, ptree, tree)
+    renames, _ = _detect_changes_renames(repo, changes)
+    for entry in renames:
+        if entry[1] == dst:
+            return entry[0]
+    return None
+
+
+def _diff_check(repo: Repository, changes: list) -> int:
+    """`git diff --check`: report whitespace errors on added lines, suppressing
+    the normal diff. Returns 2 if any error is found, else 0."""
+    from . import diff as _diff
+    found = False
+    for path, a, b in changes:
+        if not b.present or _is_binary(b.data):
+            continue
+        a_text = a.data.decode("utf-8", "replace") if (a.present and a.data is not None) else ""
+        b_text = b.data.decode("utf-8", "replace") if b.data is not None else ""
+        a_lines = a_text.split("\n")
+        b_lines = b_text.split("\n")
+        if a_text.endswith("\n"):
+            a_lines = a_lines[:-1]
+        if b_text.endswith("\n"):
+            b_lines = b_lines[:-1]
+        for kind, _ai, bi in _diff.diff_lines(a_lines, b_lines):
+            if kind != "ins":
+                continue
+            msg = _ws_check_line(b_lines[bi])
+            if msg:
+                found = True
+                _print(f"{path}:{bi + 1}: {msg}.")
+                _print(f"+{b_lines[bi]}")
+    return 2 if found else 0
+
+
 def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
@@ -2835,6 +2924,7 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--check", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--exit-code", dest="exit_code", action="store_true")
     ap.add_argument("-R", dest="reverse", action="store_true")
@@ -2912,6 +3002,8 @@ def cmd_diff(argv: list[str]) -> int:
             return "A" if not a.present else ("D" if not b.present else "M")
         changes = [(p, a, b) for p, a, b in changes if _status(a, b) in want]
 
+    if args.check:
+        return _diff_check(repo, changes)
     if args.quiet:
         return 1 if changes else 0
     if args.exit_code:
