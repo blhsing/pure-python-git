@@ -1306,6 +1306,18 @@ CASES: list[tuple] = [
     ("add-pathspec-from-file",
      ADDSETUP + [("write", "ps.txt", "a.txt\nc.txt\n"), ["add", "--pathspec-from-file", "ps.txt"]],
      ["status", "--short"]),
+    # update-index --assume-unchanged: ls-files -v lowercases the tag and status
+    # ignores the entry's worktree changes.
+    ("ui-assume-lsv", BASE + [["update-index", "--assume-unchanged", "a.txt"]],
+     ["ls-files", "-v"]),
+    ("ui-assume-status",
+     BASE + [["update-index", "--assume-unchanged", "a.txt"], ("write", "a.txt", "changed\n")],
+     ["status", "--short"]),
+    ("ui-no-assume",
+     BASE + [["update-index", "--assume-unchanged", "a.txt"],
+             ["update-index", "--no-assume-unchanged", "a.txt"]],
+     ["ls-files", "-v"]),
+    ("ui-assume-bad", BASE, ["update-index", "--assume-unchanged", "nope.txt"]),
 ]
 
 

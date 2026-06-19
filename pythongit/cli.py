@@ -1131,6 +1131,9 @@ def cmd_ls_files(argv: list[str]) -> int:
         show_this_cached = want_cached or (args.unmerged and st != 0)
         if show_this_cached and not (args.ignored and not _is_excluded(e.path)):
             tag = "M" if st != 0 else "H"
+            # -v lowercases the tag for assume-unchanged (CE_VALID) entries.
+            if args.tag_v and (e.flags & 0x8000):
+                tag = tag.lower()
             if args.format is not None:
                 out.append(_ls_files_format(repo, e, args.format, args.abbrev))
             elif args.stage or args.unmerged:
@@ -7055,8 +7058,15 @@ def cmd_update_index(argv: list[str]) -> int:
     ap.add_argument("--add", action="store_true")
     ap.add_argument("--remove", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--really-refresh", dest="really_refresh", action="store_true")
+    ap.add_argument("-q", dest="quiet", action="store_true")
     ap.add_argument("--chmod", choices=["+x", "-x"], default=None)
     ap.add_argument("--cacheinfo", nargs=3, metavar=("MODE", "SHA", "PATH"))
+    ap.add_argument("--assume-unchanged", dest="assume_unchanged", action="store_true")
+    ap.add_argument("--no-assume-unchanged", dest="no_assume_unchanged", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("--index-info", dest="index_info", action="store_true")
     ap.add_argument("--show-index-version", dest="show_index_version", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
@@ -7066,6 +7076,47 @@ def cmd_update_index(argv: list[str]) -> int:
     if args.show_index_version:
         _print(str(getattr(idx, "version", 2) or 2))
         return 0
+    # --index-info: read `mode SP sha [SP stage] TAB path` records from stdin.
+    if args.index_info:
+        data = sys.stdin.buffer.read().decode("utf-8")
+        sep = "\0" if args.nul else "\n"
+        for rec in data.split(sep):
+            if not rec:
+                continue
+            meta, _, path = rec.partition("\t")
+            fields = meta.split()
+            mode_s, sha = fields[0], fields[1]
+            stage = int(fields[2]) if len(fields) > 2 else 0
+            if int(mode_s, 8) == 0 or sha == repo.null_oid():
+                idx.remove(path, stage=stage)
+            else:
+                e = IndexEntry(mode=int(mode_s, 8), sha=sha, path=path)
+                e.set_stage(stage) if hasattr(e, "set_stage") else None
+                idx.upsert(e)
+        write_index(repo, idx)
+        return 0
+    # Gather target paths from the command line and/or stdin (-z → NUL).
+    paths = list(args.paths)
+    if args.stdin:
+        sdata = sys.stdin.buffer.read().decode("utf-8")
+        sep = "\0" if args.nul else "\n"
+        paths += [p for p in sdata.split(sep) if p]
+    # --assume-unchanged / --no-assume-unchanged toggle the CE_VALID bit.
+    if args.assume_unchanged or args.no_assume_unchanged:
+        by_path = idx.by_path()
+        for p in paths:
+            e = by_path.get(p)
+            if e is None:
+                _err(f"fatal: Unable to mark file {p}")
+                return 128
+            if args.assume_unchanged:
+                e.flags |= 0x8000
+            else:
+                e.flags &= ~0x8000
+            idx.upsert(e)
+        write_index(repo, idx)
+        return 0
+    args.paths = paths
     if args.cacheinfo:
         mode_s, sha, path = args.cacheinfo
         idx.upsert(IndexEntry(mode=int(mode_s, 8), sha=sha, path=path))
@@ -7083,7 +7134,7 @@ def cmd_update_index(argv: list[str]) -> int:
             idx.upsert(entry)
         write_index(repo, idx)
         return 0
-    if args.refresh:
+    if args.refresh or args.really_refresh:
         write_index(repo, idx)
         return 0
     if args.remove:
@@ -7094,6 +7145,9 @@ def cmd_update_index(argv: list[str]) -> int:
     if args.add:
         workdir.add_paths(repo, args.paths)
         return 0
+    # Bare paths (e.g. via --stdin) refresh the stat info of tracked entries.
+    if args.paths:
+        workdir.add_paths(repo, args.paths, update_only=True)
     return 0
 
 

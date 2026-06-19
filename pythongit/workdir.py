@@ -240,6 +240,11 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
     for rel in iter_worktree(repo):
         full = repo.path / rel
         if rel in by_path:
+            # Assume-unchanged (CE_VALID) entries are never checked against the
+            # worktree, so their modifications/deletions are not reported.
+            if by_path[rel].flags & 0x8000:
+                seen.discard(rel)
+                continue
             data = _blob_data(full)
             sha, _ = objs.hash_bytes("blob", data, repo)
             if sha != by_path[rel].sha:
@@ -249,7 +254,8 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
         else:
             untracked.append(rel)
         seen.discard(rel)
-    missing = sorted(seen)
+    # Deleted assume-unchanged entries are likewise not reported as missing.
+    missing = sorted(p for p in seen if not (by_path[p].flags & 0x8000))
 
     return {
         "staged_new": sorted(staged_new),
