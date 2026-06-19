@@ -775,6 +775,12 @@ CASES: list[tuple] = [
      ["diff", "--stat=80", "HEAD~1", "HEAD"]),
     # worktree list --porcelain.
     ("worktree-list-porcelain", BASE, ["worktree", "list", "--porcelain"]),
+    # show with multiple revisions (blank-separated) and oneline.
+    ("show-multi-rev", TAGGED, ["show", "-s", "HEAD", "HEAD~1"]),
+    ("show-multi-rev-oneline", TAGGED, ["show", "-s", "--oneline", "HEAD", "HEAD~1"]),
+    # show of a tree object lists bare names with a "tree <rev>" header.
+    ("show-tree", TAGGED + [("write", "sub/c.txt", "s\n"), ["add", "-A"], ["commit", "-m", "c3"]],
+     ["show", "HEAD^{tree}"]),
 ]
 
 

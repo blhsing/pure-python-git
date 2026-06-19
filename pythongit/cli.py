@@ -2260,7 +2260,7 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--format", default=None)
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--date", default=None)
-    ap.add_argument("rev", nargs="?", default="HEAD")
+    ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     # `--format=<builtin>` is an alias for `--pretty=<builtin>`.
@@ -2268,10 +2268,6 @@ def cmd_show(argv: list[str]) -> int:
         args.pretty, args.format = args.format, None
     pstyle = args.pretty if args.pretty in ("full", "fuller", "short", "raw", "reference") else "medium"
     date_mode = args.date or "default"
-    sha = refs_mod.rev_parse(repo, args.rev)
-    if not sha:
-        _err(f"fatal: ambiguous argument '{args.rev}': unknown revision or path not in the working tree.")
-        return 128
     fmt = args.format
     if fmt is None and args.pretty:
         if args.pretty.startswith("format:") or args.pretty.startswith("tformat:"):
@@ -2280,107 +2276,131 @@ def cmd_show(argv: list[str]) -> int:
             fmt = args.pretty
     if fmt is None and args.oneline:
         fmt = "%h %s"
-    if fmt is not None:
-        peeled = refs_mod.rev_parse(repo, args.rev + "^{commit}") or sha
-        c = objs.parse_commit(objs.read_object(repo, peeled)[1])
-        _print(_expand_commit_format(repo, peeled, c, fmt, {}))
-        if not args.no_patch and not args.stat:
-            ptree = None
+
+    def _show_one(the_rev: str) -> int:
+        sha = refs_mod.rev_parse(repo, the_rev)
+        if not sha:
+            _err(f"fatal: ambiguous argument '{the_rev}': unknown revision or path not in the working tree.")
+            _err("Use '--' to separate paths from revisions, like this:")
+            _err("'git <command> [<revision>...] -- [<file>...]'")
+            return 128
+        if fmt is not None:
+            peeled = refs_mod.rev_parse(repo, the_rev + "^{commit}") or sha
+            c = objs.parse_commit(objs.read_object(repo, peeled)[1])
+            _print(_expand_commit_format(repo, peeled, c, fmt, {}))
+            if not args.no_patch and not args.stat:
+                ptree = None
+                if c.parents:
+                    ptree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
+                _emit_tree_patch(repo, ptree, c.tree)
+            return 0
+        return _show_object(the_rev, sha)
+
+    def _show_object(the_rev: str, sha: str) -> int:
+        t, data = objs.read_object(repo, sha)
+        if t == "tag":
+            # Print the annotated-tag header, then peel to its target.
+            header, _, tagmsg = data.decode("utf-8", errors="replace").partition("\n\n")
+            tag_name = ""
+            tagger = ""
+            target = None
+            for line in header.splitlines():
+                key, _, val = line.partition(" ")
+                if key == "tag":
+                    tag_name = val
+                elif key == "tagger":
+                    tagger = val
+                elif key == "object":
+                    target = val.strip()
+            _print(f"tag {tag_name}")
+            if tagger:
+                _print(f"Tagger: {_split_ident(tagger)[0]}")
+                _print(f"Date:   {_format_date(tagger, date_mode)}")
+            _print("")
+            _print(tagmsg.rstrip("\n"))
+            _print("")
+            if target:
+                sha = target
+                t, data = objs.read_object(repo, sha)
+        if t == "commit":
+            c = objs.parse_commit(data)
+            if pstyle == "reference":
+                first = c.message.splitlines()[0] if c.message.strip() else ""
+                _print(f"{sha[:7]} ({first}, {_format_date(c.author, 'short')})")
+            elif pstyle == "raw":
+                _print(f"commit {sha}")
+                _print(f"tree {c.tree}")
+                for p in c.parents:
+                    _print(f"parent {p}")
+                _print(f"author {c.author}")
+                _print(f"committer {c.committer}")
+                _print("")
+                for line in c.message.rstrip("\n").splitlines():
+                    _print(f"    {line}")
+            elif pstyle == "short":
+                _print(f"commit {sha}")
+                if len(c.parents) > 1:
+                    _print("Merge: " + " ".join(p[:7] for p in c.parents))
+                _print(f"Author: {_split_ident(c.author)[0]}")
+                _print("")
+                first = c.message.splitlines()[0] if c.message.strip() else ""
+                _print(f"    {first}")
+            else:
+                _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode)
+                _print("")
+                for line in c.message.rstrip("\n").splitlines():
+                    _print(f"    {line}")
+            parent_tree = None
             if c.parents:
-                ptree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-            _emit_tree_patch(repo, ptree, c.tree)
-        return 0
-    t, data = objs.read_object(repo, sha)
-    if t == "tag":
-        # Print the annotated-tag header, then peel to its target.
-        header, _, tagmsg = data.decode("utf-8", errors="replace").partition("\n\n")
-        tag_name = ""
-        tagger = ""
-        target = None
-        for line in header.splitlines():
-            key, _, val = line.partition(" ")
-            if key == "tag":
-                tag_name = val
-            elif key == "tagger":
-                tagger = val
-            elif key == "object":
-                target = val.strip()
-        _print(f"tag {tag_name}")
-        if tagger:
-            _print(f"Tagger: {_split_ident(tagger)[0]}")
-            _print(f"Date:   {_format_date(tagger, date_mode)}")
-        _print("")
-        _print(tagmsg.rstrip("\n"))
-        _print("")
-        if target:
-            sha = target
-            t, data = objs.read_object(repo, sha)
-    if t == "commit":
-        c = objs.parse_commit(data)
-        if pstyle == "reference":
-            first = c.message.splitlines()[0] if c.message.strip() else ""
-            _print(f"{sha[:7]} ({first}, {_format_date(c.author, 'short')})")
-        elif pstyle == "raw":
-            _print(f"commit {sha}")
-            _print(f"tree {c.tree}")
-            for p in c.parents:
-                _print(f"parent {p}")
-            _print(f"author {c.author}")
-            _print(f"committer {c.committer}")
+                _, pd = objs.read_object(repo, c.parents[0])
+                parent_tree = objs.parse_commit(pd).tree
+            # For a merge, the default (combined) patch and raw output collapse to
+            # empty for a clean merge, but git still prints the separating blank
+            # line. '--stat' is special: it reports against the first parent.
+            is_merge = len(c.parents) > 1
+            if args.stat:
+                _print("")
+                _diff_stat(_tree_changes(repo, parent_tree, c.tree))
+            elif args.name_only:
+                _print("")
+                if not is_merge:
+                    for path, _a, _b in _tree_changes(repo, parent_tree, c.tree):
+                        _print(path)
+            elif args.name_status:
+                _print("")
+                if not is_merge:
+                    for path, a, b in _tree_changes(repo, parent_tree, c.tree):
+                        st = "A" if not a.present else ("D" if not b.present else "M")
+                        _print(f"{st}\t{path}")
+            elif args.raw:
+                _print("")
+                if not is_merge:
+                    _emit_raw_diff(repo, parent_tree, c.tree)
+            elif not args.no_patch:
+                _print("")
+                if not is_merge:
+                    _emit_tree_patch(repo, parent_tree, c.tree)
+        elif t == "tree":
+            # `git show <tree>` prints `<rev>\n\n` then bare entry names
+            # (directories suffixed with '/'), not the ls-tree triple.
+            _print(f"tree {the_rev}")
             _print("")
-            for line in c.message.rstrip("\n").splitlines():
-                _print(f"    {line}")
-        elif pstyle == "short":
-            _print(f"commit {sha}")
-            if len(c.parents) > 1:
-                _print("Merge: " + " ".join(p[:7] for p in c.parents))
-            _print(f"Author: {_split_ident(c.author)[0]}")
-            _print("")
-            first = c.message.splitlines()[0] if c.message.strip() else ""
-            _print(f"    {first}")
+            for e in objs.parse_tree(data, repo.hash_len):
+                _print(e.name + ("/" if e.is_dir() else ""))
         else:
-            _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode)
+            sys.stdout.buffer.write(data)
+            if not data.endswith(b"\n"):
+                sys.stdout.write("\n")
+        return 0
+
+    revs = args.rev or ["HEAD"]
+    multiline = fmt is None and pstyle in ("medium", "full", "fuller", "short", "raw")
+    for count, the_rev in enumerate(revs):
+        if count > 0 and multiline:
             _print("")
-            for line in c.message.rstrip("\n").splitlines():
-                _print(f"    {line}")
-        parent_tree = None
-        if c.parents:
-            _, pd = objs.read_object(repo, c.parents[0])
-            parent_tree = objs.parse_commit(pd).tree
-        # For a merge, the default (combined) patch and raw output collapse to
-        # empty for a clean merge, but git still prints the separating blank
-        # line. '--stat' is special: it reports against the first parent.
-        is_merge = len(c.parents) > 1
-        if args.stat:
-            _print("")
-            _diff_stat(_tree_changes(repo, parent_tree, c.tree))
-        elif args.name_only:
-            _print("")
-            if not is_merge:
-                for path, _a, _b in _tree_changes(repo, parent_tree, c.tree):
-                    _print(path)
-        elif args.name_status:
-            _print("")
-            if not is_merge:
-                for path, a, b in _tree_changes(repo, parent_tree, c.tree):
-                    st = "A" if not a.present else ("D" if not b.present else "M")
-                    _print(f"{st}\t{path}")
-        elif args.raw:
-            _print("")
-            if not is_merge:
-                _emit_raw_diff(repo, parent_tree, c.tree)
-        elif not args.no_patch:
-            _print("")
-            if not is_merge:
-                _emit_tree_patch(repo, parent_tree, c.tree)
-    elif t == "tree":
-        for e in objs.parse_tree(data, repo.hash_len):
-            obj_t = "tree" if e.is_dir() else "blob"
-            _print(f"{e.mode.zfill(6)} {obj_t} {e.sha}\t{e.name}")
-    else:
-        sys.stdout.buffer.write(data)
-        if not data.endswith(b"\n"):
-            sys.stdout.write("\n")
+        rc = _show_one(the_rev)
+        if rc:
+            return rc
     return 0
 
 
