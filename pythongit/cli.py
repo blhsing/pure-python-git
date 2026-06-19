@@ -1757,6 +1757,22 @@ def _parse_who(who: str) -> tuple[str, str]:
     return who, ""
 
 
+def _note_text(repo: Repository, sha: str) -> str:
+    """Return the notes blob text attached to commit ``sha`` (refs/notes/commits),
+    or '' if none."""
+    nref = refs_mod.read_ref(repo, "refs/notes/commits")
+    if not nref:
+        return ""
+    try:
+        nc = objs.parse_commit(objs.read_object(repo, nref)[1])
+    except KeyError:
+        return ""
+    for path, _m, bsha in workdir.iter_tree_files(repo, nc.tree):
+        if path.replace("/", "") == sha:
+            return objs.read_object(repo, bsha)[1].decode("utf-8", "replace")
+    return ""
+
+
 def _pad_column(text: str, spec) -> str:
     """Apply a git pretty-format column spec (align, width, trunc) to text.
     Text wider than width is left untouched unless a truncation mode is set
@@ -1823,8 +1839,9 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         ("%ah", _format_date(c.author, "human")), ("%ch", _format_date(c.committer, "human")),
         ("%at", str(a_ts) if a_ts is not None else ""), ("%ct", str(c_ts) if c_ts is not None else ""),
         ("%B", raw_body), ("%b", body), ("%f", sanitized),
-        # %e (encoding) and %N (notes) are empty for unencoded, un-noted commits.
-        ("%e", ""), ("%N", ""),
+        # %e (encoding) is empty for unencoded commits; %N is the commit's note.
+        ("%e", ""),
+        ("%N", _note_text(repo, sha) if "%N" in fmt else ""),
         # Signature placeholders: pythongit does not verify GPG signatures, so
         # commits read as unsigned ("N", empty detail fields), like unsigned
         # commits under C Git.
@@ -3755,6 +3772,7 @@ def cmd_checkout(argv: list[str]) -> int:
     revs: list[str] = []
     paths: list[str] = []
     after_dd = False
+    quiet = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -3765,6 +3783,8 @@ def cmd_checkout(argv: list[str]) -> int:
         elif a in ("-b", "-B"):
             i += 1
             new_branch = argv[i] if i < len(argv) else None
+        elif a in ("-q", "--quiet"):
+            quiet = True
         elif a.startswith("-") and a != "-":
             pass
         else:
@@ -3831,21 +3851,24 @@ def cmd_checkout(argv: list[str]) -> int:
     workdir.checkout_tree(repo, tree)
     if is_branch:
         if cur_branch == target:
-            _err(f"Already on '{target}'")
+            if not quiet:
+                _err(f"Already on '{target}'")
         else:
             refs_mod.set_head(repo, f"refs/heads/{target}")
             _log_checkout(sha, target)
-            _err(f"Switched to branch '{target}'")
+            if not quiet:
+                _err(f"Switched to branch '{target}'")
     else:
         refs_mod.set_head(repo, sha)
         _log_checkout(sha, sha[:7])
         from . import gitconfig
         advice = (gitconfig.get(repo, "advice.detachedhead") or "").lower()
-        if advice not in ("false", "0", "no", "off"):
+        if not quiet and advice not in ("false", "0", "no", "off"):
             sys.stderr.write(f"Note: switching to '{target}'.\n\n")
             sys.stderr.write(_DETACHED_ADVICE)
         subject = objs.parse_commit(data).message.splitlines()[0] if t == "commit" else ""
-        _err(f"HEAD is now at {sha[:7]} {subject}")
+        if not quiet:
+            _err(f"HEAD is now at {sha[:7]} {subject}")
     return 0
 
 
@@ -4744,12 +4767,22 @@ def cmd_reflog(argv: list[str]) -> int:
     ap.add_argument("--abbrev", nargs="?", type=int, const=7, default=7)
     ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
-    args = ap.parse_args(_expand_count_shorthand(argv))
+    # `reflog expire`/`delete` take extra flags (--dry-run, --expire=, --all, …)
+    # that we accept and treat as a no-op, so tolerate unknown options.
+    args, _unknown = ap.parse_known_args(_expand_count_shorthand(argv))
+    repo = _repo()
+    if args.action in ("expire", "delete"):
+        # pythongit never expires/prunes reflog entries; accept as a no-op.
+        return 0
+    if args.action == "exists":
+        from . import reflog as _rl
+        rr = args.ref
+        full = rr if rr == "HEAD" else (refs_mod.dwim_full_name(repo, rr) or rr)
+        return 0 if _rl.read(repo, full) else 1
     # `reflog [show] [ref]`: the first positional may be the subcommand or a ref.
     ref = args.ref
     if args.action not in ("show",) and ref == "HEAD":
         ref = args.action
-    repo = _repo()
     from . import reflog
     # The reflog is stored under logs/<full-ref>; resolve short names like
     # "main" to refs/heads/main (HEAD keeps its top-level log).

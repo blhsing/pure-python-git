@@ -1025,6 +1025,15 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # log %N expands the commit note; checkout -q suppresses switch messages.
+    ("log-fmt-note", BASE + [["notes", "add", "-m", "a note", "HEAD"]],
+     ["log", "-1", "--format=[%N]"]),
+    ("checkout-q-detach", TAGGED, ["checkout", "-q", "HEAD~1"]),
+    ("checkout-q-branch", TAGGED + [["checkout", "-q", "HEAD~1"]], ["checkout", "-q", "main"]),
+    # reflog expire/delete no-op; reflog exists.
+    ("reflog-expire", BASE, ["reflog", "expire", "--all"]),
+    ("reflog-exists", BASE, ["reflog", "exists", "HEAD"]),
+    ("reflog-exists-no", BASE, ["reflog", "exists", "refs/heads/nope"]),
     # Mailmap name/email placeholders (%aN/%aE/%cN/%cE) and signature %GP.
     ("log-fmt-mailmap", BASE, ["log", "-1", "--format=%aN <%aE> / %cN <%cE>"]),
     ("log-fmt-gp", BASE, ["log", "-1", "--format=[%GP][%GF]"]),
