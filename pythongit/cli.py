@@ -7387,9 +7387,92 @@ def cmd_cherry(argv: list[str]) -> int:
     return 0
 
 
+def _rd_format(repo: Repository, sha: str) -> tuple[str, str]:
+    """Reformat a commit into git range-diff's internal patch text (## headers),
+    returning (full_patch, diff_only). Mirrors range-diff.c:read_patches."""
+    c = objs.parse_commit(objs.read_object(repo, sha)[1])
+    lines = [" ## Metadata ##", f"Author: {_split_ident(c.author)[0]}", "",
+             " ## Commit message ##"]
+    for ml in c.message.split("\n"):
+        if ml.strip() == "":
+            continue
+        lines.append(("    " + ml).rstrip())
+    diff_lines: list[str] = []
+    parent_tree = None
+    if c.parents:
+        parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
+    for path, a, b in _tree_changes(repo, parent_tree, c.tree):
+        if not a.present:
+            sec = f"{path} (new)"
+        elif not b.present:
+            sec = f"{path} (deleted)"
+        else:
+            sec = path
+        if a.present and b.present and a.mode != b.mode:
+            sec += f" (mode change {a.mode} => {b.mode})"
+        diff_lines.append(f" ## {sec} ##")
+        a_text = (a.data or b"").decode("utf-8", "replace")
+        b_text = (b.data or b"").decode("utf-8", "replace")
+        for hl in diff_mod.format_hunks(a_text.splitlines(), b_text.splitlines(), 3):
+            if hl.startswith("@@ "):
+                # "@@ -a,b +c,d @@ section" -> "@@ <file>: section" / "@@"
+                rest = hl[3:]
+                idx = rest.find("@@")
+                tail = rest[idx + 2:] if idx >= 0 else ""
+                diff_lines.append(f"@@ {path}:{tail}" if tail else "@@")
+            else:
+                diff_lines.append(hl)
+    full = "\n".join(lines + ([""] if diff_lines else []) + diff_lines) + "\n"
+    diff_only = ("\n".join(diff_lines) + "\n") if diff_lines else ""
+    return full, diff_only
+
+
+def _rd_diffsize(a: str, b: str) -> int:
+    """git range-diff cost: number of diff hunks + body lines between a and b.
+    Newline-terminated text has no phantom trailing line (matching xdiff)."""
+    al = a.split("\n")
+    bl = b.split("\n")
+    if al and al[-1] == "":
+        al = al[:-1]
+    if bl and bl[-1] == "":
+        bl = bl[:-1]
+    spans = diff_mod._group_hunks(diff_mod.diff_lines(al, bl), 3)
+    count = len(spans)
+    for start, end in spans:
+        count += end - start
+    return count
+
+
+def _rd_assign(a_list: list, b_list: list, exact: dict, creation_factor: int = 60) -> dict:
+    """Return {a_index: b_index} matching, combining exact matches with a
+    min-cost assignment of the rest (greedy approximation of git's Hungarian)."""
+    na, nb = len(a_list), len(b_list)
+    matched_a = dict(exact)              # a_idx -> b_idx (exact)
+    used_b = set(exact.values())
+    # Candidate costs for remaining pairs.
+    rem_a = [i for i in range(na) if i not in matched_a]
+    rem_b = [j for j in range(nb) if j not in used_b]
+    crea_a = {i: _rd_diffsize(a_list[i][1], "") * creation_factor // 100 for i in rem_a}
+    crea_b = {j: _rd_diffsize(b_list[j][1], "") * creation_factor // 100 for j in rem_b}
+    pairs = []
+    for i in rem_a:
+        for j in rem_b:
+            pairs.append((_rd_diffsize(a_list[i][1], b_list[j][1]), i, j))
+    pairs.sort()
+    for cost, i, j in pairs:
+        if i in matched_a or j in used_b:
+            continue
+        # Match when keeping the pair is cheaper than creating both separately
+        # (git's cost-matrix assignment with the creation-factor weighting).
+        if cost < crea_a[i] + crea_b[j]:
+            matched_a[i] = j
+            used_b.add(j)
+    return matched_a
+
+
 def cmd_range_diff(argv: list[str]) -> int:
-    """range-diff A..B C..D — pair commits by patch-id and show diff."""
-    ap = argparse.ArgumentParser(prog="pygit range-diff")
+    """range-diff A..B C..D — match commits and show the diff of diffs."""
+    ap = argparse.ArgumentParser(prog="pygit range-diff", add_help=False)
     ap.add_argument("range1")
     ap.add_argument("range2")
     args = ap.parse_args(argv)
@@ -7434,22 +7517,111 @@ def cmd_range_diff(argv: list[str]) -> int:
         out.reverse()
         return out
 
-    a = expand(args.range1)
-    b = expand(args.range2)
-    for i, (x, y) in enumerate(zip(a, b), 1):
-        cx = objs.parse_commit(objs.read_object(repo, x)[1])
-        cy = objs.parse_commit(objs.read_object(repo, y)[1])
-        sx = cx.message.splitlines()[0] if cx.message.strip() else ""
-        sy = cy.message.splitlines()[0] if cy.message.strip() else ""
-        marker = "=" if cx.tree == cy.tree else "!"
-        _print(f"{i}: {x[:7]} {marker} {y[:7]} {sx}")
-        if sx != sy:
-            _print(f"    @@ Commit message\n    -{sx}\n    +{sy}")
-    # extras
-    for x in a[len(b):]:
-        _print(f"-: {x[:7]}")
-    for y in b[len(a):]:
-        _print(f"+: {y[:7]}")
+    a_shas = expand(args.range1)
+    b_shas = expand(args.range2)
+    # (sha, full_patch, diff_only, subject) per side.
+    def build(shas):
+        out = []
+        for s in shas:
+            full, diff = _rd_format(repo, s)
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            subj = c.message.splitlines()[0] if c.message.strip() else ""
+            out.append((s, full, diff, subj))
+        return out
+    A = build(a_shas)
+    B = build(b_shas)
+    # `_list` entries used by the matcher are (full, diff).
+    a_pf = [(x[1], x[2]) for x in A]
+    b_pf = [(x[1], x[2]) for x in B]
+    # Exact matches: identical diff text.
+    exact: dict[int, int] = {}
+    b_by_diff: dict[str, int] = {}
+    for j, (_f, d) in enumerate(b_pf):
+        b_by_diff.setdefault(d, j)
+    used_b_exact = set()
+    for i, (_f, d) in enumerate(a_pf):
+        j = b_by_diff.get(d)
+        if j is not None and j not in used_b_exact:
+            exact[i] = j
+            used_b_exact.add(j)
+    a2b = _rd_assign(a_pf, b_pf, exact)
+    b2a = {j: i for i, j in a2b.items()}
+
+    width = len(str(max(len(A), len(B)) or 1))
+    dashes = "-" * 7
+
+    def header(a_idx, b_idx):
+        if a_idx is None:
+            left = f"{'-':>{width}}:  {dashes}"
+            status = ">"
+        elif b_idx is None:
+            left = f"{a_idx + 1:>{width}}:  {A[a_idx][0][:7]}"
+            status = "<"
+        else:
+            af, bf = A[a_idx][1], B[b_idx][1]
+            status = "=" if af == bf else "!"
+            left = f"{a_idx + 1:>{width}}:  {A[a_idx][0][:7]}"
+        if b_idx is None:
+            right = f"{'-':>{width}}:  {dashes}"
+        else:
+            right = f"{b_idx + 1:>{width}}:  {B[b_idx][0][:7]}"
+        subj = (A[a_idx] if a_idx is not None else B[b_idx])[3]
+        _print(f"{left} {status} {right} {subj}")
+        return status
+
+    import re as _re
+    sec_re = _re.compile(r" ## (.*) ##$")
+
+    def emit_body(a_idx, b_idx):
+        # Inter-diff of the two reformatted patch texts. Hunk headers carry no
+        # line counts; the section name comes from the nearest preceding
+        # " ## X ##" line (git's section-header diff driver). Each line is
+        # prefixed with four spaces.
+        al = A[a_idx][1].split("\n")
+        bl = B[b_idx][1].split("\n")
+        if al and al[-1] == "":
+            al = al[:-1]
+        if bl and bl[-1] == "":
+            bl = bl[:-1]
+        ops = diff_mod.diff_lines(al, bl)
+        for start, end in diff_mod._group_hunks(ops, 3):
+            hunk = ops[start:end]
+            a_idxs = [ai for k, ai, _ in hunk if k in ("eq", "del")]
+            first_a = a_idxs[0] if a_idxs else 0
+            section = ""
+            for k in range(first_a, -1, -1):
+                m = sec_re.match(al[k])
+                if m:
+                    section = m.group(1)
+                    break
+            _print("    @@" + (" " + section if section else ""))
+            for kind, ai, bi in hunk:
+                if kind == "eq":
+                    _print("     " + al[ai])
+                elif kind == "del":
+                    _print("    -" + al[ai])
+                else:
+                    _print("    +" + bl[bi])
+
+    shown_a = set()
+    i = j = 0
+    while i < len(A) or j < len(B):
+        while i < len(A) and i in shown_a:
+            i += 1
+        if i < len(A) and i not in a2b:
+            header(i, None)
+            i += 1
+            continue
+        while j < len(B) and j not in b2a:
+            header(None, j)
+            j += 1
+        if j < len(B):
+            ai = b2a[j]
+            st = header(ai, j)
+            if st == "!":
+                emit_body(ai, j)
+            shown_a.add(ai)
+            j += 1
     return 0
 
 

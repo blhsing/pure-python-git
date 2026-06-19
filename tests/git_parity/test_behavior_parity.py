@@ -108,6 +108,17 @@ SB_THREE = BASE + [
     ["checkout", "main"]]
 SB_MERGE = MERGED  # a real merge commit, for the '-' merge marker column
 
+# Two divergent versions of a topic branch, for range-diff (= / ! / < / >).
+RANGEDIFF = BASE + [
+    ["checkout", "-b", "v1"],
+    ("write", "a.txt", "alpha\nb\n"), ["add", "-A"], ["commit", "-m", "add b"],
+    ("write", "a.txt", "alpha\nb\nc\n"), ["add", "-A"], ["commit", "-m", "add c"],
+    ["checkout", "-b", "v2", "main"],
+    ("write", "a.txt", "alpha\nb\n"), ["add", "-A"], ["commit", "-m", "add b"],
+    ("write", "a.txt", "alpha\nb\nc\nd\n"), ["add", "-A"], ["commit", "-m", "add c"],
+    ["checkout", "main"],
+]
+
 # A commit that introduces whitespace errors (trailing space, space-before-tab),
 # for `diff --check`.
 WSERR = BASE + [("write", "a.txt", "clean\ntrailing \n\tgood\n \tspacetab\n"),
@@ -1014,6 +1025,11 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # range-diff: commit matching (= identical, ! changed with inter-diff body,
+    # < only-left, > only-right) and the padded "n:  <sha>" header format.
+    ("range-diff-identical", RANGEDIFF, ["range-diff", "main..v1", "main..v1"]),
+    ("range-diff-changed", RANGEDIFF, ["range-diff", "main..v1", "main..v2"]),
+    ("range-diff-reverse", RANGEDIFF, ["range-diff", "main..v2", "main..v1"]),
     # commit-tree resolves the tree-ish argument (not used verbatim).
     ("commit-tree", SUBTREE, ["commit-tree", "-m", "msg", "HEAD^{tree}"]),
     # ls-remote against a local path: HEAD + sorted refs + peeled annotated tags.
