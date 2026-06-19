@@ -902,6 +902,13 @@ CASES: list[tuple] = [
     ("stash-log-g", STASH, ["log", "-g", "stash", "--oneline"]),
     ("stash-list-2", MULTISTASH, ["stash", "list"]),
     ("stash-show-1", MULTISTASH, ["stash", "show", "stash@{1}"]),
+    # count-objects -v includes the size-pack/prune-packable/garbage lines.
+    ("count-objects-v", TAGGED, ["count-objects", "-v"]),
+    # cat-file --batch-all-objects enumerates every object, sorted by oid.
+    ("cat-file-batch-all-check", SUBTREE, ["cat-file", "--batch-all-objects", "--batch-check"]),
+    # branch --format reuses the ref-filter %(...) atom expansion.
+    ("branch-format-refname", REFSET, ["branch", "--format=%(refname:short)"]),
+    ("branch-format-multi", REFSET, ["branch", "--format=%(objectname) %(HEAD) %(refname)"]),
 ]
 
 

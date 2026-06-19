@@ -294,9 +294,31 @@ def cmd_hash_object(argv: list[str]) -> int:
     return 0
 
 
-def _cat_file_batch(repo: Repository, check_only: bool) -> int:
-    for line in sys.stdin:
-        name = line.strip()
+def _all_object_shas(repo: Repository) -> list[str]:
+    """Every object id in the repo (loose + packed), sorted ascending — the
+    order `cat-file --batch-all-objects` emits."""
+    shas: set[str] = set()
+    objdir = repo.gitdir / "objects"
+    hex_len = repo.hex_len
+    if objdir.is_dir():
+        for d in objdir.iterdir():
+            if d.is_dir() and len(d.name) == 2 and all(c in "0123456789abcdef" for c in d.name):
+                for f in d.iterdir():
+                    if f.is_file() and len(f.name) == hex_len - 2:
+                        shas.add(d.name + f.name)
+    from . import pack as _p
+    midx = _p.read_midx(repo)
+    if midx is not None:
+        shas.update(midx.shas)
+    else:
+        for pk in _p._iter_packs(repo):
+            shas.update(pk.shas)
+    return sorted(shas)
+
+
+def _cat_file_batch(repo: Repository, check_only: bool, names=None) -> int:
+    source = names if names is not None else (line.strip() for line in sys.stdin)
+    for name in source:
         if not name:
             continue
         sha = refs_mod.rev_parse(repo, name)
@@ -353,13 +375,15 @@ def cmd_cat_file(argv: list[str]) -> int:
     g.add_argument("--batch", dest="batch", action="store_true")
     g.add_argument("--batch-check", dest="batch_check", action="store_true")
     g.add_argument("--batch-command", dest="batch_command", action="store_true")
+    ap.add_argument("--batch-all-objects", dest="batch_all", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
     if args.batch_command:
         return _cat_file_batch_command(repo)
     if args.batch or args.batch_check:
-        return _cat_file_batch(repo, check_only=args.batch_check)
+        names = _all_object_shas(repo) if args.batch_all else None
+        return _cat_file_batch(repo, check_only=args.batch_check, names=names)
 
     # The `cat-file <type> <object>` form prints the raw object content.
     has_flag = args.show_type or args.show_size or args.pretty or args.exists
@@ -3014,6 +3038,7 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("--merged", nargs="?", const="HEAD", default=None)
     ap.add_argument("--no-merged", dest="no_merged", nargs="?", const="HEAD", default=None)
     ap.add_argument("--sort", default=None)
+    ap.add_argument("--format", default=None)
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
     ap.add_argument("start", nargs="?")
@@ -3144,6 +3169,12 @@ def cmd_branch(argv: list[str]) -> int:
         width = max((len(d) for d, _ in shown), default=0)
         for display, plain in shown:
             mark = "*" if plain is not None and plain == cur else " "
+            if args.format is not None:
+                ref = (f"refs/heads/{display}" if plain is not None
+                       else f"refs/remotes/{display[len('remotes/'):]}")
+                sha = refs_mod.read_ref(repo, ref)
+                _print(_fer_expand(repo, ref, sha or "", args.format, head_sym))
+                continue
             if args.verbose:
                 ref = f"refs/heads/{display}" if plain is not None else f"refs/remotes/{display[len('remotes/'):]}"
                 sha = refs_mod.read_ref(repo, ref)
@@ -5799,10 +5830,20 @@ def cmd_count_objects(argv: list[str]) -> int:
             for pk in _p._iter_packs(repo):
                 pack_count += 1
                 pack_objs += len(pk.shas)
+        pack_dir = repo.gitdir / "objects" / "pack"
+        size_pack = 0
+        if pack_dir.is_dir():
+            for pk in pack_dir.glob("*.pack"):
+                size_pack += pk.stat().st_size
+        size_pack_kib = (size_pack + 1023) // 1024
         _print(f"count: {loose_count}")
         _print(f"size: {size}")
         _print(f"in-pack: {pack_objs}")
         _print(f"packs: {pack_count}")
+        _print(f"size-pack: {size_pack_kib}")
+        _print("prune-packable: 0")
+        _print("garbage: 0")
+        _print("size-garbage: 0")
     else:
         _print(f"{loose_count} objects, {size} kilobytes")
     return 0
