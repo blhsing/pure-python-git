@@ -1182,7 +1182,11 @@ def cmd_rm(argv: list[str]) -> int:
 
 
 def cmd_mv(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit mv")
+    ap = argparse.ArgumentParser(prog="pygit mv", add_help=False)
+    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-f", "--force", action="store_true")
+    ap.add_argument("-k", dest="skip", action="store_true")
     ap.add_argument("src")
     ap.add_argument("dst")
     args = ap.parse_args(argv)
@@ -1192,6 +1196,12 @@ def cmd_mv(argv: list[str]) -> int:
     if not src.exists():
         _err("fatal: bad source")
         return 1
+    if args.dry_run:
+        _print(f"Checking rename of '{args.src}' to '{args.dst}'")
+    if args.dry_run or args.verbose:
+        _print(f"Renaming {args.src} to {args.dst}")
+    if args.dry_run:
+        return 0
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
     workdir.rm_paths(repo, [args.src], cached=True)
@@ -4331,6 +4341,8 @@ def cmd_format_patch(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit format-patch")
     ap.add_argument("-o", "--output-directory", default=".")
     ap.add_argument("--stdout", action="store_true")
+    ap.add_argument("-n", "--numbered", action="store_true")
+    ap.add_argument("-N", "--no-numbered", dest="no_numbered", action="store_true")
     ap.add_argument("range", help="e.g. main..topic or -1 or HEAD~3")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -4393,7 +4405,10 @@ def cmd_format_patch(argv: list[str]) -> int:
         stat = _capture_output(lambda: _emit_diffstat_summary(changes))
         diff = _capture_output(lambda: [_emit_file_diff(p, a, b) for p, a, b in changes])
 
-        num = f" {i}/{len(commits)}" if len(commits) > 1 else ""
+        # Default: number only when there are multiple patches. --numbered
+        # forces N/M even for one; --no-numbered suppresses it even for many.
+        numbered = (len(commits) > 1 or args.numbered) and not args.no_numbered
+        num = f" {i}/{len(commits)}" if numbered else ""
         body = "\n".join(body_lines).rstrip("\n")
         lines = [
             f"From {sha} Mon Sep 17 00:00:00 2001",

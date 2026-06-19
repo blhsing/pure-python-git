@@ -809,6 +809,10 @@ CASES: list[tuple] = [
     ("archive-tar", TAGGED, ["archive", "--format=tar", "HEAD"]),
     ("archive-prefix", TAGGED, ["archive", "--format=tar", "--prefix=x/", "HEAD"]),
     ("archive-prefix-multi", TAGGED, ["archive", "--format=tar", "--prefix=a/b/", "HEAD"]),
+    # mv --dry-run, and format-patch numbering.
+    ("mv-dry-run", BASE, ["mv", "-n", "a.txt", "c.txt"]),
+    ("format-patch-numbered", TAGGED, ["format-patch", "-1", "--stdout", "--numbered"]),
+    ("format-patch-no-numbered", TAGGED, ["format-patch", "-1", "--stdout", "--no-numbered"]),
 ]
 
 
