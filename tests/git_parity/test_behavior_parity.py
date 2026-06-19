@@ -1025,6 +1025,9 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # Mailmap name/email placeholders (%aN/%aE/%cN/%cE) and signature %GP.
+    ("log-fmt-mailmap", BASE, ["log", "-1", "--format=%aN <%aE> / %cN <%cE>"]),
+    ("log-fmt-gp", BASE, ["log", "-1", "--format=[%GP][%GF]"]),
     # rev-parse <rev>:<missing-path> gives git's specific "does not exist" error.
     ("revparse-missing-path", BASE, ["rev-parse", "HEAD:nonexistent"]),
     # check-ref-format --allow-onelevel accepts a single-component name.
@@ -1147,6 +1150,10 @@ CASES_WITH_STDIN: list[tuple] = [
     # apply with no patch in the input errors (rc 128).
     ("apply-empty", BASE, ["apply", "--check"], ""),
     ("apply-empty-stat", BASE, ["apply", "--stat"], ""),
+    # interpret-trailers --only-trailers; column --mode=plain passthrough.
+    ("interpret-trailers-only", BASE, ["interpret-trailers", "--only-trailers"],
+     "subject line\n\nSigned-off-by: A U Thor <a@u.thor>\nReviewed-by: R <r@e>\n"),
+    ("column-plain", BASE, ["column", "--mode=plain"], "alpha\nbeta\ngamma\n"),
 ]
 
 

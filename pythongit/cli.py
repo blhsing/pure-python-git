@@ -1810,6 +1810,8 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         ("%T", c.tree), ("%t", c.tree[:abbrev]),
         ("%P", " ".join(c.parents)), ("%p", " ".join(p[:abbrev] for p in c.parents)),
         ("%an", an), ("%ae", ae), ("%cn", cn), ("%ce", ce),
+        # Mailmap-resolved name/email; with no mailmap these equal %an/%ae/etc.
+        ("%aN", an), ("%aE", ae), ("%cN", cn), ("%cE", ce),
         # Date placeholders: %ad/%cd honor --date; %aD/%ai/%aI (and committer
         # equivalents) are fixed styles; %at/%ct are the raw unix timestamps.
         ("%aD", _format_date(c.author, "rfc")), ("%cD", _format_date(c.committer, "rfc")),
@@ -1827,6 +1829,7 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         # commits read as unsigned ("N", empty detail fields), like unsigned
         # commits under C Git.
         ("%G?", "N"), ("%GG", ""), ("%GS", ""), ("%GK", ""),
+        ("%GP", ""), ("%GF", ""), ("%GT", ""),
         ("%s", subject), ("%D", deco_d), ("%d", deco),
         # %m is the left/right/boundary mark; without --left-right it is ">".
         ("%m", ">"),
@@ -8299,8 +8302,10 @@ def cmd_fast_import(argv: list[str]) -> int:
 
 
 def cmd_interpret_trailers(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit interpret-trailers")
+    ap = argparse.ArgumentParser(prog="pygit interpret-trailers", add_help=False)
     ap.add_argument("--trailer", action="append", default=[])
+    ap.add_argument("--only-trailers", dest="only_trailers", action="store_true")
+    ap.add_argument("--only-input", dest="only_input", action="store_true")
     ap.add_argument("file", nargs="?")
     args = ap.parse_args(argv)
     text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
@@ -8323,6 +8328,11 @@ def cmd_interpret_trailers(argv: list[str]) -> int:
     for t in args.trailer:
         if t not in trailers:
             trailers.append(t)
+    if args.only_trailers:
+        # --only-trailers prints just the trailer block.
+        for t in trailers:
+            _print(t)
+        return 0
     out = "\n".join(head).rstrip("\n")
     if out and trailers:
         out += "\n\n"
@@ -8705,6 +8715,11 @@ def cmd_column(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     items = [l for l in sys.stdin.read().splitlines() if l]
     if not items:
+        return 0
+    if args.mode == "plain":
+        # No columniation: emit the input lines unchanged.
+        for it in items:
+            _print(it)
         return 0
     import shutil as _sh
     width = _sh.get_terminal_size((80, 24)).columns
