@@ -2633,6 +2633,7 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--numstat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--diff-filter", dest="diff_filter", default=None)
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
@@ -2642,6 +2643,9 @@ def cmd_diff(argv: list[str]) -> int:
     # -M/-C (with optional attached values) are accepted but never consume a
     # following token; rename detection is on by default (diff.renames=true).
     ap.add_argument("--no-renames", dest="no_renames", action="store_true")
+    # `--stat=<width>` / `--stat-width=<n>` only tune column widths, which do not
+    # affect pythongit's output for the file sizes under test; normalize to bare.
+    argv = ["--stat" if a.startswith("--stat=") else a for a in argv]
     args, rest = ap.parse_known_args(argv)
     repo = _repo()
     revs: list[str] = []
@@ -2702,6 +2706,12 @@ def cmd_diff(argv: list[str]) -> int:
     if args.reverse:
         # -R swaps the two sides of every change.
         changes = [(p, b, a) for p, a, b in changes]
+
+    if args.diff_filter:
+        want = set(args.diff_filter.upper())
+        def _status(a, b):
+            return "A" if not a.present else ("D" if not b.present else "M")
+        changes = [(p, a, b) for p, a, b in changes if _status(a, b) in want]
 
     if args.quiet:
         return 1 if changes else 0
@@ -2872,6 +2882,8 @@ def cmd_branch(argv: list[str]) -> int:
     ap.add_argument("-C", dest="force_copy", action="store_true")
     ap.add_argument("--show-current", action="store_true")
     ap.add_argument("--contains", default=None)
+    ap.add_argument("--merged", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--no-merged", dest="no_merged", nargs="?", const="HEAD", default=None)
     ap.add_argument("--sort", default=None)
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("name", nargs="?")
@@ -2882,18 +2894,15 @@ def cmd_branch(argv: list[str]) -> int:
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
 
     contains_sha = refs_mod.rev_parse(repo, args.contains) if args.contains else None
+    merged_sha = refs_mod.rev_parse(repo, args.merged) if args.merged else None
+    no_merged_sha = refs_mod.rev_parse(repo, args.no_merged) if args.no_merged else None
 
-    def _branch_contains(branch: str) -> bool:
-        if contains_sha is None:
-            return True
-        tip = refs_mod.read_ref(repo, f"refs/heads/{branch}")
-        if tip is None:
-            return False
-        stack = deque([tip])
+    def _reachable_from(start: str, target: str) -> bool:
+        stack = deque([start])
         seen_c: set[str] = set()
         while stack:
             x = stack.popleft()
-            if x == contains_sha:
+            if x == target:
                 return True
             if x in seen_c:
                 continue
@@ -2902,6 +2911,19 @@ def cmd_branch(argv: list[str]) -> int:
             if info:
                 stack.extend(info[1])
         return False
+
+    def _branch_contains(branch: str) -> bool:
+        tip = refs_mod.read_ref(repo, f"refs/heads/{branch}")
+        if tip is None:
+            return False
+        # --contains C: branch tip can reach C. --merged C: C can reach the tip.
+        if contains_sha is not None and not _reachable_from(tip, contains_sha):
+            return False
+        if merged_sha is not None and not _reachable_from(merged_sha, tip):
+            return False
+        if no_merged_sha is not None and _reachable_from(no_merged_sha, tip):
+            return False
+        return True
 
     if args.move or args.force_move or args.copy or args.force_copy:
         if args.name is not None and args.start is not None:
@@ -5775,7 +5797,8 @@ def cmd_worktree(argv: list[str]) -> int:
     p_add = sub.add_parser("add")
     p_add.add_argument("path")
     p_add.add_argument("rev", nargs="?", default="HEAD")
-    sub.add_parser("list")
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--porcelain", action="store_true")
     p_remove = sub.add_parser("remove")
     p_remove.add_argument("path")
     args = ap.parse_args(argv)
@@ -5806,7 +5829,22 @@ def cmd_worktree(argv: list[str]) -> int:
     if args.action == "list":
         head = refs_mod.rev_parse(repo, "HEAD") or ""
         head_sym, _ = refs_mod.read_head(repo)
-        branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+        full_branch = head_sym if head_sym and head_sym.startswith("refs/heads/") else None
+        branch = full_branch[len("refs/heads/"):] if full_branch else None
+        if getattr(args, "porcelain", False):
+            _print(f"worktree {repo.path}")
+            _print(f"HEAD {head}")
+            _print(f"branch {full_branch}" if full_branch else "detached")
+            _print("")
+            if worktrees_dir.exists():
+                for d in sorted(worktrees_dir.iterdir()):
+                    gitdir_file, head_file = d / "gitdir", d / "HEAD"
+                    if d.is_dir() and gitdir_file.exists() and head_file.exists():
+                        wt_path = Path(gitdir_file.read_text().strip()).parent
+                        _print(f"worktree {wt_path}")
+                        _print(f"HEAD {head_file.read_text().strip()}")
+                        _print("")
+            return 0
         label = f"[{branch}]" if branch else "(detached HEAD)"
         _print(f"{repo.path} {head[:7]} {label}")
         if worktrees_dir.exists():

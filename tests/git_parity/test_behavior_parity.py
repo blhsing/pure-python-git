@@ -759,6 +759,22 @@ CASES: list[tuple] = [
     ("diff-reverse-newfile",
      BASE + [("write", "n.txt", "fresh\n"), ["add", "-A"], ["commit", "-m", "c2"]],
      ["diff", "-R", "HEAD~1", "HEAD"]),
+    # branch --merged / --no-merged.
+    ("branch-merged", MERGED, ["branch", "--merged"]),
+    ("branch-no-merged",
+     BASE + [["branch", "other"], ["checkout", "-b", "wip"], ("write", "w.txt", "w\n"),
+             ["add", "-A"], ["commit", "-m", "wip"], ["checkout", "main"]],
+     ["branch", "--no-merged"]),
+    # diff --diff-filter and --stat=<width>.
+    ("diff-filter-added",
+     BASE + [("write", "n.txt", "x\n"), ("write", "a.txt", "alpha\nz\n"), ["add", "-A"],
+             ["commit", "-m", "c2"]],
+     ["diff", "--diff-filter=A", "--name-only", "HEAD~1", "HEAD"]),
+    ("diff-stat-width",
+     BASE + [("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "--stat=80", "HEAD~1", "HEAD"]),
+    # worktree list --porcelain.
+    ("worktree-list-porcelain", BASE, ["worktree", "list", "--porcelain"]),
 ]
 
 
