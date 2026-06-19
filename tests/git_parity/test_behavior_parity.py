@@ -1157,6 +1157,51 @@ CASES: list[tuple] = [
              ["commit", "-m", "fc1"], ["checkout", "main"],
              ["merge", "-q", "--no-ff", "-m", "m", "feat"]],
      ["log", "--oneline", "-1"]),
+    # rev-list traversal ordering: default is a committer-date max-heap; topo /
+    # date order reorder the collected set (children always before parents).
+    ("rev-list-topo-order", MERGED, ["rev-list", "--topo-order", "HEAD"]),
+    ("rev-list-date-order", MERGED, ["rev-list", "--date-order", "HEAD"]),
+    ("rev-list-topo-all", MERGED, ["rev-list", "--topo-order", "--all"]),
+    ("rev-list-date-all", MERGED, ["rev-list", "--date-order", "--all"]),
+    # rev-list ref-namespace tips: --branches/--tags/--remotes (and patterns).
+    ("rev-list-branches", REFSET, ["rev-list", "--branches"]),
+    ("rev-list-tags", REFSET, ["rev-list", "--tags"]),
+    ("rev-list-remotes", REFSET, ["rev-list", "--remotes"]),
+    ("rev-list-branches-glob", REFSET, ["rev-list", "--branches=a*"]),
+    # rev-list --header: raw commit records separated by NUL.
+    ("rev-list-header", TAGGED, ["rev-list", "--header", "HEAD"]),
+    # rev-list oid abbreviation and the NUL record terminator (-z).
+    ("rev-list-abbrev-commit", TAGGED, ["rev-list", "--abbrev-commit", "HEAD"]),
+    ("rev-list-abbrev-n", TAGGED, ["rev-list", "--abbrev=4", "--abbrev-commit", "HEAD"]),
+    ("rev-list-z", TAGGED, ["rev-list", "-z", "HEAD"]),
+    ("rev-list-parents-abbrev", MERGED,
+     ["rev-list", "--parents", "--abbrev-commit", "HEAD"]),
+    # rev-list --disk-usage sums on-disk object bytes (loose objects exact).
+    ("rev-list-disk-usage", TAGGED, ["rev-list", "--disk-usage", "HEAD"]),
+    ("rev-list-disk-usage-human", TAGGED, ["rev-list", "--disk-usage=human", "HEAD"]),
+    ("rev-list-disk-usage-objects", TAGGED, ["rev-list", "--disk-usage", "--objects", "HEAD"]),
+    # rev-list --unpacked (all loose here) / no-op parent-limit resets.
+    ("rev-list-unpacked", TAGGED, ["rev-list", "--unpacked", "HEAD"]),
+    ("rev-list-no-min-parents", TAGGED, ["rev-list", "--no-min-parents", "HEAD"]),
+    ("rev-list-no-max-parents", TAGGED, ["rev-list", "--no-max-parents", "HEAD"]),
+    ("rev-list-remove-empty", TAGGED, ["rev-list", "--remove-empty", "HEAD"]),
+    # rev-list --objects-edge prefixes boundary commits with '-' and omits the
+    # objects already reachable from the uninteresting side.
+    ("rev-list-objects-edge", TAGGED, ["rev-list", "--objects-edge", "v1..HEAD"]),
+    ("rev-list-objects-exclude", MERGED, ["rev-list", "--objects", "HEAD~1..HEAD"]),
+    # rev-list --bisect / --bisect-all / --bisect-vars: halving point, full
+    # sorted set, and the shell-eval bisection variables.
+    ("rev-list-bisect", TAGGED, ["rev-list", "--bisect", "HEAD"]),
+    ("rev-list-bisect-all", MERGED, ["rev-list", "--bisect-all", "HEAD"]),
+    ("rev-list-bisect-range", PATHHIST, ["rev-list", "--bisect", "HEAD", "^HEAD~2"]),
+    ("rev-list-bisect-vars", MERGED, ["rev-list", "--bisect-vars", "HEAD"]),
+    ("rev-list-bisect-vars-range", PATHHIST, ["rev-list", "--bisect-vars", "HEAD", "^HEAD~2"]),
+    # rev-list --quiet suppresses output; --no-abbrev forces full oids;
+    # --max-age/--min-age are raw-epoch date bounds.
+    ("rev-list-quiet", TAGGED, ["rev-list", "--quiet", "HEAD"]),
+    ("rev-list-no-abbrev", TAGGED, ["rev-list", "--abbrev-commit", "--no-abbrev", "HEAD"]),
+    ("rev-list-max-age", TAGGED, ["rev-list", "--max-age=1700000000", "HEAD"]),
+    ("rev-list-min-age", TAGGED, ["rev-list", "--min-age=1700000000", "HEAD"]),
 ]
 
 

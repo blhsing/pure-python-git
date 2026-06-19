@@ -73,6 +73,53 @@ def _commit_date(repo: Repository, sha: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _object_disk_size(repo: Repository, sha: str) -> int:
+    """On-disk byte size of an object, for `rev-list --disk-usage`.
+
+    A loose object is the size of its zlib file; a packed object is the size of
+    its entry in the pack (header + compressed payload). Loose objects dominate
+    freshly written repositories and are reported exactly."""
+    p = objs._loose_path(repo, sha)
+    if p.exists():
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    try:
+        from . import pack as _pack
+        sz = _pack.packed_object_disk_size(repo, sha)
+        if sz is not None:
+            return sz
+    except Exception:
+        pass
+    try:
+        import zlib
+        return len(zlib.compress(objs.read_object(repo, sha)[1], 1))
+    except Exception:
+        return 0
+
+
+def _estimate_bisect_steps(all_count: int) -> int:
+    """C Git's estimate_bisect_steps (bisect.c): expected remaining test count."""
+    if all_count < 3:
+        return 0
+    n = all_count.bit_length() - 1   # floor(log2(all))
+    e = 1 << n                        # 2**n
+    x = all_count - e
+    return n if e < 3 * x else n - 1
+
+
+def _humanise_bytes(n: int) -> str:
+    """Match C Git's strbuf_humanise_bytes (human-readable byte counts)."""
+    if n >= 1 << 30:
+        return "%.2f GiB" % (n / (1 << 30))
+    if n >= 1 << 20:
+        return "%.2f MiB" % (n / (1 << 20))
+    if n >= 1 << 10:
+        return "%.2f KiB" % (n / (1 << 10))
+    return "%d bytes" % n
+
+
 def _approxidate(s: str) -> int:
     """Parse a --since/--until date into epoch seconds (UTC for bare dates)."""
     import datetime
@@ -131,6 +178,14 @@ def _filter_commits(repo: Repository, commits: list, args) -> list:
     committers = [re.compile(p, flags) for p in (getattr(args, "committer", None) or [])]
     since = _approxidate(args.since) if getattr(args, "since", None) else None
     until = _approxidate(args.until) if getattr(args, "until", None) else None
+    # --max-age/--min-age give raw epoch bounds (confusingly named: max-age is the
+    # older/lower date bound like --since, min-age the upper bound like --until).
+    max_age = getattr(args, "max_age", None)
+    min_age = getattr(args, "min_age", None)
+    if max_age is not None:
+        since = max_age if since is None else max(since, max_age)
+    if min_age is not None:
+        until = min_age if until is None else min(until, min_age)
     out = []
     for s in commits:
         c = objs.parse_commit(objs.read_object(repo, s)[1])
@@ -164,11 +219,14 @@ def _filter_commits(repo: Repository, commits: list, args) -> list:
     return out
 
 
-def _topo_order(repo: Repository, orig: list, first_parent: bool = False) -> list:
-    """Topologically order ``orig`` like C Git's REV_SORT_IN_GRAPH_ORDER
-    (commit.c:sort_in_topological_order): a stack-based walk that emits a commit
-    only after all its in-set children, with tips kept in traversal order."""
-    in_set = set(orig)
+def _topo_order(repo: Repository, orig: list, first_parent: bool = False,
+                by_date: bool = False) -> list:
+    """Topologically order ``orig`` like C Git's sort_in_topological_order
+    (commit.c): a Kahn's-algorithm walk that emits a commit only after all its
+    in-set children. With ``by_date`` False the ready set is a NULL-compare
+    prio_queue (a stack → graph order, REV_SORT_IN_GRAPH_ORDER); with
+    ``by_date`` True it is a max-heap on committer date (REV_SORT_BY_AUTHOR_DATE
+    style used by --date-order)."""
 
     def parents(s):
         info = _commit_tree_parents(repo, s)
@@ -181,11 +239,31 @@ def _topo_order(repo: Repository, orig: list, first_parent: bool = False) -> lis
         for p in parents(s):
             if p in indegree:
                 indegree[p] += 1
-    # Tips have no in-set child (indegree 1); the NULL-compare prio_queue is a
-    # stack, and tips are reversed so they pop in original traversal order.
+    out: list[str] = []
+    if by_date:
+        import heapq
+        heap: list[tuple] = []
+        counter = 0
+        # Tips (no in-set child) seed the queue in original list order.
+        for s in orig:
+            if indegree[s] == 1:
+                heapq.heappush(heap, (-_commit_date(repo, s), counter, s))
+                counter += 1
+        while heap:
+            _d, _c, s = heapq.heappop(heap)
+            out.append(s)
+            for p in parents(s):
+                if indegree.get(p, 0) == 0:
+                    continue
+                indegree[p] -= 1
+                if indegree[p] == 1:
+                    heapq.heappush(heap, (-_commit_date(repo, p), counter, p))
+                    counter += 1
+        return out
+    # Graph order: the NULL-compare prio_queue is a stack, and tips are reversed
+    # so they pop in original traversal order.
     tips = [s for s in orig if indegree[s] == 1]
     stack = list(reversed(tips))
-    out: list[str] = []
     while stack:
         s = stack.pop()
         out.append(s)
@@ -985,12 +1063,32 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--count", action="store_true")
     ap.add_argument("--max-count", "-n", type=int, default=None)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--branches", nargs="?", const="*", default=None)
+    ap.add_argument("--tags", nargs="?", const="*", default=None)
+    ap.add_argument("--remotes", nargs="?", const="*", default=None)
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--objects", action="store_true")
+    ap.add_argument("--objects-edge", dest="objects_edge", action="store_true")
     ap.add_argument("--parents", action="store_true")
-    ap.add_argument("--no-walk", action="store_true")
+    ap.add_argument("--no-walk", nargs="?", const="sorted", default=None)
     ap.add_argument("--children", action="store_true")
     ap.add_argument("--first-parent", action="store_true")
+    ap.add_argument("--topo-order", dest="topo_order", action="store_true")
+    ap.add_argument("--date-order", dest="date_order", action="store_true")
+    ap.add_argument("--header", action="store_true")
+    ap.add_argument("--abbrev-commit", dest="abbrev_commit", action="store_true")
+    ap.add_argument("--abbrev", type=int, default=None)
+    ap.add_argument("-z", dest="z", action="store_true")
+    ap.add_argument("--disk-usage", dest="disk_usage", nargs="?", const="", default=None)
+    ap.add_argument("--bisect", action="store_true")
+    ap.add_argument("--bisect-all", dest="bisect_all", action="store_true")
+    ap.add_argument("--bisect-vars", dest="bisect_vars", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
+    ap.add_argument("--max-age", dest="max_age", type=int, default=None)
+    ap.add_argument("--min-age", dest="min_age", type=int, default=None)
+    ap.add_argument("--unpacked", action="store_true")
+    ap.add_argument("--remove-empty", dest="remove_empty", action="store_true")
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--format", default=None)
     ap.add_argument("--oneline", action="store_true")
@@ -1000,6 +1098,8 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--no-merges", dest="no_merges", action="store_true")
     ap.add_argument("--min-parents", dest="min_parents", type=int, default=None)
     ap.add_argument("--max-parents", dest="max_parents", type=int, default=None)
+    ap.add_argument("--no-min-parents", dest="no_min_parents", action="store_true")
+    ap.add_argument("--no-max-parents", dest="no_max_parents", action="store_true")
     ap.add_argument("--grep", action="append", default=None)
     ap.add_argument("--author", action="append", default=None)
     ap.add_argument("--committer", action="append", default=None)
@@ -1015,19 +1115,53 @@ def cmd_rev_list(argv: list[str]) -> int:
         i = pre.index("--")
         rl_paths = pre[i + 1:]
         pre = pre[:i]
+    # argparse's nargs="?" greedily eats the following token, so a bare optional-
+    # value flag like `--disk-usage HEAD` would swallow the revision. Rewrite the
+    # bare forms to their attached "=<const>" so the next token stays a revision.
+    _opt_const = {"--disk-usage": "", "--branches": "*", "--tags": "*",
+                  "--remotes": "*", "--no-walk": "sorted"}
+    pre = [f"{t}={_opt_const[t]}" if t in _opt_const else t for t in pre]
     args = ap.parse_args(pre)
     if args.parents and args.children:
         _err("fatal: options '--parents' and '--children' cannot be used together")
         return 128
+    if args.no_min_parents:
+        args.min_parents = None
+    if args.no_max_parents:
+        args.max_parents = None
     repo = _repo()
+    graph = _graph_for_repo(repo)
     rev_args = args.revs
-    starts = []
+    starts: list[str] = []
     excludes: list[str] = []
-    if args.all:
-        for _ref, sha in _enumerate_refs(repo):
-            starts.append(sha)
     lr_left: set[str] = set()
     lr_right: set[str] = set()
+
+    # `--all`/`--branches`/`--tags`/`--remotes` seed tips from ref namespaces
+    # (refname order, peeling annotated tags), with HEAD appended for --all.
+    namespaces = []
+    if args.all or args.branches is not None:
+        namespaces.append(("refs/heads/", None if args.branches in (None, "*") else args.branches))
+    if args.all or args.tags is not None:
+        namespaces.append(("refs/tags/", None if args.tags in (None, "*") else args.tags))
+    if args.all or args.remotes is not None:
+        namespaces.append(("refs/remotes/", None if args.remotes in (None, "*") else args.remotes))
+    have_ns = bool(namespaces)
+    if have_ns:
+        import fnmatch
+        for refname, _rsha in _enumerate_refs(repo):
+            for pre_ns, pat in namespaces:
+                if refname.startswith(pre_ns):
+                    if pat and not fnmatch.fnmatch(refname[len(pre_ns):], pat):
+                        continue
+                    csha = refs_mod.rev_parse(repo, refname + "^{commit}")
+                    if csha:
+                        starts.append(csha)
+                    break
+        if args.all:
+            _, head_sha = refs_mod.read_head(repo)
+            if head_sha:
+                starts.append(head_sha)
 
     def _reach(start: str) -> set:
         seen_r: set[str] = set()
@@ -1075,7 +1209,7 @@ def cmd_rev_list(argv: list[str]) -> int:
         sha = refs_mod.rev_parse(repo, r)
         if sha:
             starts.append(sha)
-    if not starts and not args.all:
+    if not starts and not have_ns:
         _err("usage: git rev-list [<options>] <commit>... [--] [<path>...]")
         return 128
 
@@ -1090,7 +1224,9 @@ def cmd_rev_list(argv: list[str]) -> int:
         if info:
             estack.extend(info[1])
 
-    if args.count and args.max_count is None and starts and not excludes:
+    if (args.count and args.max_count is None and starts and not excludes
+            and not have_ns and not args.disk_usage and not args.bisect
+            and not args.bisect_all):
         try:
             from . import pack as _p
 
@@ -1100,30 +1236,62 @@ def cmd_rev_list(argv: list[str]) -> int:
                 return 0
         except Exception:
             pass
-    graph = _graph_for_repo(repo)
-    visited: set[str] = set()
+
+    # Default traversal is a committer-date max-heap (C Git's date-ordered
+    # commit_list): pop the most recent commit, emit it, push its parents.
+    want_topo = args.topo_order and not args.date_order
+    want_date = args.date_order
+    has_filter = bool(rl_paths or args.since or args.until or args.merges
+                      or args.no_merges or args.min_parents is not None
+                      or args.max_parents is not None or args.grep or args.author
+                      or args.committer or args.max_age is not None
+                      or args.min_age is not None)
+    need_full = (has_filter or want_topo or want_date or args.reverse or args.count
+                 or args.bisect or args.bisect_all or args.bisect_vars
+                 or args.disk_usage is not None or args.children)
+    import heapq
+    heap: list[tuple] = []
+    counter = 0
+    pushed: set[str] = set()
+
+    def _push(s: str) -> None:
+        nonlocal counter
+        if s in pushed:
+            return
+        pushed.add(s)
+        heapq.heappush(heap, (-_commit_date(repo, s), counter, s))
+        counter += 1
+
+    for s in starts:
+        _push(s)
     out: list[str] = []
-    stack = deque(starts)
-    while stack:
-        sha = stack.popleft()
-        if sha in visited or sha in excluded:
+    emitted: set[str] = set()
+    edges: list[str] = []
+    edge_seen: set[str] = set()
+    while heap:
+        _d, _c, sha = heapq.heappop(heap)
+        if sha in emitted:
             continue
-        visited.add(sha)
+        emitted.add(sha)
+        if sha in excluded:
+            continue
         info = _commit_tree_parents(repo, sha, graph)
         if info is None:
             continue
         out.append(sha)
-        # With path/commit filters, walk fully and trim after filtering.
-        _has_filter = (rl_paths or args.since or args.until or args.merges
-                       or args.no_merges or args.min_parents is not None
-                       or args.max_parents is not None or args.grep or args.author
-                       or args.committer)
-        if args.max_count and len(out) >= args.max_count and not _has_filter:
+        if args.no_walk is None:
+            for p in (info[1][:1] if args.first_parent else info[1]):
+                if p in excluded:
+                    if p not in edge_seen:
+                        edge_seen.add(p)
+                        edges.append(p)
+                _push(p)
+        if args.max_count and len(out) >= args.max_count and not need_full:
             break
-        if args.no_walk:
-            continue
-        _tree, parents = info
-        stack.extend(parents[:1] if args.first_parent else parents)
+    if args.no_walk is not None and args.no_walk == "unsorted":
+        # Preserve command-line / seed order rather than date order.
+        order = {s: i for i, s in enumerate(starts)}
+        out.sort(key=lambda s: order.get(s, len(order)))
 
     if rl_paths:
         def _touches(s: str) -> bool:
@@ -1140,8 +1308,122 @@ def cmd_rev_list(argv: list[str]) -> int:
             return False
         out = [s for s in out if _touches(s)]
     out = _filter_commits(repo, out, args)
+    if args.unpacked:
+        out = [s for s in out if objs._loose_path(repo, s).exists()]
+    if want_topo:
+        out = _topo_order(repo, out, args.first_parent, by_date=False)
+    elif want_date:
+        out = _topo_order(repo, out, args.first_parent, by_date=True)
     if args.max_count is not None:
         out = out[:max(0, args.max_count)]
+
+    # Output helpers: abbreviation and record terminator (-z → NUL). --oneline
+    # implies --abbrev-commit. Only a commit's own id is abbreviated; parent and
+    # child ids in --parents/--children output stay full.
+    abbrev_len = None
+    if args.abbrev_commit or args.oneline:
+        abbrev_len = max(4, args.abbrev) if args.abbrev is not None else 7
+    if args.no_abbrev:
+        abbrev_len = None
+
+    def _ab(s: str) -> str:
+        return s[:abbrev_len] if abbrev_len else s
+
+    term = "\0" if args.z else "\n"
+
+    # --quiet suppresses all object output (rc only).
+    if args.quiet:
+        return 0
+
+    # --bisect / --bisect-all / --bisect-vars: weigh each suspect by how many
+    # suspects it reaches and report the commit closest to halving the set.
+    if args.bisect or args.bisect_all or args.bisect_vars:
+        sset = set(out)
+        total = len(sset)
+
+        def _weight(x: str) -> int:
+            cnt = 0
+            st = [x]
+            seen_w: set[str] = set()
+            while st:
+                y = st.pop()
+                if y in seen_w or y not in sset:
+                    continue
+                seen_w.add(y)
+                cnt += 1
+                info = _commit_tree_parents(repo, y, graph)
+                if info:
+                    st.extend(info[1])
+            return cnt
+
+        weights = {s: _weight(s) for s in out}
+        if args.bisect_all:
+            # --bisect-all: C Git's compare_commit_dist (distance descending,
+            # ties by oid ascending) over the whole suspect set.
+            decos = _commit_decorations(repo)
+            ranked = sorted(out, key=lambda s: (-min(weights[s], total - weights[s]), s))
+            for s in ranked:
+                dist = min(weights[s], total - weights[s])
+                parts = list(decos.get(s, [])) + [f"dist={dist}"]
+                sys.stdout.write(f"{_ab(s)} ({', '.join(parts)})" + term)
+            return 0
+        # Single --bisect / --bisect-vars: C Git's best_bisection (bisect.c)
+        # reverses the walk to oldest-first, then keeps the first commit with a
+        # strictly-greater folded distance.
+        best = None
+        best_distance = -1
+        for s in reversed(out):
+            distance = min(weights[s], total - weights[s])
+            if distance > best_distance:
+                best = s
+                best_distance = distance
+        if best is None:
+            return 0
+        if args.bisect_vars:
+            reaches = weights[best]
+            _print(f"bisect_rev='{best}'")
+            _print(f"bisect_nr={max(reaches, total - reaches) - 1}")
+            _print(f"bisect_good={total - reaches - 1}")
+            _print(f"bisect_bad={reaches - 1}")
+            _print(f"bisect_all={total}")
+            _print(f"bisect_steps={_estimate_bisect_steps(total)}")
+        else:
+            sys.stdout.write(_ab(best) + term)
+        return 0
+
+    # --disk-usage: sum the on-disk byte size of every object that would be shown.
+    if args.disk_usage is not None:
+        total_bytes = 0
+        seen_du: set[str] = set()
+        if args.objects or args.objects_edge:
+            seen_du = _reachable_tree_objects(repo, excluded, graph)
+        for s in out:
+            if s not in seen_du:
+                seen_du.add(s)
+                total_bytes += _object_disk_size(repo, s)
+            if args.objects or args.objects_edge:
+                info = _commit_tree_parents(repo, s, graph)
+                if info:
+                    for osha, _p in _walk_objects(repo, info[0], ""):
+                        if osha not in seen_du:
+                            seen_du.add(osha)
+                            total_bytes += _object_disk_size(repo, osha)
+        _print(_humanise_bytes(total_bytes) if args.disk_usage == "human" else str(total_bytes))
+        return 0
+
+    # --header: raw commit record (oid, raw headers, indented message), NUL-sep.
+    if args.header:
+        buf = sys.stdout.buffer
+        for s in out:
+            raw = objs.read_object(repo, s)[1]
+            hdr, _, msg = raw.partition(b"\n\n")
+            lines = msg.split(b"\n")
+            if lines and lines[-1] == b"":
+                lines = lines[:-1]
+            indented = b"".join(b"    " + ln + b"\n" for ln in lines)
+            buf.write(s.encode() + b"\n" + hdr + b"\n\n" + indented + b"\0")
+        buf.flush()
+        return 0
 
     if args.pretty is not None or args.format is not None or args.oneline:
         fmt = args.format
@@ -1151,17 +1433,19 @@ def cmd_rev_list(argv: list[str]) -> int:
         elif fmt is None and args.pretty and "%" in args.pretty:
             fmt = args.pretty
         is_oneline = args.oneline or args.pretty == "oneline"
+        if args.reverse:
+            out = list(reversed(out))
         for s in out:
             c = objs.parse_commit(objs.read_object(repo, s)[1])
             if is_oneline and fmt is None:
                 first = c.message.splitlines()[0] if c.message.strip() else ""
-                _print(f"{s[:7] if args.oneline else s} {first}")
+                _print(f"{_ab(s)} {first}")
             elif fmt is not None:
                 # rev-list prefixes a "commit <oid>" line before the format.
-                _print(f"commit {s}")
+                _print(f"commit {_ab(s)}")
                 _print(_expand_commit_format(repo, s, c, fmt, {}))
             else:
-                _print(f"commit {s}")
+                _print(f"commit {_ab(s)}")
                 _emit_commit_header(s, c, style=args.pretty, date_mode="default")
                 _print("")
                 for line in c.message.rstrip("\n").splitlines():
@@ -1169,10 +1453,19 @@ def cmd_rev_list(argv: list[str]) -> int:
         return 0
     if args.count:
         _print(str(len(out)))
-    elif args.objects:
+    elif args.objects or args.objects_edge:
+        wbuf = sys.stdout.write
+        # Boundary (uninteresting) commits, prefixed with '-', precede the rest.
+        if args.objects_edge:
+            for e in edges:
+                wbuf(f"-{_ab(e)}" + term)
+        if args.reverse:
+            out = list(reversed(out))
         for s in out:
-            _print(s)
-        seen_obj: set[str] = set()
+            wbuf(_ab(s) + term)
+        # Objects reachable from the uninteresting (excluded) commits are
+        # already in the receiver, so C Git omits them from the listing.
+        seen_obj = _reachable_tree_objects(repo, excluded, graph)
         for s in out:
             info = _commit_tree_parents(repo, s, graph)
             if info is None:
@@ -1181,7 +1474,7 @@ def cmd_rev_list(argv: list[str]) -> int:
                 if osha in seen_obj:
                     continue
                 seen_obj.add(osha)
-                _print(f"{osha} {opath}")
+                wbuf(f"{osha} {opath}" + term)
     else:
         if args.reverse:
             out = list(reversed(out))
@@ -1191,8 +1484,10 @@ def cmd_rev_list(argv: list[str]) -> int:
             for s in out:
                 info = _commit_tree_parents(repo, s, graph)
                 if info:
+                    # C Git prepends each child to its parent's list, so the
+                    # last commit processed appears first.
                     for p in info[1]:
-                        children_map.setdefault(p, []).append(s)
+                        children_map.setdefault(p, []).insert(0, s)
         for s in out:
             mark = ""
             if args.left_right:
@@ -1209,8 +1504,23 @@ def cmd_rev_list(argv: list[str]) -> int:
                 kids = children_map.get(s, [])
                 if kids:
                     extra += " " + " ".join(kids)
-            _print(f"{ts_prefix}{mark}{s}{extra}")
+            sys.stdout.write(f"{ts_prefix}{mark}{_ab(s)}{extra}" + term)
     return 0
+
+
+def _reachable_tree_objects(repo: Repository, commits, graph=None) -> set[str]:
+    """Set of tree/blob object ids reachable from the given commits' trees.
+
+    Used to subtract objects already implied by uninteresting commits from
+    `rev-list --objects` / `--objects-edge` / `--disk-usage --objects`."""
+    seen: set[str] = set()
+    for c in commits:
+        info = _commit_tree_parents(repo, c, graph)
+        if info is None:
+            continue
+        for osha, _p in _walk_objects(repo, info[0], ""):
+            seen.add(osha)
+    return seen
 
 
 def _walk_objects(repo: Repository, tree_sha: str, prefix: str):

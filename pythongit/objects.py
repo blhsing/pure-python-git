@@ -38,7 +38,9 @@ def write_object(repo: Repository, obj_type: str, data: bytes) -> str:
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
-        tmp.write_bytes(zlib.compress(full))
+        # git compresses loose objects at zlib level 1 (core.loosecompression's
+        # default), which yields byte-identical files to the reference tool.
+        tmp.write_bytes(zlib.compress(full, 1))
         os.replace(tmp, p)
         try:
             from . import loose as _loose
