@@ -1812,6 +1812,8 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         # commits under C Git.
         ("%G?", "N"), ("%GG", ""), ("%GS", ""), ("%GK", ""),
         ("%s", subject), ("%D", deco_d), ("%d", deco),
+        # %m is the left/right/boundary mark; without --left-right it is ">".
+        ("%m", ">"),
         ("%n", "\n"), ("%%", "%"),
     ]
     # Reflog placeholders (only meaningful under `log -g`): %gD/%gd selector
@@ -1825,9 +1827,36 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
                             ("%gn", gn), ("%ge", ge)]
     else:
         replacements[:0] = [("%gD", ""), ("%gd", ""), ("%gs", ""), ("%gn", ""), ("%ge", "")]
+    def _decorate_atom(spec: str) -> str:
+        # %(decorate) / %(decorate:prefix=..,suffix=..,separator=..,...)
+        prefix, suffix, sep = " (", ")", ", "
+        tag = pointer = ""
+        if spec.startswith("decorate:"):
+            for opt in spec[len("decorate:"):].split(","):
+                k, _, v = opt.partition("=")
+                if k == "prefix":
+                    prefix = v
+                elif k == "suffix":
+                    suffix = v
+                elif k == "separator":
+                    sep = v
+                elif k == "tag":
+                    tag = v
+                elif k == "pointer":
+                    pointer = v
+        if not deco_names:
+            return ""
+        names = list(deco_names)
+        if pointer:
+            names = [n.replace(" -> ", pointer) for n in names]
+        if tag:
+            names = [tag + n[len("tag: "):] if n.startswith("tag: ") else n for n in names]
+        return prefix + sep.join(names) + suffix
+
     def expand_seg(s: str) -> str:
         # %xHH expands to the literal byte (e.g. %x09 -> tab) before field tokens.
         s = _re.sub(r"%x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+        s = _re.sub(r"%\((decorate(?::[^)]*)?)\)", lambda m: _decorate_atom(m.group(1)), s)
         for token, value in replacements:
             s = s.replace(token, value)
         return s
@@ -1930,6 +1959,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("-g", "--walk-reflogs", dest="walk_reflogs", action="store_true")
     ap.add_argument("--follow", action="store_true")
+    ap.add_argument("--left-right", dest="left_right", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
@@ -2018,8 +2048,9 @@ def cmd_log(argv: list[str]) -> int:
     date_given = args.date is not None
 
     decorate = args.decorate is not None and not args.no_decorate
-    # The %d/%D placeholders always expand decorations, even without --decorate.
-    if not decorate and fmt_string and ("%d" in fmt_string or "%D" in fmt_string):
+    # The %d/%D/%(decorate) placeholders always expand decorations.
+    if not decorate and fmt_string and ("%d" in fmt_string or "%D" in fmt_string
+                                        or "%(decorate" in fmt_string):
         decorate = True
     decorations = _commit_decorations(repo, full=(args.decorate == "full")) if decorate else {}
 
@@ -6338,13 +6369,31 @@ def _loose_disk_kib(repo: Repository) -> int:
     return total_blocks * 512 // 1024
 
 
+def _humanise_bytes(n: int) -> str:
+    """Port of git's strbuf_humanise_bytes: bytes -> '<N> bytes' / 'X.XX KiB' /
+    'MiB' / 'GiB' / 'TiB'."""
+    if n < 1024:
+        return f"{n} bytes"
+    units = ["KiB", "MiB", "GiB", "TiB"]
+    val = float(n)
+    for u in units:
+        val /= 1024.0
+        if val < 1024.0 or u == units[-1]:
+            return f"{val:.2f} {u}"
+    return f"{val:.2f} TiB"
+
+
 def cmd_count_objects(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit count-objects", add_help=False)
     ap.add_argument("-v", "--verbose", dest="v", action="store_true")
+    ap.add_argument("-H", "--human-readable", dest="human", action="store_true")
     args = ap.parse_args(argv)
     repo = _repo()
     loose_count, _bytes = _loose_count_and_size(repo)
     size = _loose_disk_kib(repo)
+    if args.human and not args.v:
+        _print(f"{loose_count} objects, {_humanise_bytes(size * 1024)}")
+        return 0
     if args.v:
         from . import pack as _p
         midx = _p.read_midx(repo)

@@ -1025,6 +1025,14 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # count-objects -H human-readable size; %m mark; %(decorate) atom.
+    ("count-objects-H", TAGGED, ["count-objects", "-H"]),
+    ("log-fmt-m", BASE, ["log", "-1", "--format=[%m]"]),
+    ("log-fmt-decorate",
+     BASE + [["tag", "-a", "-m", "r", "v1"]], ["log", "-1", "--format=%(decorate)"]),
+    ("log-fmt-decorate-opts",
+     BASE + [["tag", "-a", "-m", "r", "v1"]],
+     ["log", "-1", "--format=%(decorate:prefix=[,suffix=],separator=; )"]),
     # log/show pretty column alignment %<()/%>()/%><() and truncation.
     ("log-col-left", BODY, ["log", "-1", "--pretty=format:[%<(12)%s]"]),
     ("log-col-right", BODY, ["log", "-1", "--pretty=format:[%>(12)%s]"]),
