@@ -112,6 +112,12 @@ SB_MERGE = MERGED  # a real merge commit, for the '-' merge marker column
 # for `diff --check`.
 WSERR = BASE + [("write", "a.txt", "clean\ntrailing \n\tgood\n \tspacetab\n"),
                 ["add", "-A"], ["commit", "-m", "ws"]]
+# In-line word changes plus an end-of-line addition, for `diff --word-diff`.
+WORDDIFF = [("write", "p.txt", "the quick brown fox\nsecond line here\nunchanged\n"),
+            ["add", "-A"], ["commit", "-m", "c1"],
+            ("write", "p.txt", "the slow brown fox jumps\nsecond line here\nunchanged\nnew tail\n"),
+            ["add", "-A"], ["commit", "-m", "c2"]]
+
 # A file renamed across commits, for `log --follow`.
 RENAME = [("write", "orig.txt", "alpha\n"), ["add", "-A"], ["commit", "-m", "c1"],
           ["mv", "orig.txt", "renamed.txt"], ["commit", "-m", "c2"],
@@ -946,6 +952,11 @@ CASES: list[tuple] = [
     ("show-branch-reflog", TAGGED, ["show-branch", "--reflog"]),
     ("show-branch-reflog-n", TAGGED, ["show-branch", "--reflog=2"]),
     ("show-branch-reflog-ref", TAGGED, ["show-branch", "--reflog", "main"]),
+    # diff --word-diff: inline [-removed-]{+added+} word markers (plain mode).
+    ("word-diff", WORDDIFF, ["diff", "--word-diff", "HEAD~1", "HEAD"]),
+    ("word-diff-plain", WORDDIFF, ["diff", "--word-diff=plain", "HEAD~1", "HEAD"]),
+    ("word-diff-reverse", WORDDIFF, ["diff", "--word-diff", "HEAD", "HEAD~1"]),
+    ("word-diff-path", WORDDIFF, ["diff", "--word-diff", "HEAD~1", "HEAD", "--", "p.txt"]),
     # diff --check reports whitespace errors on added lines (rc 2), else nothing.
     ("diff-check", WSERR, ["diff", "--check", "HEAD~1", "HEAD"]),
     ("diff-check-clean", SUBTREE, ["diff", "--check", "HEAD~1", "HEAD"]),

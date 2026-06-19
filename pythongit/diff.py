@@ -150,6 +150,135 @@ def format_hunks(
     return out
 
 
+# ---------------------------------------------------------------------------
+# word-diff (git diff --word-diff[=plain]) — port of diff.c:diff_words_show
+
+
+def _split_words(text: str) -> list[tuple[int, int]]:
+    """Tokenize ``text`` into (begin, end) offsets of words — maximal runs of
+    non-whitespace, exactly as git's whitespace word-splitter (newlines, being
+    whitespace, bound words)."""
+    res: list[tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        j = i + 1
+        while j < n and not text[j].isspace():
+            j += 1
+        res.append((i, j))
+        i = j
+    return res
+
+
+def _ww(text: str, prefix: str, suffix: str) -> str:
+    """Mirror diff.c:fn_out_diff_words_write_helper for plain mode (newline
+    style "\\n"): wrap each non-empty newline-delimited segment with the
+    prefix/suffix, leaving the newlines themselves bare."""
+    out: list[str] = []
+    parts = text.split("\n")
+    for idx, seg in enumerate(parts):
+        if seg != "":
+            out.append(prefix + seg + suffix)
+        if idx < len(parts) - 1:
+            out.append("\n")
+    return "".join(out)
+
+
+def _word_render(minus_text: str, plus_text: str) -> str:
+    """Render one hunk's word-level diff. Common text (and all whitespace) comes
+    from the plus side; removed words are wrapped [-..-], added words {+..+}."""
+    if not plus_text:
+        return _ww(minus_text, "[-", "-]")
+    wm = _split_words(minus_text)
+    wp = _split_words(plus_text)
+    ops = diff_lines([minus_text[b:e] for b, e in wm],
+                     [plus_text[b:e] for b, e in wp])
+    out: list[str] = []
+    current_plus = 0
+    mi = pi = 0
+    i = 0
+    n = len(ops)
+    while i < n:
+        if ops[i][0] == "eq":
+            mi += 1
+            pi += 1
+            i += 1
+            continue
+        del_idx: list[int] = []
+        ins_idx: list[int] = []
+        while i < n and ops[i][0] != "eq":
+            if ops[i][0] == "del":
+                del_idx.append(mi)
+                mi += 1
+            else:
+                ins_idx.append(pi)
+                pi += 1
+            i += 1
+        minus_end_off = minus_text[wm[del_idx[-1]][1]:wm[del_idx[-1]][1] + 1] if del_idx else ""
+        if ins_idx:
+            plus_begin = wp[ins_idx[0]][0]
+            plus_end = wp[ins_idx[-1]][1]
+            del_lo = wm[del_idx[0]][0] if del_idx else 0
+            del_hi = wm[del_idx[-1]][1] if del_idx else 0
+        else:
+            # Pure deletion. A *whole-line* deletion (the removed words are
+            # bounded by newlines on both sides in the minus side) takes its
+            # trailing newline and consumes the next plus word's leading newline
+            # as context, so it lands on its own line — matching git. An in-line
+            # deletion keeps the removed words on the surviving line.
+            d0 = wm[del_idx[0]][0]
+            dn = wm[del_idx[-1]][1]
+            before = minus_text[d0 - 1] if d0 > 0 else "\n"
+            after = minus_text[dn] if dn < len(minus_text) else "\n"
+            del_lo, del_hi = d0, dn
+            if before == "\n" and after == "\n":
+                del_hi = dn + 1  # include the deleted line's newline
+                plus_begin = plus_end = (wp[pi][0] if pi < len(wp) else len(plus_text))
+            else:
+                plus_begin = plus_end = (wp[pi - 1][1] if pi > 0 else 0)
+        out.append(_ww(plus_text[current_plus:plus_begin], "", ""))
+        if del_idx:
+            out.append(_ww(minus_text[del_lo:del_hi], "[-", "-]"))
+        if ins_idx:
+            out.append(_ww(plus_text[wp[ins_idx[0]][0]:wp[ins_idx[-1]][1]], "{+", "+}"))
+        current_plus = plus_end
+    out.append(_ww(plus_text[current_plus:], "", ""))
+    return "".join(out)
+
+
+def word_diff_hunks(a: list[str], b: list[str], context: int = 3) -> str:
+    """Return the git ``--word-diff=plain`` body (``@@`` headers + word-diffed
+    content) for two line lists."""
+    ops = diff_lines(a, b)
+    a_cons = [0] * (len(ops) + 1)
+    b_cons = [0] * (len(ops) + 1)
+    for i, (k, _ai, _bi) in enumerate(ops):
+        a_cons[i + 1] = a_cons[i] + (1 if k in ("eq", "del") else 0)
+        b_cons[i + 1] = b_cons[i] + (1 if k in ("eq", "ins") else 0)
+    chunks: list[str] = []
+    for start, end in _group_hunks(ops, context):
+        hunk = ops[start:end]
+        a_idx = [ai for k, ai, _ in hunk if k in ("eq", "del")]
+        b_idx = [bi for k, _, bi in hunk if k in ("eq", "ins")]
+        a_count = len(a_idx)
+        b_count = len(b_idx)
+        a_start = a_idx[0] + 1 if a_idx else a_cons[start]
+        b_start = b_idx[0] + 1 if b_idx else b_cons[start]
+        first_a = a_idx[0] if a_idx else a_cons[start]
+        heading = _funcname_heading(a, first_a - 1)
+        hdr = f"@@ -{_hunk_range(a_start, a_count)} +{_hunk_range(b_start, b_count)} @@"
+        if heading:
+            hdr += " " + heading
+        minus_text = "".join(a[ai] + "\n" for k, ai, _bi in hunk if k in ("eq", "del"))
+        plus_text = "".join(b[bi] + "\n" for k, _ai, bi in hunk if k in ("eq", "ins"))
+        chunks.append(hdr + "\n" + _word_render(minus_text, plus_text))
+    return "".join(chunks)
+
+
 def unified_diff(a_text: str, b_text: str, a_label: str = "a", b_label: str = "b", context: int = 3) -> str:
     a = a_text.splitlines()
     b = b_text.splitlines()

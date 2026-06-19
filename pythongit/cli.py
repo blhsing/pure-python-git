@@ -2797,7 +2797,8 @@ def _diff_check(repo: Repository, changes: list) -> int:
     return 2 if found else 0
 
 
-def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3) -> None:
+def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3,
+                    word_diff: bool = False) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
     # Under -R the working-side prefixes are swapped (b/<path> a/<path>).
@@ -2823,6 +2824,10 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
         b_text = (b.data or b"").decode("utf-8", errors="replace")
         _print(f"--- {pa + '/' + path if a.present else '/dev/null'}")
         _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
+        if word_diff:
+            sys.stdout.write(diff_mod.word_diff_hunks(
+                a_text.splitlines(), b_text.splitlines(), context))
+            return
         body = diff_mod.format_hunks(
             a_text.splitlines(), b_text.splitlines(),
             context,
@@ -2948,7 +2953,22 @@ def cmd_diff(argv: list[str]) -> int:
     # `--stat=<width>` / `--stat-width=<n>` only tune column widths, which do not
     # affect pythongit's output for the file sizes under test; normalize to bare.
     argv = ["--stat" if a.startswith("--stat=") else a for a in argv]
+    # `--word-diff[=<mode>]` only takes a value when attached with '='; a bare
+    # flag means "plain". Pull it out of argv so the trailing rev isn't consumed.
+    word_diff_mode = None
+    _wd_argv = []
+    for a in argv:
+        if a == "--word-diff":
+            word_diff_mode = "plain"
+        elif a.startswith("--word-diff="):
+            word_diff_mode = a.split("=", 1)[1]
+        elif a == "--color-words":
+            word_diff_mode = "plain"
+        else:
+            _wd_argv.append(a)
+    argv = _wd_argv
     args, rest = ap.parse_known_args(argv)
+    args.word_diff = word_diff_mode
     repo = _repo()
     revs: list[str] = []
     paths: list[str] = []
@@ -3059,6 +3079,9 @@ def cmd_diff(argv: list[str]) -> int:
             entries.append((path, f"{status}\t{path}"))
         for _key, line in sorted(entries):
             _print(line)
+    elif args.word_diff == "plain":
+        for path, a, b in changes:
+            _emit_file_diff(path, a, b, args.reverse, args.unified, word_diff=True)
     else:
         renames = []
         if not args.no_renames:
