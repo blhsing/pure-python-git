@@ -2519,7 +2519,7 @@ def cmd_show(argv: list[str]) -> int:
         if fmt is not None:
             peeled = refs_mod.rev_parse(repo, the_rev + "^{commit}") or sha
             c = objs.parse_commit(objs.read_object(repo, peeled)[1])
-            _print(_expand_commit_format(repo, peeled, c, fmt, {}, abbrev=args.abbrev))
+            _print(_expand_commit_format(repo, peeled, c, fmt, {}, date_mode=date_mode, abbrev=args.abbrev))
             if not args.no_patch and not args.stat:
                 ptree = None
                 if c.parents:
@@ -4519,6 +4519,8 @@ def cmd_reflog(argv: list[str]) -> int:
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("--oneline", action="store_true")  # default format is already oneline
     ap.add_argument("--date", default=None)
+    ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", type=int, const=7, default=7)
     ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
     args = ap.parse_args(_expand_count_shorthand(argv))
@@ -4542,7 +4544,8 @@ def cmd_reflog(argv: list[str]) -> int:
         if args.max_count is not None and shown >= args.max_count:
             break
         inner = _format_date(ident, args.date) if args.date else str(i)
-        _print(f"{new[:7]} {ref}@{{{inner}}}: {msg}")
+        disp = new if args.no_abbrev else new[:args.abbrev]
+        _print(f"{disp} {ref}@{{{inner}}}: {msg}")
         shown += 1
     return 0
 
@@ -4724,6 +4727,9 @@ def cmd_apply(argv: list[str]) -> int:
     from . import patch
     text = sys.stdin.read() if not args.file else Path(args.file).read_text(encoding="utf-8", errors="replace")
     patches = patch.parse_patch(text)
+    if not patches:
+        _err('error: No valid patches in input (allow with "--allow-empty")')
+        return 128
 
     def counts(fp) -> tuple[int, int]:
         ins = sum(1 for h in fp.hunks for ln in h.lines if ln.startswith("+"))
@@ -5236,6 +5242,8 @@ def cmd_blame(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit blame", add_help=False)
     ap.add_argument("-l", dest="long_sha", action="store_true")
     ap.add_argument("-L", dest="line_range", default=None)
+    ap.add_argument("-p", "--porcelain", action="store_true")
+    ap.add_argument("--line-porcelain", dest="line_porcelain", action="store_true")
     ap.add_argument("path")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -5303,6 +5311,47 @@ def cmd_blame(argv: list[str]) -> int:
     for idx in range(len(blame_sha)):
         if blame_sha[idx] is None:
             blame_sha[idx] = chain[-1] if chain else head
+
+    if args.porcelain or args.line_porcelain:
+        def _porc_info(s):
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            awho, a_ts, a_tz = _split_ident(c.author)
+            cwho, c_ts, c_tz = _split_ident(c.committer)
+            an, ae = _parse_who(awho)
+            cn, ce = _parse_who(cwho)
+            subj = c.message.splitlines()[0] if c.message.strip() else ""
+            blk = [f"author {an}", f"author-mail <{ae}>", f"author-time {a_ts}",
+                   f"author-tz {a_tz}", f"committer {cn}", f"committer-mail <{ce}>",
+                   f"committer-time {c_ts}", f"committer-tz {c_tz}", f"summary {subj}"]
+            if not c.parents:
+                blk.append("boundary")
+            else:
+                ptree = _commit_tree_parents(repo, c.parents[0], graph)
+                if ptree and workdir.tree_path_entry(repo, ptree[0], args.path):
+                    blk.append(f"previous {c.parents[0]} {args.path}")
+            blk.append(f"filename {args.path}")
+            return blk
+        seen_commit: set[str] = set()
+        n = len(cur_lines)
+        idx = 0
+        while idx < n:
+            s = blame_sha[idx] or "0" * 40
+            # group: consecutive lines from the same commit.
+            g = idx
+            while g + 1 < n and (blame_sha[g + 1] or "0" * 40) == s:
+                g += 1
+            group = g - idx + 1
+            for k in range(idx, g + 1):
+                first_in_group = (k == idx)
+                hdr = f"{s} {k + 1} {k + 1}" + (f" {group}" if first_in_group else "")
+                _print(hdr)
+                if args.line_porcelain or s not in seen_commit:
+                    for bl in _porc_info(s):
+                        _print(bl)
+                    seen_commit.add(s)
+                _print("\t" + cur_lines[k])
+            idx = g + 1
+        return 0
 
     info: dict[str, tuple[str, str, bool]] = {}
     for s in set(b for b in blame_sha if b):

@@ -1025,6 +1025,14 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # blame porcelain formats.
+    ("blame-porcelain", PATHHIST, ["blame", "-p", "a.txt"]),
+    ("blame-line-porcelain", PATHHIST, ["blame", "--line-porcelain", "a.txt"]),
+    # reflog --no-abbrev shows full oids; --date renders entry times.
+    ("reflog-no-abbrev", TAGGED, ["reflog", "--no-abbrev"]),
+    # --date=unix renders the raw epoch (in show's format path too).
+    ("show-date-unix", DATED, ["show", "-s", "--format=%ad", "--date=unix", "HEAD"]),
+    ("log-date-unix", DATED, ["log", "-1", "--date=unix"]),
     # range-diff: commit matching (= identical, ! changed with inter-diff body,
     # < only-left, > only-right) and the padded "n:  <sha>" header format.
     ("range-diff-identical", RANGEDIFF, ["range-diff", "main..v1", "main..v1"]),
@@ -1062,6 +1070,9 @@ CASES_WITH_STDIN: list[tuple] = [
     ("hash-object-stdin-paths", BASE, ["hash-object", "--stdin-paths"], "a.txt\n"),
     ("cat-file-batch-command", BASE, ["cat-file", "--batch-command"],
      "info HEAD\ncontents HEAD:a.txt\n"),
+    # apply with no patch in the input errors (rc 128).
+    ("apply-empty", BASE, ["apply", "--check"], ""),
+    ("apply-empty-stat", BASE, ["apply", "--stat"], ""),
 ]
 
 
