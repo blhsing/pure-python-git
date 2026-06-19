@@ -984,6 +984,48 @@ def cmd_rev_parse(argv: list[str]) -> int:
     return 0
 
 
+_LS_FILES_USAGE = (
+    "usage: git ls-files [<options>] [<file>...]\n"
+    "\n"
+    "    -z                    separate paths with the NUL character\n"
+    "    -t                    identify the file status with tags\n"
+    "    -v                    use lowercase letters for 'assume unchanged' files\n"
+    "    -f                    use lowercase letters for 'fsmonitor clean' files\n"
+    "    -c, --[no-]cached     show cached files in the output (default)\n"
+    "    -d, --[no-]deleted    show deleted files in the output\n"
+    "    -m, --[no-]modified   show modified files in the output\n"
+    "    -o, --[no-]others     show other files in the output\n"
+    "    -i, --[no-]ignored    show ignored files in the output\n"
+    "    -s, --[no-]stage      show staged contents' object name in the output\n"
+    "    -k, --[no-]killed     show files on the filesystem that need to be removed\n"
+    "    --[no-]directory      show 'other' directories' names only\n"
+    "    --[no-]eol            show line endings of files\n"
+    "    --[no-]empty-directory\n"
+    "                          don't show empty directories\n"
+    "    -u, --[no-]unmerged   show unmerged files in the output\n"
+    "    --[no-]resolve-undo   show resolve-undo information\n"
+    "    -x, --exclude <pattern>\n"
+    "                          skip files matching pattern\n"
+    "    -X, --exclude-from <file>\n"
+    "                          read exclude patterns from <file>\n"
+    "    --[no-]exclude-per-directory <file>\n"
+    "                          read additional per-directory exclude patterns in <file>\n"
+    "    --exclude-standard    add the standard git exclusions\n"
+    "    --full-name           make the output relative to the project top directory\n"
+    "    --[no-]recurse-submodules\n"
+    "                          recurse through submodules\n"
+    "    --[no-]error-unmatch  if any <file> is not in the index, treat this as an error\n"
+    "    --[no-]with-tree <tree-ish>\n"
+    "                          pretend that paths removed since <tree-ish> are still present\n"
+    "    --[no-]abbrev[=<n>]   use <n> digits to display object names\n"
+    "    --[no-]debug          show debugging data\n"
+    "    --[no-]deduplicate    suppress duplicate entries\n"
+    "    --[no-]sparse         show sparse directories in the presence of a sparse index\n"
+    "    --format <format>     format to use for the output\n"
+    "\n"
+)
+
+
 def cmd_ls_files(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit ls-files", add_help=False)
     ap.add_argument("-s", "--stage", action="store_true")
@@ -991,16 +1033,35 @@ def cmd_ls_files(argv: list[str]) -> int:
     ap.add_argument("-m", "--modified", action="store_true")
     ap.add_argument("-o", "--others", action="store_true")
     ap.add_argument("-d", "--deleted", action="store_true")
+    ap.add_argument("-i", "--ignored", action="store_true")
+    ap.add_argument("-u", "--unmerged", action="store_true")
+    ap.add_argument("-k", "--killed", action="store_true")
+    ap.add_argument("-x", "--exclude", action="append", default=None)
+    ap.add_argument("-X", "--exclude-from", dest="exclude_from", action="append", default=None)
     ap.add_argument("--exclude-standard", action="store_true")
     ap.add_argument("--error-unmatch", action="store_true")
     ap.add_argument("--full-name", action="store_true")
     ap.add_argument("-t", dest="tag", action="store_true")
+    ap.add_argument("-v", dest="tag_v", action="store_true")
+    ap.add_argument("-f", dest="tag_f", action="store_true")
+    ap.add_argument("--format", default=None)
     ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("paths", nargs="*")
     argv = ["--abbrev=7" if a == "--abbrev" else a for a in argv]
     args = ap.parse_args(argv)
+    # -v/-f are tag variants (lowercase markers for assume-unchanged / fsmonitor,
+    # which we don't track, so they render like -t).
+    if args.tag_v or args.tag_f:
+        args.tag = True
     repo = _repo()
+    # --format cannot combine with the output modes that aren't a plain path list.
+    if args.format is not None and (args.stage or args.others or args.killed
+                                    or args.tag or args.tag_v or args.tag_f):
+        _err("fatal: --format cannot be used with -s, -o, -k, -t, "
+             "--resolve-undo, --deduplicate, --eol")
+        sys.stderr.write("\n" + _LS_FILES_USAGE)
+        return 129
     idx = read_index(repo)
     eol = "\0" if args.nul else "\n"
 
@@ -1019,43 +1080,105 @@ def cmd_ls_files(argv: list[str]) -> int:
         return any(p == ps or p.startswith(ps.rstrip("/") + "/") for ps in args.paths)
 
     want_cached = args.cached or args.stage
-    if not (want_cached or args.modified or args.others or args.deleted):
+    if not (want_cached or args.modified or args.others or args.deleted
+            or args.unmerged or args.killed):
         want_cached = True
 
     def _tag(prefix: str, text: str) -> str:
         return (prefix + " " + text) if args.tag else text
 
-    lines: list[tuple[str, str]] = []
-    if want_cached:
-        for e in idx.entries:
-            if match(e.path):
-                if args.stage:
-                    sha = e.sha[:args.abbrev] if args.abbrev is not None else e.sha
-                    lines.append((e.path, _tag("H", f"{e.mode_str()} {sha} {getattr(e, 'stage', 0)}\t{e.path}")))
-                else:
-                    lines.append((e.path, _tag("H", e.path)))
-    if args.modified or args.deleted or args.others:
-        status = workdir.status(repo, include_ignored=args.others and not args.exclude_standard)
-        if args.modified:
-            for p in status["modified"] + status["missing"]:
-                if match(p):
-                    lines.append((p, _tag("C", p)))
-        if args.deleted:
-            for p in status["missing"]:
-                if match(p):
-                    lines.append((p, _tag("R", p)))
-        if args.others:
-            for p in status["untracked"]:
-                if match(p):
-                    lines.append((p, _tag("?", p)))
+    # Build the exclude matcher for -o from --exclude-standard, -x and -X.
+    from . import ignore as ignore_mod
+    exc = None
+    if args.others or args.ignored:
+        exc = ignore_mod.IgnoreSet()
+        if args.exclude_standard:
+            exc.rules.extend(ignore_mod.load(repo.path).rules)
+        for pat in (args.exclude or []):
+            exc.rules.append(ignore_mod.IgnoreRule(pat, "", "", 0))
+        for xf in (args.exclude_from or []):
+            exc.add_file(Path(xf), "", xf)
 
-    seen: set[str] = set()
-    for _path, line in sorted(lines):
-        if line in seen:
+    def _is_excluded(p: str) -> bool:
+        return exc is not None and exc.is_ignored(p)
+
+    # C Git's show_files emits groups in a fixed order with no deduplication:
+    # first 'others'/'killed' (from the directory scan, sorted), then a single
+    # pass over the index where each entry shows its cached/stage line followed
+    # by its deleted/modified line.
+    out: list[str] = []
+    status = None
+    if args.modified or args.deleted or args.others:
+        status = workdir.status(repo, include_ignored=True)
+
+    if args.others and status is not None:
+        others = []
+        for p in status["untracked"]:
+            if not match(p):
+                continue
+            # Default: hide excluded files; -i: show only excluded files.
+            if args.ignored != _is_excluded(p):
+                continue
+            others.append(_tag("?", p))
+        out.extend(sorted(others))
+
+    modified_set = set(status["modified"]) | set(status["missing"]) if status else set()
+    missing_set = set(status["missing"]) if status else set()
+    for e in sorted(idx.entries, key=lambda e: (e.path, getattr(e, "stage", 0))):
+        st = getattr(e, "stage", 0)
+        if not match(e.path):
             continue
-        seen.add(line)
+        show_this_cached = want_cached or (args.unmerged and st != 0)
+        if show_this_cached and not (args.ignored and not _is_excluded(e.path)):
+            tag = "M" if st != 0 else "H"
+            if args.format is not None:
+                out.append(_ls_files_format(repo, e, args.format, args.abbrev))
+            elif args.stage or args.unmerged:
+                sha = e.sha[:args.abbrev] if args.abbrev is not None else e.sha
+                out.append(_tag(tag, f"{e.mode_str()} {sha} {st}\t{e.path}"))
+            else:
+                out.append(_tag(tag, e.path))
+        if args.deleted and e.path in missing_set:
+            out.append(_tag("R", e.path))
+        if args.modified and e.path in modified_set:
+            out.append(_tag("C", e.path))
+
+    for line in out:
         sys.stdout.write(line + eol)
     return 0
+
+
+def _ls_files_format(repo: Repository, entry, fmt: str, abbrev: Optional[int]) -> str:
+    """Expand a `ls-files --format` string for one index entry."""
+    import re
+    sha = entry.sha[:abbrev] if abbrev is not None else entry.sha
+    mode = entry.mode_str()
+    otype = "commit" if mode == "160000" else "blob"
+
+    def _size() -> str:
+        try:
+            return str(len(objs.read_object(repo, entry.sha)[1]))
+        except KeyError:
+            return "-"
+
+    def atom(name: str) -> str:
+        if name == "objectmode":
+            return mode
+        if name == "objectname":
+            return sha
+        if name == "objecttype":
+            return otype
+        if name == "objectsize":
+            return _size()
+        if name == "stage":
+            return str(getattr(entry, "stage", 0))
+        if name == "path":
+            return entry.path
+        if name in ("eolinfo:index", "eolinfo:worktree", "eolattr"):
+            return ""
+        return ""
+
+    return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), fmt)
 
 
 def cmd_rev_list(argv: list[str]) -> int:

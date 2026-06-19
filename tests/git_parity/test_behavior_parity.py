@@ -166,6 +166,17 @@ REMOTE = BASE + [
     ["config", "--add", "foo.bar", "two"],
 ]
 
+# A tracked file, a .gitignore, plus untracked tracked/ignored worktree files,
+# for ls-files -o/-i/-x exclusion behavior.
+LSIGNORE = [("write", "a.txt", "a\n"), ("write", ".gitignore", "*.log\n"), ["add", "-A"],
+            ["commit", "-m", "c1"],
+            ("write", "b.txt", "b\n"), ("write", "debug.log", "x\n"), ("write", "other.txt", "y\n")]
+# A merge conflict leaving unmerged (stage 1/2/3) index entries, for ls-files -u.
+LSCONFLICT = [("write", "f.txt", "base\n"), ["add", "-A"], ["commit", "-m", "c1"],
+              ["checkout", "-b", "feat"], ("write", "f.txt", "feat\n"), ["add", "-A"], ["commit", "-m", "c2"],
+              ["checkout", "main"], ("write", "f.txt", "main\n"), ["add", "-A"], ["commit", "-m", "c3"],
+              ["merge", "feat"]]
+
 CASES: list[tuple] = [
     # rev-parse repo info
     ("revparse-git-dir", [], ["rev-parse", "--git-dir"]),
@@ -1261,6 +1272,25 @@ CASES: list[tuple] = [
      ["config", "--get-regexp", r"branch\.trk\."]),
     ("branch-set-upstream", REFSET + [["branch", "ups"]], ["branch", "-u", "main", "ups"]),
     ("branch-set-upstream-bad", BASE, ["branch", "-u", "origin/nope"]),
+    # ls-files exclusion (-x/-X/-i/--exclude-standard), --format, -v/-f tags,
+    # -u unmerged listing, combined selectors, and the --format conflict error.
+    ("lsf-exclude", LSIGNORE, ["ls-files", "-o", "-x", "*.txt"]),
+    ("lsf-exclude-multi", LSIGNORE, ["ls-files", "-o", "-x", "*.log", "-x", "*.txt"]),
+    ("lsf-ignored-standard", LSIGNORE, ["ls-files", "-o", "-i", "--exclude-standard"]),
+    ("lsf-ignored-x", LSIGNORE, ["ls-files", "-o", "-i", "-x", "*.log"]),
+    ("lsf-exclude-standard", LSIGNORE, ["ls-files", "-o", "--exclude-standard"]),
+    ("lsf-format-path", BASE, ["ls-files", "--format", "%(path)"]),
+    ("lsf-format-atoms", BASE,
+     ["ls-files", "--format", "%(objectmode) %(objectname) %(objecttype) %(path)"]),
+    ("lsf-format-size", BASE, ["ls-files", "--format", "%(objectmode) %(objectsize) %(path)"]),
+    ("lsf-v", BASE, ["ls-files", "-v"]),
+    ("lsf-f", BASE, ["ls-files", "-f"]),
+    ("lsf-combined", LSIGNORE, ["ls-files", "-cdmo"]),
+    ("lsf-format-conflict", BASE, ["ls-files", "-s", "--format", "%(path)"]),
+    ("lsf-unmerged", LSCONFLICT, ["ls-files", "-u"]),
+    ("lsf-unmerged-stage", LSCONFLICT, ["ls-files", "-s"]),
+    ("lsf-unmerged-tag", LSCONFLICT, ["ls-files", "-t"]),
+    ("lsf-unmerged-default", LSCONFLICT, ["ls-files"]),
 ]
 
 
