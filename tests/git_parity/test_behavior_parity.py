@@ -930,6 +930,13 @@ CASES: list[tuple] = [
     ("show-branch-three-rev", SB_THREE, ["show-branch", "third", "feat"]),
     ("show-branch-merge", SB_MERGE, ["show-branch", "main", "feat"]),
     ("show-branch-all", SB_THREE, ["show-branch", "--all"]),
+    # show-branch plumbing modes: --merge-base, --independent, --reflog.
+    ("show-branch-merge-base", SB_THREE, ["show-branch", "--merge-base", "feat", "main"]),
+    ("show-branch-merge-base-3", SB_THREE, ["show-branch", "--merge-base", "feat", "main", "third"]),
+    ("show-branch-independent", SB_THREE, ["show-branch", "--independent", "feat", "main", "third"]),
+    ("show-branch-reflog", TAGGED, ["show-branch", "--reflog"]),
+    ("show-branch-reflog-n", TAGGED, ["show-branch", "--reflog=2"]),
+    ("show-branch-reflog-ref", TAGGED, ["show-branch", "--reflog", "main"]),
     # git merge -q suppresses the summary; ensure the flag is accepted and silent.
     ("merge-quiet",
      BASE + [["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"],

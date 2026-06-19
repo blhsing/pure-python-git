@@ -6465,8 +6465,24 @@ def cmd_show_branch(argv: list[str]) -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("-r", "--remotes", action="store_true")
     ap.add_argument("--sparse", action="store_true")
+    ap.add_argument("--merge-base", dest="merge_base", action="store_true")
+    ap.add_argument("--independent", action="store_true")
     ap.add_argument("revs", nargs="*")
-    args = ap.parse_args(argv)
+    # `--reflog[=<n>]`/`-g[<n>]` only takes a value when attached; a bare flag
+    # leaves the following token as the positional <ref>. argparse's nargs="?"
+    # would wrongly consume that token, so pull the option out of argv first.
+    reflog_val = None
+    rest_argv = []
+    for a in argv:
+        if a in ("--reflog", "-g"):
+            reflog_val = ""
+        elif a.startswith("--reflog="):
+            reflog_val = a.split("=", 1)[1]
+        elif a.startswith("-g") and len(a) > 2 and a[2:].isdigit():
+            reflog_val = a[2:]
+        else:
+            rest_argv.append(a)
+    args = ap.parse_args(rest_argv)
     repo = _repo()
     head_sym, head_oid = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
@@ -6475,7 +6491,33 @@ def cmd_show_branch(argv: list[str]) -> int:
     # default to all local heads (and remotes with -r/--all), in ref name order.
     ref_names: list[str] = []
     revs: list[str] = []
-    if args.revs:
+    reflog_msgs: list[str] = []  # only populated in --reflog mode
+    if reflog_val is not None:
+        # --reflog[=<n>] [<ref>]: each of the ref's last <n> reflog entries
+        # (default 4) becomes a column "<ref>@{i}".
+        count = int(reflog_val) if reflog_val else 4
+        if args.revs:
+            disp = args.revs[0]
+            full = refs_mod.dwim_full_name(repo, disp) or f"refs/heads/{disp}"
+        else:
+            # Default: HEAD resolved to the full branch ref it points at.
+            head_sym2, _ = refs_mod.read_head(repo)
+            full = head_sym2 or "HEAD"
+            disp = full
+        from . import reflog as _rl
+        entries = _rl.read(repo, full if full == "HEAD" else
+                           (full if full.startswith("refs/") else f"refs/heads/{full}"))
+        for i, (_old, new, ident, msg) in enumerate(reversed(entries)):
+            if i >= count:
+                break
+            ref_names.append(f"{disp}@{{{i}}}")
+            revs.append(new)
+            reldate = _format_date(ident, "relative")
+            reflog_msgs.append(f"({reldate}) {msg}")
+        if not revs:
+            _err("No revs to be shown.")
+            return 0
+    elif args.revs:
         for rv in args.revs:
             s = refs_mod.rev_parse(repo, rv + "^{commit}") or refs_mod.rev_parse(repo, rv)
             if not s:
@@ -6534,6 +6576,31 @@ def cmd_show_branch(argv: list[str]) -> int:
 
     all_mask = (1 << num_rev) - 1
 
+    # --merge-base: print the common ancestor(s) of all the revs (octopus
+    # reduction), one full oid per line — like `git merge-base`.
+    if args.merge_base:
+        from . import merge as _m
+        bases = [revs[0]]
+        for other in revs[1:]:
+            merged: list[str] = []
+            for b in bases:
+                merged.extend(_m.merge_bases(repo, b, other))
+            seen_b: set[str] = set()
+            bases = [x for x in merged if not (x in seen_b or seen_b.add(x))]
+        if not bases:
+            return 1
+        for b in bases:
+            _print(b)
+        return 0
+
+    # --independent: print the tips that are not reachable from any other tip.
+    if args.independent:
+        for i in range(num_rev):
+            if not any(j != i and revs[j] != revs[i] and revs[i] in reach[j]
+                       for j in range(num_rev)):
+                _print(revs[i])
+        return 0
+
     # Build the reachable union in rev-input order, then order it like git's
     # topo sort (REV_SORT_IN_GRAPH_ORDER over the date-stable seen list).
     # git seeds its `seen` list by prepending the tips (so they end up in
@@ -6574,10 +6641,11 @@ def cmd_show_branch(argv: list[str]) -> int:
     head_at = -1
     if num_rev > 1:
         for i in range(num_rev):
-            is_head = ref_names[i] == cur and revs[i] == head_oid
+            is_head = (reflog_val is None) and ref_names[i] == cur and revs[i] == head_oid
             mark = "*" if is_head else "!"
             line = " " * i + mark
-            _print(f"{line} [{ref_names[i]}] {subject(revs[i])}")
+            text = reflog_msgs[i] if reflog_val is not None else subject(revs[i])
+            _print(f"{line} [{ref_names[i]}] {text}")
             if is_head:
                 head_at = i
         _print("-" * num_rev)
