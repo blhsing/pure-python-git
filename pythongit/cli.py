@@ -4699,13 +4699,90 @@ def cmd_restore(argv: list[str]) -> int:
     return 0
 
 
+def _reset_worktree_path(repo: Repository, p: str, sha: Optional[str], mode: Optional[int]) -> None:
+    """Materialize (or delete) one worktree path during reset --merge/--keep."""
+    full = repo.path / p
+    if sha is None:
+        if full.exists() or full.is_symlink():
+            full.unlink()
+        return
+    data = objs.read_object(repo, sha)[1]
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_bytes(data)
+    if mode is not None and (mode & 0o111):
+        full.chmod(full.stat().st_mode | 0o111)
+
+
+def _reset_merge_keep(repo: Repository, kind: str, target_sha: str, target_tree: str,
+                      treeish: str) -> int:
+    """reset --merge / --keep: a two-way merge that updates files differing
+    between HEAD and the target while protecting local changes (atomically)."""
+    head_sha = refs_mod.rev_parse(repo, "HEAD")
+    head_tree = _commit_tree(repo, head_sha) if head_sha else None
+    H = workdir.flatten_tree(repo, head_tree) if head_tree else {}
+    T = workdir.flatten_tree(repo, target_tree) if target_tree else {}
+    idx = read_index(repo)
+    I = {p: e.sha for p, e in idx.by_path().items()}
+
+    def wt_sha(p: str) -> Optional[str]:
+        full = repo.path / p
+        if not (full.exists() or full.is_symlink()):
+            return None
+        import stat as _st
+        ls = full.lstat()
+        data = os.readlink(full).encode() if _st.S_ISLNK(ls.st_mode) else full.read_bytes()
+        return objs.hash_bytes("blob", data, repo)[0]
+
+    paths = sorted(set(H) | set(T) | set(I))
+    # Dry-run: report the first blocking entry (index order) and abort wholesale.
+    for p in paths:
+        h, t, i = H.get(p), T.get(p), I.get(p)
+        if h == t:
+            continue
+        w = wt_sha(p)
+        if kind == "keep" and i != h:
+            _err(f"error: Entry '{p}' would be overwritten by merge. Cannot merge.")
+            _err(f"fatal: Could not reset index file to revision '{treeish}'.")
+            return 128
+        if w != i:
+            _err(f"error: Entry '{p}' not uptodate. Cannot merge.")
+            _err(f"fatal: Could not reset index file to revision '{treeish}'.")
+            return 128
+
+    # Capture the per-path worktree state before any mutation.
+    W = {p: wt_sha(p) for p in paths}
+    head_sym, _ = refs_mod.read_head(repo)
+    if head_sym:
+        refs_mod.update_ref(repo, head_sym, target_sha, message=f"reset: moving to {treeish}")
+    else:
+        refs_mod.set_head(repo, target_sha)
+    workdir.read_tree(repo, target_tree)
+    new_idx = read_index(repo).by_path()
+    for p in paths:
+        h, t, i, w = H.get(p), T.get(p), I.get(p), W[p]
+        if kind == "keep":
+            update = h != t  # checks guaranteed i==h==w for these
+        else:  # merge: update unless there is an unstaged change to keep
+            update = w == i
+        if update:
+            tmode = new_idx[p].mode if p in new_idx else None
+            _reset_worktree_path(repo, p, t, tmode)
+    return 0
+
+
 def cmd_reset(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit reset", add_help=False)
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--soft", action="store_true")
     g.add_argument("--mixed", action="store_true")
     g.add_argument("--hard", action="store_true")
+    g.add_argument("--merge", action="store_true")
+    g.add_argument("--keep", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--no-refresh", dest="no_refresh", action="store_true")
+    ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
+    ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
     ap.add_argument("args", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -4718,12 +4795,25 @@ def cmd_reset(argv: list[str]) -> int:
         paths = positionals[idx_dd + 1:]
         positionals = positionals[:idx_dd]
     treeish = "HEAD"
+    from_file_paths: list[str] = []
+    if args.pathspec_from_file is not None:
+        raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
+               else open(args.pathspec_from_file, "rb").read())
+        sep = "\0" if args.pathspec_file_nul else "\n"
+        from_file_paths = [p for p in raw.decode("utf-8").split(sep) if p]
     if positionals:
-        if refs_mod.rev_parse(repo, positionals[0]) is not None and (len(positionals) > 1 or paths or not (repo.path / positionals[0]).exists()):
+        if refs_mod.rev_parse(repo, positionals[0]) is not None and (len(positionals) > 1 or paths or from_file_paths or not (repo.path / positionals[0]).exists()):
             treeish = positionals[0]
             paths = positionals[1:] + paths
         else:
             paths = positionals + paths
+    paths += from_file_paths
+
+    mode = ("soft" if args.soft else "hard" if args.hard else "merge" if args.merge
+            else "keep" if args.keep else "mixed")
+    if paths and mode != "mixed":
+        _err(f"fatal: Cannot do {mode} reset with paths.")
+        return 128
 
     if paths:
         # Pathspec reset: restore the named index entries to <treeish>.
@@ -4765,23 +4855,45 @@ def cmd_reset(argv: list[str]) -> int:
     sha = refs_mod.rev_parse(repo, treeish)
     if not sha:
         return 128
+    t, data = objs.read_object(repo, sha)
+    tree = objs.parse_commit(data).tree if t == "commit" else sha
+    # --merge / --keep run a protected two-way merge (and move HEAD themselves,
+    # only after their abort checks pass).
+    if mode in ("merge", "keep"):
+        return _reset_merge_keep(repo, mode, sha, tree, treeish)
     head_sym, _ = refs_mod.read_head(repo)
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha, message=f"reset: moving to {treeish}")
     else:
         refs_mod.set_head(repo, sha)
-    if args.soft:
+    if mode == "soft":
         return 0
-    # mixed (default) and hard: rewrite index from target
-    t, data = objs.read_object(repo, sha)
-    tree = objs.parse_commit(data).tree if t == "commit" else sha
-    if args.hard:
+    if mode == "hard":
         workdir.checkout_tree(repo, tree)
         if t == "commit":
             subject = objs.parse_commit(data).message.splitlines()[0] if data else ""
             _print(f"HEAD is now at {sha[:7]} {subject}")
-    else:
-        workdir.read_tree(repo, tree)
+        return 0
+    # mixed (default): reset the index to the target, then report files whose
+    # worktree content now differs from it (unless -q / --no-refresh).
+    workdir.read_tree(repo, tree)
+    if not args.quiet and not args.no_refresh:
+        new_idx = read_index(repo).by_path()
+        modified = []
+        import stat as _st
+        for p, entry in new_idx.items():
+            full = repo.path / p
+            if not (full.exists() or full.is_symlink()):
+                modified.append((p, "D"))
+                continue
+            ls = full.lstat()
+            wdata = os.readlink(full).encode() if _st.S_ISLNK(ls.st_mode) else full.read_bytes()
+            if objs.hash_bytes("blob", wdata, repo)[0] != entry.sha:
+                modified.append((p, "M"))
+        if modified:
+            _print("Unstaged changes after reset:")
+            for p, stt in sorted(modified):
+                _print(f"{stt}\t{p}")
     return 0
 
 

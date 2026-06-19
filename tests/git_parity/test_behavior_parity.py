@@ -176,6 +176,11 @@ LSIGNORE = [("write", "a.txt", "a\n"), ("write", ".gitignore", "*.log\n"), ["add
 ADDSETUP = [("write", "a.txt", "a\n"), ("write", "b.txt", "b\n"), ["add", "-A"],
             ["commit", "-m", "c1"],
             ("write", "a.txt", "MOD\n"), ("rm", "b.txt"), ("write", "c.txt", "NEW\n")]
+# Two commits where the second changes only a.txt (b.txt unchanged across
+# HEAD~1..HEAD), for reset --merge/--keep/--mixed semantics.
+RESETBASE = [("write", "a.txt", "a1\n"), ("write", "b.txt", "b1\n"), ["add", "-A"],
+             ["commit", "-m", "c1"],
+             ("write", "a.txt", "a2\n"), ["add", "-A"], ["commit", "-m", "c2"]]
 # A merge conflict leaving unmerged (stage 1/2/3) index entries, for ls-files -u.
 LSCONFLICT = [("write", "f.txt", "base\n"), ["add", "-A"], ["commit", "-m", "c1"],
               ["checkout", "-b", "feat"], ("write", "f.txt", "feat\n"), ["add", "-A"], ["commit", "-m", "c2"],
@@ -1318,6 +1323,34 @@ CASES: list[tuple] = [
              ["update-index", "--no-assume-unchanged", "a.txt"]],
      ["ls-files", "-v"]),
     ("ui-assume-bad", BASE, ["update-index", "--assume-unchanged", "nope.txt"]),
+    # reset --keep / --merge two-way-merge semantics (state probed via status),
+    # abort messages, the full mixed "Unstaged changes after reset:" report, the
+    # with-paths guard, and --pathspec-from-file. (reset-in-setup → status probe
+    # for success cases; reset-as-probe for the message/abort cases.)
+    ("reset-keep-kept",
+     RESETBASE + [("write", "b.txt", "b-local\n"), ["reset", "--keep", "HEAD~1"]],
+     ["status", "--short"]),
+    ("reset-keep-conflict", RESETBASE + [("write", "a.txt", "a-local\n")],
+     ["reset", "--keep", "HEAD~1"]),
+    ("reset-keep-staged-conflict",
+     RESETBASE + [("write", "a.txt", "a3\n"), ["add", "a.txt"]],
+     ["reset", "--keep", "HEAD~1"]),
+    ("reset-merge-discard-staged",
+     RESETBASE + [("write", "b.txt", "bs\n"), ["add", "b.txt"], ["reset", "--merge", "HEAD~1"]],
+     ["status", "--short"]),
+    ("reset-merge-conflict", RESETBASE + [("write", "a.txt", "a-local\n")],
+     ["reset", "--merge", "HEAD~1"]),
+    ("reset-mixed-unstaged", RESETBASE + [("write", "a.txt", "a-wt\n")],
+     ["reset", "HEAD~1"]),
+    ("reset-mixed-no-refresh", RESETBASE + [("write", "a.txt", "a-wt\n")],
+     ["reset", "--no-refresh", "HEAD~1"]),
+    ("reset-mixed-quiet", RESETBASE + [("write", "a.txt", "a-wt\n")],
+     ["reset", "-q", "HEAD~1"]),
+    ("reset-merge-paths-err", RESETBASE, ["reset", "--merge", "HEAD~1", "--", "a.txt"]),
+    ("reset-soft-paths-err", RESETBASE, ["reset", "--soft", "HEAD~1", "--", "a.txt"]),
+    ("reset-pathspec-from-file",
+     RESETBASE + [("write", "a.txt", "a-wt\n"), ("write", "specs", "a.txt\n")],
+     ["reset", "HEAD~1", "--pathspec-from-file", "specs"]),
 ]
 
 
