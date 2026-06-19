@@ -809,6 +809,15 @@ CASES: list[tuple] = [
     ("archive-tar", TAGGED, ["archive", "--format=tar", "HEAD"]),
     ("archive-prefix", TAGGED, ["archive", "--format=tar", "--prefix=x/", "HEAD"]),
     ("archive-prefix-multi", TAGGED, ["archive", "--format=tar", "--prefix=a/b/", "HEAD"]),
+    # -U/--unified context-line control on diff/log/show.
+    ("diff-U1",
+     BASE + [("write", "a.txt", "alpha\nx\ny\nz\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "-U1", "HEAD~1", "HEAD"]),
+    ("diff-U0",
+     BASE + [("write", "a.txt", "alpha\nx\ny\nz\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["diff", "--unified=0", "HEAD~1", "HEAD"]),
+    ("log-p-U1", TAGGED, ["log", "-p", "-U1", "-1"]),
+    ("show-U1", TAGGED, ["show", "-U1", "HEAD"]),
     # Short/human date atoms and empty encoding/notes atoms.
     ("log-fmt-as", DATED, ["log", "-1", "--format=%as"]),
     ("log-fmt-cs", DATED, ["log", "-1", "--format=%cs"]),

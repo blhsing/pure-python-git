@@ -1691,6 +1691,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--abbrev-commit", action="store_true")
     ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("-p", "--patch", action="store_true")
+    ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
@@ -2011,7 +2012,7 @@ def cmd_log(argv: list[str]) -> int:
                 elif args.raw:
                     _emit_raw_diff(repo, parent_tree, c.tree)
                 else:
-                    _emit_tree_patch(repo, parent_tree, c.tree)
+                    _emit_tree_patch(repo, parent_tree, c.tree, args.unified)
 
     for count, s in enumerate(commit_list):
         c = objs.parse_commit(objs.read_object(repo, s)[1])
@@ -2289,6 +2290,7 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
     ap.add_argument("--date", default=None)
     ap.add_argument("--abbrev", type=int, default=7)
+    ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -2321,7 +2323,7 @@ def cmd_show(argv: list[str]) -> int:
                 ptree = None
                 if c.parents:
                     ptree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-                _emit_tree_patch(repo, ptree, c.tree)
+                _emit_tree_patch(repo, ptree, c.tree, args.unified)
             return 0
         return _show_object(the_rev, sha)
 
@@ -2408,7 +2410,7 @@ def cmd_show(argv: list[str]) -> int:
             elif not args.no_patch:
                 _print("")
                 if not is_merge:
-                    _emit_tree_patch(repo, parent_tree, c.tree)
+                    _emit_tree_patch(repo, parent_tree, c.tree, args.unified)
         elif t == "tree":
             # `git show <tree>` prints `<rev>\n\n` then bare entry names
             # (directories suffixed with '/'), not the ls-tree triple.
@@ -2456,9 +2458,9 @@ def _emit_raw_diff(repo: Repository, a_tree: Optional[str], b_tree: Optional[str
         _print(f":{a_mode} {b_mode} {a_sha} {b_sha} {status}\t{path}")
 
 
-def _emit_tree_patch(repo: Repository, a_tree: Optional[str], b_tree: Optional[str]) -> None:
+def _emit_tree_patch(repo: Repository, a_tree: Optional[str], b_tree: Optional[str], context: int = 3) -> None:
     for path, a, b in _tree_changes(repo, a_tree, b_tree):
-        _emit_file_diff(path, a, b)
+        _emit_file_diff(path, a, b, context=context)
 
 
 def _print_tree_diff(repo: Repository, a_tree: str, b_tree: str) -> None:
@@ -2547,7 +2549,7 @@ def _is_binary(data: Optional[bytes]) -> bool:
     return bool(data) and b"\x00" in data[:8000]
 
 
-def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False) -> None:
+def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
     # Under -R the working-side prefixes are swapped (b/<path> a/<path>).
@@ -2575,6 +2577,7 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False) -> Non
         _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
         body = diff_mod.format_hunks(
             a_text.splitlines(), b_text.splitlines(),
+            context,
             a_no_newline=bool(a_text) and not a_text.endswith("\n"),
             b_no_newline=bool(b_text) and not b_text.endswith("\n"),
         )
@@ -2689,6 +2692,7 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--exit-code", dest="exit_code", action="store_true")
     ap.add_argument("-R", dest="reverse", action="store_true")
+    ap.add_argument("-U", "--unified", type=int, default=3)
     # -M/-C (with optional attached values) are accepted but never consume a
     # following token; rename detection is on by default (diff.renames=true).
     ap.add_argument("--no-renames", dest="no_renames", action="store_true")
@@ -2766,7 +2770,7 @@ def cmd_diff(argv: list[str]) -> int:
         return 1 if changes else 0
     if args.exit_code:
         for path, a, b in changes:
-            _emit_file_diff(path, a, b)
+            _emit_file_diff(path, a, b, args.reverse, args.unified)
         return 1 if changes else 0
     if args.raw:
         zero7 = "0000000"
@@ -2810,7 +2814,7 @@ def cmd_diff(argv: list[str]) -> int:
             renames, changes = _detect_changes_renames(repo, changes)
         emit = [(dst, lambda s=src, d=dst, sm=sim, sa=sa, db=db: _emit_rename_patch(s, d, sm, sa, db))
                 for src, dst, sim, sa, db in renames]
-        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b, args.reverse)) for path, a, b in changes]
+        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b, args.reverse, args.unified)) for path, a, b in changes]
         for _key, fn in sorted(emit, key=lambda e: e[0]):
             fn()
     return 0

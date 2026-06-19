@@ -61,13 +61,13 @@ def diff_lines(a: list[str], b: list[str]) -> list[tuple[str, int, int]]:
 _NO_NEWLINE = "\\ No newline at end of file"
 
 
-def _group_hunks(ops: list[tuple[str, int, int]], context: int) -> list[list[tuple[str, int, int]]]:
-    """Split the edit script into hunks with up to ``context`` lines of
-    surrounding context, merging hunks separated by <= 2*context equal lines."""
+def _group_hunks(ops: list[tuple[str, int, int]], context: int) -> list[tuple[int, int]]:
+    """Return (start, end) op-index spans for each hunk, with up to ``context``
+    lines of surrounding context, merging hunks <= 2*context equal lines apart."""
     change_idx = [i for i, op in enumerate(ops) if op[0] != "eq"]
     if not change_idx:
         return []
-    hunks: list[list[tuple[str, int, int]]] = []
+    spans: list[tuple[int, int]] = []
     i = 0
     while i < len(change_idx):
         j = i
@@ -75,9 +75,21 @@ def _group_hunks(ops: list[tuple[str, int, int]], context: int) -> list[list[tup
             j += 1
         start = max(0, change_idx[i] - context)
         end = min(len(ops), change_idx[j] + 1 + context)
-        hunks.append(ops[start:end])
+        spans.append((start, end))
         i = j + 1
-    return hunks
+    return spans
+
+
+def _funcname_heading(a: list[str], scan_from: int) -> str:
+    """C Git's default hunk 'function' heading: the nearest preceding line whose
+    first character is a letter, '_' or '$' (xdiff's default find-function)."""
+    j = scan_from
+    while j >= 0:
+        line = a[j]
+        if line and (line[0].isalpha() or line[0] in "_$"):
+            return line.rstrip()
+        j -= 1
+    return ""
 
 
 def _hunk_range(start: int, count: int) -> str:
@@ -100,14 +112,28 @@ def format_hunks(
     out: list[str] = []
     last_a = len(a) - 1
     last_b = len(b) - 1
-    for hunk in _group_hunks(ops, context):
+    # Prefix counts of a/b lines consumed before each op, for zero-length range
+    # numbering (insertions/deletions show the adjacent old/new line number).
+    a_cons = [0] * (len(ops) + 1)
+    b_cons = [0] * (len(ops) + 1)
+    for i, (k, _ai, _bi) in enumerate(ops):
+        a_cons[i + 1] = a_cons[i] + (1 if k in ("eq", "del") else 0)
+        b_cons[i + 1] = b_cons[i] + (1 if k in ("eq", "ins") else 0)
+    for start, end in _group_hunks(ops, context):
+        hunk = ops[start:end]
         a_idx = [ai for k, ai, _ in hunk if k in ("eq", "del")]
         b_idx = [bi for k, _, bi in hunk if k in ("eq", "ins")]
         a_count = len(a_idx)
         b_count = len(b_idx)
-        a_start = a_idx[0] + 1 if a_idx else 0
-        b_start = b_idx[0] + 1 if b_idx else 0
-        out.append(f"@@ -{_hunk_range(a_start, a_count)} +{_hunk_range(b_start, b_count)} @@")
+        a_start = a_idx[0] + 1 if a_idx else a_cons[start]
+        b_start = b_idx[0] + 1 if b_idx else b_cons[start]
+        # git appends the nearest preceding "function" line as a section heading.
+        first_a = a_idx[0] if a_idx else a_cons[start]
+        heading = _funcname_heading(a, first_a - 1)
+        hdr = f"@@ -{_hunk_range(a_start, a_count)} +{_hunk_range(b_start, b_count)} @@"
+        if heading:
+            hdr += " " + heading
+        out.append(hdr)
         for kind, ai, bi in hunk:
             if kind == "eq":
                 out.append(" " + a[ai])
