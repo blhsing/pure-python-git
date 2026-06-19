@@ -781,6 +781,17 @@ CASES: list[tuple] = [
     # show of a tree object lists bare names with a "tree <rev>" header.
     ("show-tree", TAGGED + [("write", "sub/c.txt", "s\n"), ["add", "-A"], ["commit", "-m", "c3"]],
      ["show", "HEAD^{tree}"]),
+    # for-each-ref format atoms.
+    ("fer-objectname-short", REFSET, ["for-each-ref", "--format=%(objectname:short)", "refs/heads"]),
+    ("fer-head-marker", REFSET, ["for-each-ref", "--format=%(HEAD) %(refname:short)", "refs/heads"]),
+    ("fer-subject", REFSET, ["for-each-ref", "--format=%(subject)", "refs/heads"]),
+    ("fer-author", REFSET, ["for-each-ref", "--format=%(authorname) %(authoremail)", "refs/heads"]),
+    ("fer-committerdate-short", REFSET, ["for-each-ref", "--format=%(committerdate:short)", "refs/heads"]),
+    ("fer-objectsize", REFSET, ["for-each-ref", "--format=%(objecttype) %(objectsize)", "refs/tags"]),
+    ("fer-multi-atom", REFSET, ["for-each-ref", "--format=%(objectname:short) %(refname:short) %(subject)", "refs/heads"]),
+    # log --no-walk shows only the named revisions, no traversal.
+    ("log-no-walk", MERGED, ["log", "--no-walk", "--oneline", "HEAD", "HEAD~1"]),
+    ("log-no-walk-unsorted", MERGED, ["log", "--no-walk=unsorted", "--oneline", "HEAD~1", "HEAD"]),
 ]
 
 

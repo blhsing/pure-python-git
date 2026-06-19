@@ -1689,6 +1689,7 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--first-parent", dest="first_parent", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--no-walk", dest="no_walk", nargs="?", const="sorted", default=None)
     ap.add_argument("--graph", action="store_true")
     ap.add_argument("--topo-order", dest="topo_order", action="store_true")
     ap.add_argument("--date-order", dest="date_order", action="store_true")
@@ -1811,7 +1812,19 @@ def cmd_log(argv: list[str]) -> int:
     # Collect the ordered list of commit shas first so --reverse can flip it.
     seen: set[str] = set()
     commit_list: list[str] = []
-    if args.all:
+    if args.no_walk is not None:
+        # --no-walk shows only the named revisions, no ancestry traversal. The
+        # default ("sorted") orders by committer date; "unsorted" keeps the
+        # command-line order. Downstream filter/--max-count/--reverse still run.
+        want_topo = collect_full = False
+        wanted = revs if revs else ["HEAD"]
+        for r in wanted:
+            rsha = refs_mod.rev_parse(repo, r)
+            if rsha and rsha not in commit_list:
+                commit_list.append(rsha)
+        if args.no_walk != "unsorted":
+            commit_list.sort(key=lambda s: -_commit_date(repo, s))
+    elif args.all:
         # `--all` walks every ref. Match git's reverse-chronological order: a
         # stable max-heap keyed on committer date, with ties broken by insertion
         # order. Tips are seeded in ascending refname order, then HEAD.
@@ -4780,6 +4793,81 @@ def _ref_sort_date(repo: Repository, sha: str, key: str) -> int:
     return 0
 
 
+def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Optional[str]) -> str:
+    """Expand a for-each-ref --format string's %(atom) placeholders."""
+    import re
+    try:
+        t, data = objs.read_object(repo, sha)
+    except KeyError:
+        t, data = "commit", b""
+    text = data.decode("utf-8", errors="replace")
+    header, _, message = text.partition("\n\n")
+    fields = {}
+    for line in header.splitlines():
+        k, _, v = line.partition(" ")
+        if k in ("author", "committer", "tagger") and k not in fields:
+            fields[k] = v
+
+    def ident_part(role, part):
+        sig = fields.get(role, "")
+        who, ts, tz = _split_ident(sig)
+        name, email = _parse_who(who)
+        if part == "name":
+            return name
+        if part == "email":
+            return f"<{email}>" if email else ""
+        if part == "email:localpart":
+            return email.split("@")[0] if email else ""
+        if part.startswith("date"):
+            if ts is None:
+                return ""
+            mode = part.split(":", 1)[1] if ":" in part else "default"
+            return _format_date(sig, mode)
+        return sig
+
+    subject = message.splitlines()[0] if message.strip() else ""
+
+    def atom(name: str) -> str:
+        if name == "refname":
+            return ref
+        if name == "refname:short":
+            return refs_mod.shorten_ref(ref)
+        if name == "objectname":
+            return sha
+        if name == "objectname:short":
+            return sha[:7]
+        if name.startswith("objectname:short="):
+            return sha[:int(name.split("=", 1)[1])]
+        if name == "objecttype":
+            return t
+        if name == "objectsize":
+            return str(len(data))
+        if name == "HEAD":
+            return "*" if ref == head_ref else " "
+        if name in ("upstream", "push", "symref"):
+            return ""
+        if name in ("subject", "contents:subject"):
+            return subject
+        if name in ("body", "contents:body"):
+            return message.partition("\n\n")[2] if "\n\n" in message else ""
+        if name == "contents":
+            return message
+        if name in ("author", "committer", "tagger"):
+            return fields.get(name, "")
+        if name == "creator":
+            return fields.get("tagger") or fields.get("committer", "")
+        if name.startswith("creatordate"):
+            role = "tagger" if "tagger" in fields else "committer"
+            part = "date" + (":" + name.split(":", 1)[1] if ":" in name else "")
+            return ident_part(role, part)
+        for role in ("author", "committer", "tagger"):
+            if name.startswith(role):
+                return ident_part(role, name[len(role):] or "")
+        return ""
+
+    return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), fmt)
+
+
 def cmd_for_each_ref(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit for-each-ref", add_help=False)
     ap.add_argument("--format", default="%(objectname) %(objecttype)\t%(refname)")
@@ -4800,6 +4888,7 @@ def cmd_for_each_ref(argv: list[str]) -> int:
                         all_refs[rel] = s
     for ref, s in refs_mod.read_packed_refs(repo).items():
         all_refs.setdefault(ref, s)
+    head_sym, _ = refs_mod.read_head(repo)
 
     def _sort_value(ref: str, key: str):
         if key in ("refname", "refname:short"):
@@ -4828,18 +4917,7 @@ def cmd_for_each_ref(argv: list[str]) -> int:
             continue
         if args.count is not None and emitted >= args.count:
             break
-        s = all_refs[ref]
-        t = "commit"
-        try:
-            t, _ = objs.read_object(repo, s)
-        except KeyError:
-            pass
-        line = args.format
-        line = line.replace("%(objectname)", s)
-        line = line.replace("%(objecttype)", t)
-        line = line.replace("%(refname:short)", refs_mod.shorten_ref(ref))
-        line = line.replace("%(refname)", ref)
-        _print(line)
+        _print(_fer_expand(repo, ref, all_refs[ref], args.format, head_sym))
         emitted += 1
     return 0
 
