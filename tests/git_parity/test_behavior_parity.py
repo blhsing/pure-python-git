@@ -95,6 +95,19 @@ DIRTY = [
     ("write", "untracked.txt", "hi\n"),
 ]
 
+# Branch topologies for show-branch: a fork (feat ahead of main) and a
+# three-way fan-out, exercising the legend, separator, marker matrix
+# (+/*/!/-), dense-merge omission, and the commit-naming (^/~) algorithm.
+SB_FORK = BASE + [("write", "a.txt", "alpha\nx\n"), ["add", "-A"], ["commit", "-m", "c2"],
+                  ["checkout", "-b", "feat"], ("write", "a.txt", "alpha\nx\ny\n"),
+                  ["add", "-A"], ["commit", "-m", "c3"], ["checkout", "main"]]
+SB_THREE = BASE + [
+    ["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"], ["commit", "-m", "fc1"],
+    ["checkout", "main"], ("write", "h.txt", "h\n"), ["add", "-A"], ["commit", "-m", "mc1"],
+    ["checkout", "-b", "third", "main"], ("write", "i.txt", "i\n"), ["add", "-A"], ["commit", "-m", "tc1"],
+    ["checkout", "main"]]
+SB_MERGE = MERGED  # a real merge commit, for the '-' merge marker column
+
 # A stash created from a modified tracked file plus a separately-staged new
 # file, for stash commit/show/selector parity.
 STASH = BASE + [("write", "a.txt", "alpha\nmod\n"), ("write", "n.txt", "new\n"),
@@ -909,6 +922,20 @@ CASES: list[tuple] = [
     # branch --format reuses the ref-filter %(...) atom expansion.
     ("branch-format-refname", REFSET, ["branch", "--format=%(refname:short)"]),
     ("branch-format-multi", REFSET, ["branch", "--format=%(objectname) %(HEAD) %(refname)"]),
+    # show-branch: legend + marker matrix + commit naming, ported from git.
+    ("show-branch-1", TAGGED, ["show-branch"]),
+    ("show-branch-fork", SB_FORK, ["show-branch"]),
+    ("show-branch-fork-args", SB_FORK, ["show-branch", "main", "feat"]),
+    ("show-branch-three", SB_THREE, ["show-branch"]),
+    ("show-branch-three-rev", SB_THREE, ["show-branch", "third", "feat"]),
+    ("show-branch-merge", SB_MERGE, ["show-branch", "main", "feat"]),
+    ("show-branch-all", SB_THREE, ["show-branch", "--all"]),
+    # git merge -q suppresses the summary; ensure the flag is accepted and silent.
+    ("merge-quiet",
+     BASE + [["checkout", "-b", "feat"], ("write", "g.txt", "g\n"), ["add", "-A"],
+             ["commit", "-m", "fc1"], ["checkout", "main"],
+             ["merge", "-q", "--no-ff", "-m", "m", "feat"]],
+     ["log", "--oneline", "-1"]),
 ]
 
 

@@ -4107,6 +4107,8 @@ def cmd_merge(argv: list[str]) -> int:
     ap.add_argument("--ff-only", action="store_true")
     ap.add_argument("--abort", action="store_true")
     ap.add_argument("--continue", dest="cont", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-m", "--message", default=None)
     ap.add_argument("other", nargs="?")
     args = ap.parse_args(argv)
@@ -4138,7 +4140,8 @@ def cmd_merge(argv: list[str]) -> int:
 
     bases = _m.merge_bases(repo, head_sha, other_sha)
     if other_sha in bases or other_sha == head_sha:
-        _print("Already up to date.")
+        if not args.quiet:
+            _print("Already up to date.")
         return 0
 
     old_tree = objs.parse_commit(objs.read_object(repo, head_sha)[1]).tree
@@ -4146,15 +4149,17 @@ def cmd_merge(argv: list[str]) -> int:
 
     if bases == [head_sha] and not args.no_ff:
         # Fast-forward.
-        _print(f"Updating {head_sha[:7]}..{other_sha[:7]}")
-        _print("Fast-forward")
+        if not args.quiet:
+            _print(f"Updating {head_sha[:7]}..{other_sha[:7]}")
+            _print("Fast-forward")
         if head_sym:
             refs_mod.update_ref(repo, head_sym, other_sha,
                                 message=f"merge {args.other}: Fast-forward")
         else:
             refs_mod.set_head(repo, other_sha)
         workdir.checkout_tree(repo, new_tree)
-        _emit_diffstat_summary(_tree_changes(repo, old_tree, new_tree))
+        if not args.quiet:
+            _emit_diffstat_summary(_tree_changes(repo, old_tree, new_tree))
         return 0
 
     if args.ff_only:
@@ -4172,9 +4177,10 @@ def cmd_merge(argv: list[str]) -> int:
             _print(f"CONFLICT (content): Merge conflict in {p}")
         _err("Automatic merge failed; fix conflicts and then commit the result.")
         return 1
-    _print("Merge made by the 'ort' strategy.")
-    merged_tree = objs.parse_commit(objs.read_object(repo, sha)[1]).tree
-    _emit_diffstat_summary(_tree_changes(repo, old_tree, merged_tree))
+    if not args.quiet:
+        _print("Merge made by the 'ort' strategy.")
+        merged_tree = objs.parse_commit(objs.read_object(repo, sha)[1]).tree
+        _emit_diffstat_summary(_tree_changes(repo, old_tree, merged_tree))
     return 0
 
 
@@ -6370,25 +6376,245 @@ def cmd_grep(argv: list[str]) -> int:
     return rc
 
 
+def _show_branch_name_commits(repo: Repository, ordered: list[str],
+                              revs: list[str], ref_names: list[str]) -> dict[str, tuple[str, int]]:
+    """Port of show-branch.c:name_commits — assign each commit a (head_name,
+    generation) so the matrix can render [name], [name^], [name~N], [name^N]."""
+    names: dict[str, tuple[str, int]] = {}
+
+    def parents_of(s):
+        info = _commit_tree_parents(repo, s)
+        return list(info[1]) if info else []
+
+    # 1) name the given tips (first matching rev wins).
+    for s in ordered:
+        if s in names:
+            continue
+        for i, r in enumerate(revs):
+            if r == s:
+                names[s] = (ref_names[i], 0)
+                break
+
+    def name_parent(c, p):
+        cn = names.get(c)
+        if cn is None:
+            return False
+        pn = names.get(p)
+        if pn is None or cn[1] + 1 < pn[1]:
+            names[p] = (cn[0], cn[1] + 1)
+            return True
+        return False
+
+    def name_first_parent_chain(c):
+        i = 0
+        while c is not None:
+            if c not in names:
+                break
+            ps = parents_of(c)
+            if not ps:
+                break
+            p = ps[0]
+            if p not in names:
+                name_parent(c, p)
+                i += 1
+            else:
+                break
+            c = p
+        return i
+
+    # 2) first-parent ancestry chains.
+    while True:
+        i = 0
+        for s in ordered:
+            i += name_first_parent_chain(s)
+        if not i:
+            break
+
+    # 3) remaining (non-first-parent / merge) parents.
+    def disp(n):
+        head, gen = n
+        if gen == 0:
+            return head
+        if gen == 1:
+            return head + "^"
+        return f"{head}~{gen}"
+
+    while True:
+        i = 0
+        for s in ordered:
+            n = names.get(s)
+            if n is None:
+                continue
+            nth = 0
+            for p in parents_of(s):
+                nth += 1
+                if p in names:
+                    continue
+                newname = disp(n)
+                newname += "^" if nth == 1 else f"^{nth}"
+                names[p] = (newname, 0)
+                i += 1
+                name_first_parent_chain(p)
+        if not i:
+            break
+    return names
+
+
 def cmd_show_branch(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit show-branch")
+    ap = argparse.ArgumentParser(prog="pygit show-branch", add_help=False)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("-r", "--remotes", action="store_true")
+    ap.add_argument("--sparse", action="store_true")
+    ap.add_argument("revs", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
-    branches = refs_mod.list_branches(repo)
-    head_sym, _ = refs_mod.read_head(repo)
+    head_sym, head_oid = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
-    for b in branches:
-        sha = refs_mod.read_ref(repo, f"refs/heads/{b}")
-        if not sha:
-            continue
+
+    # Determine the revs (and their display names). Explicit args win; otherwise
+    # default to all local heads (and remotes with -r/--all), in ref name order.
+    ref_names: list[str] = []
+    revs: list[str] = []
+    if args.revs:
+        for rv in args.revs:
+            s = refs_mod.rev_parse(repo, rv + "^{commit}") or refs_mod.rev_parse(repo, rv)
+            if not s:
+                _err(f"fatal: '{rv}' is not a valid ref.")
+                return 128
+            ref_names.append(rv)
+            revs.append(s)
+    else:
+        if not args.remotes or args.all:
+            for b in refs_mod.list_branches(repo):
+                s = refs_mod.read_ref(repo, f"refs/heads/{b}")
+                if s:
+                    ref_names.append(b)
+                    revs.append(s)
+        if args.remotes or args.all:
+            for b in _remote_branches(repo):
+                s = refs_mod.read_ref(repo, f"refs/remotes/{b}")
+                if s:
+                    ref_names.append(b)
+                    revs.append(s)
+    if not revs:
+        _err("No revs to be shown.")
+        return 0
+    num_rev = len(revs)
+
+    def subject(s):
         try:
-            c = objs.parse_commit(objs.read_object(repo, sha)[1])
-            subject = c.message.splitlines()[0] if c.message.strip() else ""
-        except KeyError:
-            subject = ""
-        mark = "*" if b == cur else " "
-        _print(f"{mark} [{b}] {subject}")
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            return c.message.splitlines()[0] if c.message.strip() else ""
+        except (KeyError, IndexError):
+            return ""
+
+    def parents_of(s):
+        info = _commit_tree_parents(repo, s)
+        return list(info[1]) if info else []
+
+    # Reachability mask: bit i set when rev[i]'s tip can reach the commit.
+    reach: list[set[str]] = []
+    for tip in revs:
+        seen: set[str] = set()
+        stack = [tip]
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(parents_of(x))
+        reach.append(seen)
+
+    def mask(s):
+        m = 0
+        for i, rs in enumerate(reach):
+            if s in rs:
+                m |= (1 << i)
+        return m
+
+    all_mask = (1 << num_rev) - 1
+
+    # Build the reachable union in rev-input order, then order it like git's
+    # topo sort (REV_SORT_IN_GRAPH_ORDER over the date-stable seen list).
+    # git seeds its `seen` list by prepending the tips (so they end up in
+    # reverse command-line order), which drives the topo sort's tie-breaking.
+    union: list[str] = []
+    useen: set[str] = set()
+    for tip in reversed(revs):
+        stack = [tip]
+        local: set[str] = set()
+        order_local: list[str] = []
+        while stack:
+            x = stack.pop()
+            if x in local:
+                continue
+            local.add(x)
+            order_local.append(x)
+            stack.extend(parents_of(x))
+        for x in order_local:
+            if x not in useen:
+                useen.add(x)
+                union.append(x)
+    ordered = _topo_order(repo, union)
+
+    names = _show_branch_name_commits(repo, ordered, revs, ref_names)
+
+    def disp_name(s):
+        n = names.get(s)
+        if not n:
+            return s[:7]
+        head, gen = n
+        if gen == 0:
+            return head
+        if gen == 1:
+            return head + "^"
+        return f"{head}~{gen}"
+
+    # head_at: column of the current branch (used for the '*' marker).
+    head_at = -1
+    if num_rev > 1:
+        for i in range(num_rev):
+            is_head = ref_names[i] == cur and revs[i] == head_oid
+            mark = "*" if is_head else "!"
+            line = " " * i + mark
+            _print(f"{line} [{ref_names[i]}] {subject(revs[i])}")
+            if is_head:
+                head_at = i
+        _print("-" * num_rev)
+
+    def omit_in_dense(s, m):
+        # Skip a merge reachable from only one tip (and not itself a tip).
+        if s in revs:
+            return False
+        if len(parents_of(s)) > 1 and bin(m).count("1") == 1:
+            return True
+        return False
+
+    shown_merge_point = False
+    for s in ordered:
+        m = mask(s)
+        is_merge_point = (m == all_mask)
+        is_merge = len(parents_of(s)) > 1
+        if num_rev > 1:
+            if not args.sparse and is_merge and omit_in_dense(s, m):
+                continue
+            marks = []
+            for i in range(num_rev):
+                if not (m & (1 << i)):
+                    marks.append(" ")
+                elif is_merge:
+                    marks.append("-")
+                elif i == head_at:
+                    marks.append("*")
+                else:
+                    marks.append("+")
+            _print(f"{''.join(marks)} [{disp_name(s)}] {subject(s)}")
+        else:
+            _print(f"[{disp_name(s)}] {subject(s)}")
+        if is_merge_point:
+            shown_merge_point = True
+        if shown_merge_point:
+            break
     return 0
 
 
