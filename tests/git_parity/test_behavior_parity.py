@@ -995,6 +995,25 @@ CASES: list[tuple] = [
     # rev-list --children lists in-set children after each commit.
     ("rev-list-children", PATHHIST, ["rev-list", "--children", "HEAD"]),
     ("rev-list-children-parents-err", PATHHIST, ["rev-list", "--children", "--parents", "HEAD"]),
+    # format-patch flags + range semantics.
+    ("format-patch-no-stat", TAGGED, ["format-patch", "-1", "--stdout", "--no-stat"]),
+    ("format-patch-signoff", TAGGED, ["format-patch", "-1", "--stdout", "--signoff"]),
+    ("format-patch-reroll", TAGGED, ["format-patch", "-1", "--stdout", "-v2"]),
+    ("format-patch-rev-range", PATHHIST, ["format-patch", "HEAD~1", "--stdout"]),
+    ("format-patch-rev-range2", PATHHIST, ["format-patch", "HEAD~2", "--stdout"]),
+    ("format-patch-multi", PATHHIST, ["format-patch", "-2", "--stdout"]),
+    ("format-patch-bad-rev", BASE, ["format-patch", "nonexistent", "--stdout"]),
+    # describe --all considers all refs with namespaced names.
+    ("describe-all", DESC, ["describe", "--all"]),
+    ("describe-all-parent", DESC, ["describe", "--all", "HEAD~1"]),
+    # restore --source / --staged --source restore from an arbitrary tree;
+    # probe the resulting status to confirm the effect matches git.
+    ("restore-source",
+     PATHHIST + [("write", "a.txt", "dirty\n"), ["restore", "--source=HEAD~1", "a.txt"]],
+     ["status", "--short"]),
+    ("restore-staged-source",
+     PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
+     ["status", "--short"]),
     # commit-tree resolves the tree-ish argument (not used verbatim).
     ("commit-tree", SUBTREE, ["commit-tree", "-m", "msg", "HEAD^{tree}"]),
     # ls-remote against a local path: HEAD + sorted refs + peeled annotated tags.

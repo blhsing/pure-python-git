@@ -3648,33 +3648,43 @@ def cmd_switch(argv: list[str]) -> int:
 
 
 def cmd_restore(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit restore")
+    ap = argparse.ArgumentParser(prog="pygit restore", add_help=False)
     ap.add_argument("--staged", action="store_true")
+    ap.add_argument("-W", "--worktree", action="store_true")
+    ap.add_argument("-s", "--source", default=None)
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
     idx = read_index(repo)
-    if args.staged:
-        head_tree = workdir._head_tree_map(repo)
+    # The source tree: --source if given, else HEAD for --staged. Default target
+    # is the worktree; --staged targets the index; both can be combined.
+    src_map = None
+    if args.source is not None:
+        src_tree = (refs_mod.rev_parse(repo, args.source + "^{tree}")
+                    or refs_mod.rev_parse(repo, args.source))
+        src_map = {p: sha for p, _m, sha in workdir.iter_tree_files(repo, src_tree)} if src_tree else {}
+    do_staged = args.staged
+    do_worktree = args.worktree or not args.staged
+
+    if do_staged:
+        from .index import REG_MODE, IndexEntry
+        stage_map = src_map if src_map is not None else workdir._head_tree_map(repo)
         for p in args.paths:
-            if p in head_tree:
-                # restore index entry from HEAD
-                t, data = objs.read_object(repo, head_tree[p])
-                full = repo.path / p
-                st = full.lstat() if full.exists() else os.stat_result((0,) * 10)
-                from .index import REG_MODE, stat_to_entry, IndexEntry
-                idx.upsert(IndexEntry(mode=REG_MODE, sha=head_tree[p], path=p))
+            if p in stage_map:
+                idx.upsert(IndexEntry(mode=REG_MODE, sha=stage_map[p], path=p))
             else:
                 idx.remove(p)
         write_index(repo, idx)
-        return 0
-    # restore worktree from index
-    by_path = idx.by_path()
-    for p in args.paths:
-        if p in by_path:
-            t, data = objs.read_object(repo, by_path[p].sha)
-            (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
-            (repo.path / p).write_bytes(data)
+
+    if do_worktree:
+        # Worktree source: --source tree if given, else the index.
+        by_path = idx.by_path()
+        for p in args.paths:
+            sha = src_map.get(p) if src_map is not None else (by_path[p].sha if p in by_path else None)
+            if sha is not None:
+                _t, data = objs.read_object(repo, sha)
+                (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
+                (repo.path / p).write_bytes(data)
     return 0
 
 
@@ -4758,11 +4768,14 @@ def cmd_apply(argv: list[str]) -> int:
 
 
 def cmd_format_patch(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit format-patch")
+    ap = argparse.ArgumentParser(prog="pygit format-patch", add_help=False)
     ap.add_argument("-o", "--output-directory", default=".")
     ap.add_argument("--stdout", action="store_true")
     ap.add_argument("-n", "--numbered", action="store_true")
     ap.add_argument("-N", "--no-numbered", dest="no_numbered", action="store_true")
+    ap.add_argument("--no-stat", dest="no_stat", action="store_true")
+    ap.add_argument("-s", "--signoff", action="store_true")
+    ap.add_argument("-v", "--reroll-count", dest="reroll", type=int, default=None)
     ap.add_argument("range", help="e.g. main..topic or -1 or HEAD~3")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -4790,7 +4803,15 @@ def cmd_format_patch(argv: list[str]) -> int:
             excludes.append(c.parents[0])
         starts.append(head)
     else:
-        starts.append(refs_mod.rev_parse(repo, rng) or "")
+        # A bare <rev> means <rev>..HEAD (the commits since <rev>), like git.
+        base = refs_mod.rev_parse(repo, rng)
+        if base is None:
+            _err(f"fatal: ambiguous argument '{rng}': unknown revision or path not in the working tree.")
+            _err("Use '--' to separate paths from revisions, like this:")
+            _err("'git <command> [<revision>...] -- [<file>...]'")
+            return 128
+        excludes.append(base)
+        starts.append(refs_mod.rev_parse(repo, "HEAD") or "")
 
     seen = set(excludes)
     commits: list[str] = []
@@ -4829,25 +4850,34 @@ def cmd_format_patch(argv: list[str]) -> int:
         # forces N/M even for one; --no-numbered suppresses it even for many.
         numbered = (len(commits) > 1 or args.numbered) and not args.no_numbered
         num = f" {i}/{len(commits)}" if numbered else ""
+        ver = f" v{args.reroll}" if args.reroll is not None else ""
         body = "\n".join(body_lines).rstrip("\n")
+        # --signoff appends a Signed-off-by trailer (committer identity).
+        if args.signoff:
+            body = (body + "\n\n" if body else "") + f"Signed-off-by: {_split_ident(c.committer)[0]}"
         lines = [
             f"From {sha} Mon Sep 17 00:00:00 2001",
             f"From: {_split_ident(c.author)[0]}",
             f"Date: {_format_rfc2822_date(c.author)}",
-            f"Subject: [PATCH{num}] {subject}",
+            f"Subject: [PATCH{ver}{num}] {subject}",
             "",
         ]
         if body:
             lines.append(body)
-        lines.append("---")
-        lines.append(stat.rstrip("\n"))
-        lines.append("")
+        if args.no_stat:
+            lines.append("")
+        else:
+            lines.append("---")
+            lines.append(stat.rstrip("\n"))
+            lines.append("")
         lines.append(diff.rstrip("\n"))
         lines.append("-- ")
         lines.append("2.54.0")
         out = "\n".join(lines) + "\n"
         if args.stdout:
-            sys.stdout.write(out + "\n")
+            # git separates patches by a blank line; between patches that yields
+            # two blank lines after the signature, one after the final patch.
+            sys.stdout.write(out + ("\n" if i == len(commits) else "\n\n"))
         else:
             safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in subject)[:52].strip("-") or "patch"
             fname = f"{i:04d}-{safe}.patch"
@@ -5056,8 +5086,9 @@ def _describe_contains(repo: Repository, rev: str, sha: str) -> int:
 
 
 def cmd_describe(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit describe")
+    ap = argparse.ArgumentParser(prog="pygit describe", add_help=False)
     ap.add_argument("--tags", action="store_true")
+    ap.add_argument("--all", action="store_true")
     ap.add_argument("--contains", action="store_true")
     ap.add_argument("--always", action="store_true")
     ap.add_argument("--long", action="store_true")
@@ -5076,6 +5107,61 @@ def cmd_describe(argv: list[str]) -> int:
     tag_for: dict[str, str] = {}
     unann_commits: set[str] = set()
     any_tags = False
+    if args.all:
+        # --all considers every ref, named with its namespace (tags/, heads/,
+        # remotes/). Tags are seeded first so they win ties at equal depth.
+        for tag in refs_mod.list_tags(repo):
+            tc = refs_mod.rev_parse(repo, f"refs/tags/{tag}^{{commit}}") or refs_mod.read_ref(repo, f"refs/tags/{tag}")
+            if tc:
+                tag_for.setdefault(tc, f"tags/{tag}")
+        for b in refs_mod.list_branches(repo):
+            s = refs_mod.read_ref(repo, f"refs/heads/{b}")
+            if s:
+                tag_for.setdefault(s, f"heads/{b}")
+        for rb in _remote_branches(repo):
+            s = refs_mod.read_ref(repo, f"refs/remotes/{rb}")
+            if s:
+                tag_for.setdefault(s, f"remotes/{rb}")
+        any_tags = bool(tag_for)
+        graph = _graph_for_repo(repo)
+
+        def _reach_all(start: str) -> set:
+            out: set[str] = set()
+            stack = [start]
+            while stack:
+                x = stack.pop()
+                if x in out:
+                    continue
+                out.add(x)
+                info = _commit_tree_parents(repo, x, graph)
+                if info:
+                    stack.extend(info[1])
+            return out
+
+        reach_sha = _reach_all(sha)
+        candidates = [(tc, name) for tc, name in tag_for.items() if tc in reach_sha]
+        if candidates:
+            best = None
+            for tc, name in candidates:
+                depth = len(reach_sha - _reach_all(tc))
+                if best is None or depth < best[0]:
+                    best = (depth, tc, name)
+            depth, tc, name = best
+            ab = max(4, args.abbrev) if args.abbrev else 0
+            if args.abbrev == 0 or (depth == 0 and not args.long):
+                _print(name)
+            else:
+                _print(f"{name}-{depth}-g{sha[:ab]}")
+            return 0
+        if args.always:
+            _print(sha[:max(4, args.abbrev)] if args.abbrev else sha[:7])
+            return 0
+        if any_tags:
+            _err(f"fatal: No tags can describe '{sha}'.")
+            _err("Try --always, or create some tags.")
+        else:
+            _err("fatal: No names found, cannot describe anything.")
+        return 128
     for tag in refs_mod.list_tags(repo):
         ts = refs_mod.read_ref(repo, f"refs/tags/{tag}")
         if not ts:
