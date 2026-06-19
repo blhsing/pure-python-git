@@ -123,6 +123,14 @@ RANGEDIFF = BASE + [
 # exercising commit's flag set (author/signoff/trailer/only/include/...).
 COMMITSTAGE = BASE + [("write", "a.txt", "alpha\nMOD\n"), ("write", "n.txt", "new\n"), ["add", "-A"]]
 
+# Tags on the base commit plus a tag on a diverged branch tip, for tag
+# --merged/--no-merged/--column listing filters.
+TAGREPO = BASE + [["tag", "v1"], ["tag", "v2"],
+                  ["checkout", "-b", "feat"], ("write", "b.txt", "b\n"), ["add", "-A"],
+                  ["commit", "-m", "c2"], ["tag", "ontip"], ["checkout", "main"]]
+# A message file staged in the working tree, for `tag -a -F <file>`.
+TAGMSGFILE = BASE + [("write", "tmsg.txt", "from file\nsecond line\n")]
+
 # A commit that introduces whitespace errors (trailing space, space-before-tab),
 # for `diff --check`.
 WSERR = BASE + [("write", "a.txt", "clean\ntrailing \n\tgood\n \tspacetab\n"),
@@ -1220,6 +1228,26 @@ CASES: list[tuple] = [
     ("fer-points-at-bad", REFSET, ["for-each-ref", "--points-at=nope"]),
     ("fer-merged-bad", REFSET, ["for-each-ref", "--merged=nope"]),
     ("fer-contains-bad", REFSET, ["for-each-ref", "--contains=nope"]),
+    # tag listing filters and columnar/case-insensitive output.
+    ("tag-merged", TAGREPO, ["tag", "--merged=HEAD"]),
+    ("tag-no-merged", TAGREPO, ["tag", "--no-merged=HEAD"]),
+    ("tag-merged-lastarg", TAGREPO, ["tag", "-l", "--merged"]),
+    ("tag-column", REFSET, ["tag", "--column"]),
+    ("tag-column-plain", REFSET, ["tag", "--column=plain"]),
+    ("tag-no-column", REFSET, ["tag", "--no-column"]),
+    ("tag-ignore-case", REFSET, ["tag", "-i", "-l", "V*"]),
+    # tag -v / --verify on a lightweight tag, an annotated (unsigned) tag, and a
+    # missing tag — each fails with git's exact message and return code.
+    ("tag-verify-lightweight", REFSET, ["tag", "-v", "v1"]),
+    ("tag-verify-annotated", DESC, ["tag", "-v", "v1"]),
+    ("tag-verify-missing", BASE, ["tag", "-v", "nope"]),
+    # tag creation: -F <file>, --trailer, multi -m (probed via the tag object).
+    ("tag-file", TAGMSGFILE + [["tag", "-a", "-F", "tmsg.txt", "ft"]],
+     ["cat-file", "-p", "ft"]),
+    ("tag-trailer", BASE + [["tag", "-a", "-m", "subj", "--trailer", "Acked-by: X", "tr"]],
+     ["cat-file", "-p", "tr"]),
+    ("tag-multi-m", BASE + [["tag", "-a", "-m", "line1", "-m", "line2", "mm"]],
+     ["cat-file", "-p", "mm"]),
 ]
 
 

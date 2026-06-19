@@ -4057,21 +4057,73 @@ def cmd_tag(argv: list[str]) -> int:
     ap.add_argument("-l", "--list", action="store_true")
     ap.add_argument("-a", "--annotate", action="store_true")
     ap.add_argument("-s", "--sign", action="store_true")
+    ap.add_argument("-u", "--local-user", dest="local_user", default=None)
     ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("-m", "--message", default=None)
+    ap.add_argument("-m", "--message", action="append", default=None)
+    ap.add_argument("-F", "--file", default=None)
+    ap.add_argument("-e", "--edit", action="store_true")
+    ap.add_argument("--trailer", action="append", default=None)
+    ap.add_argument("--cleanup", default=None)
     ap.add_argument("-n", nargs="?", const=1, type=int, default=None, dest="num")
     ap.add_argument("--sort", default=None)
     ap.add_argument("--points-at", default=None)
     ap.add_argument("--format", default=None)
     ap.add_argument("--contains", default=None)
     ap.add_argument("--no-contains", dest="no_contains", default=None)
+    ap.add_argument("--merged", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--no-merged", dest="no_merged", nargs="?", const="HEAD", default=None)
+    ap.add_argument("--column", nargs="?", const="__default__", default=None)
+    ap.add_argument("--no-column", dest="no_column", action="store_true")
+    ap.add_argument("--create-reflog", dest="create_reflog", action="store_true")
+    ap.add_argument("-v", "--verify", action="store_true")
+    ap.add_argument("-i", "--ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("name", nargs="?")
     ap.add_argument("target", nargs="?")
-    args = ap.parse_args(argv)
+    # --merged/--no-merged consume the next token (default HEAD when last);
+    # --column takes an optional attached style only.
+    consume = ("--merged", "--no-merged")
+    pre: list[str] = []
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t in consume:
+            pre.append(f"{t}={argv[i + 1]}" if i + 1 < len(argv) else f"{t}=HEAD")
+            i += 2 if i + 1 < len(argv) else 1
+            continue
+        if t == "--column":
+            pre.append("--column=__default__")
+            i += 1
+            continue
+        pre.append(t)
+        i += 1
+    args = ap.parse_args(pre)
     repo = _repo()
+    if args.verify:
+        rc = 0
+        for name in [n for n in (args.name, args.target) if n]:
+            ref = f"refs/tags/{name}"
+            sha = refs_mod.read_ref(repo, ref)
+            if sha is None:
+                _err(f"error: tag '{name}' not found.")
+                rc = 1
+                continue
+            otype, data = objs.read_object(repo, sha)
+            if otype != "tag":
+                _err(f"error: {name}: cannot verify a non-tag object of type {otype}.")
+                rc = 1
+                continue
+            # We cannot GPG-verify; print the tag payload like git, then report
+            # the missing signature (unsigned tags fail verification).
+            payload = data.decode("utf-8", "replace")
+            sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+            _err("error: no signature found")
+            rc = 1
+        return rc
     if (args.list or args.num is not None or args.sort is not None
             or args.points_at is not None or args.format is not None
             or args.contains is not None or args.no_contains is not None
+            or args.merged is not None or args.no_merged is not None
+            or args.column is not None
             or (args.name is None and not args.delete)):
         import fnmatch
         pattern = args.name
@@ -4106,17 +4158,61 @@ def cmd_tag(argv: list[str]) -> int:
             if args.no_contains is not None:
                 cs = refs_mod.rev_parse(repo, args.no_contains)
                 tags = [t for t in tags if not (_tag_commit(t) and cs and _reaches(_tag_commit(t), cs))]
+        if args.merged is not None or args.no_merged is not None:
+            graph = _graph_for_repo(repo)
+
+            def _reach2(start: str, target: str) -> bool:
+                stack, seen_c = [start], set()
+                while stack:
+                    x = stack.pop()
+                    if x == target:
+                        return True
+                    if x in seen_c:
+                        continue
+                    seen_c.add(x)
+                    info = _commit_tree_parents(repo, x, graph)
+                    if info:
+                        stack.extend(info[1])
+                return False
+
+            def _tc(t):
+                return refs_mod.rev_parse(repo, f"refs/tags/{t}^{{commit}}")
+            if args.merged is not None:
+                m = refs_mod.rev_parse(repo, args.merged + "^{commit}") or refs_mod.rev_parse(repo, args.merged)
+                tags = [t for t in tags if (_tc(t) and m and _reach2(m, _tc(t)))]
+            if args.no_merged is not None:
+                m = refs_mod.rev_parse(repo, args.no_merged + "^{commit}") or refs_mod.rev_parse(repo, args.no_merged)
+                tags = [t for t in tags if not (_tc(t) and m and _reach2(m, _tc(t)))]
         if args.sort:
             key = args.sort.lstrip("-")
             reverse = args.sort.startswith("-")
             if key in ("version:refname", "v:refname"):
                 tags.sort(key=_version_sort_key, reverse=reverse)
             else:
-                tags.sort(reverse=reverse)
+                tags.sort(key=str.lower if args.ignore_case else None, reverse=reverse)
+        elif args.ignore_case:
+            tags.sort(key=str.lower)
         head_sym, _ = refs_mod.read_head(repo)
+        selected = []
         for t in tags:
-            if pattern and not fnmatch.fnmatch(t, pattern):
-                continue
+            if pattern:
+                import re as _re
+                if args.ignore_case:
+                    if not _re.match(fnmatch.translate(pattern), t, _re.IGNORECASE):
+                        continue
+                elif not fnmatch.fnmatch(t, pattern):
+                    continue
+            selected.append(t)
+        # --column lays the plain tag-name list into terminal-width columns.
+        if args.column is not None and not args.no_column and args.format is None and args.num is None:
+            if args.column == "plain":
+                for t in selected:
+                    _print(t)
+            elif selected:
+                for line in _columnate(selected):
+                    _print(line)
+            return 0
+        for t in selected:
             if args.format is not None:
                 ref = f"refs/tags/{t}"
                 _print(_fer_expand(repo, ref, refs_mod.read_ref(repo, ref) or "", args.format, head_sym))
@@ -4142,10 +4238,21 @@ def cmd_tag(argv: list[str]) -> int:
     if not target:
         _err(f"fatal: Failed to resolve '{args.target or 'HEAD'}' as a valid ref.")
         return 128
-    annotated = args.annotate or args.sign or args.message is not None
+    annotated = (args.annotate or args.sign or args.message is not None
+                 or args.file is not None or args.local_user is not None
+                 or args.trailer is not None)
+    old_sha = refs_mod.read_ref(repo, ref)
     if annotated:
         target_type, _ = objs.read_object(repo, target)
-        message = args.message or ""
+        if args.file is not None:
+            message = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf-8").read()
+        elif args.message:
+            message = "\n\n".join(args.message)
+        else:
+            message = ""
+        message = _cleanup_commit_message(message, args.cleanup or "strip")
+        if args.trailer:
+            message = _apply_trailers(message, args.trailer)
         if not message.endswith("\n"):
             message += "\n"
         tagger = objs.build_signature(repo, "committer")
@@ -4158,8 +4265,21 @@ def cmd_tag(argv: list[str]) -> int:
         )
         tag_sha = objs.write_object(repo, "tag", body.encode("utf-8"))
         refs_mod.update_ref(repo, ref, tag_sha)
+        new_sha = tag_sha
     else:
         refs_mod.update_ref(repo, ref, target)
+        new_sha = target
+    if args.create_reflog:
+        from . import reflog as _reflog
+        zero = repo.null_oid()
+        # git's reflog message tags the underlying commit:
+        # "tag: tagging <abbrev> (<subject>, <committer-date-short>)".
+        msg = ""
+        if _commit_tree_parents(repo, target) is not None:
+            c = objs.parse_commit(objs.read_object(repo, target)[1])
+            subj = c.message.splitlines()[0] if c.message.strip() else ""
+            msg = f"tag: tagging {target[:7]} ({subj}, {_format_date(c.committer, 'short')})"
+        _reflog.append(repo, ref, old_sha or zero, new_sha, msg)
     return 0
 
 
@@ -9327,6 +9447,24 @@ def _rerere_auto_scan(repo: Repository) -> None:
     _rr.scan_and_record(repo)
 
 
+def _columnate(items: list[str], padding: int = 2) -> list[str]:
+    """Column-major layout (C Git's column.c default) into the terminal width."""
+    import shutil as _sh
+    width = _sh.get_terminal_size((80, 24)).columns
+    col_w = max(len(x) for x in items) + padding
+    cols = max(1, width // col_w)
+    rows = (len(items) + cols - 1) // cols
+    out = []
+    for r in range(rows):
+        parts = []
+        for c in range(cols):
+            idx = c * rows + r
+            if idx < len(items):
+                parts.append(items[idx].ljust(col_w))
+        out.append("".join(parts).rstrip())
+    return out
+
+
 def cmd_column(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit column")
     ap.add_argument("--mode", default="plain")
@@ -9340,18 +9478,8 @@ def cmd_column(argv: list[str]) -> int:
         for it in items:
             _print(it)
         return 0
-    import shutil as _sh
-    width = _sh.get_terminal_size((80, 24)).columns
-    col_w = max(len(x) for x in items) + args.padding
-    cols = max(1, width // col_w)
-    rows = (len(items) + cols - 1) // cols
-    for r in range(rows):
-        parts = []
-        for c in range(cols):
-            idx = c * rows + r
-            if idx < len(items):
-                parts.append(items[idx].ljust(col_w))
-        _print("".join(parts).rstrip())
+    for line in _columnate(items, args.padding):
+        _print(line)
     return 0
 
 
