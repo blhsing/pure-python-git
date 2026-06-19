@@ -994,6 +994,7 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--all-match", dest="all_match", action="store_true")
     ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("--left-right", dest="left_right", action="store_true")
+    ap.add_argument("--timestamp", action="store_true")
     ap.add_argument("revs", nargs="*")
     # Split a trailing "-- <pathspec>..." off before argparse consumes the "--".
     rl_paths: list[str] = []
@@ -1184,6 +1185,9 @@ def cmd_rev_list(argv: list[str]) -> int:
             mark = ""
             if args.left_right:
                 mark = "<" if s in lr_left else (">" if s in lr_right else "")
+            ts_prefix = ""
+            if args.timestamp:
+                ts_prefix = f"{_commit_date(repo, s)} "
             extra = ""
             if args.parents:
                 info = _commit_tree_parents(repo, s, graph)
@@ -1193,7 +1197,7 @@ def cmd_rev_list(argv: list[str]) -> int:
                 kids = children_map.get(s, [])
                 if kids:
                     extra += " " + " ".join(kids)
-            _print(f"{mark}{s}{extra}")
+            _print(f"{ts_prefix}{mark}{s}{extra}")
     return 0
 
 
@@ -4506,12 +4510,15 @@ def cmd_merge_base(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit merge-base", add_help=False)
     ap.add_argument("--is-ancestor", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--octopus", action="store_true")  # default multi-arg reduction
     ap.add_argument("--independent", action="store_true")
     ap.add_argument("commits", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import merge as _m
-    shas = [refs_mod.rev_parse(repo, c) for c in args.commits]
+    # Peel each argument to a commit (annotated tags resolve to their target).
+    shas = [refs_mod.rev_parse(repo, c + "^{commit}") or refs_mod.rev_parse(repo, c)
+            for c in args.commits]
     if any(s is None for s in shas):
         return 128
 
@@ -5297,6 +5304,7 @@ def cmd_describe(argv: list[str]) -> int:
     ap.add_argument("--contains", action="store_true")
     ap.add_argument("--always", action="store_true")
     ap.add_argument("--long", action="store_true")
+    ap.add_argument("--candidates", type=int, default=10)
     ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("rev", nargs="?", default="HEAD")
     args = ap.parse_args(argv)
@@ -7385,6 +7393,8 @@ def cmd_name_rev(argv: list[str]) -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--tags", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--annotate-stdin", dest="annotate_stdin", action="store_true")
     ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -7428,6 +7438,26 @@ def cmd_name_rev(argv: list[str]) -> int:
         if args.name_only and args.tags and name.startswith("tags/"):
             return name[len("tags/"):]
         return name
+
+    if args.stdin or args.annotate_stdin:
+        # Annotate each full oid token on stdin in place with " (<name>)".
+        if args.stdin:
+            _err("warning: --stdin is deprecated. Please use --annotate-stdin instead, "
+                 "which is functionally equivalent.")
+            _err("This option will be removed in a future release.")
+        import re as _re2
+
+        def _annot(line: str) -> str:
+            def repl(m):
+                tok = m.group(0)
+                s = refs_mod.rev_parse(repo, tok)
+                if s and s in name_for:
+                    return f"{tok} ({_display(name_for[s][0])})"
+                return tok
+            return _re2.sub(r"[0-9a-f]{40}", repl, line)
+        for line in sys.stdin:
+            sys.stdout.write(_annot(line.rstrip("\n")) + "\n")
+        return 0
 
     if args.all:
         for sha, (name, _) in sorted(name_for.items()):

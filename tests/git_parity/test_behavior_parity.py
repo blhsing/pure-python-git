@@ -1025,6 +1025,12 @@ CASES: list[tuple] = [
     ("restore-staged-source",
      PATHHIST + [["restore", "--staged", "--source=HEAD~1", "a.txt"]],
      ["status", "--short"]),
+    # rev-list --timestamp prefixes the committer epoch; merge-base --octopus
+    # and tag-peeling; describe --candidates accepted.
+    ("rev-list-timestamp", PATHHIST, ["rev-list", "--timestamp", "HEAD"]),
+    ("merge-base-octopus", DESC, ["merge-base", "--octopus", "HEAD", "v1"]),
+    ("merge-base-tag", DESC, ["merge-base", "HEAD", "v1"]),
+    ("describe-candidates", DESC, ["describe", "--candidates=1"]),
     # tag --contains/--no-contains filters; tag --format ref-filter atoms.
     ("tag-contains", DESC, ["tag", "--contains", "HEAD~1"]),
     ("tag-format", REFSET, ["tag", "-l", "--format=%(refname:short) %(objecttype)"]),
@@ -1125,6 +1131,11 @@ CASES_WITH_STDIN: list[tuple] = [
     ("hash-object-stdin-paths", BASE, ["hash-object", "--stdin-paths"], "a.txt\n"),
     ("cat-file-batch-command", BASE, ["cat-file", "--batch-command"],
      "info HEAD\ncontents HEAD:a.txt\n"),
+    # name-rev --annotate-stdin / --stdin annotate oids on stdin in place.
+    ("name-rev-annotate-stdin", BASE + [["tag", "-a", "-m", "r", "v1"]],
+     ["name-rev", "--annotate-stdin"], "a158a009e0dde60c7a948f10fd523b2bf897d3ad\n"),
+    ("name-rev-stdin-deprecated", BASE + [["tag", "-a", "-m", "r", "v1"]],
+     ["name-rev", "--stdin"], "a158a009e0dde60c7a948f10fd523b2bf897d3ad\n"),
     # apply with no patch in the input errors (rc 128).
     ("apply-empty", BASE, ["apply", "--check"], ""),
     ("apply-empty-stat", BASE, ["apply", "--stat"], ""),
