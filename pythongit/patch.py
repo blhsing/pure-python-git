@@ -27,6 +27,7 @@ class FilePatch:
     new_file: bool = False
     deleted: bool = False
     binary: bool = False
+    mode: str = "100644"
     hunks: list[Hunk] = field(default_factory=list)
 
     @property
@@ -64,10 +65,12 @@ def parse_patch(text: str) -> list[FilePatch]:
                 continue
         if line.startswith("new file mode"):
             cur.new_file = True
+            cur.mode = line.rsplit(" ", 1)[-1].strip()
             i += 1
             continue
         if line.startswith("deleted file mode"):
             cur.deleted = True
+            cur.mode = line.rsplit(" ", 1)[-1].strip()
             i += 1
             continue
         if line.startswith("Binary files"):
@@ -153,8 +156,9 @@ def apply_to_text(content: str, hunks: list[Hunk], *, reverse: bool = False) -> 
     out: list[str] = []
     src_idx = 0  # 0-based position in src
     for h in hunks:
-        # context lines until hunk start
-        start = (h.b_start if reverse else h.a_start) - 1
+        # context lines until hunk start (clamped: a new/empty file uses a 0,0
+        # hunk header whose 1-based start is 0).
+        start = max(0, (h.b_start if reverse else h.a_start) - 1)
         # copy through start
         if start < src_idx:
             return None  # cannot apply
@@ -183,8 +187,9 @@ def apply_to_text(content: str, hunks: list[Hunk], *, reverse: bool = False) -> 
                 out.append(text + "\n")
     out.extend(src[src_idx:])
     result = "".join(out)
-    # if original lacked trailing newline and last hunk preserved that, strip one '\n'
-    if not content.endswith("\n") and result.endswith("\n"):
+    # if the (non-empty) original lacked a trailing newline and the last hunk
+    # preserved that, strip one '\n' — but never for a new/empty file.
+    if content and not content.endswith("\n") and result.endswith("\n"):
         result = result[:-1]
     return result
 

@@ -554,6 +554,32 @@ CASES: list[tuple] = [
      BASE + [("write", "p.diff",
               "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-WRONG\n+ALPHA\n")],
      ["apply", "--check", "p.diff"]),
+    # apply --summary / --exclude / --include / -v, and new-file application.
+    ("apply-summary",
+     BASE + [("write", "p.diff",
+              "diff --git a/new.txt b/new.txt\nnew file mode 100644\n"
+              "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n")],
+     ["apply", "--summary", "p.diff"]),
+    ("apply-verbose",
+     BASE + [("write", "p.diff",
+              "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n")],
+     ["apply", "-v", "p.diff"]),
+    ("apply-exclude",
+     BASE + [("write", "p.diff",
+              "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n"
+              "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n")],
+     ["apply", "--exclude=new.txt", "--summary", "p.diff"]),
+    ("apply-include",
+     BASE + [("write", "p.diff",
+              "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n"
+              "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n")],
+     ["apply", "--include=new.txt", "--summary", "p.diff"]),
+    ("apply-newfile-effect",
+     BASE + [("write", "p.diff",
+              "diff --git a/new.txt b/new.txt\nnew file mode 100644\n"
+              "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n"),
+             ["apply", "p.diff"]],
+     ["status", "--short"]),
     # am (applies a patch and records a commit; "Applying:" line + exit code)
     ("am",
      BASE + [("write", "patch.mbox",

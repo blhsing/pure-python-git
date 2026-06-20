@@ -6127,6 +6127,11 @@ def cmd_apply(argv: list[str]) -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--numstat", action="store_true")
+    ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--exclude", action="append", default=None)
+    ap.add_argument("--include", action="append", default=None)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("file", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -6136,6 +6141,27 @@ def cmd_apply(argv: list[str]) -> int:
     if not patches:
         _err('error: No valid patches in input (allow with "--allow-empty")')
         return 128
+
+    # --include/--exclude filter the patched paths (fnmatch, like C Git).
+    if args.include or args.exclude:
+        import fnmatch as _fn
+
+        def _included(t: str) -> bool:
+            if args.include and not any(_fn.fnmatch(t, p) for p in args.include):
+                return False
+            if args.exclude and any(_fn.fnmatch(t, p) for p in args.exclude):
+                return False
+            return True
+        patches = [fp for fp in patches if _included(fp.target)]
+
+    # --summary: list create/delete/mode lines without applying.
+    if args.summary:
+        for fp in patches:
+            if fp.new_file:
+                _print(f" create mode {fp.mode} {fp.target}")
+            elif fp.deleted:
+                _print(f" delete mode {fp.mode} {fp.target}")
+        return 0
 
     def counts(fp) -> tuple[int, int]:
         ins = sum(1 for h in fp.hunks for ln in h.lines if ln.startswith("+"))
@@ -6164,7 +6190,12 @@ def cmd_apply(argv: list[str]) -> int:
             _print(_stat_summary_line(len(rows), ti, td))
         return 0
 
+    # C Git checks every file first (the "Checking patch ..." pass), then applies
+    # (the "Applied patch ... cleanly." pass); -v reports both to stderr.
+    results: list[tuple] = []
     for fp in patches:
+        if args.verbose:
+            _err(f"Checking patch {fp.target}...")
         tgt = repo.path / fp.target
         content = tgt.read_text(encoding="utf-8", errors="replace") if tgt.exists() else ""
         result = patch.apply_to_text(content, fp.hunks, reverse=args.reverse)
@@ -6173,9 +6204,13 @@ def cmd_apply(argv: list[str]) -> int:
             _err(f"error: patch failed: {fp.target}:{line}")
             _err(f"error: {fp.target}: patch does not apply")
             return 1
-        if not args.check:
+        results.append((tgt, result, fp.target))
+    if not args.check:
+        for tgt, result, target in results:
             tgt.parent.mkdir(parents=True, exist_ok=True)
             tgt.write_text(result, encoding="utf-8")
+            if args.verbose:
+                _err(f"Applied patch {target} cleanly.")
     return 0
 
 
