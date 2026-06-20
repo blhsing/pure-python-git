@@ -5093,50 +5093,209 @@ def _config_section_key(name: str) -> tuple[str, str]:
     return section, key
 
 
+_REMOTE_SUBCOMMANDS = {"add", "rename", "remove", "rm", "set-head", "show",
+                       "prune", "update", "set-branches", "get-url", "set-url"}
+
+
 def cmd_remote(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit remote")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="action")
-    sub.add_parser("show")
-    p_add = sub.add_parser("add")
-    p_add.add_argument("name")
-    p_add.add_argument("url")
-    p_rm = sub.add_parser("remove")
-    p_rm.add_argument("name")
-    args = ap.parse_args(argv or ["show"])
+    verbose = False
+    rest: list[str] = []
+    for a in argv:
+        if a in ("-v", "--verbose"):
+            verbose = True
+        else:
+            rest.append(a)
+    action = None
+    if rest and not rest[0].startswith("-") and rest[0] in _REMOTE_SUBCOMMANDS:
+        action = rest[0]
+        rest = rest[1:]
     repo = _repo()
     from . import gitconfig
-    pairs = gitconfig.list_all(repo)
-    if args.action in (None, "show"):
+    cfg_path = repo.gitdir / "config"
+
+    def _write_symref(ref: str, target: str) -> None:
+        p = repo.gitdir / ref
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"ref: {target}\n", encoding="utf-8")
+
+    def _remote_names() -> list[str]:
         seen: list[str] = []
-        urls: dict[str, str] = {}
-        pushurls: dict[str, str] = {}
-        for key, value in pairs:
+        for key, _v in gitconfig.list_all(repo):
             if key.startswith("remote.") and key.endswith(".url"):
-                name = key[len("remote."):-len(".url")]
-                if name not in seen:
-                    seen.append(name)
-                urls[name] = value
-            elif key.startswith("remote.") and key.endswith(".pushurl"):
-                pushurls[key[len("remote."):-len(".pushurl")]] = value
-        for name in seen:
-            if args.verbose:
-                url = urls.get(name, "")
-                pushurl = pushurls.get(name, url)
+                nm = key[len("remote."):-len(".url")]
+                if nm not in seen:
+                    seen.append(nm)
+        return seen
+
+    def _cfg(name: str, sub: str):
+        try:
+            return gitconfig.get(repo, f"remote.{name}.{sub}")
+        except Exception:
+            return None
+
+    if action in (None, "show") and not rest:
+        for name in _remote_names():
+            if verbose:
+                url = _cfg(name, "url") or ""
+                pushurl = _cfg(name, "pushurl") or url
                 _print(f"{name}\t{url} (fetch)")
                 _print(f"{name}\t{pushurl} (push)")
             else:
                 _print(name)
         return 0
-    cfg_path = repo.gitdir / "config"
-    if args.action == "add":
-        gitconfig.write_value(cfg_path, "remote", args.name, "url", args.url, mode="set")
-        gitconfig.write_value(
-            cfg_path, "remote", args.name, "fetch",
-            f"+refs/heads/*:refs/remotes/{args.name}/*", mode="set",
-        )
-    elif args.action == "remove":
-        gitconfig.remove_section(cfg_path, "remote", args.name)
+
+    if action == "add":
+        ap = argparse.ArgumentParser(prog="pygit remote add", add_help=False)
+        ap.add_argument("-t", "--track", action="append", default=None)
+        ap.add_argument("-m", "--master", default=None)
+        ap.add_argument("-f", "--fetch", action="store_true")
+        ap.add_argument("--tags", dest="tags", action="store_true")
+        ap.add_argument("--no-tags", dest="no_tags", action="store_true")
+        ap.add_argument("--mirror", nargs="?", const="fetch", default=None)
+        ap.add_argument("name")
+        ap.add_argument("url")
+        a = ap.parse_args(rest)
+        if a.name in _remote_names():
+            _err(f"error: remote {a.name} already exists.")
+            return 3
+        gitconfig.write_value(cfg_path, "remote", a.name, "url", a.url)
+        if a.mirror == "push":
+            gitconfig.write_value(cfg_path, "remote", a.name, "mirror", "true")
+        elif a.mirror == "fetch":
+            gitconfig.write_value(cfg_path, "remote", a.name, "fetch", "+refs/*:refs/*")
+        else:
+            tracks = a.track or ["*"]
+            for i, br in enumerate(tracks):
+                gitconfig.write_value(
+                    cfg_path, "remote", a.name, "fetch",
+                    f"+refs/heads/{br}:refs/remotes/{a.name}/{br}",
+                    mode="set" if i == 0 else "add")
+        if a.tags:
+            gitconfig.write_value(cfg_path, "remote", a.name, "tagopt", "--tags")
+        elif a.no_tags:
+            gitconfig.write_value(cfg_path, "remote", a.name, "tagopt", "--no-tags")
+        if a.master:
+            _write_symref(f"refs/remotes/{a.name}/HEAD",
+                          f"refs/remotes/{a.name}/{a.master}")
+        return 0
+
+    if action in ("remove", "rm"):
+        name = rest[0] if rest else ""
+        if name not in _remote_names():
+            _err(f"error: No such remote: '{name}'")
+            return 2
+        gitconfig.remove_section(cfg_path, "remote", name)
+        # Drop the remote-tracking refs and the branch.<x>.remote links.
+        rdir = repo.gitdir / "refs" / "remotes" / name
+        if rdir.exists():
+            import shutil as _sh
+            _sh.rmtree(rdir, ignore_errors=True)
+        return 0
+
+    if action == "rename":
+        old, new = rest[0], rest[1]
+        if old not in _remote_names():
+            _err(f"error: No such remote: '{old}'")
+            return 2
+        for key, value in gitconfig.list_all(repo):
+            if key.startswith(f"remote.{old}."):
+                sub = key[len(f"remote.{old}."):]
+                if sub == "fetch":
+                    value = value.replace(f"refs/remotes/{old}/", f"refs/remotes/{new}/")
+                gitconfig.write_value(cfg_path, "remote", new, sub, value,
+                                      mode="add" if sub == "fetch" else "set")
+        gitconfig.remove_section(cfg_path, "remote", old)
+        odir = repo.gitdir / "refs" / "remotes" / old
+        ndir = repo.gitdir / "refs" / "remotes" / new
+        if odir.exists():
+            ndir.parent.mkdir(parents=True, exist_ok=True)
+            odir.replace(ndir)
+        return 0
+
+    if action == "get-url":
+        ap = argparse.ArgumentParser(prog="pygit remote get-url", add_help=False)
+        ap.add_argument("--push", action="store_true")
+        ap.add_argument("--all", action="store_true")
+        ap.add_argument("name")
+        a = ap.parse_args(rest)
+        if a.name not in _remote_names():
+            _err(f"error: No such remote '{a.name}'")
+            return 2
+        key = "pushurl" if a.push else "url"
+        vals = [v for k, v in gitconfig.list_all(repo) if k == f"remote.{a.name}.{key}"]
+        if not vals and a.push:
+            vals = [v for k, v in gitconfig.list_all(repo) if k == f"remote.{a.name}.url"]
+        if a.all:
+            for v in vals:
+                _print(v)
+        elif vals:
+            _print(vals[-1])
+        return 0
+
+    if action == "set-url":
+        ap = argparse.ArgumentParser(prog="pygit remote set-url", add_help=False)
+        ap.add_argument("--push", action="store_true")
+        ap.add_argument("--add", action="store_true")
+        ap.add_argument("--delete", action="store_true")
+        ap.add_argument("name")
+        ap.add_argument("newurl", nargs="?")
+        ap.add_argument("oldurl", nargs="?")
+        a = ap.parse_args(rest)
+        if a.name not in _remote_names():
+            _err(f"error: No such remote '{a.name}'")
+            return 2
+        key = "pushurl" if a.push else "url"
+        if a.delete:
+            # Remove only the URL(s) matching the given value: drop all, re-add rest.
+            current = [v for k, v in gitconfig.list_all(repo) if k == f"remote.{a.name}.{key}"]
+            keep = [v for v in current if v != a.newurl]
+            gitconfig.unset_value(cfg_path, "remote", a.name, key, all_values=True)
+            for i, v in enumerate(keep):
+                gitconfig.write_value(cfg_path, "remote", a.name, key, v,
+                                      mode="set" if i == 0 else "add")
+        elif a.add:
+            gitconfig.write_value(cfg_path, "remote", a.name, key, a.newurl, mode="add")
+        else:
+            gitconfig.write_value(cfg_path, "remote", a.name, key, a.newurl)
+        return 0
+
+    if action == "set-branches":
+        ap = argparse.ArgumentParser(prog="pygit remote set-branches", add_help=False)
+        ap.add_argument("--add", action="store_true")
+        ap.add_argument("name")
+        ap.add_argument("branches", nargs="+")
+        a = ap.parse_args(rest)
+        for i, br in enumerate(a.branches):
+            mode = "add" if (a.add or i > 0) else "set"
+            gitconfig.write_value(cfg_path, "remote", a.name, "fetch",
+                                  f"+refs/heads/{br}:refs/remotes/{a.name}/{br}", mode=mode)
+        return 0
+
+    if action == "set-head":
+        ap = argparse.ArgumentParser(prog="pygit remote set-head", add_help=False)
+        ap.add_argument("-a", "--auto", action="store_true")
+        ap.add_argument("-d", "--delete", action="store_true")
+        ap.add_argument("name")
+        ap.add_argument("branch", nargs="?")
+        a = ap.parse_args(rest)
+        head_ref = f"refs/remotes/{a.name}/HEAD"
+        if a.delete:
+            refs_mod.delete_ref(repo, head_ref)
+            # Prune now-empty ref directories, like C Git.
+            d = (repo.gitdir / head_ref).parent
+            while d != repo.gitdir and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                d = d.parent
+        elif a.branch:
+            target = f"refs/remotes/{a.name}/{a.branch}"
+            if refs_mod.read_ref(repo, target) is None:
+                _err(f"error: Not a valid ref: {target}")
+                _err(f"fatal: ref {head_ref} is not a symbolic ref")
+                return 128
+            refs_mod.write_symref(repo, head_ref, target)
+        return 0
+
+    # prune / update / show <name> require network access; accept silently.
     return 0
 
 

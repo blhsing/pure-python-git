@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 439 flags across 49 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 422 flags across 48 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -105,9 +105,6 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 
 ## push (14)
   -v -q --all -d --branches --mirror -n -f -u --no-verify --verify -o --ipv4 --ipv6
-
-## remote (17)
-  -t -m -f --tags --no-tags --mirror -a --auto -d --delete -n --dry-run -p --prune --add --push --all
 
 ## repack (25)
   -A -f -F -l -n -q -m --window --depth --threads --keep-pack --write-midx --name-hash-version --path-walk --cruft --combine-cruft-below-size --max-cruft-size --no-reuse-delta --no-reuse-object --local -i --delta-islands -k --max-pack-size -g
