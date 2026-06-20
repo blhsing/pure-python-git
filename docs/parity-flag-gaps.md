@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 407 flags across 48 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 395 flags across 48 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -43,8 +43,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## diagnose (3)
   -s --suffix --mode
 
-## diff-files (22)
-  -q -c --cc -z -p -u --patch-with-raw --patch-with-stat --name-status --full-index --abbrev -R -B -M -C --find-copies-harder -l -O -S --pickaxe-all -a --text
+## diff-files (10)
+  -c --cc -B -M -C --find-copies-harder -l -O -S --pickaxe-all
 
 ## diff-pairs (83)
   -z -p --patch -s --no-patch -u -U --unified -W --raw --patch-with-raw --patch-with-stat --stat --numstat --shortstat -X --dirstat --cumulative --dirstat-by-file --check --summary --name-only --name-status --stat-width --stat-name-width --stat-graph-width --stat-count --binary --ws-error-highlight --src-prefix --dst-prefix --line-prefix --no-prefix --default-prefix --inter-hunk-context --output-indicator-new --output-indicator-old --output-indicator-context -B --break-rewrites -M --find-renames -D --irreversible-delete -C --find-copies --no-renames -l --minimal -w --ignore-all-space -b --ignore-space-change --ignore-space-at-eol --ignore-cr-at-eol --ignore-blank-lines -I --patience --histogram --diff-algorithm --anchored --word-diff --word-diff-regex --color-words --color-moved -a -R --ignore-submodules --submodule --ita-invisible-in-index -N --ita-visible-in-index -S -G --pickaxe-all --pickaxe-regex -O --rotate-to --skip-to --find-object --diff-filter --max-depth --output

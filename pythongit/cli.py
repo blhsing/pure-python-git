@@ -10718,45 +10718,101 @@ def cmd_diff_tree(argv: list[str]) -> int:
 
 
 def cmd_diff_files(argv: list[str]) -> int:
-    """Show diff between index and worktree (raw format)."""
-    ap = argparse.ArgumentParser(prog="pygit diff-files")
-    ap.add_argument("--name-only", action="store_true")
+    """Show the diff between the index and the working tree (plumbing)."""
+    ap = argparse.ArgumentParser(prog="pygit diff-files", add_help=False)
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--numstat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
+    ap.add_argument("-p", "-u", "--patch", dest="patch", action="store_true")
+    ap.add_argument("--patch-with-raw", dest="patch_with_raw", action="store_true")
+    ap.add_argument("--patch-with-stat", dest="patch_with_stat", action="store_true")
+    ap.add_argument("-R", dest="reverse", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
+    ap.add_argument("--full-index", dest="full_index", action="store_true")
+    ap.add_argument("-a", "--text", dest="text", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-U", "--unified", type=int, default=3)
+    ap.add_argument("paths", nargs="*")
+    argv = ["--abbrev=7" if a == "--abbrev" else a for a in argv]
     args = ap.parse_args(argv)
     repo = _repo()
     from .index import read_index
     idx = read_index(repo)
-    if args.stat or args.numstat or args.shortstat:
-        changes = []
-        for e in idx.entries:
-            full = repo.path / e.path
-            a = _side_from_object(repo, e.mode_str(), e.sha)
-            b = _side_from_worktree(repo, e.path) if full.exists() else _ABSENT
-            if a.sha != b.sha or a.mode != b.mode:
-                changes.append((e.path, a, b))
-        if args.stat:
-            _diff_stat(changes)
-        elif args.numstat:
-            _diff_numstat(changes)
-        else:
-            _diff_shortstat(changes)
-        return 0
+
+    # Build the index-vs-worktree change set. The worktree blob is unstored, so
+    # its raw id is all-zero (diff-files convention).
+    changes: list[tuple[str, _Side, _Side]] = []
     for e in idx.entries:
-        full = repo.path / e.path
-        if not full.exists():
-            _print(_raw_diff_status(e.mode_str(), "000000", e.sha, None, e.path) if not args.name_only else e.path)
+        if getattr(e, "stage", 0) != 0:
             continue
-        data = full.read_bytes()
-        sha, _ = objs.hash_bytes("blob", data, repo)
-        if sha != e.sha:
-            if args.name_only:
-                _print(e.path)
+        full = repo.path / e.path
+        a = _side_from_object(repo, e.mode_str(), e.sha)
+        b = _side_from_worktree(repo, e.path) if (full.exists() or full.is_symlink()) else _ABSENT
+        if a.sha != b.sha or a.mode != b.mode:
+            changes.append((e.path, a, b))
+    if args.paths:
+        changes = [c for c in changes if c[0] in set(args.paths)
+                   or any(c[0].startswith(w.rstrip("/") + "/") for w in args.paths)]
+    # -q is a no-op in diff-files (it is not --quiet); output is unaffected.
+
+    if args.stat or args.patch_with_stat:
+        _diff_stat([(p, b, a) for p, a, b in changes] if args.reverse else changes)
+        if not args.patch_with_stat:
+            return 0
+    if args.numstat:
+        _diff_numstat([(p, b, a) for p, a, b in changes] if args.reverse else changes)
+        return 0
+    if args.shortstat:
+        _diff_shortstat(changes)
+        return 0
+    sep = "\0" if args.nul else "\t"
+    term = "\0" if args.nul else "\n"
+    if args.name_only:
+        for p, _a, _b in changes:
+            sys.stdout.write(p + term)
+        return 0
+    if args.name_status:
+        for p, a, b in changes:
+            st = "A" if not a.present else ("D" if not b.present else "M")
+            if args.reverse:
+                st = {"A": "D", "D": "A"}.get(st, st)
+            sys.stdout.write(st + sep + p + term)
+        return 0
+    if args.patch or args.patch_with_raw or args.patch_with_stat:
+        if args.patch_with_raw:
+            for p, a, b in changes:
+                sys.stdout.write(_df_raw_line(p, a, b, args.abbrev, args.full_index, args.reverse) + sep + p + term)
+            _print("")
+        for p, a, b in changes:
+            # -R swaps the sides (content) and flips the a/b prefix labels.
+            if args.reverse:
+                _emit_file_diff(p, b, a, True, args.unified)
             else:
-                # The worktree side is not a stored object, so its id is zeros.
-                _print(f":{e.mode_str()} {e.mode_str()} {e.sha} {'0' * 40} M\t{e.path}")
+                _emit_file_diff(p, a, b, False, args.unified)
+        return 0
+    # Default: the raw diff line per change.
+    for p, a, b in changes:
+        sys.stdout.write(_df_raw_line(p, a, b, args.abbrev, args.full_index, args.reverse) + sep + p + term)
     return 0
+
+
+def _df_raw_line(path: str, idx_side: "_Side", wt_side: "_Side", abbrev: Optional[int],
+                 full_index: bool, reverse: bool) -> str:
+    """A diff-files raw prefix ':MODE MODE ID ID STATUS' (no path). The worktree
+    side id is always zero (unstored); ``reverse`` swaps the two columns."""
+    width = 40 if (full_index or abbrev is None) else max(4, abbrev)
+    zero = "0" * width
+    idx_mode = idx_side.mode if idx_side.present else "000000"
+    wt_mode = wt_side.mode if wt_side.present else "000000"
+    idx_id = (idx_side.sha[:width] if width < 40 else idx_side.sha) if idx_side.present else zero
+    st = "D" if not wt_side.present else ("A" if not idx_side.present else "M")
+    if reverse:
+        st = {"A": "D", "D": "A"}.get(st, st)
+        return f":{wt_mode} {idx_mode} {zero} {idx_id} {st}"
+    return f":{idx_mode} {wt_mode} {idx_id} {zero} {st}"
 
 
 def cmd_diff_index(argv: list[str]) -> int:
