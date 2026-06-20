@@ -1351,6 +1351,21 @@ CASES: list[tuple] = [
     ("reset-pathspec-from-file",
      RESETBASE + [("write", "a.txt", "a-wt\n"), ("write", "specs", "a.txt\n")],
      ["reset", "HEAD~1", "--pathspec-from-file", "specs"]),
+    # show-branch display flags: -a, topo/date order, --current, --list,
+    # --no-name/--sha1-name naming, --more extension, --topics filter, and the
+    # --color=always per-column marker palette.
+    ("sb-all", SB_THREE, ["show-branch", "-a"]),
+    ("sb-topo-order", SB_THREE, ["show-branch", "--topo-order"]),
+    ("sb-date-order", SB_THREE, ["show-branch", "--date-order"]),
+    ("sb-current", SB_THREE, ["show-branch", "--current"]),
+    ("sb-list", SB_THREE, ["show-branch", "--list"]),
+    ("sb-no-name", SB_FORK, ["show-branch", "--no-name", "main", "feat"]),
+    ("sb-sha1-name", SB_FORK, ["show-branch", "--sha1-name", "main", "feat"]),
+    ("sb-more", SB_FORK, ["show-branch", "--more=2", "main", "feat"]),
+    ("sb-topics", SB_THREE, ["show-branch", "--topics", "main", "feat"]),
+    ("sb-color", SB_THREE, ["show-branch", "--color=always"]),
+    ("sb-color-explicit", SB_FORK, ["show-branch", "--color=always", "main", "feat"]),
+    ("sb-no-color", SB_THREE, ["show-branch", "--no-color"]),
 ]
 
 

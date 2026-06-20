@@ -8244,15 +8244,27 @@ def _show_branch_name_commits(repo: Repository, ordered: list[str],
 
 def cmd_show_branch(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit show-branch", add_help=False)
-    ap.add_argument("--all", action="store_true")
+    ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("-r", "--remotes", action="store_true")
     ap.add_argument("--sparse", action="store_true")
     ap.add_argument("--merge-base", dest="merge_base", action="store_true")
     ap.add_argument("--independent", action="store_true")
+    ap.add_argument("--topo-order", dest="topo_order", action="store_true")
+    ap.add_argument("--date-order", dest="date_order", action="store_true")
+    ap.add_argument("--current", action="store_true")
+    ap.add_argument("--topics", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--more", type=int, default=0)
+    ap.add_argument("--name", dest="name", action="store_true")
+    ap.add_argument("--no-name", dest="no_name", action="store_true")
+    ap.add_argument("--sha1-name", dest="sha1_name", action="store_true")
+    ap.add_argument("--color", nargs="?", const="auto", default="never")
+    ap.add_argument("--no-color", dest="no_color", action="store_true")
     ap.add_argument("revs", nargs="*")
     # `--reflog[=<n>]`/`-g[<n>]` only takes a value when attached; a bare flag
     # leaves the following token as the positional <ref>. argparse's nargs="?"
     # would wrongly consume that token, so pull the option out of argv first.
+    # `--color` / `--more` similarly take only an attached value.
     reflog_val = None
     rest_argv = []
     for a in argv:
@@ -8262,9 +8274,21 @@ def cmd_show_branch(argv: list[str]) -> int:
             reflog_val = a.split("=", 1)[1]
         elif a.startswith("-g") and len(a) > 2 and a[2:].isdigit():
             reflog_val = a[2:]
+        elif a == "--color":
+            rest_argv.append("--color=auto")
+        elif a == "--more":
+            rest_argv.append("--more=1")
         else:
             rest_argv.append(a)
     args = ap.parse_args(rest_argv)
+    color_on = (args.color == "always") and not args.no_color
+    # column-indexed marker palette (C Git's column_colors_ansi).
+    _SB_COLORS = ["\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m"]
+
+    def _col(ch: str, i: int) -> str:
+        if not color_on or ch == " ":
+            return ch
+        return f"{_SB_COLORS[i % len(_SB_COLORS)]}{ch}\033[m"
     repo = _repo()
     head_sym, head_oid = refs_mod.read_head(repo)
     cur = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
@@ -8320,10 +8344,33 @@ def cmd_show_branch(argv: list[str]) -> int:
                 if s:
                     ref_names.append(b)
                     revs.append(s)
+    # --current appends the current branch as an extra column when not already
+    # listed (e.g. alongside explicit revs).
+    if args.current and reflog_val is None and cur and cur not in ref_names:
+        s = refs_mod.read_ref(repo, f"refs/heads/{cur}")
+        if s:
+            ref_names.append(cur)
+            revs.append(s)
     if not revs:
         _err("No revs to be shown.")
         return 0
     num_rev = len(revs)
+
+    def _sb_subject(s):
+        try:
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            return c.message.splitlines()[0] if c.message.strip() else ""
+        except (KeyError, IndexError):
+            return ""
+
+    # --list: just the ref headers (current marked with '*'), no matrix.
+    if args.list:
+        for i in range(num_rev):
+            is_head = (reflog_val is None) and ref_names[i] == cur and revs[i] == head_oid
+            mark = _col("*", i) if is_head else " "
+            sub_i = reflog_msgs[i] if reflog_val is not None else _sb_subject(revs[i])
+            _print(f"{mark} [{ref_names[i]}] {sub_i}")
+        return 0
 
     def subject(s):
         try:
@@ -8404,11 +8451,13 @@ def cmd_show_branch(argv: list[str]) -> int:
             if x not in useen:
                 useen.add(x)
                 union.append(x)
-    ordered = _topo_order(repo, union)
+    ordered = _topo_order(repo, union, by_date=args.date_order)
 
     names = _show_branch_name_commits(repo, ordered, revs, ref_names)
 
     def disp_name(s):
+        if args.sha1_name:
+            return s[:7]
         n = names.get(s)
         if not n:
             return s[:7]
@@ -8419,12 +8468,16 @@ def cmd_show_branch(argv: list[str]) -> int:
             return head + "^"
         return f"{head}~{gen}"
 
+    def body(s):
+        # --no-name suppresses the "[<name>] " prefix, leaving the bare subject.
+        return subject(s) if args.no_name else f"[{disp_name(s)}] {subject(s)}"
+
     # head_at: column of the current branch (used for the '*' marker).
     head_at = -1
     if num_rev > 1:
         for i in range(num_rev):
             is_head = (reflog_val is None) and ref_names[i] == cur and revs[i] == head_oid
-            mark = "*" if is_head else "!"
+            mark = _col("*" if is_head else "!", i)
             line = " " * i + mark
             text = reflog_msgs[i] if reflog_val is not None else subject(revs[i])
             _print(f"{line} [{ref_names[i]}] {text}")
@@ -8441,30 +8494,40 @@ def cmd_show_branch(argv: list[str]) -> int:
         return False
 
     shown_merge_point = False
+    extra = 0  # commits emitted past the first merge point (for --more)
     for s in ordered:
         m = mask(s)
         is_merge_point = (m == all_mask)
         is_merge = len(parents_of(s)) > 1
+        # --topics: omit commits that are on the first branch but not a common
+        # point (i.e. reachable from rev[0] yet not from every rev).
+        if args.topics and (m & 1) and m != all_mask:
+            continue
+        if num_rev > 1 and not args.sparse and is_merge and omit_in_dense(s, m):
+            continue
+        # Stop after the merge point unless --more=<n> asks for n more rows.
+        if shown_merge_point:
+            if extra >= args.more:
+                break
+            extra += 1
         if num_rev > 1:
-            if not args.sparse and is_merge and omit_in_dense(s, m):
-                continue
             marks = []
             for i in range(num_rev):
                 if not (m & (1 << i)):
                     marks.append(" ")
                 elif is_merge:
-                    marks.append("-")
+                    marks.append(_col("-", i))
                 elif i == head_at:
-                    marks.append("*")
+                    marks.append(_col("*", i))
                 else:
-                    marks.append("+")
-            _print(f"{''.join(marks)} [{disp_name(s)}] {subject(s)}")
+                    marks.append(_col("+", i))
+            _print(f"{''.join(marks)} {body(s)}")
         else:
-            _print(f"[{disp_name(s)}] {subject(s)}")
-        if is_merge_point:
+            _print(body(s))
+        if is_merge_point and not shown_merge_point:
             shown_merge_point = True
-        if shown_merge_point:
-            break
+            if args.more <= 0:
+                break
     return 0
 
 
