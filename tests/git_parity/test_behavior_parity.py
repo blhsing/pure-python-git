@@ -1365,6 +1365,28 @@ CASES: list[tuple] = [
              ["update-index", "--no-assume-unchanged", "a.txt"]],
      ["ls-files", "-v"]),
     ("ui-assume-bad", BASE, ["update-index", "--assume-unchanged", "nope.txt"]),
+    # index v3: intent-to-add (add -N) and skip-worktree, with their observable
+    # status/ls-files/diff/version effects.
+    ("add-N-status", BASE + [("write", "new.txt", "n\n"), ["add", "-N", "new.txt"]],
+     ["status", "--short"]),
+    ("add-N-lsfiles", BASE + [("write", "new.txt", "n\n"), ["add", "-N", "new.txt"]],
+     ["ls-files", "-s"]),
+    ("add-N-diff", BASE + [("write", "new.txt", "n\n"), ["add", "-N", "new.txt"]],
+     ["diff"]),
+    ("add-N-version", BASE + [("write", "new.txt", "n\n"), ["add", "-N", "new.txt"]],
+     ["update-index", "--show-index-version"]),
+    ("add-N-commit-nothing",
+     BASE + [("write", "new.txt", "n\n"), ["add", "-N", "new.txt"], ["commit", "-m", "x"]],
+     ["status", "--short"]),
+    ("ui-skip-worktree",
+     BASE + [["update-index", "--skip-worktree", "a.txt"], ("write", "a.txt", "changed\n")],
+     ["status", "--short"]),
+    ("ui-skip-lsfiles-t", BASE + [["update-index", "--skip-worktree", "a.txt"]],
+     ["ls-files", "-t"]),
+    ("ui-no-skip-worktree",
+     BASE + [["update-index", "--skip-worktree", "a.txt"], ("write", "a.txt", "changed\n"),
+             ["update-index", "--no-skip-worktree", "a.txt"]],
+     ["status", "--short"]),
     # reset --keep / --merge two-way-merge semantics (state probed via status),
     # abort messages, the full mixed "Unstaged changes after reset:" report, the
     # with-paths guard, and --pathspec-from-file. (reset-in-setup → status probe

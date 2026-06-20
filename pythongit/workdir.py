@@ -167,15 +167,32 @@ def would_add(repo: Repository, paths: Iterable[str]) -> list[str]:
 
 
 def add_paths(repo: Repository, paths: Iterable[str], *,
-              ignore_removal: bool = False, update_only: bool = False) -> None:
+              ignore_removal: bool = False, update_only: bool = False,
+              intent_to_add: bool = False) -> None:
     """Stage worktree paths into the index. ``update_only`` (git add -u) limits
     to already-tracked files; ``ignore_removal`` (git add --no-all) keeps the
-    index entries of files removed from the worktree."""
+    index entries of files removed from the worktree; ``intent_to_add``
+    (git add -N) records new paths with the empty blob and the intent-to-add
+    flag rather than their content."""
     idx = read_index(repo)
     tracked = set(idx.by_path())
     to_add = _gather_add_candidates(repo, paths, tracked)
     if update_only:
         to_add = [r for r in to_add if r in tracked]
+    if intent_to_add:
+        # Only new (untracked) paths become intent-to-add; tracked paths are
+        # left untouched (git add -N is a no-op for them).
+        empty = objs.write_object(repo, "blob", b"")
+        for rel in sorted(set(to_add)):
+            full = repo.path / rel
+            if rel in tracked or not (full.exists() or full.is_symlink()):
+                continue
+            st = full.lstat()
+            entry = stat_to_entry(rel, st, empty, _mode_for(full))
+            entry.intent_to_add = True
+            idx.upsert(entry)
+        write_index(repo, idx)
+        return
     for rel in sorted(set(to_add)):
         full = repo.path / rel
         if not full.exists() and not full.is_symlink():
@@ -225,8 +242,18 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
 
     head_tree = _head_tree_map(repo)
 
-    staged_new, staged_mod, staged_del = [], [], []
+    def _frozen(entry) -> bool:
+        # Assume-unchanged (CE_VALID 0x8000) and skip-worktree entries are not
+        # checked against the worktree, so their changes are never reported.
+        return bool(entry.flags & 0x8000) or entry.skip_worktree
+
+    staged_new, staged_mod, staged_del, intent_to_add = [], [], [], []
     for path, entry in by_path.items():
+        if entry.intent_to_add:
+            # Intent-to-add: recorded in the index but reported as a not-yet-
+            # staged new file, never as a staged addition.
+            intent_to_add.append(path)
+            continue
         if path not in head_tree:
             staged_new.append(path)
         elif head_tree[path] != entry.sha:
@@ -240,9 +267,7 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
     for rel in iter_worktree(repo):
         full = repo.path / rel
         if rel in by_path:
-            # Assume-unchanged (CE_VALID) entries are never checked against the
-            # worktree, so their modifications/deletions are not reported.
-            if by_path[rel].flags & 0x8000:
+            if _frozen(by_path[rel]) or by_path[rel].intent_to_add:
                 seen.discard(rel)
                 continue
             data = _blob_data(full)
@@ -254,8 +279,9 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
         else:
             untracked.append(rel)
         seen.discard(rel)
-    # Deleted assume-unchanged entries are likewise not reported as missing.
-    missing = sorted(p for p in seen if not (by_path[p].flags & 0x8000))
+    # Frozen/intent-to-add entries are not reported as missing when absent.
+    missing = sorted(p for p in seen
+                     if not _frozen(by_path[p]) and not by_path[p].intent_to_add)
 
     return {
         "staged_new": sorted(staged_new),
@@ -264,6 +290,7 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
         "modified": sorted(modified),
         "missing": missing,
         "untracked": sorted(untracked),
+        "intent_to_add": sorted(intent_to_add),
     }
 
 
@@ -387,11 +414,13 @@ def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[
 # tree <-> index
 
 
-def write_tree(repo: Repository) -> str:
+def write_tree(repo: Repository, *, skip_intent_to_add: bool = False) -> str:
     """Build trees from the current index, returning the root tree sha.
 
     Refuses to run while conflict stages are present in the index — fail
     early instead of building a tree from a half-resolved state.
+    ``skip_intent_to_add`` (used by commit) omits not-yet-staged intent-to-add
+    entries, which C Git excludes from the committed tree.
     """
     idx = read_index(repo)
     if idx.has_conflicts():
@@ -403,6 +432,8 @@ def write_tree(repo: Repository) -> str:
     root: dict = {}
     for e in idx.entries:
         if e.stage != 0:
+            continue
+        if skip_intent_to_add and e.intent_to_add:
             continue
         parts = e.path.split("/")
         cur = root

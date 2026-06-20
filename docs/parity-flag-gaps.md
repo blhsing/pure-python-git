@@ -1,11 +1,11 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 412 flags across 48 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 408 flags across 48 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
-## add (7)
-  -i -p -U --unified --inter-hunk-context -e -N
+## add (6)
+  -i -p -U --unified --inter-hunk-context -e
 
 ## am (26)
   --continue --skip --abort -i -n --no-verify --verify -q -s -u -k -b -m --keep-cr -c --quoted-cr -C -p -r --resolved --quit --show-current-patch --retry --allow-empty -S --empty
@@ -127,8 +127,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## show-ref (6)
   --abbrev --branches -q --quiet --exclude-existing --exists
 
-## stage (7)
-  -i -p -U --unified --inter-hunk-context -e -N
+## stage (6)
+  -i -p -U --unified --inter-hunk-context -e
 
 ## stash (14)
   -u --include-untracked --only-untracked --index -p --patch -S --staged -a --all --pathspec-from-file --pathspec-file-nul --print --to-ref
@@ -142,8 +142,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## unpack-objects (4)
   -n -q -r --strict
 
-## update-index (8)
-  --skip-worktree --no-skip-worktree --unresolve -g --again --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid
+## update-index (6)
+  --unresolve -g --again --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid
 
 ## update-server-info (2)
   -f --force

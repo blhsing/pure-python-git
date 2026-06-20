@@ -1130,7 +1130,7 @@ def cmd_ls_files(argv: list[str]) -> int:
             continue
         show_this_cached = want_cached or (args.unmerged and st != 0)
         if show_this_cached and not (args.ignored and not _is_excluded(e.path)):
-            tag = "M" if st != 0 else "H"
+            tag = "S" if (st == 0 and e.skip_worktree) else ("M" if st != 0 else "H")
             # -v lowercases the tag for assume-unchanged (CE_VALID) entries.
             if args.tag_v and (e.flags & 0x8000):
                 tag = tag.lower()
@@ -1684,6 +1684,7 @@ def cmd_add(argv: list[str]) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("-u", "--update", action="store_true")
+    ap.add_argument("-N", "--intent-to-add", dest="intent_to_add", action="store_true")
     ap.add_argument("--no-all", "--ignore-removal", dest="no_all", action="store_true")
     ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
     ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
@@ -1710,7 +1711,8 @@ def cmd_add(argv: list[str]) -> int:
             for rel in report:
                 _print(f"add '{rel}'")
             return 0
-    workdir.add_paths(repo, targets, ignore_removal=args.no_all, update_only=args.update)
+    workdir.add_paths(repo, targets, ignore_removal=args.no_all, update_only=args.update,
+                      intent_to_add=args.intent_to_add)
     if args.verbose:
         for rel in report:
             _print(f"add '{rel}'")
@@ -1813,6 +1815,9 @@ def _status_model(repo: Repository, s: dict) -> tuple[list[tuple[str, str, str]]
         worktree_status[p] = "M"
     for p in s["missing"]:
         worktree_status[p] = "D"
+    # Intent-to-add entries report as a not-yet-staged new file (" A").
+    for p in s.get("intent_to_add", []):
+        worktree_status[p] = "A"
     changes = []
     for p in sorted(set(index_status) | set(worktree_status)):
         changes.append((p, index_status.get(p, " "), worktree_status.get(p, " ")))
@@ -2193,7 +2198,9 @@ def cmd_commit(argv: list[str]) -> int:
         workdir.add_paths(repo, args.pathspec)  # refresh the named index entries
         tree = _partial_commit_tree(repo, parent, args.pathspec)
     else:
-        tree = workdir.write_tree(repo)
+        # Intent-to-add entries are excluded from the commit (treated as
+        # not-yet-staged), matching C Git.
+        tree = workdir.write_tree(repo, skip_intent_to_add=True)
 
     if args.amend:
         if parent is None:
@@ -3807,12 +3814,17 @@ def cmd_diff(argv: list[str]) -> int:
     elif args.cached:
         head_map = _tree_map_full(repo, _commit_tree(repo, refs_mod.rev_parse(repo, "HEAD") or ""))
         for p in sorted(set(head_map) | set(idx)):
+            # Intent-to-add entries are not staged, so --cached ignores them.
+            if p in idx and idx[p].intent_to_add and p not in head_map:
+                continue
             a = _side_from_object(repo, *head_map[p]) if p in head_map else _ABSENT
             b = _side_from_object(repo, idx[p].mode_str(), idx[p].sha) if p in idx else _ABSENT
             add_change(p, a, b)
     else:
         for p in sorted(idx):
-            a = _side_from_object(repo, idx[p].mode_str(), idx[p].sha)
+            # An intent-to-add entry diffs as a brand-new file (a-side absent),
+            # not against its placeholder empty blob.
+            a = _ABSENT if idx[p].intent_to_add else _side_from_object(repo, idx[p].mode_str(), idx[p].sha)
             b = _side_from_worktree(repo, p)
             add_change(p, a, b)
 
@@ -7501,6 +7513,8 @@ def cmd_update_index(argv: list[str]) -> int:
     ap.add_argument("--cacheinfo", nargs=3, metavar=("MODE", "SHA", "PATH"))
     ap.add_argument("--assume-unchanged", dest="assume_unchanged", action="store_true")
     ap.add_argument("--no-assume-unchanged", dest="no_assume_unchanged", action="store_true")
+    ap.add_argument("--skip-worktree", dest="skip_worktree", action="store_true")
+    ap.add_argument("--no-skip-worktree", dest="no_skip_worktree", action="store_true")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("--index-info", dest="index_info", action="store_true")
@@ -7550,6 +7564,17 @@ def cmd_update_index(argv: list[str]) -> int:
                 e.flags |= 0x8000
             else:
                 e.flags &= ~0x8000
+            idx.upsert(e)
+        write_index(repo, idx)
+        return 0
+    if args.skip_worktree or args.no_skip_worktree:
+        by_path = idx.by_path()
+        for p in paths:
+            e = by_path.get(p)
+            if e is None:
+                _err(f"fatal: Unable to mark file {p}")
+                return 128
+            e.skip_worktree = bool(args.skip_worktree)
             idx.upsert(e)
         write_index(repo, idx)
         return 0

@@ -41,6 +41,8 @@ class IndexEntry:
     sha: str = "0" * 40
     flags: int = 0
     path: str = ""
+    # On-disk extended (v3) flags: CE_INTENT_TO_ADD 0x2000, CE_SKIP_WORKTREE 0x4000.
+    extended_flags: int = 0
 
     def mode_str(self) -> str:
         return f"{self.mode:06o}"
@@ -52,6 +54,22 @@ class IndexEntry:
     @stage.setter
     def stage(self, value: int) -> None:
         self.flags = (self.flags & ~0x3000) | ((value & 0x3) << 12)
+
+    @property
+    def intent_to_add(self) -> bool:
+        return bool(self.extended_flags & 0x2000)
+
+    @intent_to_add.setter
+    def intent_to_add(self, value: bool) -> None:
+        self.extended_flags = (self.extended_flags | 0x2000) if value else (self.extended_flags & ~0x2000)
+
+    @property
+    def skip_worktree(self) -> bool:
+        return bool(self.extended_flags & 0x4000)
+
+    @skip_worktree.setter
+    def skip_worktree(self, value: bool) -> None:
+        self.extended_flags = (self.extended_flags | 0x4000) if value else (self.extended_flags & ~0x4000)
 
 
 @dataclass
@@ -125,6 +143,12 @@ def read_index(repo: Repository) -> Index:
         )
         (cts, ctn, mts, mtn, dev, ino, mode, uid, gid, size, sha_b, flags) = fields
         pos += head_len
+        # CE_EXTENDED (v3+): a second 16-bit flags word precedes the path.
+        ext_flags = 0
+        if flags & 0x4000:
+            ext_flags = struct.unpack(">H", raw[pos:pos + 2])[0]
+            pos += 2
+            flags &= ~0x4000  # CE_EXTENDED is a serialization detail, not stored
         name_len = flags & 0x0FFF
         if name_len < 0x0FFF:
             path = raw[pos : pos + name_len].decode("utf-8", errors="replace")
@@ -140,7 +164,7 @@ def read_index(repo: Repository) -> Index:
         idx.entries.append(
             IndexEntry(
                 cts, ctn, mts, mtn, dev, ino, mode, uid, gid, size,
-                sha_b.hex(), flags, path,
+                sha_b.hex(), flags, path, ext_flags,
             )
         )
     return idx
@@ -148,12 +172,19 @@ def read_index(repo: Repository) -> Index:
 
 def write_index(repo: Repository, idx: Index) -> None:
     buf = bytearray()
-    buf += b"DIRC" + struct.pack(">II", 2, len(idx.entries))
+    # The index is upgraded to v3 only when an entry carries extended flags
+    # (intent-to-add / skip-worktree); otherwise it stays byte-identical v2.
+    version = 3 if any(e.extended_flags for e in idx.entries) else 2
+    buf += b"DIRC" + struct.pack(">II", version, len(idx.entries))
     idx.entries.sort(key=lambda e: (e.path, e.stage))
     for e in idx.entries:
         start = len(buf)
         path_bytes = e.path.encode("utf-8")
-        flags = (e.flags & 0xF000) | min(len(path_bytes), 0x0FFF)
+        # Preserve stage (0x3000) and assume-valid (0x8000); CE_EXTENDED (0x4000)
+        # is derived solely from extended_flags so a cleared flag drops the word.
+        flags = (e.flags & 0xB000) | min(len(path_bytes), 0x0FFF)
+        if e.extended_flags:
+            flags |= 0x4000  # CE_EXTENDED
         buf += struct.pack(
             f">10I{repo.hash_len}sH",
             e.ctime_s & 0xFFFFFFFF, e.ctime_n & 0xFFFFFFFF,
@@ -163,6 +194,8 @@ def write_index(repo: Repository, idx: Index) -> None:
             e.size & 0xFFFFFFFF,
             bytes.fromhex(e.sha), flags,
         )
+        if e.extended_flags:
+            buf += struct.pack(">H", e.extended_flags & 0xFFFF)
         buf += path_bytes + b"\0"
         while (len(buf) - start) % 8 != 0:
             buf += b"\0"
