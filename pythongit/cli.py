@@ -7868,48 +7868,12 @@ def _notes_ref(name: str) -> str:
     return name if name.startswith("refs/notes/") else f"refs/notes/{name}"
 
 
-def cmd_notes(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit notes")
-    sub = ap.add_subparsers(dest="action")
-    p_add = sub.add_parser("add")
-    p_add.add_argument("-m", "--message", required=True)
-    p_add.add_argument("commit", nargs="?", default="HEAD")
-    p_show = sub.add_parser("show")
-    p_show.add_argument("commit", nargs="?", default="HEAD")
-    p_remove = sub.add_parser("remove")
-    p_remove.add_argument("commit", nargs="?", default="HEAD")
-    sub.add_parser("list")
-    args = ap.parse_args(argv or ["list"])
-    repo = _repo()
-    ref = _notes_ref("commits")
-    action = args.action or "list"
+_NOTES_SUBCOMMANDS = {"add", "append", "copy", "edit", "show", "list", "remove",
+                      "prune", "get-ref", "merge"}
 
-    notes_tree_sha = refs_mod.read_ref(repo, ref)
-    notes_map: dict[str, str] = {}
-    if notes_tree_sha:
-        nc = objs.parse_commit(objs.read_object(repo, notes_tree_sha)[1])
-        notes_map = {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, nc.tree)}
 
-    if action == "list":
-        for path, blob_sha in sorted(notes_map.items()):
-            _print(f"{blob_sha} {path.replace('/', '')}")
-        return 0
-    target = refs_mod.rev_parse(repo, args.commit)
-    if not target:
-        return 128
-    key = target[:2] + "/" + target[2:]
-    if action == "show":
-        if key not in notes_map:
-            _err(f"error: no note found for object {target}.")
-            return 1
-        _, data = objs.read_object(repo, notes_map[key])
-        sys.stdout.buffer.write(data)
-        return 0
-    if action == "add":
-        blob = objs.write_object(repo, "blob", args.message.encode("utf-8") + b"\n")
-        notes_map[key] = blob
-    elif action == "remove":
-        notes_map.pop(key, None)
+def _notes_write(repo: Repository, ref: str, notes_map: dict, base_sha, verb: str) -> None:
+    """Rebuild the notes tree from ``notes_map`` and commit it onto ``ref``."""
     from .index import Index, IndexEntry, REG_MODE, write_index, read_index
     saved_idx = read_index(repo) if (repo.gitdir / "index").exists() else None
     idx = Index()
@@ -7923,11 +7887,173 @@ def cmd_notes(argv: list[str]) -> int:
         (repo.gitdir / "index").unlink(missing_ok=True)
     name, email = repo.user()
     sig = objs.format_signature(name, email, when=int(time.time()))
-    parents = [notes_tree_sha] if notes_tree_sha else []
+    parents = [base_sha] if base_sha else []
     c = objs.Commit(tree=new_tree, parents=parents, author=sig, committer=sig,
-                    message=f"Notes added by 'pygit notes {action}'\n")
+                    message=f"Notes {verb} by 'git notes'\n")
     sha = objs.write_object(repo, "commit", c.encode())
-    refs_mod.update_ref(repo, ref, sha, message=f"notes: {action}")
+    refs_mod.update_ref(repo, ref, sha, message=f"notes: {verb}")
+
+
+def cmd_notes(argv: list[str]) -> int:
+    repo = _repo()
+    # Extract the global --ref[=<ref>] (may appear before the subcommand).
+    ref_name = "commits"
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--ref" and i + 1 < len(argv):
+            ref_name = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--ref="):
+            ref_name = a.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    ref = _notes_ref(ref_name)
+
+    action = "list"
+    if rest and not rest[0].startswith("-") and rest[0] in _NOTES_SUBCOMMANDS:
+        action = rest[0]
+        rest = rest[1:]
+
+    if action == "get-ref":
+        _print(ref)
+        return 0
+
+    notes_tree_sha = refs_mod.read_ref(repo, ref)
+    notes_map: dict[str, str] = {}
+    if notes_tree_sha:
+        nc = objs.parse_commit(objs.read_object(repo, notes_tree_sha)[1])
+        notes_map = {path: sha for path, _mode, sha in workdir.iter_tree_files(repo, nc.tree)}
+
+    def _key(oid: str) -> str:
+        return oid[:2] + "/" + oid[2:]
+
+    if action == "list":
+        if rest:
+            t = refs_mod.rev_parse(repo, rest[0])
+            if t and _key(t) in notes_map:
+                _print(notes_map[_key(t)])
+                return 0
+            _err(f"error: no note found for object {t or rest[0]}.")
+            return 1
+        for path, blob_sha in sorted(notes_map.items()):
+            _print(f"{blob_sha} {path.replace('/', '')}")
+        return 0
+
+    if action == "prune":
+        dry = "-n" in rest or "--dry-run" in rest
+        pruned = []
+        for path in list(notes_map):
+            oid = path.replace("/", "")
+            if not objs.object_exists(repo, oid):
+                pruned.append(oid)
+                if not dry:
+                    del notes_map[path]
+        for oid in pruned:
+            _print(oid)
+        if pruned and not dry:
+            _notes_write(repo, ref, notes_map, notes_tree_sha, "removed")
+        return 0
+
+    if action in ("add", "append", "edit"):
+        mp = argparse.ArgumentParser(prog="pygit notes", add_help=False)
+        mp.add_argument("-m", "--message", action="append", default=None)
+        mp.add_argument("-F", "--file", action="append", default=None)
+        mp.add_argument("-c", dest="reuse_edit", action="append", default=None)
+        mp.add_argument("-C", "--reuse-message", dest="reuse", action="append", default=None)
+        mp.add_argument("--separator", default=None)
+        mp.add_argument("--no-separator", dest="no_separator", action="store_true")
+        mp.add_argument("-f", "--force", action="store_true")
+        mp.add_argument("--allow-empty", dest="allow_empty", action="store_true")
+        mp.add_argument("-e", "--edit", action="store_true")
+        mp.add_argument("object", nargs="?", default="HEAD")
+        a = mp.parse_args(rest)
+        target = refs_mod.rev_parse(repo, a.object)
+        if not target:
+            _err(f"error: Failed to resolve '{a.object}' as a valid ref.")
+            return 128
+        key = _key(target)
+        parts: list[str] = []
+        if action == "append" and key in notes_map:
+            parts.append(objs.read_object(repo, notes_map[key])[1].decode("utf-8", "replace"))
+        for m in (a.message or []):
+            parts.append(m)
+        for f in (a.file or []):
+            parts.append(sys.stdin.read() if f == "-" else open(f, encoding="utf-8").read())
+        for o in (a.reuse or []) + (a.reuse_edit or []):
+            s = refs_mod.rev_parse(repo, o)
+            if s:
+                parts.append(objs.read_object(repo, s)[1].decode("utf-8", "replace"))
+        sep = "\n" if a.no_separator else (f"\n{a.separator}\n" if a.separator is not None else "\n\n")
+        body = sep.join(p.rstrip("\n") for p in parts)
+        if not body and not a.allow_empty and action != "edit":
+            _err("fatal: please supply the note contents using either -m or -F option")
+            return 128
+        if action == "add" and key in notes_map and not a.force:
+            _err(f"error: Cannot add notes. Found existing notes for object {target}. "
+                 "Use '-f' to overwrite existing notes")
+            return 1
+        if action == "add" and key in notes_map and a.force:
+            _err(f"Overwriting existing notes for object {target}")
+        blob = objs.write_object(repo, "blob", (body + "\n").encode("utf-8") if body else b"")
+        notes_map[key] = blob
+        _notes_write(repo, ref, notes_map, notes_tree_sha, "added")
+        return 0
+
+    if action == "copy":
+        cp = argparse.ArgumentParser(prog="pygit notes", add_help=False)
+        cp.add_argument("-f", "--force", action="store_true")
+        cp.add_argument("from_obj")
+        cp.add_argument("to_obj")
+        a = cp.parse_args(rest)
+        src = refs_mod.rev_parse(repo, a.from_obj)
+        dst = refs_mod.rev_parse(repo, a.to_obj)
+        if not src or not dst:
+            return 128
+        if _key(src) not in notes_map:
+            _err(f"error: missing notes on source object {src}. Cannot copy.")
+            return 1
+        if _key(dst) in notes_map and not a.force:
+            _err(f"error: Cannot copy notes. Found existing notes for object {dst}. "
+                 "Use '-f' to overwrite existing notes")
+            return 1
+        notes_map[_key(dst)] = notes_map[_key(src)]
+        _notes_write(repo, ref, notes_map, notes_tree_sha, "added")
+        return 0
+
+    if action == "show":
+        obj = rest[-1] if rest and not rest[-1].startswith("-") else "HEAD"
+        target = refs_mod.rev_parse(repo, obj)
+        if not target:
+            return 128
+        if _key(target) not in notes_map:
+            _err(f"error: no note found for object {target}.")
+            return 1
+        sys.stdout.buffer.write(objs.read_object(repo, notes_map[_key(target)])[1])
+        return 0
+
+    if action == "remove":
+        rp = argparse.ArgumentParser(prog="pygit notes", add_help=False)
+        rp.add_argument("--ignore-missing", dest="ignore_missing", action="store_true")
+        rp.add_argument("objects", nargs="*", default=None)
+        a = rp.parse_args(rest)
+        objs_list = a.objects or ["HEAD"]
+        changed = False
+        for o in objs_list:
+            target = refs_mod.rev_parse(repo, o)
+            if not target:
+                continue
+            if _key(target) in notes_map:
+                _err(f"Removing note for object {o}")
+                del notes_map[_key(target)]
+                changed = True
+        if changed:
+            _notes_write(repo, ref, notes_map, notes_tree_sha, "removed")
+        return 0
     return 0
 
 

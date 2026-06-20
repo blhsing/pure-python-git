@@ -1410,6 +1410,24 @@ CASES: list[tuple] = [
     ("lsr-exit-code-nomatch", BASE, ["ls-remote", "--exit-code", ".", "nomatchxyz"]),
     ("lsr-exit-code-ok", BASE, ["ls-remote", "--exit-code", "."]),
     ("lsr-branches-val-err", BASE, ["ls-remote", "--branches=val", "."]),
+    # notes: append, --separator, copy, -f overwrite, list, remove, get-ref,
+    # --ref, --allow-empty, and the no-force "existing notes" error.
+    ("notes-append", BASE + [["notes", "add", "-m", "one"], ["notes", "append", "-m", "two"]],
+     ["notes", "show"]),
+    ("notes-separator",
+     BASE + [["notes", "add", "-m", "l1", "--separator=---", "-m", "l2"]], ["notes", "show"]),
+    ("notes-copy", TAGGED + [["notes", "add", "-m", "cp", "HEAD"], ["notes", "copy", "HEAD", "HEAD~1"]],
+     ["notes", "show", "HEAD~1"]),
+    ("notes-add-exists-err", BASE + [["notes", "add", "-m", "a"]], ["notes", "add", "-m", "b"]),
+    ("notes-add-force", BASE + [["notes", "add", "-m", "a"]], ["notes", "add", "-f", "-m", "b"]),
+    ("notes-list", TAGGED + [["notes", "add", "-m", "n1", "HEAD"], ["notes", "add", "-m", "n2", "HEAD~1"]],
+     ["notes", "list"]),
+    ("notes-list-obj", BASE + [["notes", "add", "-m", "n1"]], ["notes", "list", "HEAD"]),
+    ("notes-remove", BASE + [["notes", "add", "-m", "n"]], ["notes", "remove", "HEAD"]),
+    ("notes-get-ref", BASE, ["notes", "get-ref"]),
+    ("notes-ref-custom", BASE + [["notes", "--ref=review", "add", "-m", "rn", "HEAD"]],
+     ["notes", "--ref=review", "show", "HEAD"]),
+    ("notes-allow-empty", BASE + [["notes", "add", "--allow-empty"]], ["notes", "show"]),
 ]
 
 
