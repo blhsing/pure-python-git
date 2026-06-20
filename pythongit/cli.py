@@ -10277,45 +10277,106 @@ _register_phase5()
 #           verify-commit / verify-tag / commit-graph / rerere / column
 
 
+def _log2u(n: int) -> int:
+    """C Git's log2u: floor(log2(n)) for n>=1, else 0."""
+    return n.bit_length() - 1 if n >= 1 else 0
+
+
 def cmd_pack_refs(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit pack-refs")
+    import fnmatch
+    ap = argparse.ArgumentParser(prog="pygit pack-refs", add_help=False)
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--prune", action="store_true")
+    ap.add_argument("--prune", dest="prune", action="store_true", default=None)
+    ap.add_argument("--no-prune", dest="prune", action="store_false")
+    ap.add_argument("--auto", action="store_true")
+    ap.add_argument("--include", action="append", default=[])
+    ap.add_argument("--exclude", action="append", default=[])
     args = ap.parse_args(argv)
     repo = _repo()
-    lines = ["# pack-refs with: peeled fully-peeled sorted"]
-    packed: list[tuple[str, str]] = []
-    for kind in ("refs/heads", "refs/tags", "refs/remotes"):
-        if not args.all and kind == "refs/heads":
-            # by default pack only tags/remotes; --all packs everything
-            continue
-        root = repo.gitdir / kind
-        if root.exists():
-            for f in root.rglob("*"):
-                if f.is_file():
-                    rel = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
-                    sha = refs_mod.read_ref(repo, rel)
-                    if sha:
-                        packed.append((sha, rel))
-    packed.sort(key=lambda x: x[1])
-    for sha, name in packed:
+    prune = True if args.prune is None else args.prune  # prune is the default
+
+    # Ref selection mirrors pack-refs.c: --include patterns (or "*" for --all)
+    # form the set; the "refs/tags/*" default applies only when none are given.
+    includes = list(args.include)
+    if args.all:
+        includes.append("*")
+    if not includes:
+        includes.append("refs/tags/*")
+    excludes = list(args.exclude)
+
+    def _peeled(sha: str) -> Optional[str]:
+        """Recursively peel a tag to its non-tag object; None if not a tag."""
+        cur, peeled_any = sha, False
+        while True:
+            try:
+                t, data = objs.read_object(repo, cur)
+            except (KeyError, ValueError):
+                return None
+            if t != "tag":
+                return cur if peeled_any else None
+            peeled_any = True
+            obj = None
+            for line in data.split(b"\n"):
+                if line.startswith(b"object "):
+                    obj = line[len(b"object "):].decode("ascii", "replace").strip()
+                    break
+                if line == b"":
+                    break
+            if not obj:
+                return None
+            cur = obj
+
+    def should_pack(name: str) -> bool:
+        if any(fnmatch.fnmatch(name, p) for p in excludes):
+            return False
+        return any(fnmatch.fnmatch(name, p) for p in includes)
+
+    # Collect loose refs under refs/ (skipping symbolic and broken ones).
+    loose: list[tuple[str, str]] = []
+    refs_root = repo.gitdir / "refs"
+    if refs_root.exists():
+        for f in sorted(refs_root.rglob("*")):
+            if not f.is_file():
+                continue
+            name = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
+            try:
+                raw = f.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if raw.startswith("ref: "):
+                continue  # symbolic ref — never packed
+            if len(raw) != repo.hex_len or any(ch not in "0123456789abcdef" for ch in raw):
+                continue  # broken / not an object id
+            loose.append((name, raw))
+
+    to_pack = [(n, s) for n, s in loose if should_pack(n)]
+
+    # --auto packs only when the loose-in-set count crosses the size-scaled limit.
+    if args.auto:
+        ppath = repo.gitdir / "packed-refs"
+        packed_size = ppath.stat().st_size if ppath.exists() else 0
+        limit = max(16, _log2u(packed_size // 100) * 5)
+        if len(to_pack) < limit:
+            return 0
+
+    # Merge into any existing packed-refs (existing packed entries are kept).
+    merged = dict(refs_mod.read_packed_refs(repo))
+    for name, sha in to_pack:
+        merged[name] = sha
+
+    lines = ["# pack-refs with: peeled fully-peeled sorted "]
+    for name in sorted(merged):
+        sha = merged[name]
         lines.append(f"{sha} {name}")
-        # for annotated tags, also write peeled
-        try:
-            t, data = objs.read_object(repo, sha)
-            if t == "tag":
-                for line in data.decode("utf-8", errors="replace").splitlines():
-                    if line.startswith("object "):
-                        peel = line[len("object "):].strip()
-                        lines.append(f"^{peel}")
-                        break
-        except KeyError:
-            pass
+        peel = _peeled(sha)
+        if peel is not None:
+            lines.append(f"^{peel}")
     (repo.gitdir / "packed-refs").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if args.prune:
-        for sha, name in packed:
+
+    if prune:
+        for name, _sha in to_pack:
             p = repo.gitdir / name
-            if p.exists():
+            if p.is_file():
                 p.unlink()
     return 0
 

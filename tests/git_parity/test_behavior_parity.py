@@ -1809,3 +1809,65 @@ def test_archive_tar_byte_identical(tmp_path: Path, git_254_oracle: str):
             [*base, "archive", "--format=tar", "HEAD"], cwd=repo, env=env, capture_output=True
         ).stdout
     assert outputs["pygit"] == outputs["oracle"]
+
+
+# pack-refs is transparent to every ref-reading command (loose and packed refs
+# resolve identically), so its parity can only be observed by comparing the
+# on-disk packed-refs file and the surviving loose refs directly.
+PACK_REFS_SETUP = [
+    ("write", "a.txt", "1\n"), ["add", "-A"], ["commit", "-m", "first"],
+    ["branch", "dev"], ["tag", "v1"], ["tag", "-a", "-m", "anno", "v2"],
+    ["update-ref", "refs/remotes/origin/main", "HEAD"],
+]
+PACK_REFS_CASES = [
+    ("default", PACK_REFS_SETUP, ["pack-refs"]),
+    ("all", PACK_REFS_SETUP, ["pack-refs", "--all"]),
+    ("all-no-prune", PACK_REFS_SETUP, ["pack-refs", "--all", "--no-prune"]),
+    ("prune-explicit", PACK_REFS_SETUP, ["pack-refs", "--prune"]),
+    ("include-heads", PACK_REFS_SETUP, ["pack-refs", "--include", "refs/heads/*"]),
+    ("all-exclude-tags", PACK_REFS_SETUP, ["pack-refs", "--all", "--exclude", "refs/tags/*"]),
+    ("include-two", PACK_REFS_SETUP,
+     ["pack-refs", "--include", "refs/heads/*", "--include", "refs/tags/*"]),
+    ("exclude-specific", PACK_REFS_SETUP, ["pack-refs", "--all", "--exclude", "refs/tags/v1"]),
+    ("auto-small-noop", PACK_REFS_SETUP, ["pack-refs", "--auto"]),
+    ("no-tags-header-only",
+     [("write", "a.txt", "1\n"), ["add", "-A"], ["commit", "-m", "f"], ["branch", "dev"]],
+     ["pack-refs"]),
+]
+
+
+@pytest.mark.parametrize("case", PACK_REFS_CASES, ids=[c[0] for c in PACK_REFS_CASES])
+def test_pack_refs_state_parity(case, tmp_path: Path, git_254_oracle: str):
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, probe = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    def snapshot(repo: Path):
+        pf = repo / ".git" / "packed-refs"
+        packed = pf.read_text() if pf.exists() else "<no-packed-refs>"
+        refs_dir = repo / ".git" / "refs"
+        loose = sorted(
+            str(p.relative_to(repo / ".git")).replace("\\", "/")
+            for p in refs_dir.rglob("*") if p.is_file()
+        )
+        return packed, loose
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).parent.mkdir(parents=True, exist_ok=True)
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, capture_output=True, text=True)
+        results[tool] = (proc.returncode, proc.stdout, proc.stderr, *snapshot(repo))
+
+    assert results["pygit"] == results["oracle"]
