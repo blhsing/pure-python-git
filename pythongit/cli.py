@@ -1824,7 +1824,28 @@ def _status_model(repo: Repository, s: dict) -> tuple[list[tuple[str, str, str]]
     return changes, sorted(s["untracked"])
 
 
-def _status_staged_renames(repo: Repository, s: dict) -> list:
+def _parse_rename_score(s: str) -> int:
+    """Port of diffcore-rename.c parse_rename_score: turn an -M/-C threshold like
+    "50%", "9", or "0.9" into a 0..MAX_SCORE similarity score (0 means default)."""
+    num, scale, dot = 0, 1, False
+    for ch in s:
+        if not dot and ch == ".":
+            scale, dot = 1, True
+        elif ch == "%":
+            scale = scale * 100 if dot else 100
+            break
+        elif ch.isdigit():
+            if scale < 100000:
+                scale *= 10
+                num = num * 10 + int(ch)
+        else:
+            break
+    from . import diffcore
+    m = int(diffcore.MAX_SCORE)
+    return m if num >= scale else (m * num) // scale
+
+
+def _status_staged_renames(repo: Repository, s: dict, minimum_score: int = 0) -> list:
     """Detect staged renames (HEAD->index) and return (src, dst) pairs."""
     if not s["staged_del"] or not s["staged_new"]:
         return []
@@ -1842,7 +1863,9 @@ def _status_staged_renames(repo: Repository, s: dict) -> list:
             side_map[p] = (idx[p].mode, idx[p].sha)
     if not base_map or not side_map:
         return []
-    return [(pair.src.path, pair.dst.path) for pair in diffcore.detect_renames(repo, base_map, side_map)]
+    return [(pair.src.path, pair.dst.path)
+            for pair in diffcore.detect_renames(repo, base_map, side_map,
+                                                minimum_score=minimum_score)]
 
 
 def _status_branch_header_short(repo: Repository, head_sym, head_sha) -> str:
@@ -1920,6 +1943,30 @@ def _count_commits(repo: Repository, tip: str, exclude: str) -> int:
 
 
 def cmd_status(argv: list[str]) -> int:
+    # Rename detection is on by default (status.renames -> diff.renames -> true).
+    # Per builtin/commit.c: --no-renames/--renames set a tri-state (last wins),
+    # then -M/--find-renames is applied afterwards and force-enables detection
+    # regardless of order. -M/--find-renames take a threshold only when attached.
+    no_renames = -1  # -1 unset, 0 --renames, 1 --no-renames
+    find_given = False
+    rename_score = 0  # 0 -> diffcore's default (50%)
+    rest: list[str] = []
+    for t in argv:
+        if t == "--no-renames":
+            no_renames = 1
+        elif t == "--renames":
+            no_renames = 0
+        elif t in ("-M", "--find-renames"):
+            find_given = True
+            rename_score = 0
+        elif t.startswith("-M") and not t.startswith("--"):
+            find_given, rename_score = True, _parse_rename_score(t[2:])
+        elif t.startswith("--find-renames="):
+            find_given, rename_score = True, _parse_rename_score(t[len("--find-renames="):])
+        else:
+            rest.append(t)
+    rename_enabled = not (no_renames == 1 and not find_given)
+
     ap = argparse.ArgumentParser(prog="pygit status", add_help=False)
     ap.add_argument("-s", "--short", action="store_true")
     ap.add_argument("-b", "--branch", action="store_true")
@@ -1927,13 +1974,13 @@ def cmd_status(argv: list[str]) -> int:
     ap.add_argument("--porcelain", nargs="?", const="v1", default=None)
     ap.add_argument("-u", "--untracked-files", nargs="?", const="all", default="all")
     ap.add_argument("-z", dest="nul", action="store_true")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(rest)
     repo = _repo()
     s = workdir.status(repo)
     head_sym, head_sha = refs_mod.read_head(repo)
     branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
     changes, untracked = _status_model(repo, s)
-    renames = _status_staged_renames(repo, s)
+    renames = _status_staged_renames(repo, s, rename_score) if rename_enabled else []
     if renames:
         consumed = {src for src, _ in renames} | {dst for _, dst in renames}
         changes = [(p, x, y) for p, x, y in changes if p not in consumed]

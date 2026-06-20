@@ -145,6 +145,17 @@ SHOWREF = BASE + [["branch", "dev"], ["tag", "v1"], ["tag", "-a", "-m", "anno", 
 MKTREE = [("write", "h", "hello\n"), ["add", "-A"], ["commit", "-m", "h"]]
 HELLO_BLOB = "ce013625030ba8dba906f756967f9e9ca394464a"
 
+# A staged 100%-identical rename, for status rename detection + --no-renames.
+RENAME_EXACT = [
+    ("write", "orig.txt", "aaa\nbbb\nccc\nddd\neee\n"), ["add", "-A"], ["commit", "-m", "first"],
+    ["mv", "orig.txt", "renamed.txt"], ["add", "-A"],
+]
+# A staged ~80%-similar rename (one of five lines changed), for -M thresholds.
+RENAME_PARTIAL = [
+    ("write", "orig.txt", "aaa\nbbb\nccc\nddd\neee\n"), ["add", "-A"], ["commit", "-m", "first"],
+    ("rm", "orig.txt"), ("write", "new.txt", "aaa\nbbb\nccc\nddd\nZZZ\n"), ["add", "-A"],
+]
+
 # Distinct authors (committer stays the pinned identity) plus a long subject,
 # for shortlog grouping (-c), record formats (--pretty/--format) and -w wrapping.
 SHORTLOG_MULTI = [
@@ -336,6 +347,24 @@ CASES: list[tuple] = [
     ("status-dirty-short", DIRTY, ["status", "-s"]),
     ("status-dirty-long", DIRTY, ["status"]),
     ("status-untracked-only", BASE + [("write", "u.txt", "u\n")], ["status"]),
+    # rename detection is on by default; --no-renames shows delete+add instead.
+    ("status-rename-default", RENAME_EXACT, ["status"]),
+    ("status-rename-no-renames", RENAME_EXACT, ["status", "--no-renames"]),
+    ("status-rename-renames", RENAME_EXACT, ["status", "--renames"]),
+    ("status-rename-short", RENAME_EXACT, ["status", "-s"]),
+    ("status-rename-short-no-renames", RENAME_EXACT, ["status", "-s", "--no-renames"]),
+    ("status-rename-porcelain", RENAME_EXACT, ["status", "--porcelain"]),
+    ("status-rename-porcelain-no-renames", RENAME_EXACT, ["status", "--porcelain", "--no-renames"]),
+    # -M/--find-renames force detection on even after --no-renames (builtin/commit.c).
+    ("status-rename-M-forces-on", RENAME_EXACT, ["status", "-M", "--no-renames"]),
+    ("status-rename-no-then-yes", RENAME_EXACT, ["status", "--no-renames", "--renames"]),
+    # -M<n> threshold: a partial rename is detected at 50% but not at 90%.
+    ("status-partial-default", RENAME_PARTIAL, ["status"]),
+    ("status-partial-M50", RENAME_PARTIAL, ["status", "-M50%"]),
+    ("status-partial-M90", RENAME_PARTIAL, ["status", "-M90%"]),
+    ("status-partial-M9", RENAME_PARTIAL, ["status", "-M9"]),
+    ("status-partial-find-renames", RENAME_PARTIAL, ["status", "--find-renames=90%"]),
+    ("status-partial-short-M90", RENAME_PARTIAL, ["status", "-s", "-M90%"]),
     # cat-file / ls-tree
     ("catfile-type", BASE, ["cat-file", "-t", "HEAD"]),
     ("catfile-pretty-tree", BASE, ["cat-file", "-p", "HEAD^{tree}"]),
