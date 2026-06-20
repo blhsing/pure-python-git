@@ -168,6 +168,20 @@ SHORTLOG_MULTI = [
     ["commit", "--author=Alice <alice@x>", "-m", "second from alice"],
 ]
 
+# Commits by four identities plus a .mailmap exercising all four mapping forms,
+# for --use-mailmap / %aN / check-mailmap. Committer stays the pinned identity.
+MAILMAP_SETUP = [
+    ["commit", "--allow-empty", "--author=Joe D <joe@old.com>", "-m", "c1"],
+    ["commit", "--allow-empty", "--author=Jane <jane@work.com>", "-m", "c2"],
+    ["commit", "--allow-empty", "--author=Bob <bob@x>", "-m", "c3"],
+    ["commit", "--allow-empty", "--author=Typo <real@x>", "-m", "c4"],
+    ("write", ".mailmap",
+     "Joe Proper <joe@old.com>\n"
+     "<jane@new.com> <jane@work.com>\n"
+     "Robert <bob@new.com> <bob@x>\n"
+     "Real Name <real@x> Typo <real@x>\n"),
+]
+
 # Tags on the base commit plus a tag on a diverged branch tip, for tag
 # --merged/--no-merged/--column listing filters.
 TAGREPO = BASE + [["tag", "v1"], ["tag", "v2"],
@@ -1314,6 +1328,23 @@ CASES: list[tuple] = [
     ("commit-status-flag", CMMIX, ["commit", "--status", "-m", "x"]),
     ("commit-ahead-behind", CMMIX, ["commit", "--ahead-behind", "-m", "x"]),
     ("commit-branch-commits", CMMIX, ["commit", "--branch", "-m", "x"]),
+    # mailmap: %aN/%aE/%cN/%cE always map; %an/%ae stay raw; builtin formats map
+    # by default (log.mailmap=true) with --no-use-mailmap opting out; raw doesn't.
+    ("mailmap-aN-aE", MAILMAP_SETUP, ["log", "--format=%aN <%aE>"]),
+    ("mailmap-an-ae-raw", MAILMAP_SETUP, ["log", "--format=%an <%ae>"]),
+    ("mailmap-cN-cE", MAILMAP_SETUP, ["log", "-1", "--format=%cN <%cE>"]),
+    ("mailmap-medium-default", MAILMAP_SETUP, ["log", "--format=medium"]),
+    ("mailmap-no-use-mailmap", MAILMAP_SETUP, ["log", "--no-use-mailmap", "--format=medium"]),
+    ("mailmap-use-mailmap-an-raw", MAILMAP_SETUP, ["log", "--use-mailmap", "--format=%an"]),
+    ("mailmap-pretty-short", MAILMAP_SETUP, ["log", "--pretty=short"]),
+    ("mailmap-pretty-full", MAILMAP_SETUP, ["log", "--pretty=full"]),
+    ("mailmap-pretty-fuller", MAILMAP_SETUP, ["log", "-1", "--pretty=fuller"]),
+    ("mailmap-pretty-raw", MAILMAP_SETUP, ["log", "-1", "--pretty=raw"]),
+    ("mailmap-show", MAILMAP_SETUP, ["show", "--no-patch"]),
+    ("mailmap-show-no-mailmap", MAILMAP_SETUP, ["show", "--no-patch", "--no-use-mailmap"]),
+    ("mailmap-check", MAILMAP_SETUP,
+     ["check-mailmap", "Joe D <joe@old.com>", "Jane <jane@work.com>",
+      "Bob <bob@x>", "Typo <real@x>", "Unknown <u@x>"]),
     # log %N expands the commit note; checkout -q suppresses switch messages.
     ("log-fmt-note", BASE + [["notes", "add", "-m", "a note", "HEAD"]],
      ["log", "-1", "--format=[%N]"]),

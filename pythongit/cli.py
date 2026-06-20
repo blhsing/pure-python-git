@@ -2684,6 +2684,15 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
     c_who, c_ts, c_tz = _split_ident(c.committer)
     an, ae = _parse_who(a_who)
     cn, ce = _parse_who(c_who)
+    # %aN/%aE/%cN/%cE are always mailmap-resolved (independent of --use-mailmap,
+    # which only governs the builtin-format identity lines). %an/%ae stay raw.
+    man, mae, mcn, mce = an, ae, cn, ce
+    if any(k in fmt for k in ("%aN", "%aE", "%cN", "%cE")):
+        from . import mailmap as _mailmap
+        mm = _mailmap.load(repo)
+        if not mm.empty:
+            man, mae = mm.resolve(an, ae)
+            mcn, mce = mm.resolve(cn, ce)
     # The subject (%s) is the first line with trailing whitespace stripped.
     subject = c.message.splitlines()[0].rstrip() if c.message.strip() else ""
     # %B is the raw message; %b is the body after the subject's blank line; %f
@@ -2704,7 +2713,7 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         ("%P", " ".join(c.parents)), ("%p", " ".join(p[:abbrev] for p in c.parents)),
         ("%an", an), ("%ae", ae), ("%cn", cn), ("%ce", ce),
         # Mailmap-resolved name/email; with no mailmap these equal %an/%ae/etc.
-        ("%aN", an), ("%aE", ae), ("%cN", cn), ("%cE", ce),
+        ("%aN", man), ("%aE", mae), ("%cN", mcn), ("%cE", mce),
         # Date placeholders: %ad/%cd honor --date; %aD/%ai/%aI (and committer
         # equivalents) are fixed styles; %at/%ct are the raw unix timestamps.
         ("%aD", _format_date(c.author, "rfc")), ("%cD", _format_date(c.committer, "rfc")),
@@ -2847,6 +2856,10 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--no-merges", dest="no_merges", action="store_true")
+    # The builtin formats honour the mailmap by default (log.mailmap=true);
+    # --no-use-mailmap shows raw identities. %an/%ae stay raw regardless.
+    ap.add_argument("--use-mailmap", "--mailmap", dest="use_mailmap", action="store_true")
+    ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="no_use_mailmap", action="store_true")
     # pythongit never colorizes, so color controls are accepted and ignored.
     ap.add_argument("--color", nargs="?", const="always", default=None)
     ap.add_argument("--no-color", action="store_true")
@@ -2881,6 +2894,9 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
+    # Builtin formats honour the mailmap by default; --no-use-mailmap disables it.
+    from . import mailmap as _mailmap
+    mm_log = None if args.no_use_mailmap else _mailmap.load(repo)
     # --no-abbrev[-commit] override the abbreviation: full oids everywhere.
     if args.no_abbrev:
         args.abbrev = repo.hex_len
@@ -3253,7 +3269,7 @@ def cmd_log(argv: list[str]) -> int:
             else:  # short
                 if len(c.parents) > 1:
                     _print("Merge: " + " ".join(p[:7] for p in c.parents))
-                _print(f"Author: {_split_ident(c.author)[0]}")
+                _print(f"Author: {_mapped_who(_split_ident(c.author)[0], mm_log)}")
                 _print("")
                 first = c.message.splitlines()[0] if c.message.strip() else ""
                 _print(f"    {first}")
@@ -3265,7 +3281,7 @@ def cmd_log(argv: list[str]) -> int:
             _emit_commit_header(s[:7] if args.abbrev_commit else s, c, style=style,
                                 date_mode=date_mode, parents_suffix=psuf,
                                 decoration=_format_decoration(decorations.get(s, [])),
-                                reflog=meta, date_given=date_given)
+                                reflog=meta, date_given=date_given, mailmap=mm_log)
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
@@ -3531,9 +3547,19 @@ def _format_ident_date(sig: str) -> str:
     return _format_date(sig, "default")
 
 
+def _mapped_who(who: str, mailmap=None) -> str:
+    """Apply a mailmap to a `Name <email>` string (identity unless mailmap maps it)."""
+    if mailmap is None or mailmap.empty:
+        return who
+    n, e = _parse_who(who)
+    mn, me = mailmap.resolve(n, e)
+    return f"{mn} <{me}>"
+
+
 def _emit_commit_header(sha: str, c, *, style: str = "medium",
                         date_mode: str = "default", decoration: str = "",
-                        parents_suffix: str = "", reflog=None, date_given: bool = False) -> None:
+                        parents_suffix: str = "", reflog=None, date_given: bool = False,
+                        mailmap=None) -> None:
     """Print the ``commit``/``Author``/``Date`` header block for medium, full,
     and fuller pretty styles, shared by ``log`` and ``show``."""
     _print(f"commit {sha}{parents_suffix}{decoration}")
@@ -3545,6 +3571,15 @@ def _emit_commit_header(sha: str, c, *, style: str = "medium",
         _print("Merge: " + " ".join(p[:7] for p in c.parents))
     author_who = _split_ident(c.author)[0]
     committer_who = _split_ident(c.committer)[0]
+    # The builtin formats honour the mailmap by default (log.mailmap=true);
+    # --no-use-mailmap passes mailmap=None to show the raw identities.
+    if mailmap is not None and not mailmap.empty:
+        an, ae = _parse_who(author_who)
+        mn, me = mailmap.resolve(an, ae)
+        author_who = f"{mn} <{me}>"
+        cwho_n, cwho_e = _parse_who(committer_who)
+        mcn, mce = mailmap.resolve(cwho_n, cwho_e)
+        committer_who = f"{mcn} <{mce}>"
     if style == "fuller":
         _print(f"Author:     {author_who}")
         _print(f"AuthorDate: {_format_date(c.author, date_mode)}")
@@ -3571,9 +3606,13 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--date", default=None)
     ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("-U", "--unified", type=int, default=3)
+    ap.add_argument("--use-mailmap", "--mailmap", dest="use_mailmap", action="store_true")
+    ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="no_use_mailmap", action="store_true")
     ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+    from . import mailmap as _mailmap
+    mm_show = None if args.no_use_mailmap else _mailmap.load(repo)
     # `--format=<builtin>` is an alias for `--pretty=<builtin>`.
     if args.format in ("oneline", "short", "medium", "full", "fuller", "raw", "reference"):
         args.pretty, args.format = args.format, None
@@ -3655,12 +3694,12 @@ def cmd_show(argv: list[str]) -> int:
                 _print(f"commit {sha}")
                 if len(c.parents) > 1:
                     _print("Merge: " + " ".join(p[:7] for p in c.parents))
-                _print(f"Author: {_split_ident(c.author)[0]}")
+                _print(f"Author: {_mapped_who(_split_ident(c.author)[0], mm_show)}")
                 _print("")
                 first = c.message.splitlines()[0] if c.message.strip() else ""
                 _print(f"    {first}")
             else:
-                _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode)
+                _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode, mailmap=mm_show)
                 _print("")
                 for line in c.message.rstrip("\n").splitlines():
                     _print(f"    {line}")
@@ -11744,31 +11783,20 @@ def cmd_check_ref_format(argv: list[str]) -> int:
 
 
 def cmd_check_mailmap(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit check-mailmap")
-    ap.add_argument("contacts", nargs="+")
+    ap = argparse.ArgumentParser(prog="pygit check-mailmap", add_help=False)
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("contacts", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
-    # mailmap file (.mailmap at root) maps "Real Name <email>" to canonical
-    mm = repo.path / ".mailmap"
-    mapping: dict[str, str] = {}
-    if mm.exists():
-        for line in mm.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # Formats: Name <email> [other-name] <other-email>
-            # We support: <canonical-email> <original-email>
-            # and:        Canonical Name <canonical-email> <original-email>
-            if "<" not in line:
-                continue
-            # find the last <...>
-            parts = line.rsplit("<", 1)
-            orig = "<" + parts[1] if parts[1].endswith(">") else line
-            canon = parts[0].strip() + (" " if parts[0].strip() else "") + (
-                "<" + parts[1].split(">")[0] + ">" if ">" in parts[1] else "")
-            mapping[orig] = canon
-    for c in args.contacts:
-        _print(mapping.get(c, c))
+    from . import mailmap as _mailmap
+    mm = _mailmap.load(repo)
+    contacts = list(args.contacts)
+    if args.stdin:
+        contacts += [line.rstrip("\n") for line in sys.stdin]
+    for c in contacts:
+        name, email = _parse_who(c)
+        mn, me = mm.resolve(name, email)
+        _print(f"{mn} <{me}>" if mn else f"<{me}>")
     return 0
 
 
