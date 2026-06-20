@@ -1396,6 +1396,20 @@ CASES: list[tuple] = [
     ("merge-X-theirs", MERGECONF, ["merge", "-X", "theirs", "--no-ff", "-m", "m", "feat"]),
     ("merge-conflict", MERGECONF, ["merge", "--no-ff", "-m", "m", "feat"]),
     ("merge-F-bad", MERGEDIV, ["merge", "-F", "nope.txt", "--no-ff", "feat"]),
+    # ls-remote on a local path: --refs (drop HEAD + peeled), --symref, -b/
+    # --branches namespace filter, --get-url, --sort, patterns, --exit-code, and
+    # the boolean "takes no value" error.
+    ("lsr-refs", DESC, ["ls-remote", "--refs", "."]),
+    ("lsr-symref", DESC, ["ls-remote", "--symref", "."]),
+    ("lsr-refs-symref", DESC, ["ls-remote", "--refs", "--symref", "."]),
+    ("lsr-branches", REFSET, ["ls-remote", "--branches", "."]),
+    ("lsr-b", REFSET, ["ls-remote", "-b", "."]),
+    ("lsr-get-url", BASE, ["ls-remote", "--get-url", "."]),
+    ("lsr-sort-rev", REFSET, ["ls-remote", "--sort=-refname", "."]),
+    ("lsr-pattern", REFSET, ["ls-remote", ".", "main"]),
+    ("lsr-exit-code-nomatch", BASE, ["ls-remote", "--exit-code", ".", "nomatchxyz"]),
+    ("lsr-exit-code-ok", BASE, ["ls-remote", "--exit-code", "."]),
+    ("lsr-branches-val-err", BASE, ["ls-remote", "--branches=val", "."]),
 ]
 
 

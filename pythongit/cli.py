@@ -5141,10 +5141,26 @@ def cmd_remote(argv: list[str]) -> int:
 
 
 def cmd_ls_remote(argv: list[str]) -> int:
+    # The boolean --tags/--branches/--heads reject an attached value, exactly
+    # like C Git's parse-options ("option `<name>' takes no value").
+    for tok in argv:
+        for nm in ("branches", "tags", "heads"):
+            if tok.startswith(f"--{nm}="):
+                _err(f"error: option `{nm}' takes no value")
+                return 129
     ap = argparse.ArgumentParser(prog="pygit ls-remote", add_help=False)
     ap.add_argument("-t", "--tags", action="store_true")
-    ap.add_argument("--heads", action="store_true")
+    ap.add_argument("-b", "--branches", "--heads", dest="branches", action="store_true")
+    ap.add_argument("--refs", action="store_true")
+    ap.add_argument("--symref", action="store_true")
+    ap.add_argument("--get-url", dest="get_url", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--exit-code", dest="exit_code", action="store_true")
+    ap.add_argument("--sort", default=None)
+    ap.add_argument("--upload-pack", dest="upload_pack", default=None)
+    ap.add_argument("-o", "--server-option", dest="server_option", action="append", default=None)
     ap.add_argument("url", nargs="?", default=None)
+    ap.add_argument("patterns", nargs="*")
     args = ap.parse_args(argv)
     url = args.url
     if url is None:
@@ -5159,37 +5175,75 @@ def cmd_ls_remote(argv: list[str]) -> int:
         if not url:
             _err("fatal: No remote configured to list refs from.")
             return 128
+    if args.get_url:
+        _print(url)
+        return 0
     src = url[7:] if url.startswith("file://") else url
+
+    import fnmatch as _fn
+
+    def _pat_match(name: str) -> bool:
+        if not args.patterns:
+            return True
+        for p in args.patterns:
+            if name == p or _fn.fnmatch(name, p) or name.endswith("/" + p) \
+                    or _fn.fnmatch(name, "*/" + p):
+                return True
+        return False
+
+    def _sort_key(disp: str):
+        key = args.sort.lstrip("-") if args.sort else "refname"
+        if key in ("version:refname", "v:refname"):
+            return _version_sort_key(disp)
+        return disp
+
     # A local repository path is read directly: HEAD, then refs in sorted order,
     # with annotated tags followed by their peeled ``^{}`` line — like git.
     if not url.startswith(("http://", "https://", "git://", "ssh://")) and Path(src).exists():
         repo = Repository.discover(src)
-        _, head_sha = refs_mod.read_head(repo)
-        # --heads/--tags restrict to that namespace; HEAD shows only when neither
-        # (or no namespace filter) is given.
-        if head_sha and not (args.tags or args.heads):
-            _print(f"{head_sha}\tHEAD")
+        head_symref, head_sha = refs_mod.read_head(repo)
+        # Each output line is (display-name, oid). HEAD shows only when no
+        # namespace filter and --refs is off.
+        lines: list[tuple[str, str]] = []
+        if head_sha and not (args.tags or args.branches) and not args.refs:
+            lines.append(("HEAD", head_sha))
         for name, sha in sorted(_enumerate_refs(repo)):
-            if args.heads or args.tags:
-                # When namespace filters are given, include the union of them.
-                if not ((args.heads and name.startswith("refs/heads/"))
-                        or (args.tags and name.startswith("refs/tags/"))):
-                    continue
-            _print(f"{sha}\t{name}")
-            if name.startswith("refs/tags/"):
+            if (args.tags or args.branches) and not (
+                    (args.branches and name.startswith("refs/heads/"))
+                    or (args.tags and name.startswith("refs/tags/"))):
+                continue
+            lines.append((name, sha))
+            if name.startswith("refs/tags/") and not args.refs:
                 try:
-                    t, _ = objs.read_object(repo, sha)
-                    if t == "tag":
+                    if objs.read_object(repo, sha)[0] == "tag":
                         peeled = refs_mod.rev_parse(repo, name + "^{commit}")
                         if peeled:
-                            _print(f"{peeled}\t{name}^{{}}")
+                            lines.append((name + "^{}", peeled))
                 except KeyError:
                     pass
+        lines = [(n, s) for n, s in lines if _pat_match(n)]
+        if args.sort:
+            reverse = args.sort.startswith("-")
+            lines.sort(key=lambda t: _sort_key(t[0]), reverse=reverse)
+        emitted = 0
+        for name, sha in lines:
+            # --symref prefixes HEAD's oid line with its symbolic target.
+            if args.symref and name == "HEAD" and head_symref:
+                _print(f"ref: {head_symref}\tHEAD")
+            _print(f"{sha}\t{name}")
+            emitted += 1
+        if args.exit_code and emitted == 0:
+            return 2
         return 0
     from . import protocol
     refs = protocol.discover_refs(url)
+    emitted = 0
     for name, sha in refs.items():
-        _print(f"{sha}\t{name}")
+        if _pat_match(name):
+            _print(f"{sha}\t{name}")
+            emitted += 1
+    if args.exit_code and emitted == 0:
+        return 2
     return 0
 
 
