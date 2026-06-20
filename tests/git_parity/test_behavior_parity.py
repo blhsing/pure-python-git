@@ -1495,6 +1495,20 @@ CASES: list[tuple] = [
      ["remote", "add", "o", "https://x/d.git"]),
     ("remote-remove-nonexist", BASE, ["remote", "remove", "nope"]),
     ("remote-v", BASE + [["remote", "add", "o", "https://x/r.git"]], ["remote", "-v"]),
+    # stash push -q/-m, save <msg>, and -k/--keep-index.
+    ("stash-push-q", BASE + [("write", "a.txt", "mod\n")], ["stash", "push", "-q"]),
+    ("stash-push-m",
+     BASE + [("write", "a.txt", "mod\n"), ["stash", "push", "-m", "my msg"]], ["stash", "list"]),
+    ("stash-save-msg",
+     BASE + [("write", "a.txt", "mod\n"), ["stash", "save", "saved msg"]], ["stash", "list"]),
+    ("stash-keep-index",
+     BASE + [("write", "a.txt", "staged\n"), ["add", "a.txt"], ("write", "b.txt", "wt\n"),
+             ["stash", "push", "-k"]],
+     ["status", "--short"]),
+    ("stash-push-nochanges", BASE, ["stash", "push"]),
+    ("stash-bare-q", BASE + [("write", "a.txt", "mod\n")], ["stash", "-q"]),
+    ("stash-bare-m",
+     BASE + [("write", "a.txt", "mod\n"), ["stash", "-m", "bare msg"]], ["stash", "list"]),
 ]
 
 

@@ -30,7 +30,7 @@ def _commit_tree(repo: Repository, tree: str, parents: list[str], msg: str) -> s
     return objs.write_object(repo, "commit", c.encode())
 
 
-def push(repo: Repository, message: str = "") -> Optional[str]:
+def push(repo: Repository, message: str = "", *, keep_index: bool = False) -> Optional[str]:
     head_sym, head_sha = refs_mod.read_head(repo)
     if not head_sha:
         return None
@@ -64,10 +64,14 @@ def push(repo: Repository, message: str = "") -> Optional[str]:
     w_commit = _commit_tree(repo, w_tree, [head_sha, i_commit], msg)
     refs_mod.update_ref(repo, "refs/stash", w_commit, message=msg)
 
-    # 3) reset worktree+index to HEAD
-    t, data = objs.read_object(repo, head_sha)
-    head_tree = objs.parse_commit(data).tree
-    workdir.checkout_tree(repo, head_tree)
+    # 3) reset worktree+index. --keep-index leaves the staged state in place by
+    # resetting to the index tree instead of HEAD.
+    if keep_index:
+        workdir.checkout_tree(repo, idx_tree)
+    else:
+        t, data = objs.read_object(repo, head_sha)
+        head_tree = objs.parse_commit(data).tree
+        workdir.checkout_tree(repo, head_tree)
     return w_commit
 
 

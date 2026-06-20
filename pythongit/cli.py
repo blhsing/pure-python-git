@@ -5961,27 +5961,46 @@ def cmd_stash(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="action")
     p_push = sub.add_parser("push")
     p_push.add_argument("-m", "--message", default="")
+    p_push.add_argument("-q", "--quiet", action="store_true")
+    p_push.add_argument("-k", "--keep-index", dest="keep_index", action="store_true")
+    p_save = sub.add_parser("save")
+    p_save.add_argument("-q", "--quiet", action="store_true")
+    p_save.add_argument("-k", "--keep-index", dest="keep_index", action="store_true")
+    p_save.add_argument("message", nargs="?", default="")
     sub.add_parser("list")
     p_apply = sub.add_parser("apply")
+    p_apply.add_argument("-q", "--quiet", action="store_true")
     p_apply.add_argument("index", nargs="?", type=int, default=0)
     p_pop = sub.add_parser("pop")
+    p_pop.add_argument("-q", "--quiet", action="store_true")
     p_pop.add_argument("index", nargs="?", type=int, default=0)
     p_show = sub.add_parser("show")
     p_show.add_argument("-p", "--patch", action="store_true")
     p_show.add_argument("-U", "--unified", type=int, default=3)
     p_show.add_argument("stash", nargs="?", default="stash@{0}")
-    args = ap.parse_args(argv or ["push"])
+    # `git stash` defaults to the `push` subcommand, so bare options/pathspecs
+    # (e.g. `stash -q`, `stash -m msg`) are treated as `stash push ...`.
+    _stash_subs = {"push", "save", "list", "apply", "pop", "show", "drop",
+                   "clear", "branch", "create", "store", "export", "import"}
+    if not argv:
+        argv = ["push"]
+    elif argv[0] not in _stash_subs:
+        argv = ["push"] + argv
+    args = ap.parse_args(argv)
     repo = _repo()
     from . import stash
     action = args.action or "push"
-    if action == "push":
-        sha = stash.push(repo, getattr(args, "message", ""))
+    if action in ("push", "save"):
+        sha = stash.push(repo, getattr(args, "message", "") or "",
+                         keep_index=getattr(args, "keep_index", False))
         if sha is None:
-            _print("No local changes to save")
+            if not getattr(args, "quiet", False):
+                _print("No local changes to save")
             return 0
-        stashes = stash.list_stashes(repo)
-        saved_msg = stashes[0][2] if stashes else f"WIP on HEAD: {sha[:7]}"
-        _print(f"Saved working directory and index state {saved_msg}")
+        if not getattr(args, "quiet", False):
+            stashes = stash.list_stashes(repo)
+            saved_msg = stashes[0][2] if stashes else f"WIP on HEAD: {sha[:7]}"
+            _print(f"Saved working directory and index state {saved_msg}")
     elif action == "list":
         for i, sha, msg in stash.list_stashes(repo):
             _print(f"stash@{{{i}}}: {msg}")
