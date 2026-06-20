@@ -1974,6 +1974,7 @@ def cmd_status(argv: list[str]) -> int:
     ap.add_argument("--porcelain", nargs="?", const="v1", default=None)
     ap.add_argument("-u", "--untracked-files", nargs="?", const="all", default="all")
     ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(rest)
     repo = _repo()
     s = workdir.status(repo)
@@ -2010,11 +2011,17 @@ def cmd_status(argv: list[str]) -> int:
             emit(f"?? {p}")
         return 0
 
-    # Long (default) format.
-    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden, renames)
+    # Long (default) format. -v/-vv append the staged (and, for -vv, worktree)
+    # diff just before the summary line.
+    verbose_hook = None
+    if args.verbose:
+        verbose_hook = lambda committable: _status_verbose_diff(
+            repo, args.verbose, committable, rename_enabled, rename_score)
+    return _status_long(repo, s, changes, untracked, branch, head_sym, head_sha,
+                        untracked_hidden, renames, verbose_hook)
 
 
-def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden=False, renames=None) -> int:
+def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untracked_hidden=False, renames=None, verbose_hook=None) -> int:
     unborn = head_sym is not None and head_sha is None
     if branch is not None:
         _print(f"On branch {branch}")
@@ -2061,6 +2068,10 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untrac
         _print("Untracked files not listed (use -u option to show untracked files)")
 
     has_staged = bool(staged) or bool(rename_rows)
+    # C Git prints the verbose (-v/-vv) diff after the sections but before the
+    # trailing summary line (wt_longstatus_print order).
+    if verbose_hook is not None:
+        verbose_hook(has_staged)
     if not has_staged and not unstaged and not untracked:
         if untracked_hidden:
             _print("nothing to commit (use -u to show untracked files)")
@@ -2073,6 +2084,61 @@ def _status_long(repo, s, changes, untracked, branch, head_sym, head_sha, untrac
     elif not has_staged and unstaged:
         _print('no changes added to commit (use "git add" and/or "git commit -a")')
     return 0
+
+
+def _emit_change_diffs(repo: Repository, changes: list, rename_enabled: bool,
+                       rename_score: int, a_prefix: str, b_prefix: str) -> None:
+    """Render a change list as a patch (rename-aware), with the given prefixes."""
+    if rename_enabled:
+        renames, remaining = _detect_changes_renames(repo, changes, rename_score)
+    else:
+        renames, remaining = [], changes
+    emit = [(dst, lambda s=src, d=dst, sm=sim, sa=sa, db=db:
+             _emit_rename_patch(s, d, sm, sa, db, a_prefix=a_prefix, b_prefix=b_prefix))
+            for src, dst, sim, sa, db in renames]
+    emit += [(path, lambda p=path, a=a, b=b:
+              _emit_file_diff(p, a, b, a_prefix=a_prefix, b_prefix=b_prefix))
+             for path, a, b in remaining]
+    for _key, fn in sorted(emit, key=lambda e: e[0]):
+        fn()
+
+
+def _status_verbose_diff(repo: Repository, verbose: int, committable: bool,
+                         rename_enabled: bool, rename_score: int) -> None:
+    """Port of wt_longstatus_print_verbose: the staged diff (HEAD vs index) and,
+    for -vv, the worktree diff (index vs worktree). -v uses a/b prefixes with no
+    header; -vv uses c/i under a "Changes to be committed:" header, then a
+    50-dash separator and i/w under "Changes not staged for commit:"."""
+    idx = read_index(repo).by_path()
+    head_sha = refs_mod.rev_parse(repo, "HEAD")
+    head_map = _tree_map_full(repo, _commit_tree(repo, head_sha)) if head_sha else {}
+
+    staged: list[tuple[str, _Side, _Side]] = []
+    for p in sorted(set(head_map) | set(idx)):
+        if p in idx and idx[p].intent_to_add and p not in head_map:
+            continue  # intent-to-add is not staged
+        a = _side_from_object(repo, *head_map[p]) if p in head_map else _ABSENT
+        b = _side_from_object(repo, idx[p].mode_str(), idx[p].sha) if p in idx else _ABSENT
+        if a.sha != b.sha or a.mode != b.mode:
+            staged.append((p, a, b))
+    if verbose > 1 and committable:
+        _print("Changes to be committed:")
+        sa, sb = "c", "i"
+    else:
+        sa, sb = "a", "b"
+    _emit_change_diffs(repo, staged, rename_enabled, rename_score, sa, sb)
+
+    if verbose > 1:
+        unstaged: list[tuple[str, _Side, _Side]] = []
+        for p in sorted(idx):
+            a = _ABSENT if idx[p].intent_to_add else _side_from_object(repo, idx[p].mode_str(), idx[p].sha)
+            b = _side_from_worktree(repo, p)
+            if a.sha != b.sha or a.mode != b.mode:
+                unstaged.append((p, a, b))
+        if unstaged:
+            _print("--------------------------------------------------")
+            _print("Changes not staged for commit:")
+            _emit_change_diffs(repo, unstaged, rename_enabled, rename_score, "i", "w")
 
 
 def _status_porcelain_v2(repo, s, changes, untracked, want_branch, head_sym, head_sha, eol) -> int:
@@ -3834,11 +3900,12 @@ def _diff_check(repo: Repository, changes: list) -> int:
 
 
 def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3,
-                    word_diff=None) -> None:
+                    word_diff=None, a_prefix: str = "a", b_prefix: str = "b") -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
-    # Under -R the working-side prefixes are swapped (b/<path> a/<path>).
-    pa, pb = ("b", "a") if reverse else ("a", "b")
+    # Under -R the working-side prefixes are swapped (b/<path> a/<path>). The
+    # prefixes default to a/b but `status -vv` overrides them (c/i, then i/w).
+    pa, pb = (b_prefix, a_prefix) if reverse else (a_prefix, b_prefix)
     _print(f"diff --git {pa}/{path} {pb}/{path}")
     if not a.present:
         _print(f"new file mode {b.mode}")
@@ -4135,8 +4202,9 @@ def cmd_diff(argv: list[str]) -> int:
     return 0
 
 
-def _emit_rename_patch(src: str, dst: str, sim: int, src_side: _Side, dst_side: _Side) -> None:
-    _print(f"diff --git a/{src} b/{dst}")
+def _emit_rename_patch(src: str, dst: str, sim: int, src_side: _Side, dst_side: _Side,
+                       a_prefix: str = "a", b_prefix: str = "b") -> None:
+    _print(f"diff --git {a_prefix}/{src} {b_prefix}/{dst}")
     _print(f"similarity index {sim}%")
     _print(f"rename from {src}")
     _print(f"rename to {dst}")
@@ -4145,8 +4213,8 @@ def _emit_rename_patch(src: str, dst: str, sim: int, src_side: _Side, dst_side: 
     _print(f"index {src_side.sha[:7]}..{dst_side.sha[:7]} {dst_side.mode}")
     a_text = (src_side.data or b"").decode("utf-8", errors="replace")
     b_text = (dst_side.data or b"").decode("utf-8", errors="replace")
-    _print(f"--- a/{src}")
-    _print(f"+++ b/{dst}")
+    _print(f"--- {a_prefix}/{src}")
+    _print(f"+++ {b_prefix}/{dst}")
     for line in diff_mod.format_hunks(
         a_text.splitlines(), b_text.splitlines(),
         a_no_newline=bool(a_text) and not a_text.endswith("\n"),
@@ -4155,7 +4223,7 @@ def _emit_rename_patch(src: str, dst: str, sim: int, src_side: _Side, dst_side: 
         _print(line)
 
 
-def _detect_changes_renames(repo: Repository, changes: list):
+def _detect_changes_renames(repo: Repository, changes: list, minimum_score: int = 0):
     """Split ``changes`` into detected (src, dst, similarity%) renames and the
     remaining non-rename changes, using the validated spanhash estimator."""
     from . import diffcore
@@ -4169,7 +4237,7 @@ def _detect_changes_renames(repo: Repository, changes: list):
     if not base_map or not side_map:
         return [], changes
     by_path = {p: (a, b) for p, a, b in changes}
-    pairs = diffcore.detect_renames(repo, base_map, side_map)
+    pairs = diffcore.detect_renames(repo, base_map, side_map, minimum_score=minimum_score)
     renamed_src = {p.src.path for p in pairs}
     renamed_dst = {p.dst.path for p in pairs}
     renames = [
