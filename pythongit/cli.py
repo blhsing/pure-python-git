@@ -2138,6 +2138,50 @@ def _apply_trailers(msg: str, trailers: list[str]) -> str:
     return (body + "\n\n" + block) if body else block
 
 
+def _incompatible_opts(opts: list[str]) -> str:
+    """Render C Git's "options ... cannot be used together" message for a list
+    of 2-4 option names (the count selects the comma/and punctuation)."""
+    if len(opts) == 2:
+        joined = f"'{opts[0]}' and '{opts[1]}'"
+    else:
+        joined = ", ".join(f"'{o}'" for o in opts[:-1]) + f", and '{opts[-1]}'"
+    return f"fatal: options {joined} cannot be used together"
+
+
+def _strip_commit_subject(msg: str) -> str:
+    """Return a commit message's body: everything after the first blank line,
+    with leading blank lines skipped (C Git's skip_blank_lines(buffer + 2))."""
+    idx = msg.find("\n\n")
+    if idx < 0:
+        return ""
+    return msg[idx + 2:].lstrip("\n")
+
+
+def _commit_message_conflict(args) -> Optional[str]:
+    """Mirror C Git's commit message-source incompatibility checks, in order:
+    (A) at most one of -m/-C/-c/-F; (B) --squash and --fixup are exclusive;
+    (C) --fixup cannot combine with -C/-c/-F (but -m is allowed as a body)."""
+    group = []
+    if args.message is not None:
+        group.append("-m")
+    if args.reuse_message is not None:
+        group.append("-C")
+    if args.reedit_message is not None:
+        group.append("-c")
+    if args.file is not None:
+        group.append("-F")
+    if len(group) >= 2:
+        return _incompatible_opts(group)
+    if args.squash is not None and args.fixup is not None:
+        return _incompatible_opts(["--squash", "--fixup"])
+    if args.fixup is not None:
+        for opt, val in (("-C", args.reuse_message), ("-c", args.reedit_message),
+                         ("-F", args.file)):
+            if val is not None:
+                return _incompatible_opts([opt, "--fixup"])
+    return None
+
+
 def cmd_commit(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit commit", add_help=False)
     ap.add_argument("-m", "--message", action="append", default=None)
@@ -2158,23 +2202,106 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("-o", "--only", action="store_true")
     ap.add_argument("-i", "--include", action="store_true")
     ap.add_argument("-n", "--no-verify", dest="no_verify", action="store_true")
+    ap.add_argument("--verify", dest="verify", action="store_true")
     ap.add_argument("--no-post-rewrite", dest="no_post_rewrite", action="store_true")
+    ap.add_argument("--post-rewrite", dest="post_rewrite", action="store_true")
+    ap.add_argument("-C", "--reuse-message", dest="reuse_message", default=None)
+    ap.add_argument("-c", "--reedit-message", dest="reedit_message", default=None)
+    ap.add_argument("--squash", default=None)
+    ap.add_argument("--fixup", default=None)
+    ap.add_argument("--dry-run", dest="dry_run", action="store_true")
+    ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
+    ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
+    ap.add_argument("-u", "--untracked-files", dest="untracked_files", nargs="?", const="all", default="all")
+    # Dry-run output formats: --short/--porcelain/--long/-z all imply --dry-run.
+    ap.add_argument("--short", action="store_true")
+    ap.add_argument("--porcelain", action="store_true")
+    ap.add_argument("--long", dest="long", action="store_true")
+    ap.add_argument("--branch", action="store_true")
+    ap.add_argument("--ahead-behind", dest="ahead_behind", action="store_true")
+    ap.add_argument("--no-ahead-behind", dest="no_ahead_behind", action="store_true")
+    ap.add_argument("--status", dest="status", action="store_true")
+    ap.add_argument("--no-status", dest="no_status", action="store_true")
+    ap.add_argument("-z", "--null", dest="nul", action="store_true")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("pathspec", nargs="*")
     args = ap.parse_args(argv)
-    # Multiple -m values are joined into paragraphs, like C Git.
-    if args.message is not None:
-        args.message = "\n\n".join(args.message)
-    elif args.file is not None:
-        args.message = (sys.stdin.read() if args.file == "-"
-                        else open(args.file, encoding="utf-8").read())
     repo = _repo()
+    # --pathspec-from-file supplies the pathspec for a partial commit.
+    if args.pathspec_from_file is not None:
+        raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
+               else open(args.pathspec_from_file, "rb").read())
+        psep = "\0" if args.pathspec_file_nul else "\n"
+        args.pathspec = [p for p in raw.decode("utf-8").split(psep) if p]
+    # Message construction. --squash/--fixup set the subject header; -m/-F/-C/-c
+    # supply the body (and -C/-c also reuse the source commit's author). C Git
+    # appends the body under the squash!/fixup! header. Incompatible combinations
+    # (e.g. two body sources, --squash with --fixup) are rejected first.
+    conflict = _commit_message_conflict(args)
+    if conflict is not None:
+        _err(conflict)
+        return 128
+    if args.reset_author and not (args.amend or args.reuse_message or args.reedit_message):
+        _err("fatal: --reset-author can be used only with -C, -c or --amend.")
+        return 128
+    reuse = args.reuse_message or args.reedit_message
+    reuse_author = None
+    reuse_sha = None
+    body = None
+    if args.message is not None:
+        body = "\n\n".join(args.message)
+    elif args.file is not None:
+        body = (sys.stdin.read() if args.file == "-"
+                else open(args.file, encoding="utf-8").read())
+    elif reuse is not None:
+        reuse_sha = refs_mod.rev_parse(repo, reuse)
+        rc_commit = objs.parse_commit(objs.read_object(repo, reuse_sha)[1])
+        body = rc_commit.message.rstrip("\n")
+        reuse_author = rc_commit.author
+    header = None
+    header_sha = None
+    if args.squash is not None:
+        header_sha = refs_mod.rev_parse(repo, args.squash)
+        subj = objs.parse_commit(objs.read_object(repo, header_sha)[1]).message.splitlines()[0]
+        header = f"squash! {subj}"
+    elif args.fixup is not None:
+        spec = args.fixup
+        if ":" in spec:
+            mode, ref = spec.split(":", 1)
+        else:
+            mode, ref = "fixup", spec
+        header_sha = refs_mod.rev_parse(repo, ref)
+        c = objs.parse_commit(objs.read_object(repo, header_sha)[1])
+        subj = c.message.splitlines()[0]
+        if mode in ("amend", "reword"):
+            header = f"amend! {subj}\n\n{c.message.rstrip(chr(10))}"
+            if mode == "reword":
+                args.allow_empty = True
+        else:
+            header = f"fixup! {subj}"
+    # When -C/-c reuse the very commit being squashed/fixed up, C Git keeps only
+    # the reused body (its subject is already in the squash!/fixup! header).
+    if (reuse_sha is not None and header_sha is not None
+            and reuse_sha == header_sha and body is not None):
+        body = _strip_commit_subject(body)
+    if header is not None and body is not None:
+        args.message = f"{header}\n\n{body}"
+    elif header is not None:
+        args.message = header
+    else:
+        args.message = body
     try:
         from . import rerere as _rr
         _rr.scan_and_record(repo)
     except Exception:
         pass
+
+    # --short/--porcelain/--long/-z all imply --dry-run in C Git. Dry-run must not
+    # touch the index, so snapshot it before any staging and restore it after.
+    dry_mode = (args.dry_run or args.short or args.porcelain or args.long or args.nul)
+    idx_file = repo.gitdir / "index"
+    dry_snapshot = idx_file.read_bytes() if (dry_mode and idx_file.exists()) else None
 
     if args.all:
         workdir.add_paths(repo, sorted(workdir.tracked_paths(repo)))
@@ -2189,6 +2316,52 @@ def cmd_commit(argv: list[str]) -> int:
             _err(f"\t{p}")
         _err("hint: stage the resolved files with `pygit add` then commit again.")
         return 1
+
+    if dry_mode:
+        only = not args.all and not args.include and args.pathspec
+        if only:
+            workdir.add_paths(repo, args.pathspec)
+        s = workdir.status(repo)
+        hsym, hsha = refs_mod.read_head(repo)
+        br = hsym[len("refs/heads/"):] if hsym and hsym.startswith("refs/heads/") else None
+        ch, unt = _status_model(repo, s)
+        rnm = _status_staged_renames(repo, s)
+        if rnm:
+            consumed = {p for pair in rnm for p in pair}
+            ch = [(p, x, y) for p, x, y in ch if p not in consumed]
+        show_unt = args.untracked_files != "no"
+        had_untracked = bool(unt)
+        if not show_unt:
+            unt = []
+        if dry_snapshot is not None:
+            idx_file.write_bytes(dry_snapshot)
+        elif idx_file.exists():
+            idx_file.unlink()
+        staged = [p for p, x, y in ch if x != " "]
+        rc = 0 if (staged or rnm) else 1
+        # Format selection mirrors C Git: --long (or plain --dry-run) → long;
+        # --porcelain → porcelain v1; --short → short; bare -z → porcelain.
+        if args.porcelain or (args.nul and not args.short and not args.long):
+            fmt = "porcelain"
+        elif args.short:
+            fmt = "short"
+        else:
+            fmt = "long"
+        if fmt == "long":
+            _status_long(repo, s, ch, unt, br, hsym, hsha,
+                         untracked_hidden=(had_untracked and not show_unt),
+                         renames=rnm)
+            return rc
+        eol = "\0" if args.nul else "\n"
+        out = []
+        if args.branch:
+            out.append(_status_branch_header_short(repo, hsym, hsha))
+        entries = [(dst, f"R  {src} -> {dst}") for src, dst in rnm]
+        entries += [(p, f"{x}{y} {p}") for p, x, y in ch]
+        out += [line for _key, line in sorted(entries)]
+        out += [f"?? {p}" for p in unt]
+        sys.stdout.write("".join(line + eol for line in out))
+        return rc
 
     head_sym, parent = refs_mod.read_head(repo)
     # A pathspec (or -o/--only) makes a partial commit: HEAD's tree with just the
@@ -2231,7 +2404,16 @@ def cmd_commit(argv: list[str]) -> int:
             _err('error: empty commit message')
             return 1
         parents = [parent] if parent else []
-        author_sig = objs.build_signature(repo, "author", date_override=args.date)
+        # -C/-c reuse the source commit's author identity *and* date; --date
+        # overrides just the date, --author/--reset-author override identity below.
+        if reuse_author is not None and args.date is None:
+            author_sig = reuse_author
+        elif reuse_author is not None:
+            who, _ts, _tz = _split_ident(reuse_author)
+            fresh = objs.build_signature(repo, "author", date_override=args.date)
+            author_sig = who + fresh[fresh.rindex(">") + 1:]
+        else:
+            author_sig = objs.build_signature(repo, "author", date_override=args.date)
         message = args.message
         if parent and not args.allow_empty:
             _, pdata = objs.read_object(repo, parent)
@@ -2247,7 +2429,7 @@ def cmd_commit(argv: list[str]) -> int:
     if args.author is not None:
         base = objs.build_signature(repo, "author", date_override=args.date)
         author_sig = args.author + base[base.rindex(">") + 1:]
-    elif args.amend and args.reset_author:
+    elif args.reset_author:
         author_sig = objs.build_signature(repo, "author", date_override=args.date)
     # Message cleanup (default 'whitespace' for -m/-F; 'verbatim' keeps as-is),
     # then any --signoff / --trailer trailers.
@@ -2282,9 +2464,14 @@ def cmd_commit(argv: list[str]) -> int:
     c_who, c_ts, _ctz = _split_ident(committer_sig)
     if a_who != c_who:
         _print(f" Author: {a_who}")
-    # The author date is "interesting" (shown) when preserved on --amend or set
-    # via --date — not when freshly defaulted (normal commit / --reset-author).
-    date_interesting = (args.amend and not args.reset_author) or args.date is not None or a_ts != c_ts
+    # Mirrors C Git's author_date_is_interesting() == author_message || force_date:
+    # the " Date:" line shows when the author identity was reused from another
+    # commit (--amend / -C / -c) or set via --date, not on a fresh default and
+    # not when --reset-author discards the reused identity.
+    date_interesting = (
+        args.date is not None
+        or ((args.amend or reuse_author is not None) and not args.reset_author)
+    )
     if date_interesting:
         _print(f" Date: {_format_ident_date(author_sig)}")
     parent_tree = None

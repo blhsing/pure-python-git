@@ -123,6 +123,21 @@ RANGEDIFF = BASE + [
 # exercising commit's flag set (author/signoff/trailer/only/include/...).
 COMMITSTAGE = BASE + [("write", "a.txt", "alpha\nMOD\n"), ("write", "n.txt", "new\n"), ["add", "-A"]]
 
+# One staged new file on top of BASE, for commit message-source flags.
+CMSTAGE = BASE + [("write", "c.txt", "c\n"), ["add", "c.txt"]]
+# Staged + unstaged + untracked at once, for commit --dry-run output formats.
+CMMIX = BASE + [("write", "c.txt", "c\n"), ["add", "c.txt"],
+                ("write", "a.txt", "alpha-mod\n"), ("write", "u.txt", "u\n")]
+# Two distinct commits with multi-paragraph messages, for --squash <X> -C <Y>.
+CMTWO = [("write", "a.txt", "alpha\n"), ["add", "-A"],
+         ["commit", "-m", "tgt subject", "-m", "tgt body"],
+         ["commit", "--allow-empty", "-m", "reuse subj", "-m", "reuse body"],
+         ("write", "c.txt", "c\n"), ["add", "c.txt"]]
+# A multi-paragraph commit, for the same-commit --squash/-C subject-strip rule.
+CMML = [("write", "a.txt", "alpha\n"), ["add", "-A"],
+        ["commit", "-m", "P-subj", "-m", "P-body"],
+        ("write", "c.txt", "c\n"), ["add", "c.txt"]]
+
 # Tags on the base commit plus a tag on a diverged branch tip, for tag
 # --merged/--no-merged/--column listing filters.
 TAGREPO = BASE + [["tag", "v1"], ["tag", "v2"],
@@ -1134,6 +1149,64 @@ CASES: list[tuple] = [
      ["status", "--short"]),
     ("commit-amend-reset-author",
      BASE + [["commit", "--amend", "--reset-author", "--no-edit"]], ["log", "-1"]),
+    # commit --dry-run: long status of the worktree, never creates a commit.
+    ("commit-dry-run-staged", CMSTAGE, ["commit", "--dry-run"]),
+    ("commit-dry-run-clean", BASE, ["commit", "--dry-run"]),
+    ("commit-dry-run-unstaged", BASE + [("write", "a.txt", "x\n")], ["commit", "--dry-run"]),
+    ("commit-dry-run-all", BASE + [("write", "a.txt", "x\n")], ["commit", "--dry-run", "-a"]),
+    ("commit-dry-run-untracked", BASE + [("write", "u.txt", "u\n")], ["commit", "--dry-run"]),
+    ("commit-dry-run-pathspec",
+     BASE + [("write", "a.txt", "x\n"), ("write", "b.txt", "y\n")], ["commit", "--dry-run", "a.txt"]),
+    # commit --dry-run still doesn't commit when invoked next (proves no mutation).
+    ("commit-dry-run-then-status", CMSTAGE + [["commit", "--dry-run"]], ["status", "--short"]),
+    # commit dry-run output formats (each implies --dry-run, no commit created).
+    ("commit-short", CMMIX, ["commit", "--short"]),
+    ("commit-porcelain", CMMIX, ["commit", "--porcelain"]),
+    ("commit-long", CMMIX, ["commit", "--long"]),
+    ("commit-z", CMMIX, ["commit", "-z"]),
+    ("commit-null", CMMIX, ["commit", "--null"]),
+    ("commit-porcelain-branch", CMMIX, ["commit", "--porcelain", "--branch"]),
+    ("commit-short-branch", CMMIX, ["commit", "--short", "--branch"]),
+    ("commit-dry-run-short", CMMIX, ["commit", "--dry-run", "--short"]),
+    ("commit-short-uno", CMMIX, ["commit", "--short", "-uno"]),
+    ("commit-long-uno", CMMIX, ["commit", "--long", "-uno"]),
+    ("commit-short-ignores-m", CMMIX, ["commit", "--short", "-m", "x"]),
+    ("commit-porcelain-nothing-staged", BASE + [("write", "u.txt", "u\n")], ["commit", "--porcelain"]),
+    ("commit-short-clean", BASE, ["commit", "--short"]),
+    # message reuse: -C/-c reuse message (and author -> shows Date:); --reset-author resets.
+    ("commit-reuse-C", CMSTAGE, ["commit", "-C", "HEAD"]),
+    ("commit-reuse-C-reset-author", CMSTAGE, ["commit", "-C", "HEAD", "--reset-author"]),
+    ("commit-reedit-c", CMSTAGE, ["commit", "-c", "HEAD"]),
+    # autosquash headers.
+    ("commit-squash", CMSTAGE, ["commit", "--squash", "HEAD"]),
+    ("commit-fixup", CMSTAGE, ["commit", "--fixup", "HEAD"]),
+    ("commit-fixup-amend", CMSTAGE, ["commit", "--fixup=amend:HEAD"]),
+    ("commit-fixup-reword",
+     BASE + [["commit", "--allow-empty", "-m", "x"]], ["commit", "--allow-empty", "--fixup=reword:HEAD~1"]),
+    ("commit-squash-plus-m", CMSTAGE, ["commit", "--squash", "HEAD", "-m", "extra"]),
+    ("commit-fixup-plus-m", CMSTAGE, ["commit", "--fixup", "HEAD", "-m", "extra"]),
+    # --squash <X> -C <Y>: header from X, body+author from distinct Y.
+    ("commit-squash-reuse-distinct", CMTWO, ["commit", "--squash", "HEAD~1", "-C", "HEAD"]),
+    # same commit squashed and reused: the reused subject is dropped.
+    ("commit-squash-reuse-same", CMML, ["commit", "--squash", "HEAD", "-C", "HEAD"]),
+    # verify the constructed message bytes directly.
+    ("commit-squash-reuse-same-show",
+     CMML + [["commit", "--squash", "HEAD", "-C", "HEAD"]], ["show", "-s", "--format=%B"]),
+    # message-source conflicts: name order in the fatal must match C Git exactly.
+    ("commit-conflict-m-F", CMSTAGE + [("write", "m.txt", "x\n")], ["commit", "-m", "x", "-F", "m.txt"]),
+    ("commit-conflict-C-m", CMSTAGE, ["commit", "-C", "HEAD", "-m", "x"]),
+    ("commit-conflict-c-F", CMSTAGE + [("write", "m.txt", "x\n")], ["commit", "-c", "HEAD", "-F", "m.txt"]),
+    ("commit-conflict-C-c", CMSTAGE, ["commit", "-C", "HEAD", "-c", "HEAD"]),
+    ("commit-conflict-squash-fixup", CMSTAGE, ["commit", "--squash", "HEAD", "--fixup", "HEAD"]),
+    ("commit-conflict-fixup-C", CMSTAGE, ["commit", "--fixup", "HEAD", "-C", "HEAD"]),
+    ("commit-conflict-fixup-F", CMSTAGE + [("write", "m.txt", "x\n")], ["commit", "--fixup", "HEAD", "-F", "m.txt"]),
+    # --reset-author requires -C/-c/--amend.
+    ("commit-reset-author-alone", CMSTAGE, ["commit", "--reset-author", "-m", "x"]),
+    # accept-only flags commit normally.
+    ("commit-verify", CMSTAGE, ["commit", "--verify", "-m", "x"]),
+    ("commit-status-flag", CMMIX, ["commit", "--status", "-m", "x"]),
+    ("commit-ahead-behind", CMMIX, ["commit", "--ahead-behind", "-m", "x"]),
+    ("commit-branch-commits", CMMIX, ["commit", "--branch", "-m", "x"]),
     # log %N expands the commit note; checkout -q suppresses switch messages.
     ("log-fmt-note", BASE + [["notes", "add", "-m", "a note", "HEAD"]],
      ["log", "-1", "--format=[%N]"]),
@@ -1554,6 +1627,14 @@ CASES: list[tuple] = [
 
 
 CASES_WITH_STDIN: list[tuple] = [
+    # commit --pathspec-from-file: read the partial-commit pathspec from a file
+    # (here "-" reads the pathspec from stdin), message supplied via -F -.
+    ("commit-pathspec-from-file",
+     BASE + [("write", "a.txt", "x\n"), ("write", "b.txt", "y\n"), ("write", "specs", "a.txt\n")],
+     ["commit", "-F", "-", "--pathspec-from-file", "specs"], "msg\n"),
+    ("commit-pathspec-file-nul",
+     BASE + [("write", "a.txt", "x\n"), ("write", "b.txt", "y\n"), ("write", "specs", "a.txt\0b.txt")],
+     ["commit", "-F", "-", "--pathspec-from-file", "specs", "--pathspec-file-nul"], "msg\n"),
     ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
     ("cat-file-batch-check-fmt", BASE,
      ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], "HEAD\nHEAD:a.txt\n"),
