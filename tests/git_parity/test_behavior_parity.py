@@ -1415,6 +1415,10 @@ CASES: list[tuple] = [
     ("reset-pathspec-from-file",
      RESETBASE + [("write", "a.txt", "a-wt\n"), ("write", "specs", "a.txt\n")],
      ["reset", "HEAD~1", "--pathspec-from-file", "specs"]),
+    # reset -N: a file added in the last commit is re-marked intent-to-add.
+    ("reset-intent-to-add",
+     BASE + [("write", "new.txt", "n\n"), ["add", "-A"], ["commit", "-m", "c2"]],
+     ["reset", "-N", "HEAD~1"]),
     # show-branch display flags: -a, topo/date order, --current, --list,
     # --no-name/--sha1-name naming, --more extension, --topics filter, and the
     # --color=always per-column marker palette.

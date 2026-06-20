@@ -4791,6 +4791,7 @@ def cmd_reset(argv: list[str]) -> int:
     g.add_argument("--merge", action="store_true")
     g.add_argument("--keep", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-N", "--intent-to-add", dest="intent_to_add", action="store_true")
     ap.add_argument("--no-refresh", dest="no_refresh", action="store_true")
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
@@ -4888,13 +4889,34 @@ def cmd_reset(argv: list[str]) -> int:
         return 0
     # mixed (default): reset the index to the target, then report files whose
     # worktree content now differs from it (unless -q / --no-refresh).
+    old_paths = set(read_index(repo).by_path())
     workdir.read_tree(repo, tree)
+    if args.intent_to_add:
+        # -N: paths the reset dropped from the index but still in the worktree
+        # are re-added as intent-to-add.
+        idx2 = read_index(repo)
+        now = set(idx2.by_path())
+        empty = objs.write_object(repo, "blob", b"")
+        changed = False
+        for p in old_paths - now:
+            full = repo.path / p
+            if full.exists() or full.is_symlink():
+                from .index import IndexEntry
+                e = IndexEntry(mode=workdir._mode_for(full), sha=empty, path=p)
+                e.intent_to_add = True
+                idx2.upsert(e)
+                changed = True
+        if changed:
+            write_index(repo, idx2)
     if not args.quiet and not args.no_refresh:
         new_idx = read_index(repo).by_path()
         modified = []
         import stat as _st
         for p, entry in new_idx.items():
             full = repo.path / p
+            if entry.intent_to_add:
+                modified.append((p, "A"))
+                continue
             if not (full.exists() or full.is_symlink()):
                 modified.append((p, "D"))
                 continue
