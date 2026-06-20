@@ -7409,14 +7409,174 @@ def cmd_for_each_ref(argv: list[str]) -> int:
     return 0
 
 
+def _indent_text(s: str, indent: int, indent2: int) -> str:
+    """Port of utf8.c strbuf_add_indented_text (the width<=0 wrap fallback)."""
+    if indent < 0:
+        indent = 0
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        eol = s.find("\n", i)
+        eol = n if eol < 0 else eol + 1
+        out.append(" " * indent)
+        out.append(s[i:eol])
+        i = eol
+        indent = indent2
+    return "".join(out)
+
+
+def _wrap_text(s: str, indent1: int, indent2: int, width: int) -> str:
+    """Port of utf8.c strbuf_add_wrapped_text for ASCII text (1 col per byte)."""
+    if width <= 0:
+        return _indent_text(s, indent1, indent2)
+    out: list[str] = []
+    n = len(s)
+    text = bol = 0
+    w = indent = indent1
+    space: Optional[int] = None
+    if indent < 0:
+        w = -indent
+        space = 0
+    while True:
+        c = s[text] if text < n else "\0"
+        if c == "\0" or c.isspace():
+            new_line = False
+            if w <= width or space is None:
+                start = bol
+                if c == "\0" and text == start:
+                    break
+                if space is not None:
+                    start = space
+                else:
+                    out.append(" " * indent)
+                out.append(s[start:text])
+                if c == "\0":
+                    break
+                space = text
+                if c == "\t":
+                    w |= 0x07
+                    w += 1
+                    text += 1
+                elif c == "\n":
+                    space += 1
+                    nxt = s[space] if space < n else "\0"
+                    if nxt == "\n":
+                        out.append("\n")
+                        new_line = True
+                    elif not nxt.isalnum():
+                        new_line = True
+                    else:
+                        out.append(" ")
+                        w += 1
+                        text += 1
+                else:
+                    w += 1
+                    text += 1
+            else:
+                new_line = True
+            if new_line:
+                out.append("\n")
+                sp = s[space] if space is not None and space < n else "\0"
+                text = bol = space + (1 if sp.isspace() else 0)
+                space = None
+                w = indent = indent2
+            continue
+        w += 1
+        text += 1
+    return "".join(out)
+
+
+def _parse_wrap_args(arg: Optional[str]) -> Optional[tuple[int, int, int]]:
+    """Parse shortlog -w[<width>[,<i1>[,<i2>]]]; None on error (defaults 76,6,9)."""
+    defaults = (76, 6, 9)
+    if not arg:
+        return defaults
+    parts = arg.split(",")
+    vals = list(defaults)
+    for k in range(3):
+        if k < len(parts) and parts[k] != "":
+            try:
+                vals[k] = int(parts[k])
+            except ValueError:
+                return None
+    w, i1, i2 = vals
+    if w < 0 or i1 < 0 or i2 < 0:
+        return None
+    if w and ((i1 and w <= i1) or (i2 and w <= i2)):
+        return None
+    return (w, i1, i2)
+
+
+_SHORTLOG_STYLES = ("oneline", "short", "medium", "full", "fuller", "raw")
+
+
 def cmd_shortlog(argv: list[str]) -> int:
+    # -w, --pretty and --format take their argument only in the attached form
+    # (PARSE_OPT_OPTARG / "--opt=val"), never from a following token, which would
+    # otherwise be swallowed instead of being treated as the revision.
+    wrap_lines = False
+    wrap = (76, 6, 9)
+    pretty_spec: Optional[str] = None
+    format_spec: Optional[str] = None
+    rest: list[str] = []
+    for t in argv:
+        if t == "-w":
+            wrap_lines = True
+        elif t.startswith("-w") and not t.startswith("--") and len(t) > 2:
+            parsed = _parse_wrap_args(t[2:])
+            if parsed is None:
+                _err("error: -w[<width>[,<indent1>[,<indent2>]]]")
+                return 129
+            wrap_lines = True
+            wrap = parsed
+        elif t == "--pretty":
+            pretty_spec = "medium"
+        elif t.startswith("--pretty="):
+            pretty_spec = t[len("--pretty="):]
+        elif t.startswith("--format="):
+            format_spec = t[len("--format="):]
+        else:
+            rest.append(t)
+
     ap = argparse.ArgumentParser(prog="pygit shortlog", add_help=False)
     ap.add_argument("-n", "--numbered", action="store_true")
     ap.add_argument("-s", "--summary", action="store_true")
     ap.add_argument("-e", "--email", action="store_true")
+    ap.add_argument("-c", "--committer", action="store_true")
     ap.add_argument("rev", nargs="?", default="HEAD")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(rest)
     repo = _repo()
+
+    # Record format: only CMIT_FMT_USERFORMAT changes the per-commit record.
+    # The real builtin styles (oneline/short/medium/full/fuller/raw) fall back to
+    # the subject ("%s"); `reference` is itself a userformat; a bare word that is
+    # neither builtin nor a "%"/prefix format is rejected like C Git.
+    record_fmt: Optional[str] = None
+    record_date = "default"
+
+    def _resolve_fmt(val: str) -> Optional[str]:
+        nonlocal record_fmt, record_date
+        if val in _SHORTLOG_STYLES:
+            return None
+        if val == "reference":
+            record_fmt = "%h (%s, %ad)"
+            record_date = "short"
+            return None
+        if val.startswith(("format:", "tformat:")):
+            record_fmt = val.split(":", 1)[1]
+            return None
+        if "%" in val:
+            record_fmt = val
+            return None
+        return f"fatal: invalid --pretty format: {val}"
+
+    spec = format_spec if format_spec is not None else pretty_spec
+    if spec is not None:
+        err = _resolve_fmt(spec)
+        if err is not None:
+            _err(err)
+            return 128
+
     head = refs_mod.rev_parse(repo, args.rev)
     if not head:
         return 128
@@ -7432,11 +7592,15 @@ def cmd_shortlog(argv: list[str]) -> int:
             c = objs.parse_commit(objs.read_object(repo, s)[1])
         except KeyError:
             continue
-        who, _ts, _tz = _split_ident(c.author)
+        ident = c.committer if args.committer else c.author
+        who, _ts, _tz = _split_ident(ident)
         name, email = _parse_who(who)
-        author = f"{name} <{email}>" if args.email else name
-        first = c.message.splitlines()[0] if c.message.strip() else ""
-        by_author.setdefault(author, []).append(first)
+        key = f"{name} <{email}>" if args.email else name
+        if record_fmt is not None:
+            record = _expand_commit_format(repo, s, c, record_fmt, {}, date_mode=record_date)
+        else:
+            record = c.message.splitlines()[0].rstrip() if c.message.strip() else ""
+        by_author.setdefault(key, []).append(record if record else "<none>")
         stack.extend(c.parents)
     # git lists each author's commits oldest-first (we collected newest-first).
     for msgs in by_author.values():
@@ -7452,7 +7616,10 @@ def cmd_shortlog(argv: list[str]) -> int:
         else:
             _print(f"{author} ({len(msgs)}):")
             for m in msgs:
-                _print(f"      {m}")
+                if wrap_lines:
+                    sys.stdout.write(_wrap_text(m, wrap[1], wrap[2], wrap[0]) + "\n")
+                else:
+                    _print(f"      {m}")
             _print("")
     return 0
 

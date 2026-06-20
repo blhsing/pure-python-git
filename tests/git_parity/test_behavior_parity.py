@@ -145,6 +145,18 @@ SHOWREF = BASE + [["branch", "dev"], ["tag", "v1"], ["tag", "-a", "-m", "anno", 
 MKTREE = [("write", "h", "hello\n"), ["add", "-A"], ["commit", "-m", "h"]]
 HELLO_BLOB = "ce013625030ba8dba906f756967f9e9ca394464a"
 
+# Distinct authors (committer stays the pinned identity) plus a long subject,
+# for shortlog grouping (-c), record formats (--pretty/--format) and -w wrapping.
+SHORTLOG_MULTI = [
+    ("write", "a.txt", "1\n"), ["add", "-A"],
+    ["commit", "--author=Alice <alice@x>", "-m", "short one"],
+    ("write", "a.txt", "2\n"), ["add", "-A"],
+    ["commit", "--author=Bob <bob@y>", "-m",
+     "this is a considerably longer subject line that should wrap when width limited"],
+    ("write", "a.txt", "3\n"), ["add", "-A"],
+    ["commit", "--author=Alice <alice@x>", "-m", "second from alice"],
+]
+
 # Tags on the base commit plus a tag on a diverged branch tip, for tag
 # --merged/--no-merged/--column listing filters.
 TAGREPO = BASE + [["tag", "v1"], ["tag", "v2"],
@@ -1285,6 +1297,26 @@ CASES: list[tuple] = [
     ("shortlog-default", PATHHIST, ["shortlog", "HEAD"]),
     ("shortlog-email", PATHHIST, ["shortlog", "-e", "HEAD"]),
     ("shortlog-summary-email", PATHHIST, ["shortlog", "-se", "HEAD"]),
+    # -c groups by committer (the pinned identity) rather than the per-commit author.
+    ("shortlog-committer", SHORTLOG_MULTI, ["shortlog", "-c", "HEAD"]),
+    ("shortlog-committer-email", SHORTLOG_MULTI, ["shortlog", "-c", "-e", "HEAD"]),
+    ("shortlog-numbered", SHORTLOG_MULTI, ["shortlog", "-n", "HEAD"]),
+    # --format/--pretty change the per-commit record; named styles fall back to %s.
+    ("shortlog-format-h", SHORTLOG_MULTI, ["shortlog", "--format=%h", "HEAD"]),
+    ("shortlog-format-h-s", SHORTLOG_MULTI, ["shortlog", "--format=%h %s", "HEAD"]),
+    ("shortlog-format-prefix", SHORTLOG_MULTI, ["shortlog", "--format=format:%h", "HEAD"]),
+    ("shortlog-pretty-oneline", SHORTLOG_MULTI, ["shortlog", "--pretty=oneline", "HEAD"]),
+    ("shortlog-pretty-medium", SHORTLOG_MULTI, ["shortlog", "--pretty=medium", "HEAD"]),
+    ("shortlog-pretty-format", SHORTLOG_MULTI, ["shortlog", "--pretty=format:%h", "HEAD"]),
+    ("shortlog-pretty-reference", SHORTLOG_MULTI, ["shortlog", "--pretty=reference", "HEAD"]),
+    ("shortlog-pretty-bare", SHORTLOG_MULTI, ["shortlog", "--pretty", "HEAD"]),
+    ("shortlog-format-invalid", SHORTLOG_MULTI, ["shortlog", "--format=fixed", "HEAD"]),
+    ("shortlog-pretty-invalid", SHORTLOG_MULTI, ["shortlog", "--pretty=fixed", "HEAD"]),
+    # -w wraps each record line (width,indent1,indent2; 0 = no wrap, indent only).
+    ("shortlog-wrap", SHORTLOG_MULTI, ["shortlog", "-w", "HEAD"]),
+    ("shortlog-wrap-custom", SHORTLOG_MULTI, ["shortlog", "-w20,2,4", "HEAD"]),
+    ("shortlog-wrap-zero", SHORTLOG_MULTI, ["shortlog", "-w0", "HEAD"]),
+    ("shortlog-wrap-width-only", SHORTLOG_MULTI, ["shortlog", "-w40", "HEAD"]),
     # diff-tree -t emits changed tree (directory) nodes; without -r it lists
     # only the top-level changed entries.
     ("diff-tree-t", SUBTREE, ["diff-tree", "-t", "-r", "HEAD"]),
