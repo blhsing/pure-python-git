@@ -7642,72 +7642,310 @@ def _enumerate_refs(repo: Repository) -> list[tuple[str, str]]:
     return sorted(refs.items())
 
 
+def _clamp_abbrev(s: str) -> int:
+    """C Git's parse_opt_abbrev_cb: 0 stays 0 (full), else clamp to [4, 40]."""
+    try:
+        v = int(s)
+    except ValueError:
+        return 7
+    if v == 0:
+        return 0
+    return min(40, max(4, v))
+
+
+def _refname_is_safe(ref: str) -> bool:
+    """Port of refs.c refname_is_safe: refs/<normalized> or an all-uppercase /
+    underscore pseudo-ref (HEAD, MERGE_HEAD, ...)."""
+    if ref.startswith("refs/"):
+        rest = ref[len("refs/"):]
+        if not rest or rest.startswith("/") or rest.endswith("/"):
+            return False
+        return all(c and c not in (".", "..") for c in rest.split("/"))
+    return bool(ref) and all(c.isupper() or c == "_" for c in ref)
+
+
+def _check_refname_invalid(ref: str) -> bool:
+    """True when ref fails check_refname_format(ref, 0) (no one-level refs)."""
+    if not ref or ref == "@" or "@{" in ref or ".." in ref or "//" in ref:
+        return True
+    comps = ref.split("/")
+    if len(comps) < 2:
+        return True
+    bad = set("\\ ~^:?*[")
+    for c in comps:
+        if not c or c.startswith(".") or c.endswith(".lock") or c.endswith("."):
+            return True
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch in bad for ch in c):
+            return True
+    return False
+
+
+def _show_ref_exclude_existing(repo: Repository, pattern: Optional[str]) -> int:
+    """show-ref --exclude-existing: filter stdin refnames, emitting those that
+    are well-formed and absent from the local ref store (port of C Git)."""
+    existing = {name for name, _ in _enumerate_refs(repo)}
+    plen = len(pattern) if pattern else 0
+    for raw in sys.stdin:
+        line = raw[:-1] if raw.endswith("\n") else raw
+        if len(line) >= 3 and line.endswith("^{}"):
+            line = line[:-3]
+        ref = line
+        for i in range(len(line) - 1, -1, -1):
+            if line[i].isspace():
+                ref = line[i + 1:]
+                break
+        if pattern is not None and (len(ref) < plen or ref[:plen] != pattern):
+            continue
+        if _check_refname_invalid(ref):
+            _err(f"warning: ref '{ref}' ignored")
+            continue
+        if ref not in existing:
+            _print(line)
+    return 0
+
+
 def cmd_show_ref(argv: list[str]) -> int:
+    # -s/--hash, --abbrev and --exclude-existing take optional arguments only in
+    # the attached (=value) form — a following token is never consumed (C Git's
+    # PARSE_OPT_OPTARG). Pre-scan them so argparse's nargs="?" can't grab a token.
+    abbrev = 0  # 0 == full hash
+    hash_only = False
+    exclude_enabled = False
+    exclude_pattern: Optional[str] = None
+    rest: list[str] = []
+    for t in argv:
+        if t in ("-s", "--hash"):
+            hash_only = True
+        elif t.startswith("-s") and not t.startswith("--") and len(t) > 2:
+            hash_only = True
+            abbrev = _clamp_abbrev(t[2:])
+        elif t.startswith("--hash="):
+            hash_only = True
+            abbrev = _clamp_abbrev(t[len("--hash="):])
+        elif t == "--abbrev":
+            abbrev = 7
+        elif t.startswith("--abbrev="):
+            abbrev = _clamp_abbrev(t[len("--abbrev="):])
+        elif t == "--exclude-existing":
+            exclude_enabled = True
+        elif t.startswith("--exclude-existing="):
+            exclude_enabled = True
+            exclude_pattern = t[len("--exclude-existing="):]
+        else:
+            rest.append(t)
+
     ap = argparse.ArgumentParser(prog="pygit show-ref", add_help=False)
-    ap.add_argument("--head", action="store_true")
+    ap.add_argument("-h", "--head", dest="head", action="store_true")
     ap.add_argument("--tags", action="store_true")
-    ap.add_argument("--heads", action="store_true")
+    ap.add_argument("--heads", dest="branches", action="store_true")
+    ap.add_argument("--branches", dest="branches", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--exists", action="store_true")
     ap.add_argument("-d", "--dereference", action="store_true")
-    ap.add_argument("-s", "--hash", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("patterns", nargs="*")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(rest)
     repo = _repo()
 
-    def show(sha: str, refname: str) -> None:
-        if args.hash:
-            _print(sha)
-        else:
-            _print(f"{sha} {refname}")
+    def _abbr(s: str) -> str:
+        return s if abbrev == 0 else s[:abbrev]
+
+    def show_one(sha: str, name: str) -> None:
+        if args.quiet:
+            return
+        _print(_abbr(sha) if hash_only else f"{_abbr(sha)} {name}")
+        if args.dereference:
+            try:
+                if objs.read_object(repo, sha)[0] == "tag":
+                    peeled = refs_mod.rev_parse(repo, name + "^{}")
+                    if peeled:
+                        _print(f"{_abbr(peeled)} {name}^{{}}" if not hash_only else _abbr(peeled))
+            except (KeyError, ValueError):
+                pass
+
+    if exclude_enabled:
+        return _show_ref_exclude_existing(repo, exclude_pattern)
 
     if args.verify:
-        printed = 0
-        for pat in args.patterns:
-            sha = refs_mod.read_ref(repo, pat) if pat.startswith("refs/") or pat == "HEAD" else None
-            if sha is None:
-                _err(f"fatal: '{pat}' - not a valid ref")
+        if not args.patterns:
+            _err("fatal: --verify requires a reference")
+            return 128
+        for ref in args.patterns:
+            sha = (refs_mod.read_ref(repo, ref)
+                   if (ref.startswith("refs/") or _refname_is_safe(ref)) else None)
+            if sha is not None:
+                show_one(sha, ref)
+            elif not args.quiet:
+                _err(f"fatal: '{ref}' - not a valid ref")
                 return 128
-            show(sha, pat)
-            printed += 1
-        return 0 if printed else 1
+            else:
+                return 1
+        return 0
+
+    if args.exists:
+        if not args.patterns:
+            _err("fatal: --exists requires a reference")
+            return 128
+        if len(args.patterns) > 1:
+            _err("fatal: --exists requires exactly one reference")
+            return 128
+        ref = args.patterns[0]
+        if (repo.gitdir / ref).is_file() or ref in refs_mod.read_packed_refs(repo):
+            return 0
+        _err("error: reference does not exist")
+        return 2
 
     def matches(refname: str) -> bool:
         if not args.patterns:
             return True
-        return any(refname == pat or refname.endswith("/" + pat) for pat in args.patterns)
+        for m in args.patterns:
+            if len(m) > len(refname):
+                continue
+            if refname[len(refname) - len(m):] != m:
+                continue
+            if len(m) == len(refname) or refname[len(refname) - len(m) - 1] == "/":
+                return True
+        return False
 
-    printed = 0
+    if args.branches or args.tags:
+        refs_iter: list[tuple[str, str]] = []
+        if args.branches:
+            refs_iter += sorted((n, s) for n, s in _enumerate_refs(repo)
+                                if n.startswith("refs/heads/"))
+        if args.tags:
+            refs_iter += sorted((n, s) for n, s in _enumerate_refs(repo)
+                                if n.startswith("refs/tags/"))
+    else:
+        refs_iter = sorted(_enumerate_refs(repo))
+
+    found = 0
     if args.head:
         _, headsha = refs_mod.read_head(repo)
         if headsha:
-            show(headsha, "HEAD")
-            printed += 1
-    for refname, sha in _enumerate_refs(repo):
-        if args.heads and not refname.startswith("refs/heads/"):
-            continue
-        if args.tags and not refname.startswith("refs/tags/"):
-            continue
+            show_one(headsha, "HEAD")
+            found += 1
+    for refname, sha in refs_iter:
         if not matches(refname):
             continue
-        show(sha, refname)
-        printed += 1
-    return 0 if printed else 1
+        show_one(sha, refname)
+        found += 1
+    return 0 if found else 1
+
+
+def _unquote_c_style(s: str) -> str:
+    """Decode a C-quoted path (`"..."`) as git's unquote_c_style does."""
+    if not (len(s) >= 2 and s[0] == '"'):
+        return s
+    simple = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
+              '"': 34, "\\": 92}
+    out = bytearray()
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            return out.decode("utf-8", "replace")
+        if c == "\\":
+            i += 1
+            if i >= len(s):
+                raise ValueError("invalid quoting")
+            n = s[i]
+            if n in simple:
+                out.append(simple[n]); i += 1
+            elif n in "01234567":
+                val = j = 0
+                while j < 3 and i + j < len(s) and s[i + j] in "01234567":
+                    val = val * 8 + int(s[i + j]); j += 1
+                out.append(val & 0xFF); i += j
+            else:
+                raise ValueError("invalid quoting")
+        else:
+            out.append(ord(c)); i += 1
+    raise ValueError("invalid quoting")
 
 
 def cmd_mktree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit mktree")
-    ap.parse_args(argv)
+    ap = argparse.ArgumentParser(prog="pygit mktree", add_help=False)
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("--missing", dest="allow_missing", action="store_true")
+    ap.add_argument("--batch", dest="batch", action="store_true")
+    args = ap.parse_args(argv)
     repo = _repo()
-    entries: list[objs.TreeEntry] = []
-    for line in sys.stdin.read().splitlines():
-        if not line.strip():
-            continue
-        head, _, name = line.partition("\t")
-        mode, _, rest = head.partition(" ")
-        obj_t, _, sha = rest.partition(" ")
-        entries.append(objs.TreeEntry(mode.lstrip("0") or "0", name, sha))
-    sha = objs.write_object(repo, "tree", objs.encode_tree(entries))
-    _print(sha)
+
+    def parse_line(line: str, entries: list) -> Optional[str]:
+        # Non-recursive ls-tree format: "mode SP type SP sha TAB name".
+        mode_s, sp, rest = line.partition(" ")
+        if not sp:
+            return f"input format error: {line}"
+        try:
+            mode = int(mode_s, 8)
+        except ValueError:
+            return f"input format error: {line}"
+        type_s, sp2, rest2 = rest.partition(" ")
+        sha, tab, name = rest2.partition("\t")
+        if not sp2 or not tab:
+            return f"input format error: {line}"
+        if len(sha) != repo.hex_len or any(c not in "0123456789abcdefABCDEF" for c in sha):
+            return f"input format error: {line}"
+        sha = sha.lower()
+        if not args.nul and name.startswith('"'):
+            try:
+                name = _unquote_c_style(name)
+            except ValueError:
+                return "invalid quoting"
+        if type_s not in ("blob", "tree", "commit", "tag"):
+            return f'invalid object type "{type_s}"'
+        fmt = mode & 0o170000
+        mode_type = "tree" if fmt == 0o040000 else ("commit" if mode == 0o160000 else "blob")
+        if mode_type != type_s:
+            return (f"entry '{name}' object type ({type_s}) doesn't match "
+                    f"mode type ({mode_type})")
+        # Submodule (gitlink) commits are normally absent, so treat as missing-ok.
+        allow_missing = args.allow_missing or mode == 0o160000
+        try:
+            actual_type = objs.read_object(repo, sha)[0]
+        except (KeyError, ValueError, FileNotFoundError):
+            actual_type = None
+        if actual_type is None:
+            if not allow_missing:
+                return f"entry '{name}' object {sha} is unavailable"
+        elif actual_type != mode_type:
+            return (f"entry '{name}' object {sha} is a {actual_type} "
+                    f"but specified type was ({mode_type})")
+        entries.append(objs.TreeEntry(format(mode, "o"), name, sha))
+        return None
+
+    sep = "\0" if args.nul else "\n"
+    parts = sys.stdin.buffer.read().decode("utf-8", "replace").split(sep)
+    if parts and parts[-1] == "":
+        parts.pop()  # trailing terminator is EOF, not an empty line
+
+    out: list[str] = []
+    entries: list = []
+    idx, n = 0, len(parts)
+    while True:
+        hit_eof = True
+        while idx < n:
+            line = parts[idx]
+            idx += 1
+            if line == "":
+                if args.batch:
+                    hit_eof = False
+                    break
+                _err("fatal: input format error: (blank line only valid in batch mode)")
+                return 128
+            err = parse_line(line, entries)
+            if err is not None:
+                _err(f"fatal: {err}")
+                return 128
+        # In batch mode a trailing newline after the last entry yields no final
+        # (empty) tree; otherwise write the accumulated entries.
+        if not (args.batch and hit_eof and not entries):
+            out.append(objs.write_object(repo, "tree", objs.encode_tree(entries)))
+        entries = []
+        if hit_eof:
+            break
+    for o in out:
+        _print(o)
     return 0
 
 

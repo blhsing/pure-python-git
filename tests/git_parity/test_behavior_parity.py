@@ -138,6 +138,13 @@ CMML = [("write", "a.txt", "alpha\n"), ["add", "-A"],
         ["commit", "-m", "P-subj", "-m", "P-body"],
         ("write", "c.txt", "c\n"), ["add", "c.txt"]]
 
+# A branch, a lightweight tag and an annotated tag, for show-ref flag coverage.
+SHOWREF = BASE + [["branch", "dev"], ["tag", "v1"], ["tag", "-a", "-m", "anno", "v2"]]
+
+# A committed "hello\n" blob (content-addressed sha, env-independent) for mktree.
+MKTREE = [("write", "h", "hello\n"), ["add", "-A"], ["commit", "-m", "h"]]
+HELLO_BLOB = "ce013625030ba8dba906f756967f9e9ca394464a"
+
 # Tags on the base commit plus a tag on a diverged branch tip, for tag
 # --merged/--no-merged/--column listing filters.
 TAGREPO = BASE + [["tag", "v1"], ["tag", "v2"],
@@ -273,6 +280,41 @@ CASES: list[tuple] = [
     ("showref-head", BASE, ["show-ref", "--head"]),
     ("showref-heads", BASE + [["branch", "feature"]], ["show-ref", "--heads"]),
     ("showref-nomatch", BASE, ["show-ref", "zzz"]),
+    # show-ref --abbrev (=N clamps to [4,40]; 0 means full; a token is a pattern).
+    ("showref-abbrev", SHOWREF, ["show-ref", "--abbrev"]),
+    ("showref-abbrev-8", SHOWREF, ["show-ref", "--abbrev=8", "--heads"]),
+    ("showref-abbrev-0", SHOWREF, ["show-ref", "--abbrev=0", "--heads"]),
+    ("showref-abbrev-clamp-lo", SHOWREF, ["show-ref", "--abbrev=2", "--heads"]),
+    ("showref-abbrev-clamp-hi", SHOWREF, ["show-ref", "--abbrev=100", "--heads"]),
+    ("showref-abbrev-token-pattern", SHOWREF, ["show-ref", "--abbrev", "8"]),
+    # --branches is the 2.54 name for --heads; both can combine with --tags.
+    ("showref-branches", SHOWREF, ["show-ref", "--branches"]),
+    ("showref-branches-tags", SHOWREF, ["show-ref", "--branches", "--tags"]),
+    ("showref-tags", SHOWREF, ["show-ref", "--tags"]),
+    # -d dereferences annotated tags into a trailing ^{} line.
+    ("showref-deref", SHOWREF, ["show-ref", "-d"]),
+    ("showref-deref-tags", SHOWREF, ["show-ref", "-d", "--tags"]),
+    # -s/--hash (with optional attached <n>); -q sets only the exit code.
+    ("showref-hash", SHOWREF, ["show-ref", "-s"]),
+    ("showref-hash-n", SHOWREF, ["show-ref", "-s8", "--heads"]),
+    ("showref-quiet-hit", SHOWREF, ["show-ref", "-q", "refs/heads/main"]),
+    ("showref-quiet-miss", SHOWREF, ["show-ref", "-q", "refs/heads/nope"]),
+    ("showref-pattern-tail", SHOWREF, ["show-ref", "heads/main"]),
+    # --verify: exact ref path (refs/* or a safe pseudo-ref like HEAD).
+    ("showref-verify-ok", SHOWREF, ["show-ref", "--verify", "refs/heads/main"]),
+    ("showref-verify-head", SHOWREF, ["show-ref", "--verify", "HEAD"]),
+    ("showref-verify-bad", SHOWREF, ["show-ref", "--verify", "main"]),
+    ("showref-verify-missing", SHOWREF, ["show-ref", "--verify", "refs/heads/nope"]),
+    ("showref-verify-none", SHOWREF, ["show-ref", "--verify"]),
+    ("showref-verify-quiet-miss", SHOWREF, ["show-ref", "-q", "--verify", "refs/heads/nope"]),
+    ("showref-verify-deref", SHOWREF, ["show-ref", "--verify", "-d", "refs/tags/v2"]),
+    # --exists: literal existence check (rc 0 / 2, never resolves/DWIMs).
+    ("showref-exists-ok", SHOWREF, ["show-ref", "--exists", "refs/heads/main"]),
+    ("showref-exists-head", SHOWREF, ["show-ref", "--exists", "HEAD"]),
+    ("showref-exists-miss", SHOWREF, ["show-ref", "--exists", "refs/heads/nope"]),
+    ("showref-exists-not-full", SHOWREF, ["show-ref", "--exists", "main"]),
+    ("showref-exists-none", SHOWREF, ["show-ref", "--exists"]),
+    ("showref-exists-two", SHOWREF, ["show-ref", "--exists", "refs/heads/main", "refs/heads/dev"]),
     # status
     ("status-clean-long", BASE, ["status"]),
     ("status-clean-porcelain", BASE, ["status", "--porcelain"]),
@@ -1635,6 +1677,32 @@ CASES_WITH_STDIN: list[tuple] = [
     ("commit-pathspec-file-nul",
      BASE + [("write", "a.txt", "x\n"), ("write", "b.txt", "y\n"), ("write", "specs", "a.txt\0b.txt")],
      ["commit", "-F", "-", "--pathspec-from-file", "specs", "--pathspec-file-nul"], "msg\n"),
+    # show-ref --exclude-existing filters stdin refnames (strip ^{}, warn on
+    # ill-formed, drop existing, optional prefix pattern).
+    ("showref-exclude-existing", SHOWREF, ["show-ref", "--exclude-existing"],
+     "refs/heads/main\nrefs/heads/zzz\nfoo\n"),
+    ("showref-exclude-caret", SHOWREF, ["show-ref", "--exclude-existing"],
+     "refs/tags/zzz^{}\nrefs/tags/v1\n"),
+    ("showref-exclude-pattern", SHOWREF, ["show-ref", "--exclude-existing=refs/tags/"],
+     "refs/tags/v1\nrefs/tags/new\nrefs/heads/main\n"),
+    # mktree builds a tree from ls-tree-format stdin (mode stored verbatim as %o,
+    # type/availability checked, --missing/--batch/-z, empty input -> empty tree).
+    ("mktree-std", MKTREE, ["mktree"], f"100644 blob {HELLO_BLOB}\ta\n"),
+    ("mktree-noncanon-mode", MKTREE, ["mktree"], f"100664 blob {HELLO_BLOB}\ta\n"),
+    ("mktree-exec", MKTREE, ["mktree"], f"100755 blob {HELLO_BLOB}\ta\n"),
+    ("mktree-leading-zero", MKTREE, ["mktree"], f"0100644 blob {HELLO_BLOB}\ta\n"),
+    ("mktree-empty", MKTREE, ["mktree"], ""),
+    ("mktree-type-mismatch", MKTREE, ["mktree"], f"040000 tree {HELLO_BLOB}\tsub\n"),
+    ("mktree-missing", MKTREE, ["mktree"], f"100644 blob {'0' * 40}\tx\n"),
+    ("mktree-missing-ok", MKTREE, ["mktree", "--missing"], f"100644 blob {'0' * 40}\tx\n"),
+    ("mktree-invalid-type", MKTREE, ["mktree"], f"100644 xyz {HELLO_BLOB}\ta\n"),
+    ("mktree-bad-format", MKTREE, ["mktree"], "garbage line\n"),
+    ("mktree-batch", MKTREE, ["mktree", "--batch"],
+     f"100644 blob {HELLO_BLOB}\ta\n\n100644 blob {HELLO_BLOB}\tb\n"),
+    ("mktree-batch-trailing-nl", MKTREE, ["mktree", "--batch"],
+     f"100644 blob {HELLO_BLOB}\ta\n\n"),
+    ("mktree-blank-nonbatch", MKTREE, ["mktree"], f"100644 blob {HELLO_BLOB}\ta\n\n"),
+    ("mktree-z", MKTREE, ["mktree", "-z"], f"100644 blob {HELLO_BLOB}\ta\0"),
     ("cat-file-batch-check", BASE, ["cat-file", "--batch-check"], "HEAD\n"),
     ("cat-file-batch-check-fmt", BASE,
      ["cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], "HEAD\nHEAD:a.txt\n"),
