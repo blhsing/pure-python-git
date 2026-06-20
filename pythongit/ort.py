@@ -9,7 +9,7 @@ index stages) is byte-for-byte identical to ``git merge-tree --write-tree``.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from . import mergeort
@@ -25,6 +25,7 @@ class OrtResult:
     tree: str
     conflicts: list[str]
     conflict_index: Optional[Index]
+    auto_merged: list[str] = field(default_factory=list)
 
 
 def _peel_to_tree(repo: Repository, rev: str) -> str:
@@ -155,7 +156,7 @@ def _ort_result(repo: Repository, tree: str, opt) -> OrtResult:
     stages = mergeort.conflicted_stages(opt)
     conflicts = sorted({path for path, _stage, _mode, _sha in stages})
     conflict_index = _result_index(repo, tree, stages) if stages else None
-    return OrtResult(tree, conflicts, conflict_index)
+    return OrtResult(tree, conflicts, conflict_index, list(opt.auto_merged))
 
 
 def merge_tree(
@@ -192,6 +193,7 @@ def merge_commits(
     *,
     cfg: "Optional[mergeort.MergeConfig]" = None,
     allow_unrelated: bool = True,
+    favor: int = 0,
 ) -> OrtResult:
     """Recursive (virtual-merge-base) merge of two commits, mirroring
     ``git merge-tree --write-tree <ours> <theirs>`` (no --merge-base): all
@@ -207,6 +209,9 @@ def merge_commits(
                      else objs.hash_bytes("tree", b"", repo)[0])
         cfg = _build_config(repo, base_tree, _peel_to_tree(repo, ours_sha),
                             _peel_to_tree(repo, theirs_sha))
+    if favor:
+        # -X ours/theirs: auto-resolve textual conflicts toward one side.
+        cfg.variant = favor
     tree, _clean, opt = mergeort.merge_recursive(
         repo, ours_sha, theirs_sha, branch1=ours, branch2=theirs,
         merge_bases=bases, cfg=cfg)

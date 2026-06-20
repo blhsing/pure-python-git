@@ -34,7 +34,7 @@ def _default_merge_message(repo: Repository, other_rev: str, head_sym: Optional[
 
 
 def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
-          allow_ff: bool = True, no_ff: bool = False) -> tuple[str, list[str]]:
+          allow_ff: bool = True, no_ff: bool = False, favor: int = 0) -> tuple[str, list[str]]:
     """Return (result_sha, conflicts). result_sha is "" on conflicts."""
     head_sym, head = refs_mod.read_head(repo)
     if not head:
@@ -67,10 +67,11 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
     # virtual ancestor), matching `git merge`.
     from . import ort as ort_mod
     from .sequencer import _note_rerere_conflicts
-    ort_result = ort_mod.merge_commits(repo, "HEAD", other_rev)
+    ort_result = ort_mod.merge_commits(repo, "HEAD", other_rev, favor=favor)
     new_tree = ort_result.tree
     conflicts = ort_result.conflicts
     conflict_idx = ort_result.conflict_index
+    auto_merged = ort_result.auto_merged
     if conflicts:
         _note_rerere_conflicts(repo, new_tree, conflicts)
     workdir.checkout_tree(repo, new_tree)
@@ -80,7 +81,7 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
             write_index(repo, conflict_idx)
         (repo.gitdir / "MERGE_HEAD").write_text(other + "\n", encoding="utf-8")
         (repo.gitdir / "MERGE_MSG").write_text(message or f"Merge: {other_rev}\n", encoding="utf-8")
-        return "", conflicts
+        return "", conflicts, auto_merged
 
     msg = message or _default_merge_message(repo, other_rev, head_sym)
     author_sig = objs.build_signature(repo, "author")
@@ -92,4 +93,4 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
         refs_mod.update_ref(repo, head_sym, sha, message=f"merge {other_rev}: Merge made by the 'ort' strategy.")
     else:
         refs_mod.set_head(repo, sha)
-    return sha, []
+    return sha, [], auto_merged

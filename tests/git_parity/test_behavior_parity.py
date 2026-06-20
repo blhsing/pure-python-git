@@ -176,6 +176,22 @@ LSIGNORE = [("write", "a.txt", "a\n"), ("write", ".gitignore", "*.log\n"), ["add
 ADDSETUP = [("write", "a.txt", "a\n"), ("write", "b.txt", "b\n"), ["add", "-A"],
             ["commit", "-m", "c1"],
             ("write", "a.txt", "MOD\n"), ("rm", "b.txt"), ("write", "c.txt", "NEW\n")]
+# Diverged branches (feat adds g.txt, main adds h.txt) with no overlap, for
+# clean non-ff merge flag coverage.
+MERGEDIV = [("write", "f.txt", "base\n"), ["add", "-A"], ["commit", "-m", "c1"],
+            ["checkout", "-b", "feat"], ("write", "g.txt", "feat\n"), ["add", "-A"], ["commit", "-m", "fc1"],
+            ["checkout", "main"], ("write", "h.txt", "main\n"), ["add", "-A"], ["commit", "-m", "mc1"]]
+# Both branches edit the same file in conflicting regions, for merge conflicts
+# and -X ours/theirs.
+MERGECONF = [("write", "f.txt", "l1\nl2\nl3\n"), ["add", "-A"], ["commit", "-m", "c1"],
+             ["checkout", "-b", "feat"], ("write", "f.txt", "l1\nFEAT\nl3\n"), ["add", "-A"], ["commit", "-m", "fc1"],
+             ["checkout", "main"], ("write", "f.txt", "MAIN\nl2\nl3\n"), ["add", "-A"], ["commit", "-m", "mc1"]]
+# Both branches edit the same file in non-overlapping regions (clean content
+# merge → the "Auto-merging" notice without a conflict).
+MERGEBOTH = [("write", "f.txt", "l1\nl2\nl3\nl4\nl5\n"), ["add", "-A"], ["commit", "-m", "c1"],
+             ["checkout", "-b", "feat"], ("write", "f.txt", "TOP\nl2\nl3\nl4\nl5\n"), ["add", "-A"], ["commit", "-m", "fc1"],
+             ["checkout", "main"], ("write", "f.txt", "l1\nl2\nl3\nl4\nBOT\n"), ["add", "-A"], ["commit", "-m", "mc1"]]
+
 # Two commits where the second changes only a.txt (b.txt unchanged across
 # HEAD~1..HEAD), for reset --merge/--keep/--mixed semantics.
 RESETBASE = [("write", "a.txt", "a1\n"), ("write", "b.txt", "b1\n"), ["add", "-A"],
@@ -1366,6 +1382,20 @@ CASES: list[tuple] = [
     ("sb-color", SB_THREE, ["show-branch", "--color=always"]),
     ("sb-color-explicit", SB_FORK, ["show-branch", "--color=always", "main", "feat"]),
     ("sb-no-color", SB_THREE, ["show-branch", "--no-color"]),
+    # merge flags: -n (no diffstat), -s strategy (name echoed; ours; unknown
+    # error), --no-verify, -X ours/theirs conflict resolution, the "Auto-merging"
+    # notice, and -F file-read error.
+    ("merge-n", MERGEDIV, ["merge", "-n", "--no-ff", "-m", "m", "feat"]),
+    ("merge-stat", MERGEDIV, ["merge", "--stat", "--no-ff", "-m", "m", "feat"]),
+    ("merge-s-recursive", MERGEDIV, ["merge", "-s", "recursive", "--no-ff", "-m", "m", "feat"]),
+    ("merge-s-ours", MERGEDIV, ["merge", "-s", "ours", "-m", "m", "feat"]),
+    ("merge-s-bogus", MERGEDIV, ["merge", "-s", "bogus", "-m", "m", "feat"]),
+    ("merge-no-verify", MERGEDIV, ["merge", "--no-verify", "--no-ff", "-m", "m", "feat"]),
+    ("merge-auto-merging", MERGEBOTH, ["merge", "--no-ff", "-m", "m", "feat"]),
+    ("merge-X-ours", MERGECONF, ["merge", "-X", "ours", "--no-ff", "-m", "m", "feat"]),
+    ("merge-X-theirs", MERGECONF, ["merge", "-X", "theirs", "--no-ff", "-m", "m", "feat"]),
+    ("merge-conflict", MERGECONF, ["merge", "--no-ff", "-m", "m", "feat"]),
+    ("merge-F-bad", MERGEDIV, ["merge", "-F", "nope.txt", "--no-ff", "feat"]),
 ]
 
 

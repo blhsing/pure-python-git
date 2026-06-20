@@ -154,6 +154,9 @@ class Opt:
         self.paths: dict[str, CI] = {}
         self.conflicted: dict[str, CI] = {}
         self.call_depth = 0
+        # Paths that underwent a top-level 3-way content merge (git's
+        # "Auto-merging <path>" message), recorded in processing order.
+        self.auto_merged: list[str] = []
         self.null_oid = "0" * (repo.hash_len * 2)
         self._tree_cache: dict[str, dict] = {}
         self.rename_limit = rename_limit
@@ -573,6 +576,8 @@ def handle_content_merge(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
     elif b.oid == o.oid:
         result.oid = a.oid
     elif s_isreg(a.mode):
+        if not opt.call_depth:
+            opt.auto_merged.append(path)
         merged, status = merge_3way(opt, path, o, a, b, pathnames, extra_marker_size)
         result.oid = objs.write_object(opt.repo, "blob", merged)
         clean = clean & (1 if status == 0 else 0)

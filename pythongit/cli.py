@@ -5488,10 +5488,43 @@ def cmd_merge(argv: list[str]) -> int:
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-m", "--message", default=None)
+    ap.add_argument("-F", "--file", default=None)
+    ap.add_argument("-n", dest="no_stat", action="store_true")
+    ap.add_argument("--stat", dest="stat", action="store_true")
+    ap.add_argument("-e", "--edit", action="store_true")
+    ap.add_argument("--no-edit", dest="no_edit", action="store_true")
+    ap.add_argument("-s", "--strategy", default=None)
+    ap.add_argument("-X", "--strategy-option", dest="strategy_option", action="append", default=None)
+    ap.add_argument("-S", "--gpg-sign", dest="gpg_sign", nargs="?", const="", default=None)
+    ap.add_argument("--no-verify", dest="no_verify", action="store_true")
+    ap.add_argument("--verify", action="store_true")
     ap.add_argument("other", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
     from . import merge as _m
+
+    # Resolve the merge strategy (default ort; recursive is its alias) and
+    # -X ours/theirs favor. Unknown strategies fail exactly like C Git.
+    strategy = args.strategy or "ort"
+    if strategy not in ("ort", "recursive", "ours"):
+        _err(f"Could not find merge strategy '{strategy}'.")
+        _err("Available strategies are: octopus ours recursive resolve subtree.")
+        return 1
+    favor = 0
+    for opt in (args.strategy_option or []):
+        if opt == "ours":
+            favor = 1
+        elif opt == "theirs":
+            favor = 2
+    if args.file is not None:
+        if args.file == "-":
+            args.message = sys.stdin.read()
+        else:
+            try:
+                args.message = open(args.file, encoding="utf-8").read()
+            except OSError:
+                _err(f"error: could not read file '{args.file}'")
+                return 129
 
     if args.abort:
         if not (repo.gitdir / "MERGE_HEAD").exists():
@@ -5525,6 +5558,24 @@ def cmd_merge(argv: list[str]) -> int:
     old_tree = objs.parse_commit(objs.read_object(repo, head_sha)[1]).tree
     new_tree = objs.parse_commit(objs.read_object(repo, other_sha)[1]).tree
 
+    # -s ours: keep our tree entirely, recording other as a second parent.
+    if strategy == "ours":
+        message = args.message or ""
+        if not message.endswith("\n"):
+            message += "\n"
+        author = objs.build_signature(repo, "author")
+        committer = objs.build_signature(repo, "committer")
+        c = objs.Commit(tree=old_tree, parents=[head_sha, other_sha],
+                        author=author, committer=committer, message=message)
+        sha = objs.write_object(repo, "commit", c.encode())
+        if head_sym:
+            refs_mod.update_ref(repo, head_sym, sha, message=f"merge {args.other}: Merge made by the 'ours' strategy.")
+        else:
+            refs_mod.set_head(repo, sha)
+        if not args.quiet:
+            _print("Merge made by the 'ours' strategy.")
+        return 0
+
     if bases == [head_sha] and not args.no_ff:
         # Fast-forward.
         if not args.quiet:
@@ -5536,7 +5587,7 @@ def cmd_merge(argv: list[str]) -> int:
         else:
             refs_mod.set_head(repo, other_sha)
         workdir.checkout_tree(repo, new_tree)
-        if not args.quiet:
+        if not args.quiet and not args.no_stat:
             _emit_diffstat_summary(_tree_changes(repo, old_tree, new_tree))
         return 0
 
@@ -5546,19 +5597,26 @@ def cmd_merge(argv: list[str]) -> int:
 
     from . import porcelain_merge as pm
     try:
-        sha, conflicts = pm.merge(repo, args.other, message=args.message, no_ff=args.no_ff)
+        sha, conflicts, auto_merged = pm.merge(repo, args.other, message=args.message,
+                                               no_ff=args.no_ff, favor=favor)
     except RuntimeError as e:
         _err(f"fatal: {e}")
         return 1
+    # "Auto-merging <path>" precedes both the conflict notices and the summary.
+    if not args.quiet:
+        for p in auto_merged:
+            _print(f"Auto-merging {p}")
     if conflicts:
         for p in conflicts:
             _print(f"CONFLICT (content): Merge conflict in {p}")
-        _err("Automatic merge failed; fix conflicts and then commit the result.")
+        # C Git prints this summary to stdout (not stderr).
+        _print("Automatic merge failed; fix conflicts and then commit the result.")
         return 1
     if not args.quiet:
-        _print("Merge made by the 'ort' strategy.")
-        merged_tree = objs.parse_commit(objs.read_object(repo, sha)[1]).tree
-        _emit_diffstat_summary(_tree_changes(repo, old_tree, merged_tree))
+        _print(f"Merge made by the '{strategy}' strategy.")
+        if not args.no_stat:
+            merged_tree = objs.parse_commit(objs.read_object(repo, sha)[1]).tree
+            _emit_diffstat_summary(_tree_changes(repo, old_tree, merged_tree))
     return 0
 
 
