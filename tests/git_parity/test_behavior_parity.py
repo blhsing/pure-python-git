@@ -2629,3 +2629,246 @@ BATCH6_STASH_CASES = [
 def test_batch6_stash_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+BATCH7_CASES = [
+    ('apply-p2-strip', [('write', 'sub/g.txt', 'a\nb\nc\n'), ('write', 'g.txt', 'a\nb\nc\n'), ['add', '.'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/sub/g.txt b/sub/g.txt\nindex de98044..7be73ce 100644\n--- a/sub/g.txt\n+++ b/sub/g.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n')], ['apply', '-p2', 'P.diff']),
+    ('apply-no-add', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--no-add', 'P.diff']),
+    ('apply-z-numstat', [('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '-z', '--numstat', 'P.diff']),
+    ('apply-C1-context-fuzz', [('write', 'f.txt', 'Z1\nc2\nc3\nTARGET\nc4\nc5\nc6\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex f9fea4a..d8b4659 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,7 +1,7 @@\n c1\n c2\n c3\n-TARGET\n+MODIFIED\n c4\n c5\n c6\n')], ['apply', '-C1', 'P.diff']),
+    ('apply-C3-context-fuzz-fail', [('write', 'f.txt', 'Z1\nc2\nc3\nTARGET\nc4\nc5\nc6\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex f9fea4a..d8b4659 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,7 +1,7 @@\n c1\n c2\n c3\n-TARGET\n+MODIFIED\n c4\n c5\n c6\n')], ['apply', '-C3', 'P.diff']),
+    ('apply-N-intent-to-add', [('write', 'base.txt', 'base\n'), ['add', 'base.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..94954ab\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n')], ['apply', '-N', 'P.diff']),
+    ('apply-3way-conflict-stages', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'f.txt', 'line1\nline2\nLOCAL3\nline4\nline5\n'), ['add', 'f.txt'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--3way', 'P.diff']),
+    ('apply-3way-ours', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'f.txt', 'line1\nline2\nLOCAL3\nline4\nline5\n'), ['add', 'f.txt'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--3way', '--ours', 'P.diff']),
+    ('apply-3way-union', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'f.txt', 'line1\nline2\nLOCAL3\nline4\nline5\n'), ['add', 'f.txt'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--3way', '--union', 'P.diff']),
+    ('apply-ours-without-3way-fatal', [('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--ours', 'P.diff']),
+    ('apply-reverse-newfile-becomes-delete', [('write', 'base.txt', 'base\n'), ['add', 'base.txt'], ['commit', '-m', 'base'], ('write', 'new.txt', 'hello\nworld\n'), ['add', 'new.txt'], ['commit', '-m', 'add new'], ('write', 'P.diff', 'diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..94954ab\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n')], ['apply', '-R', 'P.diff']),
+    ('apply-stat-apply', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', '--stat', '--apply', 'P.diff']),
+    ('apply-mismatch-fail', [('write', 'f.txt', 'DIFFERENT\nstuff\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git a/f.txt b/f.txt\nindex b3c5a95..cf92929 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line1\n line2\n-line3\n+CHANGED\n line4\n line5\n')], ['apply', 'P.diff']),
+    ('apply-lacks-filename-fatal', [('write', 't.txt', 'x\ny\nz\n'), ['add', 't.txt'], ['commit', '-m', 'base'], ('write', 'P.diff', 'diff --git t.txt t.txt\nindex 04ec35a..20a747d 100644\n--- t.txt\n+++ t.txt\n@@ -1,3 +1,3 @@\n x\n-y\n+Y\n z\n')], ['apply', 'P.diff']),
+    ('stash push single pathspec resets only that path', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n')], ['stash', 'push', '--', 'a.txt']),
+    ('stash push pathspec then status shows others still modified', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ('write', 'c.txt', 'c1\n'), ['add', 'a.txt', 'b.txt', 'c.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ('write', 'c.txt', 'c1\nc2\n'), ['stash', 'push', '--', 'a.txt']], ['status', '--porcelain']),
+    ('stash push pathspec staged+worktree resets both to HEAD', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\nstaged\n'), ['add', 'a.txt'], ('write', 'a.txt', 'a1\nstaged\nwork\n'), ('write', 'b.txt', 'b1\nwork\n'), ['stash', 'push', '--', 'a.txt']], ['status', '--porcelain']),
+    ('stash push --keep-index pathspec restores staged content', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\nstaged\n'), ['add', 'a.txt'], ('write', 'a.txt', 'a1\nstaged\nwork\n'), ('write', 'b.txt', 'b1\nwork\n'), ['stash', 'push', '--keep-index', '--', 'a.txt']], ['status', '--porcelain']),
+    ('stash push pathspec matching no tracked file errors', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--', 'nonexistent.txt']),
+    ('stash push one matched one unmatched pathspec errors', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n')], ['stash', 'push', '--', 'a.txt', 'nope.txt']),
+    ('stash push two unmatched pathspecs reports both in order', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--', 'zzz.txt', 'aaa.txt']),
+    ('stash push pathspec matching tracked file with no change', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--', 'b.txt']),
+    ('stash push directory pathspec stashes all under it', [('write', 'a.txt', 'a1\n'), ('write', 'd/x.txt', 'x1\n'), ('write', 'd/y.log', 'y1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'd/x.txt', 'x1\nx2\n'), ('write', 'd/y.log', 'y1\ny2\n'), ['stash', 'push', '--', 'd']], ['status', '--porcelain']),
+    ('stash push --pathspec-from-file newline', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ('write', 'c.txt', 'c1\n'), ['add', 'a.txt', 'b.txt', 'c.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ('write', 'c.txt', 'c1\nc2\n'), ('write', 'specs.txt', 'a.txt\nb.txt\n'), ['stash', 'push', '--pathspec-from-file=specs.txt']], ['status', '--porcelain']),
+    ('stash push --pathspec-from-file --pathspec-file-nul', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ('write', 'c.txt', 'c1\n'), ['add', 'a.txt', 'b.txt', 'c.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ('write', 'c.txt', 'c1\nc2\n'), ('write', 'specs.txt', 'a.txt\x00b.txt\x00'), ['stash', 'push', '--pathspec-from-file=specs.txt', '--pathspec-file-nul']], ['status', '--porcelain']),
+    ('error --pathspec-from-file with command-line pathspecs', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'specs.txt', 'a.txt\n')], ['stash', 'push', '--pathspec-from-file=specs.txt', '--', 'a.txt']),
+    ('error --pathspec-file-nul without --pathspec-from-file', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--pathspec-file-nul', '--', 'a.txt']),
+    ('error --pathspec-from-file with --staged', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'specs.txt', 'a.txt\n')], ['stash', 'push', '--pathspec-from-file=specs.txt', '--staged']),
+    ('error missing pathspec file', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--pathspec-from-file=nofile.txt']),
+    ('stash push pathspec with -m message', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ['stash', 'push', '-m', 'my msg', '--', 'a.txt']], ['log', '--format=%s', '-1', 'refs/stash']),
+    ('stash push -u pathspec deletes matched untracked', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'untr.txt', 'u1\n'), ['stash', 'push', '-u', '--', 'untr.txt']], ['status', '--porcelain']),
+    ('stash push pathspec deleted-in-worktree restores HEAD', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('rm', 'a.txt'), ('write', 'b.txt', 'b1\nb2\n'), ['stash', 'push', '--', 'a.txt']], ['status', '--porcelain']),
+    ('stash push pathspec newly-staged removed on reset', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'new.txt', 'n1\n'), ['add', 'new.txt'], ('write', 'a.txt', 'a1\na2\n'), ['stash', 'push', '--', 'new.txt']], ['status', '--porcelain']),
+    ('stash push exclude magic only-exclude matches all but excluded', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ['stash', 'push', '--', ':!b.txt']], ['status', '--porcelain']),
+    ('stash push :/ top magic matches single file from root', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n'), ['stash', 'push', '--', ':/a.txt']], ['status', '--porcelain']),
+    ('error invalid pathspec magic', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n')], ['stash', 'push', '--', ':(bogus)x']),
+    ('no-HEAD pathspec nomatch reports path error', [('write', 'a.txt', 'a1\n')], ['stash', 'push', '--', 'a.txt']),
+    ('no-HEAD pathspec match reports initial commit', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt']], ['stash', 'push', '--', 'a.txt']),
+    ('--staged + pathspec reverse-apply failure', [('write', 'a.txt', 'a1\n'), ['add', 'a.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\nstaged\n'), ['add', 'a.txt'], ('write', 'a.txt', 'a1\nstaged\nwork\n')], ['stash', 'push', '--staged', '--', 'a.txt']),
+    ('stash push :(glob) does not cross slash', [('write', 'a.txt', 'a1\n'), ('write', 'd/x.txt', 'x1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'd/x.txt', 'x1\nx2\n'), ['stash', 'push', '--', ':(glob)*.txt']], ['status', '--porcelain']),
+]
+
+BATCH7_STDIN_CASES = [
+    ('diff-pairs default patch', [('write', 'a.txt', 'line1\nline2\nline3\n'), ('write', 'b.txt', 'hello\nworld\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'line1\nline2 changed\nline3\nline4\n'), ('rm', 'b.txt'), ('write', 'c.txt', 'new content\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z'], ''),
+    ('diff-pairs requires -z (rc 129)', [('write', 'a.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'y\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs'], ''),
+    ('diff-pairs -h usage rc 129', [], ['diff-pairs', '-h'], ''),
+    ('diff-pairs raw full oids', [('write', 'f.txt', 'a\nb\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--raw'], ''),
+    ('diff-pairs name-status', [('write', 'f.txt', 'a\n'), ('write', 'g.txt', 'g\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('rm', 'g.txt'), ('write', 'f.txt', 'a\nb\n'), ('write', 'h.txt', 'h\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--name-status'], ''),
+    ('diff-pairs stat with binary', [('write', 't.txt', '1\n2\n3\n'), ('write', 'bin.dat', '\x00\x01\x02'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 't.txt', '1\n2\n3\n4\n'), ('write', 'bin.dat', '\x00\x01\x02\x03\x04'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--stat'], ''),
+    ('diff-pairs numstat', [('write', 'f.txt', 'a\nb\nc\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nX\nc\nd\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--numstat'], ''),
+    ('diff-pairs -R reverse patch', [('write', 'f.txt', 'a\nb\n'), ('write', 'del.txt', 'd1\nd2\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('rm', 'del.txt'), ('write', 'f.txt', 'a\nb\nc\n'), ('write', 'add.txt', 'new\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '-R'], ''),
+    ('diff-pairs -R raw keeps input status', [('write', 'add.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'add2.txt', 'added\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '-R', '--raw'], ''),
+    ('diff-pairs whitespace -w', [('write', 'w.txt', 'foo  \nbar\nbaz\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'w.txt', 'foo\nbar   \nbaz\nqux\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '-w'], ''),
+    ('diff-pairs ignore-cr-at-eol drops all-ignored', [('write', 'crlf.txt', 'a\r\nb\r\nc\r\n'), ('write', 'keep.txt', 'p\nq\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'crlf.txt', 'a\nb\nc\n'), ('write', 'keep.txt', 'p\nq\nr\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--ignore-cr-at-eol', '--numstat'], ''),
+    ('diff-pairs --binary', [('write', 'bin.dat', '\x00\x01\x02bin\x00\x03'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'bin.dat', '\x00\x01\x02BIN\x00\x03changed'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--binary'], ''),
+    ('diff-pairs no-prefix', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nb\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--no-prefix'], ''),
+    ('diff-pairs src/dst prefix', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nb\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--src-prefix=S/', '--dst-prefix=D/'], ''),
+    ('diff-pairs line-prefix', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nb\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--line-prefix=XX_'], ''),
+    ('diff-pairs output indicators', [('write', 'f.txt', 'a\nb\nc\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--output-indicator-new=!', '--output-indicator-old=?', '--output-indicator-context=.'], ''),
+    ('diff-pairs -M rename detect', [('write', 'orig.txt', 'one\ntwo\nthree\nfour\nfive\nsix\n'), ['add', '-A'], ['commit', '-m', 'c1'], ['mv', 'orig.txt', 'renamed.txt'], ['commit', '-am', 'c2']], ['diff-pairs', '-z', '-M', '--name-status'], ''),
+    ('diff-pairs -D irreversible delete', [('write', 'del.txt', 'aaa\nbbb\nccc\n'), ('write', 'keep.txt', 'p\nq\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('rm', 'del.txt'), ('write', 'keep.txt', 'p\nq\nr\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '-D'], ''),
+    ('diff-pairs diff-filter D', [('write', 'del.txt', 'x\ny\n'), ('write', 'mod.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('rm', 'del.txt'), ('write', 'mod.txt', 'a\nb\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--diff-filter=D'], ''),
+    ('diff-pairs pickaxe -S', [('write', 'f.txt', 'needle here\nfoo\n'), ('write', 'g.txt', 'plain\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'no it\nfoo\nneedle twice needle\n'), ('write', 'g.txt', 'plain\nmore\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '-Sneedle', '--name-only'], ''),
+    ('diff-pairs find-object', [('write', 'a.txt', 'aa\n'), ('write', 'b.txt', 'bb\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'aa2\n'), ('write', 'b.txt', 'bb2\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--name-only'], ''),
+    ('diff-pairs exclusivity name-only+name-status rc 128', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'b\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--name-only', '--name-status'], ''),
+    ('diff-pairs invalid raw input rc 128', [], ['diff-pairs', '-z'], 'garbage\x00'),
+    ('diff-pairs unknown status rc 128', [], ['diff-pairs', '-z'], ':100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 Z\x00p\x00'),
+    ('diff-pairs --check rc 2', [('write', 'ws.txt', 'clean\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'ws.txt', 'clean\ntrailing   \n\tspace before tab\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--check'], ''),
+    ('diff-pairs word-diff plain', [('write', 'f.txt', 'the quick brown fox\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'the slow brown cat\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--word-diff'], ''),
+    ('diff-pairs summary create+delete+mode', [('write', 'old.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('rm', 'old.txt'), ('write', 'new.txt', 'y\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--summary'], ''),
+    ('diff-pairs multi-format numstat+stat order', [('write', 'f.txt', 'a\nb\nc\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nX\nc\nd\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['diff-pairs', '-z', '--numstat', '--stat'], ''),
+    ('stash push --pathspec-from-file=- stdin', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a1\na2\n'), ('write', 'b.txt', 'b1\nb2\n')], ['stash', 'push', '--pathspec-from-file=-'], 'a.txt\n'),
+]
+
+@pytest.mark.parametrize("case", BATCH7_CASES, ids=[c[0] for c in BATCH7_CASES])
+def test_batch7_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH7_STDIN_CASES, ids=[c[0] for c in BATCH7_STDIN_CASES])
+def test_batch7_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+BATCH8_CASES = [
+    ('init reftable byte-exact layout', [], ['init', '--ref-format=reftable', 'r']),
+    ('init-db reftable', [], ['init-db', '--ref-format=reftable', 'r']),
+    ('init reftable bare', [], ['init', '--bare', '--ref-format=reftable', 'r']),
+    ('init reftable sha256', [], ['init', '--object-format=sha256', '--ref-format=reftable', 'r']),
+    ('init unknown ref-format', [], ['init', '--ref-format=bogus', 'r']),
+    ('commit then show-ref on reftable', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first commit']], ['show-ref']),
+    ('commit then for-each-ref on reftable', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first commit']], ['for-each-ref']),
+    ('branch list on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'feature']], ['branch']),
+    ('branch -a on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'feature']], ['branch', '-a']),
+    ('lightweight tag list', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', 'v1']], ['tag']),
+    ('annotated tag for-each-ref objecttype', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', '-a', '-m', 'msg', 'v2']], ['for-each-ref', '--format=%(objecttype) %(refname)']),
+    ('show-ref -d peels annotated tag', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', '-a', '-m', 'msg', 'v2']], ['show-ref', '-d']),
+    ('rev-parse HEAD on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['rev-parse', 'HEAD']),
+    ('symbolic-ref HEAD on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['symbolic-ref', 'HEAD']),
+    ('symbolic-ref --short HEAD', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['symbolic-ref', '--short', 'HEAD']),
+    ('log oneline on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['log', '--oneline']),
+    ('checkout -b then symbolic-ref', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['checkout', '-b', 'newbranch']], ['symbolic-ref', 'HEAD']),
+    ('branch -D delete then show-ref --heads', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'b2'], ['branch', '-D', 'b2']], ['show-ref', '--heads']),
+    ('tag -d delete then show-ref', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', 't1'], ['tag', '-d', 't1']], ['show-ref']),
+    ('branch -m rename then show-ref --heads', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'old'], ['branch', '-m', 'old', 'newn']], ['show-ref', '--heads']),
+    ('rename current branch then symbolic-ref', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', '-m', 'main', 'trunk']], ['symbolic-ref', 'HEAD']),
+    ('update-ref create then show-ref --heads', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['update-ref', 'refs/heads/manual', 'HEAD']], ['show-ref', '--heads']),
+    ('update-ref -d delete', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'z'], ['update-ref', '-d', 'refs/heads/z']], ['show-ref', '--heads']),
+    ('symbolic-ref set non-HEAD then rev-parse', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['symbolic-ref', 'refs/heads/sym', 'refs/heads/main']], ['rev-parse', 'sym']),
+    ('symbolic-ref -d delete', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['symbolic-ref', 'refs/heads/sym', 'refs/heads/main'], ['symbolic-ref', '-d', 'refs/heads/sym']], ['show-ref', '--heads']),
+    ('reflog after commit', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['reflog']),
+    ('reflog show main', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'y\n'), ['add', 'a.txt'], ['commit', '-m', 'c2']], ['reflog', 'show', 'main']),
+    ('log -g HEAD format', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['log', '-g', '--format=%gd %gs']),
+    ('reflog after checkout -b', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['checkout', '-b', 'dev']], ['reflog']),
+    ('rename branch reflog carried over', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'old'], ['branch', '-m', 'old', 'new']], ['reflog', 'show', 'new']),
+    ('rev-parse --all on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'b'], ['tag', 't']], ['rev-parse', '--all']),
+    ('rev-parse --branches', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'feat']], ['rev-parse', '--branches']),
+    ('describe annotated tag', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', '-a', '-m', 'm', 'v1.0']], ['describe']),
+    ('name-rev HEAD on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'y\n'), ['add', 'a.txt'], ['commit', '-m', 'c2'], ['tag', 'v1']], ['name-rev', 'HEAD']),
+    ('log --all on reftable', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['branch', 'feat']], ['log', '--all', '--oneline']),
+    ('for-each-ref sorted tags geometric', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['tag', 'a'], ['tag', 'b'], ['tag', 'c']], ['for-each-ref', 'refs/tags/']),
+    ('show-ref --verify missing ref', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['show-ref', '--verify', 'refs/heads/nope']),
+    ('show-ref --exists', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['show-ref', '--exists', 'refs/heads/main']),
+    ('clean filter tr upper', [('write', '.gitattributes', '*.txt filter=up\n'), ['config', 'filter.up.clean', 'tr a-z A-Z'], ('write', 'f.txt', 'hello world\n')], ['hash-object', '--filters', 'f.txt']),
+    ('clean filter then crlf ordering', [('write', '.gitattributes', '*.txt filter=up text\n'), ['config', 'filter.up.clean', 'tr a-z A-Z'], ('write', 'f.txt', 'hello\r\nworld\r\n')], ['hash-object', '--filters', 'f.txt']),
+    ('clean filter %f expansion', [('write', '.gitattributes', '*.txt filter=pf\n'), ['config', 'filter.pf.clean', 'cat; echo "PATH=%f"'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('clean %% and %z literal -w', [('write', '.gitattributes', '*.txt filter=pf\n'), ['config', 'filter.pf.clean', 'printf "[%f]-%%-%z"'], ('write', 'f.txt', 'X')], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('required clean fails die', [('write', '.gitattributes', '*.txt filter=pf\n'), ['config', 'filter.pf.clean', 'false'], ['config', 'filter.pf.required', 'true'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('non-required clean fails passthrough', [('write', '.gitattributes', '*.txt filter=pf\n'), ['config', 'filter.pf.clean', 'false'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('filter attr no driver configured', [('write', '.gitattributes', '*.txt filter=nf\n'), ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('filter attr no driver but required', [('write', '.gitattributes', '*.txt filter=nf\n'), ['config', 'filter.nf.required', 'true'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('process clean upper', [('write', '.gitattributes', '*.txt filter=pr\n'), ['config', 'filter.pr.process', '/homeTMC/m902216/src/pure-python-git/.venv/bin/python /tmp/procfilter.py'], ('write', 'f.txt', 'hello world\n')], ['hash-object', '--filters', 'f.txt']),
+    ('process beats clean', [('write', '.gitattributes', '*.txt filter=pr\n'), ['config', 'filter.pr.process', '/homeTMC/m902216/src/pure-python-git/.venv/bin/python /tmp/procfilter.py'], ['config', 'filter.pr.clean', 'tr A-Z a-z'], ('write', 'f.txt', 'Hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('process status=error non-required passthrough', [('write', '.gitattributes', '*.txt filter=pr\n'), ['config', 'filter.pr.process', '/homeTMC/m902216/src/pure-python-git/.venv/bin/python /tmp/procfilter_err.py'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('process status=error required die', [('write', '.gitattributes', '*.txt filter=pr\n'), ['config', 'filter.pr.process', '/homeTMC/m902216/src/pure-python-git/.venv/bin/python /tmp/procfilter_err.py'], ['config', 'filter.pr.required', 'true'], ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('wte UTF-16 with BOM -w', [('write', '.gitattributes', '*.txt working-tree-encoding=UTF-16\n'), ['init-shell', "iconv -f UTF-8 -t UTF-16 to produce f.txt from 'héllo\\n'"]], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('wte UTF-16LE prohibited BOM -w die', [('write', '.gitattributes', '*.txt working-tree-encoding=UTF-16LE\n'), ['init-shell', "write f.txt = iconv UTF-8->UTF-16 of 'héllo\\n' (has BOM)"]], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('wte UTF-16 missing BOM -w die', [('write', '.gitattributes', '*.txt working-tree-encoding=UTF-16\n'), ['init-shell', "write f.txt = iconv UTF-8->UTF-16BE of 'héllo\\n' (no BOM)"]], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('wte bogus encoding -w die', [('write', '.gitattributes', '*.txt working-tree-encoding=NOSUCHENC\n'), ('write', 'f.txt', 'hello\n')], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('wte invalid content for enc no-w passthrough', [('write', '.gitattributes', '*.txt working-tree-encoding=UTF-16LE\n'), ('write', 'f.txt', 'abc')], ['hash-object', '--filters', 'f.txt']),
+    ('wte UTF-8 no-op', [('write', '.gitattributes', '*.txt working-tree-encoding=UTF-8\n'), ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('wte SHIFT-JIS roundtrip -w', [('write', '.gitattributes', '*.txt working-tree-encoding=SHIFT-JIS\n'), ['init-shell', 'write f.txt = bytes 82 a0 0a (SJIS hiragana + LF)']], ['hash-object', '-w', '--filters', 'f.txt']),
+    ('wte true value die', [('write', '.gitattributes', '*.txt working-tree-encoding\n'), ('write', 'f.txt', 'hello\n')], ['hash-object', '--filters', 'f.txt']),
+    ('combined filter+UTF-16+text', [('write', '.gitattributes', '*.txt filter=up working-tree-encoding=UTF-16 text\n'), ['config', 'filter.up.clean', 'tr a-z A-Z'], ['init-shell', "write f.txt = iconv UTF-8->UTF-16 of 'hi there\\n'"]], ['hash-object', '--filters', 'f.txt']),
+    ('fast-export --anonymize on branches/paths/messages/tags', [('write', 'file.txt', 'hello\n'), ('write', 'dir/sub.txt', 'nested\n'), ['add', '-A'], ['commit', '-m', 'first commit'], ('write', 'file.txt', 'hello world\n'), ['add', '-A'], ['commit', '-m', 'second commit\n\nwith body'], ['branch', 'topic'], ['checkout', 'topic'], ('write', 'dir/sub.txt', 'topic change\n'), ['add', '-A'], ['commit', '-m', 'topic commit'], ['checkout', 'main'], ['tag', '-a', '-m', 'tag msg', 'v1.0']], ['fast-export', '--all', '--anonymize']),
+    ('fast-export --anonymize-map repeatable (ref + path)', [('write', 'file.txt', 'hello\n'), ('write', 'dir/sub.txt', 'nested\n'), ['add', '-A'], ['commit', '-m', 'first commit'], ['branch', 'topic'], ['tag', '-a', '-m', 'tag msg', 'v1.0']], ['fast-export', '--all', '--anonymize', '--anonymize-map=main:trunk', '--anonymize-map=file.txt:secret.txt']),
+    ('fast-export --anonymize-map orig-alone keeps token and counter', [('write', 'f', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ['branch', 'topic'], ['tag', '-a', '-m', 'tm', 'v1.0']], ['fast-export', '--all', '--anonymize', '--anonymize-map=main']),
+    ('fast-export --anonymize-map without --anonymize errors rc128', [('write', 'f', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1']], ['fast-export', '--all', '--anonymize-map=main:trunk']),
+    ('fast-export --anonymize-map empty key errors rc129', [('write', 'f', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1']], ['fast-export', '--all', '--anonymize', '--anonymize-map=:foo']),
+    ('fast-export --anonymize-map empty value errors rc129', [('write', 'f', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1']], ['fast-export', '--all', '--anonymize', '--anonymize-map=foo:']),
+    ('fast-export --anonymize two distinct authors (committer-first ident counter)', [('write', 'a.txt', 'a\n'), ['add', '-A'], ['-c', 'user.name=Alice', '-c', 'user.email=alice@x.com', 'commit', '-m', 'c1'], ('write', 'a.txt', 'b\n'), ['add', '-A'], ['-c', 'user.name=Bob', '-c', 'user.email=bob@y.com', 'commit', '-m', 'c2']], ['fast-export', '--all', '--anonymize']),
+    ('fast-export --anonymize with merge topology', [('write', 'top.txt', 'top\n'), ('write', 'deep/a/x.txt', '1\n'), ('write', 'deep/b/y.txt', '2\n'), ['add', '-A'], ['commit', '-m', 'c1'], ['branch', 'feature'], ('write', 'deep/a/x.txt', '1m\n'), ['add', '-A'], ['commit', '-m', 'c2-main'], ['checkout', 'feature'], ('rm', 'top.txt'), ('write', 'deep/b/y.txt', '2f\n'), ['add', '-A'], ['commit', '-m', 'c3-feature'], ['checkout', 'main'], ['merge', '--no-edit', 'feature']], ['fast-export', '--all', '--anonymize']),
+    ('fast-export --anonymize --no-data (fake-oid M-lines)', [('write', 'top.txt', 'top\n'), ('write', 'deep/a/x.txt', '1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'deep/a/x.txt', '2\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['fast-export', '--all', '--anonymize', '--no-data']),
+    ('fast-export --anonymize nested annotated tags with --mark-tags', [('write', 'f', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ['tag', '-a', '-m', 'inner tag', 'inner'], ['tag', '-a', '-m', 'outer tag', 'outer', 'inner']], ['fast-export', '--all', '--mark-tags', '--anonymize']),
+    ('fast-export --anonymize-map on tag/branch/path components together', [('write', 'shared/a/f1', '1\n'), ('write', 'other/f3', '3\n'), ['add', '-A'], ['commit', '-m', 'msg one'], ['branch', 'feature/awesome'], ['tag', '-a', '-m', 'ann', 'annotated/v1']], ['fast-export', '--all', '--anonymize', '--anonymize-map=shared:S', '--anonymize-map=feature:FE', '--anonymize-map=awesome:AW']),
+    ('remote tar to stdout', [('write', 'f.txt', 'hello\n'), ('write', 'sub/g.txt', 'world\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', '--format=tar', 'HEAD']),
+    ('remote default format (tar) to stdout', [('write', 'f.txt', 'hello\n'), ('write', 'sub/g.txt', 'world\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', 'HEAD']),
+    ('remote tar with prefix', [('write', 'f.txt', 'hello\n'), ('write', 'sub/g.txt', 'world\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', '--format=tar', '--prefix=p/', 'HEAD']),
+    ('remote tar verbose (stderr relay)', [('write', 'f.txt', 'hello\n'), ('write', 'sub/g.txt', 'world\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', '-v', '--format=tar', 'HEAD']),
+    ('remote list formats', [('write', 'f.txt', 'hello\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', '--list']),
+    ('remote explicit default exec', [('write', 'f.txt', 'hello\n'), ('write', 'sub/g.txt', 'world\n'), ['add', '-A'], ['commit', '-m', 'initial']], ['archive', '--remote=.', '--exec=git-upload-archive', '--format=tar', 'HEAD']),
+    ('remote complex tree (symlink/exec/binary/nested)', [('write', 'a.txt', 'alpha\n'), ('write', 'd1/d2/deep.txt', 'deep\n'), ('write', 'bin.dat', 'binary\x00\x01\x02data'), ['add', '-A'], ['commit', '-m', 'complex']], ['archive', '--remote=.', '--format=tar', 'HEAD']),
+    ('upload-archive -h usage', [], ['upload-archive', '-h']),
+    ('diagnose-stats-empty', [], ['diagnose', '-s', 'fixt']),
+    ('diagnose-mode-all', [], ['diagnose', '--mode=all', '-s', 'fixt']),
+    ('diagnose-invalid-mode', [], ['diagnose', '--mode=bogus', '-s', 'foo']),
+    ('diagnose-mode-none', [], ['diagnose', '--mode=none', '-s', 'foo']),
+    ('diagnose-mode-no-value', [], ['diagnose', '--mode']),
+    ('diagnose-no-mode', [], ['diagnose', '--no-mode', '-s', 'foo']),
+    ('diagnose-help-short', [], ['diagnose', '-h']),
+    ('diagnose-unknown-long', [], ['diagnose', '--foo']),
+    ('diagnose-output-dir', [], ['diagnose', '-o', 'out/sub', '-s', 'fixt']),
+    ('diagnose-suffix-fixed', [], ['diagnose', '-s', 'FIXED']),
+    ('bugreport-diagnose-stats', [], ['bugreport', '--diagnose', '-s', 'fixt']),
+    ('bugreport-diagnose-all', [], ['bugreport', '--diagnose=all', '-s', 'fixt']),
+    ('bugreport-diagnose-invalid', [], ['bugreport', '--diagnose=bogus']),
+    ('bugreport-no-diagnose', [], ['bugreport', '-s', 'fixt']),
+    ('bugreport-help-short', [], ['bugreport', '-h']),
+]
+
+BATCH8_STDIN_CASES = [
+]
+
+@pytest.mark.parametrize("case", BATCH8_CASES, ids=[c[0] for c in BATCH8_CASES])
+def test_batch8_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH8_STDIN_CASES, ids=[c[0] for c in BATCH8_STDIN_CASES])
+def test_batch8_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# Binary archive output (gzip: --format=tgz/tar.gz) cannot go through the text=True
+# command-parity harness — gzip's 0x8b byte is invalid UTF-8. git writes its gzip
+# header with a fixed mtime=0, so the stream is deterministic and byte-comparable;
+# these compare raw stdout BYTES (rc + stderr + stdout) against the oracle.
+BATCH8_ARCHIVE_BIN_CASES = [
+    ("remote-tgz-bytes",
+     [("write", "f.txt", "hello\n"), ("write", "sub/g.txt", "world\n"), ["add", "-A"], ["commit", "-m", "initial"]],
+     ["archive", "--remote=.", "--format=tgz", "HEAD"]),
+    ("remote-tar-gz-bytes",
+     [("write", "f.txt", "hello\n"), ("write", "sub/g.txt", "world\n"), ["add", "-A"], ["commit", "-m", "initial"]],
+     ["archive", "--remote=.", "--format=tar.gz", "HEAD"]),
+    ("local-tgz-bytes",
+     [("write", "f.txt", "hello\n"), ("write", "sub/g.txt", "world\n"), ["add", "-A"], ["commit", "-m", "initial"]],
+     ["archive", "--format=tgz", "HEAD"]),
+]
+
+
+@pytest.mark.parametrize("case", BATCH8_ARCHIVE_BIN_CASES, ids=[c[0] for c in BATCH8_ARCHIVE_BIN_CASES])
+def test_batch8_archive_binary_parity(case, tmp_path: Path, git_254_oracle: str):
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, probe = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).parent.mkdir(parents=True, exist_ok=True)
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        # capture_output WITHOUT text=True -> raw bytes (gzip-safe)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, capture_output=True)
+        results[tool] = (proc.returncode, proc.stdout, proc.stderr)
+
+    assert results["pygit"] == results["oracle"]

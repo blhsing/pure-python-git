@@ -84,11 +84,14 @@ class Repository:
         *,
         bare: bool = False,
         object_format: str = "sha1",
+        ref_format: str = "files",
         gitdir_override: "os.PathLike | str | None" = None,
         write_default_extras: bool = True,
     ) -> "Repository":
         if object_format not in ("sha1", "sha256"):
             raise ValueError(f"unsupported object format {object_format}")
+        if ref_format not in ("files", "reftable"):
+            raise ValueError(f"unsupported ref format {ref_format}")
         path = Path(path).resolve()
         path.mkdir(parents=True, exist_ok=True)
         if gitdir_override is not None:
@@ -96,23 +99,46 @@ class Repository:
         else:
             gitdir = path if bare else (path / ".git")
         gitdir.mkdir(parents=True, exist_ok=True)
-        for sub in ("objects", "objects/info", "objects/pack", "refs", "refs/heads", "refs/tags"):
+        reftable = ref_format == "reftable"
+        for sub in ("objects", "objects/info", "objects/pack"):
             (gitdir / sub).mkdir(parents=True, exist_ok=True)
+        if not reftable:
+            for sub in ("refs", "refs/heads", "refs/tags"):
+                (gitdir / sub).mkdir(parents=True, exist_ok=True)
         head = gitdir / "HEAD"
-        if not head.exists():
+        if reftable:
+            # The reftable backend writes a stub HEAD/refs layout; the real
+            # HEAD symref is stored in the initial table (set by cmd_init).
+            cls._init_reftable(gitdir, object_format)
+        elif not head.exists():
             head.write_text("ref: refs/heads/main\n", encoding="utf-8")
         cfg = gitdir / "config"
         if not cfg.exists():
-            config = (
+            # Reftable bumps repositoryformatversion to 1 and records the
+            # refstorage extension (refs.c / setup.c create_default_files).
+            version = 1 if (object_format == "sha256" or reftable) else 0
+            core = (
                 "[core]\n"
-                f"\trepositoryformatversion = {1 if object_format == 'sha256' else 0}\n"
+                f"\trepositoryformatversion = {version}\n"
                 f"\tfilemode = {'true' if _probe_filemode(gitdir) else 'false'}\n"
                 f"\tbare = {'true' if bare else 'false'}\n"
             )
             if not bare:
-                config += "\tlogallrefupdates = true\n"
-            if object_format != "sha1":
-                config += "[extensions]\n\tobjectformat = sha256\n"
+                core += "\tlogallrefupdates = true\n"
+            if reftable:
+                # When the reftable extension is in play, C Git writes the
+                # [extensions] block before [core] (the extension is recorded
+                # during repository creation, before the default config). The
+                # objectformat extension, if present, comes first.
+                ext = "[extensions]\n"
+                if object_format != "sha1":
+                    ext += "\tobjectformat = sha256\n"
+                ext += "\trefstorage = reftable\n"
+                config = ext + core
+            else:
+                config = core
+                if object_format != "sha1":
+                    config += "[extensions]\n\tobjectformat = sha256\n"
             cfg.write_text(config, encoding="utf-8")
         if write_default_extras:
             # C Git 2.54 produces description/hooks/info/exclude only from the
@@ -140,6 +166,25 @@ class Repository:
                     encoding="utf-8",
                 )
         return cls(path, gitdir=gitdir, bare=bare)
+
+    @staticmethod
+    def _init_reftable(gitdir: Path, object_format: str) -> None:
+        """Create the reftable stub layout (refs.c refs_create_refdir_stubs).
+
+        Writes the placeholder HEAD ("ref: refs/heads/.invalid"), the
+        ``refs/heads`` stub file ("this repository uses the reftable format.")
+        and an empty ``reftable/`` directory. The real initial table is written
+        by the caller once the initial branch name is known.
+        """
+        from . import reftable as _reftable
+
+        head = gitdir / "HEAD"
+        if not head.exists():
+            head.write_text(_reftable.HEAD_STUB_TEXT, encoding="utf-8")
+        refs_dir = gitdir / "refs"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        (refs_dir / "heads").write_text(_reftable.STUB_TEXT, encoding="utf-8")
+        (gitdir / "reftable").mkdir(parents=True, exist_ok=True)
 
     # ---- config --------------------------------------------------------
 

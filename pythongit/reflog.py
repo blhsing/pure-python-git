@@ -31,7 +31,28 @@ def append(repo: Repository, ref: str, old_sha: str, new_sha: str, message: str,
 
 
 def read(repo: Repository, ref: str) -> list[tuple[str, str, str, str]]:
-    """Return list of (old, new, ident, message)."""
+    """Return list of (old, new, ident, message), oldest-first."""
+    from . import reftable as _reftable
+    if _reftable.is_reftable(repo.gitdir):
+        store = _reftable.RefStore(repo.gitdir, hash_size=repo.hash_len)
+        recs = [r for r in store._all_logs()
+                if r.refname == ref and r.value_type == _reftable.LOG_UPDATE]
+        # reftable stores newest first (reverse_int64 key order); the reflog
+        # file is oldest-first, so present in ascending update_index order.
+        recs.sort(key=lambda r: r.update_index)
+        out = []
+        for r in recs:
+            # tz_offset is stored as the raw HHMM integer (git's
+            # fill_reftable_log_record uses atoi of the HHMM string), so it maps
+            # straight back to the "+HHMM" reflog timezone field.
+            tz = r.tz_offset
+            sign = "+" if tz >= 0 else "-"
+            ident = f"{r.name} <{r.email}> {r.time} {sign}{abs(tz):04d}"
+            msg = r.message
+            if msg.endswith("\n"):
+                msg = msg[:-1]
+            out.append((r.old_hash.hex(), r.new_hash.hex(), ident, msg))
+        return out
     p = _reflog_path(repo, ref)
     if not p.exists():
         return []

@@ -19,6 +19,96 @@ def _is_sha(s: str, hex_len: int = SHA_LEN) -> bool:
     return len(s) == hex_len and all(c in "0123456789abcdef" for c in s.lower())
 
 
+# ---------------------------------------------------------------------------
+# reftable backend dispatch
+#
+# When the repository stores refs in the reftable format (.git/reftable/), all
+# ref reads and writes go through pythongit.reftable.RefStore instead of loose
+# files + packed-refs. The functions below detect this once per call and route
+# accordingly so every command (commit, branch, tag, show-ref, ...) works on a
+# reftable repo transparently.
+# ---------------------------------------------------------------------------
+def _reftable_store(repo: Repository):
+    from . import reftable as _reftable
+    if _reftable.is_reftable(repo.gitdir):
+        return _reftable.RefStore(repo.gitdir, hash_size=repo.hash_len)
+    return None
+
+
+def uses_reftable(repo: Repository) -> bool:
+    from . import reftable as _reftable
+    return _reftable.is_reftable(repo.gitdir)
+
+
+def _reftable_now() -> "tuple[int, int]":
+    """Return (time_seconds, tz_offset) for a reflog entry.
+
+    ``tz_offset`` matches C Git's reftable backend (fill_reftable_log_record):
+    it is ``sign * atoi(HHMM)`` of the committer-ident timezone string, i.e. the
+    raw 4-digit value (e.g. "+0530" -> 530, "-0800" -> -800), NOT total minutes.
+    Honours GIT_COMMITTER_DATE ("<seconds> <+/-HHMM>") for reproducibility, then
+    falls back to wall clock with the local UTC offset.
+    """
+    import time as _time
+    env = os.environ.get("GIT_COMMITTER_DATE")
+    if env:
+        env = env.strip()
+        parts = env.split()
+        try:
+            secs = int(parts[0])
+        except (ValueError, IndexError):
+            secs = int(_time.time())
+        tz = 0
+        if len(parts) > 1 and len(parts[1]) == 5 and parts[1][0] in "+-":
+            sign = -1 if parts[1][0] == "-" else 1
+            tz = sign * int(parts[1][1:5])  # raw HHMM, like atoi("0530")==530
+        return secs, tz
+    secs = int(_time.time())
+    off = -_time.timezone if (_time.localtime().tm_isdst == 0) else -_time.altzone
+    # Convert seconds-of-offset to the raw HHMM integer git would store.
+    sign = -1 if off < 0 else 1
+    off = abs(off) // 60
+    return secs, sign * (off // 60 * 100 + off % 60)
+
+
+def _reftable_committer() -> "tuple[str, str]":
+    name = os.environ.get("GIT_COMMITTER_NAME") or "pythongit"
+    email = os.environ.get("GIT_COMMITTER_EMAIL") or "pythongit@example.invalid"
+    return name, email
+
+
+def _reftable_peeler(repo: Repository):
+    """Return a function hex_sha -> peeled hex_sha (None if not an annotated tag).
+
+    Mirrors peel_object(PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE): an object peels
+    only when it is a tag chain that ultimately resolves to a real object.
+    """
+    from . import objects as objs
+
+    def peel(hexsha: str) -> Optional[str]:
+        try:
+            obj_type, data = objs.read_object(repo, hexsha)
+        except (KeyError, ValueError):
+            return None
+        if obj_type != "tag":
+            return None
+        cur = hexsha
+        for _ in range(32):
+            try:
+                obj_type, data = objs.read_object(repo, cur)
+            except (KeyError, ValueError):
+                return None
+            if obj_type != "tag":
+                return cur
+            tgt = _tag_target(data)
+            if tgt is None:
+                return None
+            cur = tgt
+        return None
+
+    return peel
+
+
 def read_packed_refs(repo: Repository) -> dict[str, str]:
     f = repo.gitdir / "packed-refs"
     out: dict[str, str] = {}
@@ -34,6 +124,14 @@ def read_packed_refs(repo: Repository) -> dict[str, str]:
 
 def read_ref(repo: Repository, name: str) -> Optional[str]:
     """Return the SHA the ref ultimately points at, following symrefs."""
+    store = _reftable_store(repo)
+    if store is not None:
+        # HEAD is the only ref kept on disk for reftable repos; everything
+        # else (including HEAD's symref target) lives in the table stack.
+        if name == "HEAD":
+            sym, sha = read_head(repo)
+            return sha
+        return store.read_ref(name)
     seen: set[str] = set()
     cur = name
     while True:
@@ -57,6 +155,27 @@ def read_ref(repo: Repository, name: str) -> Optional[str]:
 def update_ref(repo: Repository, name: str, sha: str, *, message: str = "") -> None:
     if not _is_sha(sha, repo.hex_len):
         raise ValueError(f"not a sha: {sha}")
+    store = _reftable_store(repo)
+    if store is not None:
+        old = read_ref(repo, name) or repo.null_oid()
+        # git's reftable backend logs the message verbatim (an empty message,
+        # e.g. from `update-ref` without -m, is stored as just "\n"); it does
+        # not synthesise an "update:" line the way our files path historically
+        # did. Whether the ref is logged at all follows core.logAllRefUpdates.
+        msg = message
+        updates = [{"name": name, "type": "val1", "new": sha, "old": old,
+                    "message": msg if _should_log(repo, name) else None}]
+        # also log HEAD if it points at this ref (git logs both)
+        head_sym = store.read_symbolic("HEAD")
+        if head_sym == name:
+            updates.append({"name": "HEAD", "type": "val1", "new": sha,
+                            "old": old, "message": msg})
+            # HEAD's symref target is updated implicitly; do not change it.
+            updates[-1]["type"] = "headlog"
+        store.transaction(_reftable_updates(repo, store, updates),
+                          committer=_reftable_committer(), now=_reftable_now(),
+                          peel=_reftable_peeler(repo))
+        return
     old = read_ref(repo, name) or repo.null_oid()
     p = repo.gitdir / name
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -76,7 +195,67 @@ def update_ref(repo: Repository, name: str, sha: str, *, message: str = "") -> N
             pass
 
 
+def rename_ref(repo: Repository, oldname: str, newname: str,
+               logmsg: str) -> bool:
+    """Rename ref ``oldname`` to ``newname`` through the reftable backend.
+
+    Returns True on success. Only valid for reftable repos; callers gate on
+    uses_reftable(). Mirrors reftable-backend.c write_copy_table (two update
+    indices: delete old + reflog, create new + reflog, copy old reflog)."""
+    store = _reftable_store(repo)
+    if store is None:
+        return False
+    ok = store.rename_ref(oldname, newname, logmsg,
+                          committer=_reftable_committer(), now=_reftable_now())
+    return ok
+
+
+def update_ref_symbolic(repo: Repository, name: str, target: str) -> None:
+    """Write a symbolic ref ``name`` -> ``target`` (e.g. for symbolic-ref)."""
+    store = _reftable_store(repo)
+    if store is not None:
+        store.transaction(
+            [{"name": name, "type": "symref", "new": target, "old": None,
+              "message": None}],
+            committer=_reftable_committer(), now=_reftable_now())
+        return
+    p = repo.gitdir / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"ref: {target}\n", encoding="utf-8")
+
+
+def _should_log(repo: Repository, name: str) -> bool:
+    return (name.startswith("refs/heads/") or name == "HEAD"
+            or name.startswith("refs/remotes/") or name == "refs/stash")
+
+
+def _reftable_updates(repo: Repository, store, updates):
+    """Normalise update dicts for RefStore.transaction.
+
+    A 'headlog' pseudo-type logs HEAD (resolved sha) without rewriting HEAD's
+    symref record; it is turned into a 'logonly' update here so HEAD's symref
+    record keeps its original update_index (matching C Git's reftable backend,
+    which only writes a HEAD reflog entry when the pointed-to branch moves).
+    """
+    out = []
+    for up in updates:
+        if up.get("type") == "headlog":
+            out.append({"name": "HEAD", "type": "logonly", "new": None,
+                        "old": up.get("old"), "message": up.get("message")})
+        else:
+            out.append(up)
+    return out
+
+
 def delete_ref(repo: Repository, name: str) -> None:
+    store = _reftable_store(repo)
+    if store is not None:
+        old = read_ref(repo, name) or repo.null_oid()
+        store.transaction(
+            [{"name": name, "type": "delete", "new": None, "old": old,
+              "message": None}],
+            committer=_reftable_committer(), now=_reftable_now())
+        return
     p = repo.gitdir / name
     if p.exists():
         p.unlink()
@@ -84,6 +263,19 @@ def delete_ref(repo: Repository, name: str) -> None:
 
 def read_head(repo: Repository) -> tuple[Optional[str], Optional[str]]:
     """Return (symbolic_ref_or_None, sha_or_None)."""
+    store = _reftable_store(repo)
+    if store is not None:
+        rec = store.read_raw("HEAD")
+        if rec is None:
+            return None, None
+        from . import reftable as _reftable
+        if rec.value_type == _reftable.REF_SYMREF:
+            return rec.target, store.read_ref(rec.target)
+        if rec.value_type == _reftable.REF_VAL2:
+            return None, rec.value[0].hex()
+        if rec.value_type == _reftable.REF_VAL1:
+            return None, rec.value.hex()
+        return None, None
     p = repo.gitdir / "HEAD"
     if not p.exists():
         return None, None
@@ -94,7 +286,27 @@ def read_head(repo: Repository) -> tuple[Optional[str], Optional[str]]:
     return None, txt if _is_sha(txt, repo.hex_len) else None
 
 
-def set_head(repo: Repository, target: str) -> None:
+def set_head(repo: Repository, target: str, *, message: Optional[str] = None,
+             old: Optional[str] = None) -> None:
+    """Point HEAD at ``target`` (a full ref, a branch shorthand, or a sha).
+
+    For reftable repos, when ``message`` is given the symref switch and the
+    HEAD reflog entry are written in one transaction (matching git, where e.g.
+    "checkout: moving from X to Y" shares the update_index of the symref move).
+    """
+    store = _reftable_store(repo)
+    if store is not None:
+        if target.startswith("refs/"):
+            typ, val = "symref", target
+        elif _is_sha(target, repo.hex_len):
+            typ, val = "val1", target
+        else:
+            typ, val = "symref", f"refs/heads/{target}"
+        store.transaction(
+            [{"name": "HEAD", "type": typ, "new": val, "old": old,
+              "message": message}],
+            committer=_reftable_committer(), now=_reftable_now())
+        return
     p = repo.gitdir / "HEAD"
     if target.startswith("refs/"):
         p.write_text(f"ref: {target}\n", encoding="utf-8")
@@ -105,7 +317,79 @@ def set_head(repo: Repository, target: str) -> None:
         p.write_text(f"ref: refs/heads/{target}\n", encoding="utf-8")
 
 
+def iter_all_refs(repo: Repository) -> "dict[str, str]":
+    """All refs as full-name -> resolved hex SHA (heads/tags/remotes/etc).
+
+    For reftable repos this reads the table stack; for files repos it walks
+    loose refs under refs/ plus packed-refs. Symbolic refs are followed; HEAD
+    is not included (callers add it explicitly when wanted).
+    """
+    store = _reftable_store(repo)
+    if store is not None:
+        out = {}
+        for name, sha in store.iter_refs().items():
+            if name == "HEAD":
+                continue
+            out[name] = sha
+        return out
+    out: dict[str, str] = {}
+    root = repo.gitdir / "refs"
+    if root.exists():
+        for f in root.rglob("*"):
+            if f.is_file():
+                rel = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
+                s = read_ref(repo, rel)
+                if s:
+                    out[rel] = s
+    for ref, s in read_packed_refs(repo).items():
+        out.setdefault(ref, s)
+    return out
+
+
+def read_symbolic(repo: Repository, name: str) -> Optional[str]:
+    """Return the target of symbolic ref ``name`` (e.g. "refs/heads/main"), or
+    None if ``name`` is not a symbolic ref / does not exist."""
+    store = _reftable_store(repo)
+    if store is not None:
+        return store.read_symbolic(name)
+    p = repo.gitdir / name
+    if not p.exists():
+        return None
+    txt = p.read_text(encoding="utf-8").strip()
+    if txt.startswith("ref: "):
+        return txt[5:].strip()
+    return None
+
+
+def ref_record_exists(repo: Repository, name: str) -> bool:
+    store = _reftable_store(repo)
+    if store is not None:
+        return store.read_raw(name) is not None
+    return (repo.gitdir / name).exists()
+
+
+def read_raw_ref_exists(repo: Repository, name: str) -> bool:
+    """True if ``name`` exists as a direct (non-dwim) ref record."""
+    store = _reftable_store(repo)
+    if store is not None:
+        return store.read_raw(name) is not None
+    return ((repo.gitdir / name).is_file() or name in read_packed_refs(repo))
+
+
+def peel_ref(repo: Repository, name: str) -> Optional[str]:
+    """Return the peeled (VAL2) target for a tag ref if stored, else None."""
+    store = _reftable_store(repo)
+    if store is not None:
+        return store.peeled(name)
+    return None
+
+
 def list_branches(repo: Repository) -> list[str]:
+    store = _reftable_store(repo)
+    if store is not None:
+        return sorted(name[len("refs/heads/"):]
+                      for name in store.iter_refs()
+                      if name.startswith("refs/heads/"))
     root = repo.gitdir / "refs" / "heads"
     found: set[str] = set()
     if root.exists():
@@ -119,6 +403,11 @@ def list_branches(repo: Repository) -> list[str]:
 
 
 def list_tags(repo: Repository) -> list[str]:
+    store = _reftable_store(repo)
+    if store is not None:
+        return sorted(name[len("refs/tags/"):]
+                      for name in store.iter_refs()
+                      if name.startswith("refs/tags/"))
     root = repo.gitdir / "refs" / "tags"
     found: set[str] = set()
     if root.exists():

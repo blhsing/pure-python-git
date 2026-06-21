@@ -112,18 +112,17 @@ def main() -> int:
         rc = run("multi-pack-index", "verify")
         check(rc == 0, "multi-pack-index verify")
 
-        # diff-pairs
-        from pythongit import refs as r, objects as o
-        from pythongit.repo import Repository
-        rp = Repository.discover(tmp)
-        head = r.read_ref(rp, "refs/heads/main")
-        t_head = o.parse_commit(o.read_object(rp, head)[1]).tree
-        sys.stdin = FakeStdin(f"{t_head} {t_head}\n")
+        # diff-pairs: the real plumbing requires -z and reads NUL-terminated raw
+        # diff pairs from stdin; empty input yields no pairs and exits 0. Without
+        # -z it errors, matching git's "fatal: working without -z is not supported".
+        sys.stdin = FakeStdin("")
         try:
-            rc = run("diff-pairs")
-            check(rc == 0, "diff-pairs")
+            rc = run("diff-pairs", "-z")
+            check(rc == 0, "diff-pairs (-z, empty input)")
         finally:
             sys.stdin = old_stdin
+        rc = run("diff-pairs")
+        check(rc != 0, "diff-pairs requires -z")
 
         # request-pull
         rc = run("request-pull", "HEAD^1", "https://example.invalid/r.git", "HEAD")
