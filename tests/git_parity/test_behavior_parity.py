@@ -2485,3 +2485,147 @@ def test_branch_rename_state_parity(case, tmp_path: Path, git_254_oracle: str):
         results[tool] = (proc.returncode, proc.stdout, proc.stderr, *snapshot(repo))
 
     assert results["pygit"] == results["oracle"]
+
+
+BATCH6_CASES = [
+    ('push-u', [('write', 't.txt', 'a'), ['add', 't.txt'], ['commit', '-q', '-m', 'init'], ('write', 't.txt', 'amod'), ('write', 'u.txt', 'untr')], ['stash', 'push', '-u', '-m', 'wu']),
+    ('text-attr-crlf-converts-via-path', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'crlf.txt', 'crlf.txt']),
+    ('text-attr-plain-uses-own-path', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', 'crlf.txt']),
+    ('no-filters-bypasses-conversion', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--no-filters', 'crlf.txt']),
+    ('filters-flag-enables-default-conversion', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--filters', '--path', 'crlf.txt', 'crlf.txt']),
+    ('text-auto-crlf-converts', [('write', '.gitattributes', '*.txt text=auto\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('text-auto-binary-no-conversion', [('write', '.gitattributes', '*.txt text=auto\n'), ('write', 'f.txt', 'a\r\nb\x00\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('eol-crlf-lf-to-crlf', [('write', '.gitattributes', '*.txt text eol=crlf\n'), ('write', 'f.txt', 'a\nb\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('binary-attr-no-conversion', [('write', '.gitattributes', '*.txt -text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('text-mixed-lone-cr-kept', [('write', '.gitattributes', '*.txt text\n'), ('write', 'f.txt', 'a\r\nb\r\nc\rd')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('write-w-emits-safecrlf-warning', [('write', '.gitattributes', '*.txt text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '-w', '--path', 'f.txt', 'f.txt']),
+    ('safecrlf-true-dies-with-w', [['config', 'core.safecrlf', 'true'], ('write', '.gitattributes', '*.txt text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '-w', '--path', 'f.txt', 'f.txt']),
+    ('safecrlf-true-no-check-without-w', [['config', 'core.safecrlf', 'true'], ('write', '.gitattributes', '*.txt text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('autocrlf-true-converts-undefined', [['config', 'core.autocrlf', 'true'], ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '-w', '--path', 'f.txt', 'f.txt']),
+    ('ident-strips-expanded-id', [('write', '.gitattributes', '*.txt ident\n'), ('write', 'f.txt', 'x $Id: abcdef0123 $ y\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('ident-plain-id-unchanged', [('write', '.gitattributes', '*.txt ident\n'), ('write', 'f.txt', 'plain $Id$ here\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('err-no-filters-with-path', [('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--no-filters', '--path', 'crlf.txt', 'crlf.txt']),
+    ('err-stdin-paths-with-stdin', [], ['hash-object', '--stdin-paths', '--stdin']),
+    ('err-stdin-paths-with-files', [], ['hash-object', '--stdin-paths', 'f']),
+    ('err-multiple-stdin', [], ['hash-object', '--stdin', '--stdin', 'f']),
+    ('err-missing-file', [], ['hash-object', 'nope']),
+    ('info-attributes-precedence', [('write', '.gitattributes', '*.txt -text\n'), ('write', '.git/info/attributes', '*.txt text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('last-rule-wins', [('write', '.gitattributes', '*.txt text\n*.txt -text\n'), ('write', 'f.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 'f.txt', 'f.txt']),
+    ('subdir-no-slash-pattern-matches-basename', [('write', '.gitattributes', '*.txt text\n'), ('write', 's/x.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 's/x.txt', 's/x.txt']),
+    ('anchored-pattern-not-in-subdir', [('write', '.gitattributes', '/x.txt text\n'), ('write', 's/x.txt', 'a\r\nb\r\n')], ['hash-object', '--path', 's/x.txt', 's/x.txt']),
+    ('diff-files-find-renames-raw', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M']),
+    ('diff-files-find-renames-inexact-patch', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nCHG\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M', '-p']),
+    ('diff-files-find-renames-name-status', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nCHG\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M', '--name-status']),
+    ('diff-files-find-renames-z', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M', '-z']),
+    ('diff-files-find-renames-reverse', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nCHG\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M', '-R']),
+    ('diff-files-find-renames-threshold-reject', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'copy.txt', 'l1\nl2\nCHG\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-M85']),
+    ('diff-files-rename-subdir-numstat-compact', [('write', 'dir/orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'dir/orig.txt'), ('write', 'dir/moved.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n'), ['add', '-N', 'dir/moved.txt']], ['diff-files', '-M', '--numstat']),
+    ('diff-files-find-copies-raw', [('write', 'base.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'base.txt', 'l1\nl2\nMOD\nl4\nl5\nl6\nl7\nl8\n'), ('write', 'copy.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-C']),
+    ('diff-files-find-copies-patch', [('write', 'base.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'base.txt', 'l1\nl2\nMOD\nl4\nl5\nl6\nl7\nl8\n'), ('write', 'copy.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-C', '-p']),
+    ('diff-files-find-copies-harder', [('write', 'base.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'copy.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-N', 'copy.txt']], ['diff-files', '-C', '--find-copies-harder']),
+    ('diff-files-copy-one-src-two-dst', [('write', 'orig.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 'orig.txt'), ('write', 'c1.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ('write', 'c2.txt', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n'), ['add', '-N', 'c1.txt', 'c2.txt']], ['diff-files', '-C']),
+    ('diff-files-pickaxe-S-raw', [('write', 'a.txt', 'apple\nbanana\ncherry\n'), ('write', 'b.txt', 'dog\ncat\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'a.txt', 'apple\nbanana\nneedle\ncherry\n'), ('write', 'b.txt', 'dog\ncat\nbird\n')], ['diff-files', '-S', 'needle']),
+    ('diff-files-pickaxe-G-patch', [('write', 'a.txt', 'apple\nbanana\ncherry\n'), ('write', 'b.txt', 'dog\ncat\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'a.txt', 'apple\nbanana\nneedle\ncherry\n'), ('write', 'b.txt', 'dog\ncat\nbird\n')], ['diff-files', '-G', 'needle', '-p']),
+    ('diff-files-pickaxe-G-deleted-line', [('write', 'a.txt', 'keep\nremoveme\nkeep2\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'a.txt', 'keep\nkeep2\n')], ['diff-files', '-G', 'removeme', '-p']),
+    ('diff-files-pickaxe-all-patch', [('write', 'a.txt', 'apple\nbanana\ncherry\n'), ('write', 'b.txt', 'dog\ncat\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'a.txt', 'apple\nbanana\nneedle\ncherry\n'), ('write', 'b.txt', 'dog\ncat\nbird\n')], ['diff-files', '-S', 'needle', '--pickaxe-all', '-p']),
+    ('diff-files-pickaxe-S-no-match', [('write', 'a.txt', 'apple\nbanana\ncherry\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'a.txt', 'apple\nbanana\nneedle\ncherry\n')], ['diff-files', '-S', 'zzz']),
+    ('diff-files-orderfile', [('write', 'zebra.txt', 'z\n'), ('write', 'apple.txt', 'a\n'), ('write', 'middle.txt', 'm\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'zebra.txt', 'z2\n'), ('write', 'apple.txt', 'a2\n'), ('write', 'middle.txt', 'm2\n'), ('write', '.order', 'middle.txt\nzebra.txt\n')], ['diff-files', '-O.order']),
+    ('diff-files-orderfile-missing-fatal', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-O.nope']),
+    ('diff-files-break-rewrites-patch', [('write', 'f.txt', 'oldline000\noldline001\noldline002\noldline003\noldline004\noldline005\noldline006\noldline007\noldline008\noldline009\noldline010\noldline011\noldline012\noldline013\noldline014\noldline015\noldline016\noldline017\noldline018\noldline019\noldline020\noldline021\noldline022\noldline023\noldline024\noldline025\noldline026\noldline027\noldline028\noldline029\noldline030\noldline031\noldline032\noldline033\noldline034\noldline035\noldline036\noldline037\noldline038\noldline039\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'newline000\nnewline001\nnewline002\nnewline003\nnewline004\nnewline005\nnewline006\nnewline007\nnewline008\nnewline009\nnewline010\nnewline011\nnewline012\nnewline013\nnewline014\nnewline015\nnewline016\nnewline017\nnewline018\nnewline019\nnewline020\nnewline021\nnewline022\nnewline023\nnewline024\nnewline025\nnewline026\nnewline027\nnewline028\nnewline029\nnewline030\nnewline031\nnewline032\nnewline033\nnewline034\nnewline035\nnewline036\nnewline037\nnewline038\nnewline039\n')], ['diff-files', '-B', '-p']),
+    ('diff-files-break-rewrites-raw', [('write', 'f.txt', 'oldline000\noldline001\noldline002\noldline003\noldline004\noldline005\noldline006\noldline007\noldline008\noldline009\noldline010\noldline011\noldline012\noldline013\noldline014\noldline015\noldline016\noldline017\noldline018\noldline019\noldline020\noldline021\noldline022\noldline023\noldline024\noldline025\noldline026\noldline027\noldline028\noldline029\noldline030\noldline031\noldline032\noldline033\noldline034\noldline035\noldline036\noldline037\noldline038\noldline039\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'newline000\nnewline001\nnewline002\nnewline003\nnewline004\nnewline005\nnewline006\nnewline007\nnewline008\nnewline009\nnewline010\nnewline011\nnewline012\nnewline013\nnewline014\nnewline015\nnewline016\nnewline017\nnewline018\nnewline019\nnewline020\nnewline021\nnewline022\nnewline023\nnewline024\nnewline025\nnewline026\nnewline027\nnewline028\nnewline029\nnewline030\nnewline031\nnewline032\nnewline033\nnewline034\nnewline035\nnewline036\nnewline037\nnewline038\nnewline039\n')], ['diff-files', '-B']),
+    ('diff-files-break-rewrites-numstat', [('write', 'f.txt', 'oldline000\noldline001\noldline002\noldline003\noldline004\noldline005\noldline006\noldline007\noldline008\noldline009\noldline010\noldline011\noldline012\noldline013\noldline014\noldline015\noldline016\noldline017\noldline018\noldline019\noldline020\noldline021\noldline022\noldline023\noldline024\noldline025\noldline026\noldline027\noldline028\noldline029\noldline030\noldline031\noldline032\noldline033\noldline034\noldline035\noldline036\noldline037\noldline038\noldline039\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'newline000\nnewline001\nnewline002\nnewline003\nnewline004\nnewline005\nnewline006\nnewline007\nnewline008\nnewline009\nnewline010\nnewline011\nnewline012\nnewline013\nnewline014\nnewline015\nnewline016\nnewline017\nnewline018\nnewline019\nnewline020\nnewline021\nnewline022\nnewline023\nnewline024\nnewline025\nnewline026\nnewline027\nnewline028\nnewline029\nnewline030\nnewline031\nnewline032\nnewline033\nnewline034\nnewline035\nnewline036\nnewline037\nnewline038\nnewline039\n')], ['diff-files', '-B', '--numstat']),
+    ('diff-files-rename-limit-warning', [('write', 's1.txt', 'a\nb\nc\n'), ('write', 's2.txt', 'd\ne\nf\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('rm', 's1.txt'), ('rm', 's2.txt'), ('write', 'd1.txt', 'a\nb\nX\n'), ('write', 'd2.txt', 'd\ne\nY\n'), ['add', '-N', 'd1.txt', 'd2.txt']], ['diff-files', '-M', '-l1']),
+    ('diff-files-M-invalid-arg', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-Mxyz']),
+    ('diff-files-C-invalid-arg', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-Cabc']),
+    ('diff-files-B-bad-form', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-B/0/0']),
+    ('diff-files-S-missing-value', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-S']),
+    ('diff-files-l-non-numeric', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['diff-files', '-l', 'foo']),
+    ('log-l-range-linear', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'line1\nline2 modified\nline3\nline4\nline5\n'), ['commit', '-am', 'c2'], ('write', 'f.txt', 'line1\nline2 modified\nline3 changed\nline4\nline5\nline6 new\n'), ['commit', '-am', 'c3']], ['log', '-L2,3:f.txt']),
+    ('log-l-oneline', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['commit', '-am', 'c2']], ['log', '--oneline', '-L1,2:f.txt']),
+    ('log-l-relative-end', [('write', 'f.txt', 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\nd\ne\nf\ng\nh\nI\nj\n'), ['commit', '-am', 'c2']], ['log', '-L2,+3:f.txt']),
+    ('log-l-funcname', [('write', 'f.c', 'int foo(void)\n{\n\treturn 1;\n}\n\nint bar(void)\n{\n\treturn 2;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1'], ('write', 'f.c', 'int foo(void)\n{\n\treturn 11;\n}\n\nint bar(void)\n{\n\treturn 2;\n}\n'), ['commit', '-am', 'c2']], ['log', '-L:foo:f.c']),
+    ('log-l-funcname-suffix-in-hunk', [('write', 'f.c', 'int foo(void)\n{\n\tint a = 1;\n\tint b = 2;\n\tint c = 3;\n\treturn a;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1'], ('write', 'f.c', 'int foo(void)\n{\n\tint a = 1;\n\tint b = 2;\n\tint c = 30;\n\treturn a;\n}\n'), ['commit', '-am', 'c2']], ['log', '-L5,5:f.c']),
+    ('log-l-regex-bounds', [('write', 'f.c', 'int foo(void)\n{\n\tint a = 1;\n\tint b = 2;\n\tint c = 3;\n\treturn a;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1'], ('write', 'f.c', 'int foo(void)\n{\n\tint a = 1;\n\tint b = 2;\n\tint c = 30;\n\treturn a;\n}\n'), ['commit', '-am', 'c2']], ['log', '-L/int b/,/return a/:f.c']),
+    ('log-l-tracks-through-insertion', [('write', 'f.txt', 'a\nb\nc\nd\ne\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'HEADER\na\nb\nc\nd\ne\n'), ['commit', '-am', 'c2'], ('write', 'f.txt', 'HEADER\na\nb\nC\nd\ne\n'), ['commit', '-am', 'c3']], ['log', '-L4,4:f.txt']),
+    ('log-l-deletion', [('write', 'f.txt', 'a\nb\nc\nd\ne\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nc\nd\ne\n'), ['commit', '-am', 'c2']], ['log', '-L1,3:f.txt']),
+    ('log-l-multiple-files-path-sorted', [('write', 'a.txt', 'a1\na2\na3\n'), ('write', 'b.txt', 'b1\nb2\nb3\n'), ['add', 'a.txt'], ['add', 'b.txt'], ['commit', '-m', 'c1'], ('write', 'a.txt', 'a1\nA2\na3\n'), ['commit', '-am', 'c2'], ('write', 'b.txt', 'b1\nB2\nb3\n'), ['commit', '-am', 'c3']], ['log', '-L2,2:b.txt', '-L2,2:a.txt']),
+    ('log-l-no-newline-eof', [('write', 'f.txt', 'a\nb\nc'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc'), ['commit', '-am', 'c2']], ['log', '-L1,3:f.txt']),
+    ('log-l-raw-format', [('write', 'f.txt', 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\nd\ne\nf\ng\nh\nI\nj\n'), ['commit', '-am', 'c2']], ['log', '-L2,2:f.txt', '--pretty=raw']),
+    ('log-l-rename-follow', [('write', 'old.txt', 'a\nb\nc\nd\n'), ['add', 'old.txt'], ['commit', '-m', 'c1'], ['mv', 'old.txt', 'new.txt'], ['commit', '-am', 'rename'], ('write', 'new.txt', 'a\nB\nc\nd\n'), ['commit', '-am', 'modify']], ['log', '-L2,2:new.txt']),
+    ('show-l-default-head', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'line1\nline2 modified\nline3\nline4\nline5\n'), ['commit', '-am', 'c2']], ['show', '-L2,3:f.txt']),
+    ('show-l-explicit-rev', [('write', 'f.txt', 'line1\nline2\nline3\nline4\nline5\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'line1\nline2 modified\nline3\nline4\nline5\n'), ['commit', '-am', 'c2']], ['show', '-L2,3:f.txt', 'HEAD~1']),
+    ('show-l-multi-range', [('write', 'f.txt', 'a\nb\nc\nd\ne\nf\ng\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['show', '-L2,3:f.txt', '-L6,6:f.txt']),
+    ('show-l-no-patch', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['commit', '-am', 'c2']], ['show', '-L1,2:f.txt', '-s']),
+    ('show-l-two-commits-error', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['commit', '-am', 'c2']], ['show', '-L1,2:f.txt', 'HEAD', 'HEAD~1']),
+    ('log-l-error-no-file-part', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-L2,3']),
+    ('log-l-error-missing-colon', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-Lfoo']),
+    ('log-l-error-bad-range', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-L2,bad:f.txt']),
+    ('log-l-error-line-zero', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-L0,2:f.txt']),
+    ('log-l-error-too-many-lines', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-L100,200:f.txt']),
+    ('log-l-error-no-such-path', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'c1']], ['log', '-L1,2:nope.txt']),
+    ('log-l-error-empty-funcname', [('write', 'f.c', 'int foo(void)\n{\n\treturn 1;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1']], ['log', '-L::f.c']),
+    ('log-l-error-funcname-no-match', [('write', 'f.c', 'int foo(void)\n{\n\treturn 1;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1']], ['log', '-L:nosuchfunc:f.c']),
+    ('log-l-error-regex-no-match', [('write', 'f.c', 'int foo(void)\n{\n\treturn 1;\n}\n'), ['add', 'f.c'], ['commit', '-m', 'c1']], ['log', '-L/nomatch_regex_xyz/:f.c']),
+    ('log-l-error-directory-path', [('write', 'sub/x.txt', 'a\nb\nc\n'), ['add', 'sub/x.txt'], ['commit', '-m', 'c1']], ['log', '-L1,2:sub']),
+]
+
+BATCH6_STDIN_CASES = [
+    ('stdin-with-path-converts', [('write', '.gitattributes', '*.txt text\n')], ['hash-object', '--stdin', '--path', 'crlf.txt'], 'a\r\nb\r\n'),
+    ('stdin-without-path-no-conversion', [('write', '.gitattributes', '*.txt text\n')], ['hash-object', '--stdin'], 'a\r\nb\r\n'),
+    ('stdin-paths-converts', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--stdin-paths'], 'crlf.txt\n'),
+    ('stdin-paths-no-filters', [('write', '.gitattributes', '*.txt text\n'), ('write', 'crlf.txt', 'a\r\nb\r\n')], ['hash-object', '--stdin-paths', '--no-filters'], 'crlf.txt\n'),
+    ('no-args-succeeds-silently', [], ['hash-object'], ''),
+]
+
+@pytest.mark.parametrize("case", BATCH6_CASES, ids=[c[0] for c in BATCH6_CASES])
+def test_batch6_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH6_STDIN_CASES, ids=[c[0] for c in BATCH6_STDIN_CASES])
+def test_batch6_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# stash: the batch-6 agent verified ~28 cases but serialized only one, so these
+# lock the implemented push/show/export flags (-u/-a/--staged, show -u/
+# --only-untracked, export --print/--to-ref) byte-exact incl. the refs/stash
+# commit graph. `stash push <pathspec>` is honestly rejected (not byte-exact),
+# so it is intentionally absent.
+_ST_BASE = [("write", "t.txt", "a\nb\n"), ["add", "t.txt"], ["commit", "-q", "-m", "init"]]
+BATCH6_STASH_CASES = [
+    ("stash-push-default-msg", _ST_BASE + [("write", "t.txt", "mod\n")], ["stash"]),
+    ("stash-no-local-changes", _ST_BASE, ["stash"]),
+    ("stash-list-after", _ST_BASE + [("write", "t.txt", "mod\n"), ["stash", "push", "-m", "one"]],
+     ["stash", "list"]),
+    ("stash-show-p-after", _ST_BASE + [("write", "t.txt", "mod\n"), ["stash", "push", "-m", "one"]],
+     ["stash", "show", "-p", "stash@{0}"]),
+    ("stash-show-u", _ST_BASE + [("write", "t.txt", "mod\n"), ("write", "u.txt", "untr\n"),
+                                 ["stash", "push", "-u", "-m", "wu"]],
+     ["stash", "show", "-u", "stash@{0}"]),
+    ("stash-show-only-untracked",
+     _ST_BASE + [("write", "t.txt", "mod\n"), ("write", "u.txt", "u\n"),
+                 ["stash", "push", "-u", "-q", "-m", "wu"]],
+     ["stash", "show", "--only-untracked", "stash@{0}"]),
+    ("stash-staged-clean-worktree",
+     _ST_BASE + [("write", "t.txt", "staged\n"), ["add", "t.txt"]],
+     ["stash", "push", "--staged", "-m", "st"]),
+    ("stash-all-ignored",
+     _ST_BASE + [("write", ".gitignore", "*.ign\n"), ["add", ".gitignore"], ["commit", "-q", "-m", "gi"],
+                 ("write", "t.txt", "mod\n"), ("write", "x.ign", "ign\n")],
+     ["stash", "push", "-a", "-m", "all"]),
+    ("stash-export-print",
+     _ST_BASE + [("write", "t.txt", "mod\n"), ["stash", "push", "-q", "-m", "one"]],
+     ["stash", "export", "--print", "stash@{0}"]),
+    ("stash-export-to-ref",
+     _ST_BASE + [("write", "t.txt", "mod\n"), ["stash", "push", "-q", "-m", "one"]],
+     ["stash", "export", "--to-ref", "refs/x", "stash@{0}"]),
+]
+
+
+@pytest.mark.parametrize("case", BATCH6_STASH_CASES, ids=[c[0] for c in BATCH6_STASH_CASES])
+def test_batch6_stash_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)

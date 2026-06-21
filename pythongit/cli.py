@@ -674,14 +674,32 @@ def cmd_init(argv: list[str]) -> int:
     return 0
 
 
+_HASH_OBJECT_USAGE = (
+    "usage: git hash-object [-t <type>] [-w] [--path=<file> | --no-filters]\n"
+    "                       [--stdin [--literally]] [--] <file>...\n"
+    "   or: git hash-object [-t <type>] [-w] --stdin-paths [--no-filters]\n"
+    "\n"
+    "    -t <type>             object type\n"
+    "    -w                    write the object into the object database\n"
+    "    --[no-]stdin          read the object from stdin\n"
+    "    --[no-]stdin-paths    read file names from stdin\n"
+    "    --no-filters          store file as is without filters\n"
+    "    --filters             opposite of --no-filters\n"
+    "    --[no-]literally      just hash any random garbage to create corrupt objects for debugging Git\n"
+    "    --[no-]path <file>    process file as it were from this path\n"
+    "\n"
+)
+
+
 def cmd_hash_object(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit hash-object", add_help=False)
     ap.add_argument("-w", action="store_true", help="write object")
     ap.add_argument("-t", default="blob", choices=["blob", "tree", "commit", "tag"])
-    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--stdin", action="count", default=0)
     ap.add_argument("--stdin-paths", action="store_true")
     ap.add_argument("--literally", action="store_true")
     ap.add_argument("--no-filters", dest="no_filters", action="store_true")
+    ap.add_argument("--filters", dest="no_filters", action="store_false")
     ap.add_argument("--path", default=None)
     ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
@@ -691,25 +709,174 @@ def cmd_hash_object(argv: list[str]) -> int:
     except RepositoryError:
         pass
 
-    def emit(data: bytes) -> None:
+    def usage_error(msg: str) -> int:
+        _err("error: " + msg)
+        sys.stderr.write(_HASH_OBJECT_USAGE)
+        return 129
+
+    # Resolve --path against the cwd-relative prefix, matching git's vpath.
+    vpath = args.path
+    prefix = ""
+    if repo is not None:
+        try:
+            rel = os.path.relpath(os.getcwd(), str(repo.path))
+            if rel not in (".", ""):
+                prefix = rel.replace(os.sep, "/") + "/"
+        except ValueError:
+            prefix = ""
+    if vpath is not None and prefix:
+        vpath = prefix + vpath
+
+    # Argument-combination checks (builtin/hash-object.c).
+    if args.stdin_paths:
+        if args.stdin:
+            return usage_error("Can't use --stdin-paths with --stdin")
+        if args.files:
+            return usage_error("Can't specify files with --stdin-paths")
+        if vpath is not None:
+            return usage_error("Can't use --stdin-paths with --path")
+    else:
+        if args.stdin > 1:
+            return usage_error("Multiple --stdin arguments are not supported")
+        if vpath is not None and args.no_filters:
+            return usage_error("Can't use --path with --no-filters")
+
+    from . import convert as _convert
+
+    def emit(raw: bytes, conv_path: Optional[str]) -> int:
+        data = raw
+        if args.t == "blob" and conv_path is not None:
+            try:
+                data, warn = _convert.convert_to_git(repo, conv_path, raw, args.w)
+            except _convert.SafeCrlfDie as exc:
+                # core.safecrlf=true: the round-trip would lose EOLs.
+                _err("fatal: %s" % exc)
+                return 128
+            except _convert.ConvertError:
+                # An attribute requested a conversion we cannot perform
+                # byte-exact (external clean filter / working-tree-encoding).
+                _err("fatal: cannot run filters for %r: unsupported" % conv_path)
+                return 128
+            else:
+                if warn:
+                    _err(warn)
         if args.w:
             _print(objs.write_object(repo, args.t, data))
         else:
             _print(objs.hash_bytes(args.t, data, repo)[0])
+        return 0
+
+    def read_file(open_name: str, display: str) -> Optional[bytes]:
+        """Read a file the way git's xopen + index_fd do, with git's errors.
+
+        git chdir's to the repository top and opens ``prefix + name`` from
+        there; we stay in the caller's cwd, so the file is reached by opening
+        ``open_name`` relative to cwd, while error messages use ``display``
+        (the prefix-prepended path git would print).
+        """
+        try:
+            fd = os.open(open_name, os.O_RDONLY)
+        except OSError as exc:
+            _err(
+                "fatal: could not open '%s' for reading: %s"
+                % (display, os.strerror(exc.errno))
+            )
+            return None
+        try:
+            st = os.fstat(fd)
+            if not _stat_is_reg(st.st_mode):
+                # Directories / non-regular: git tries to read and fails.
+                _err("fatal: Unable to hash %s" % display)
+                return None
+            data = b""
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        finally:
+            os.close(fd)
+
+    # Order mirrors builtin/hash-object.c: --stdin first, then files, then
+    # --stdin-paths.
+    if args.stdin:
+        rc = emit(sys.stdin.buffer.read(), None if args.no_filters else vpath)
+        if rc:
+            return rc
+
+    for name in args.files:
+        display = prefix + name if prefix else name
+        raw = read_file(name, display)
+        if raw is None:
+            return 128
+        conv = None if args.no_filters else (vpath if vpath is not None else display)
+        rc = emit(raw, conv)
+        if rc:
+            return rc
 
     if args.stdin_paths:
         for line in sys.stdin.read().splitlines():
-            if line:
-                emit(Path(line).read_bytes())
-        return 0
-    if args.stdin:
-        emit(sys.stdin.buffer.read())
-    if args.files:
-        for f in args.files:
-            emit(Path(f).read_bytes())
-    elif not args.stdin:
-        ap.error("need file or --stdin")
+            if not line:
+                continue
+            name = line
+            if line.startswith('"'):
+                try:
+                    name = _unquote_c_style(line)
+                except ValueError:
+                    _err("fatal: line is badly quoted")
+                    return 128
+            raw = read_file(name, name)
+            if raw is None:
+                return 128
+            conv = None if args.no_filters else name
+            rc = emit(raw, conv)
+            if rc:
+                return rc
+
     return 0
+
+
+def _stat_is_reg(mode: int) -> bool:
+    import stat as _stat
+
+    return _stat.S_ISREG(mode)
+
+
+def _unquote_c_style(s: str) -> str:
+    """Minimal C-style unquoting for double-quoted --stdin-paths lines."""
+    if not (s.startswith('"') and s.endswith('"') and len(s) >= 2):
+        raise ValueError("badly quoted")
+    body = s[1:-1]
+    out = bytearray()
+    i = 0
+    simple = {
+        "a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11,
+        "\\": 92, '"': 34,
+    }
+    while i < len(body):
+        c = body[i]
+        if c == "\\":
+            i += 1
+            if i >= len(body):
+                raise ValueError("badly quoted")
+            e = body[i]
+            if e in simple:
+                out.append(simple[e])
+                i += 1
+            elif e in "01234567":
+                oct_digits = e
+                i += 1
+                while i < len(body) and body[i] in "01234567" and len(oct_digits) < 3:
+                    oct_digits += body[i]
+                    i += 1
+                out.append(int(oct_digits, 8) & 0xFF)
+            else:
+                raise ValueError("badly quoted")
+        else:
+            out.extend(c.encode("utf-8"))
+            i += 1
+    return out.decode("utf-8", "surrogateescape")
 
 
 def _loose_object_shas(repo: Repository) -> set[str]:
@@ -3896,6 +4063,291 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
     return expand_seg(fmt)
 
 
+def _line_log_file_header(path: str, parent_path: str, a_text: str, b_text: str,
+                          a_sha: Optional[str], b_sha: Optional[str],
+                          a_present: bool, b_mode: str) -> list[str]:
+    """The ``diff --git`` / mode / ``index`` / ``---``+``+++`` header lines for a
+    line-log file pair, matching git's builtin_diff for the line-range case."""
+    out: list[str] = []
+    out.append(f"diff --git a/{parent_path} b/{path}")
+    a_abbrev = (a_sha or "0" * 40)[:7]
+    b_abbrev = (b_sha or "0" * 40)[:7]
+    if not a_present:
+        out.append(f"new file mode {b_mode}")
+        out.append(f"index {a_abbrev}..{b_abbrev}")
+        out.append("--- /dev/null")
+        out.append(f"+++ b/{path}")
+    else:
+        out.append(f"index {a_abbrev}..{b_abbrev} {b_mode}")
+        out.append(f"--- a/{parent_path}")
+        out.append(f"+++ b/{path}")
+    return out
+
+
+def _run_line_log(repo: Repository, args, mode: str) -> int:
+    """Drive ``git log -L`` / ``git show -L`` (line-level history).
+
+    ``mode`` is "log" (walk ancestry) or "show" (no-walk: render only the start
+    commit, with the in-range lines shown as a new-file diff).
+    """
+    from . import linelog as _ll
+
+    # The single starting commit.  Both log and show dig from exactly one commit.
+    start_rev = None
+    if mode == "log":
+        non_dd = [t for t in args.pos if t != "--"]
+        revs = [t for t in non_dd]
+        start_rev = revs[0] if revs else "HEAD"
+    else:
+        revs = args.rev or ["HEAD"]
+        if len(revs) > 1:
+            # git: "More than one commit to dig from: <b> and <a>?"
+            _err(f"fatal: More than one commit to dig from: {revs[1]} and {revs[0]}?")
+            return 128
+        start_rev = revs[0]
+
+    start_sha = refs_mod.rev_parse(repo, start_rev + "^{commit}") \
+        or refs_mod.rev_parse(repo, start_rev)
+    if not start_sha:
+        head_sym, _ = refs_mod.read_head(repo)
+        if start_rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
+            branch = head_sym[len("refs/heads/"):]
+            _err(f"fatal: your current branch '{branch}' does not have any commits yet")
+            return 128
+        _err(f"fatal: ambiguous argument '{start_rev}': unknown revision or path not in the working tree.")
+        _err("Use '--' to separate paths from revisions, like this:")
+        _err("'git <command> [<revision>...] -- [<file>...]'")
+        return 128
+
+    info = _commit_tree_parents(repo, start_sha)
+    if info is None:
+        _err(f"fatal: ambiguous argument '{start_rev}': unknown revision or path not in the working tree.")
+        return 128
+    start_tree = info[0]
+
+    def _read_path_text(tree: str, path: str) -> Optional[str]:
+        e = workdir.tree_path_entry(repo, tree, path)
+        if e is None:
+            return None
+        if e.is_dir() or e.is_gitlink():
+            # git: get_tree_entry succeeds, then diff_populate_filespec fails to
+            # read the (tree/gitlink) object as a blob.
+            raise _ll.LParseError(f"Cannot read blob {e.sha}")
+        return objs.read_object(repo, e.sha)[1].decode("utf-8", errors="replace")
+
+    try:
+        ranges0 = _ll.parse_args(repo, start_tree, args.line_ranges, _read_path_text)
+    except _ll.LParseError as exc:
+        _err("fatal: " + str(exc))
+        return 128
+
+    # Output format determination (shared with cmd_log / cmd_show).
+    fmt_string: Optional[str] = None
+    style = "medium"
+    fmt_terminator = True
+    pretty = getattr(args, "pretty", None)
+    fmt_attr = getattr(args, "format", None)
+    if fmt_attr in ("oneline", "short", "medium", "full", "fuller", "raw", "reference"):
+        pretty, fmt_attr = fmt_attr, None
+    if fmt_attr is not None:
+        fmt_string = fmt_attr
+        style = "format"
+    elif pretty is not None:
+        if pretty == "oneline":
+            style = "oneline_full"
+        elif pretty.startswith("format:"):
+            fmt_terminator = False
+            fmt_string = pretty.split(":", 1)[1]
+            style = "format"
+        elif pretty.startswith("tformat:") or "%" in pretty:
+            fmt_string = (pretty.split(":", 1)[1]
+                          if pretty.startswith("tformat:") else pretty)
+            style = "format"
+        else:
+            style = pretty
+    if getattr(args, "oneline", False):
+        style = "oneline"
+    date_mode = getattr(args, "date", None) or "default"
+    no_patch = getattr(args, "no_patch", False) or getattr(args, "quiet", False)
+    context = getattr(args, "unified", 3)
+    from . import mailmap as _mailmap
+    mm = None if getattr(args, "no_use_mailmap", False) else _mailmap.load(repo)
+
+    # Render a single commit's header in the active style.
+    def render_header(count: int, sha: str, c) -> None:
+        if style == "format":
+            expansion = _expand_commit_format(repo, sha, c, fmt_string, {},
+                                              date_mode, getattr(args, "abbrev", 7))
+            if fmt_terminator:
+                sys.stdout.write(expansion + "\n")
+            else:
+                if count > 0:
+                    sys.stdout.write("\n")
+                sys.stdout.write(expansion)
+        elif style in ("oneline", "oneline_full"):
+            abbrev = sha[:7] if style == "oneline" else sha
+            first = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"{abbrev} {first}")
+        elif style == "reference":
+            first = c.message.splitlines()[0] if c.message.strip() else ""
+            _print(f"{sha[:7]} ({first}, {_format_date(c.author, 'short')})")
+        elif style in ("short", "raw"):
+            if count > 0:
+                _print("")
+            _print(f"commit {sha}")
+            if style == "raw":
+                _print(f"tree {c.tree}")
+                for p in c.parents:
+                    _print(f"parent {p}")
+                _print(f"author {c.author}")
+                _print(f"committer {c.committer}")
+                _print("")
+                for line in c.message.rstrip("\n").splitlines():
+                    _print(f"    {line}")
+            else:
+                if len(c.parents) > 1:
+                    _print("Merge: " + " ".join(p[:7] for p in c.parents))
+                _print(f"Author: {_mapped_who(_split_ident(c.author)[0], mm)}")
+                _print("")
+                first = c.message.splitlines()[0] if c.message.strip() else ""
+                _print(f"    {first}")
+        else:  # medium / full / fuller
+            if count > 0:
+                _print("")
+            _emit_commit_header(sha, c, style=style, date_mode=date_mode, mailmap=mm)
+            _print("")
+            for line in c.message.rstrip("\n").splitlines():
+                _print(f"    {line}")
+
+    # Emit one commit's scoped line-log diff (after its header).
+    def emit_diff(diff_blocks: list[tuple]) -> None:
+        # line_log_print: fprintf(file, "%s\n", prefix) -> a blank line.
+        _print("")
+        for (path, parent_path, a_text, b_text, a_sha, b_sha, a_present,
+             b_mode, scoped) in diff_blocks:
+            for h in _line_log_file_header(path, parent_path, a_text, b_text,
+                                           a_sha, b_sha, a_present, b_mode):
+                _print(h)
+            for ln in scoped:
+                _print(ln)
+
+    if mode == "show":
+        # show -L: render the start commit only, with each tracked file's
+        # in-range lines as a brand-new-file diff (no parent).
+        c = objs.parse_commit(objs.read_object(repo, start_sha)[1])
+        render_header(0, start_sha, c)
+        if not no_patch:
+            blocks = []
+            for fr in ranges0:
+                e = workdir.tree_path_entry(repo, start_tree, fr.path)
+                b_sha = e.sha
+                b_mode = e.mode
+                b_text = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
+                scoped = _ll.emit_scoped_hunks("", b_text, fr.ranges, context)
+                blocks.append((fr.path, fr.path, "", b_text, None, b_sha,
+                               False, b_mode, scoped))
+            emit_diff(blocks)
+        return 0
+
+    # log -L: line-level traverse forces topological order (revision.c
+    # sets revs->topo_order=1).  Collect the reachable commit set in
+    # committer-date order (limit_list), topo-sort it, then run the line-log
+    # filter in that order so each commit is seen after all its children.
+    graph = _graph_for_repo(repo)
+    import heapq
+    first_parent = getattr(args, "first_parent", False)
+
+    seed_heap: list[tuple] = []
+    seed_counter = 0
+    seen_collect: set[str] = set()
+    reachable: list[str] = []
+    heapq.heappush(seed_heap, (-_commit_date(repo, start_sha), seed_counter, start_sha))
+    seed_counter += 1
+    seeded = {start_sha}
+    while seed_heap:
+        _d, _c, sha = heapq.heappop(seed_heap)
+        if sha in seen_collect:
+            continue
+        seen_collect.add(sha)
+        info = _commit_tree_parents(repo, sha, graph)
+        if info is None:
+            continue
+        reachable.append(sha)
+        for p in (info[1][:1] if first_parent else info[1]):
+            if p not in seeded:
+                heapq.heappush(seed_heap, (-_commit_date(repo, p), seed_counter, p))
+                seed_counter += 1
+                seeded.add(p)
+    order = _topo_order(repo, reachable, first_parent)
+
+    # Decoration: sha -> list[FileRanges] tracked at that commit.
+    tracked: dict[str, list] = {start_sha: ranges0}
+    out_commits: list[tuple] = []  # (sha, commit_obj, diff_blocks)
+
+    def _propagate(parent: str, parent_ranges):
+        existing = tracked.get(parent)
+        tracked[parent] = (_ll.merge_file_ranges(existing, parent_ranges)
+                           if existing else parent_ranges)
+
+    for sha in order:
+        cinfo = _commit_tree_parents(repo, sha, graph)
+        if cinfo is None:
+            continue
+        ctree, parents = cinfo
+        fr_list = tracked.get(sha)
+        if fr_list is None:
+            continue
+
+        is_merge = len(parents) > 1
+        if is_merge:
+            eff_parents = parents[:1] if first_parent else parents
+            ptrees = [(p, _commit_tree_parents(repo, p, graph)[0]) for p in eff_parents]
+            shown, propagate = _ll.process_merge_commit(repo, fr_list, ctree, ptrees)
+            if shown:
+                c = objs.parse_commit(objs.read_object(repo, sha)[1])
+                out_commits.append((sha, c, []))  # merge: empty (combined) diff
+            for psha, pr in propagate:
+                _propagate(psha, pr)
+            continue
+
+        # Ordinary commit (or first-parent traversal of a merge).
+        parent = parents[0] if parents else None
+        parent_tree = _commit_tree_parents(repo, parent, graph)[0] if parent else None
+        changed, parent_ranges = _ll.process_commit(repo, fr_list, ctree, parent_tree)
+        if changed:
+            blocks = []
+            c = objs.parse_commit(objs.read_object(repo, sha)[1])
+            for fr in fr_list:
+                if fr.pair is None:
+                    continue
+                parent_path, a_text, b_text = fr.pair
+                pe = (workdir.tree_path_entry(repo, parent_tree, parent_path)
+                      if parent_tree else None)
+                a_sha = pe.sha if pe else None
+                b_entry = workdir.tree_path_entry(repo, ctree, fr.path)
+                b_sha = b_entry.sha if b_entry else None
+                b_mode = b_entry.mode if b_entry else "100644"
+                scoped = _ll.emit_scoped_hunks(a_text, b_text, fr.ranges_at_target,
+                                               context)
+                blocks.append((fr.path, parent_path, a_text, b_text, a_sha, b_sha,
+                               a_sha is not None, b_mode, scoped))
+            out_commits.append((sha, c, blocks))
+        if parent is not None:
+            _propagate(parent, parent_ranges)
+
+    max_count = getattr(args, "max_count", None)
+    if max_count is not None:
+        out_commits = out_commits[:max(0, max_count)]
+    if getattr(args, "reverse", False):
+        out_commits = list(reversed(out_commits))
+
+    for count, (sha, c, blocks) in enumerate(out_commits):
+        render_header(count, sha, c)
+        if not no_patch:
+            emit_diff(blocks)
+    return 0
+
+
 def cmd_log(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit log", add_help=False)
     ap.add_argument("--oneline", action="store_true")
@@ -3959,9 +4411,15 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("-g", "--walk-reflogs", dest="walk_reflogs", action="store_true")
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--left-right", dest="left_right", action="store_true")
+    ap.add_argument("-L", dest="line_ranges", action="append", default=None)
+    # -s/--no-patch suppresses the per-commit patch; only consulted in the
+    # line-log path (the default log output already emits no diff).
+    ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
     ap.add_argument("pos", nargs="*")
     args = ap.parse_args(_expand_count_shorthand(argv))
     repo = _repo()
+    if args.line_ranges:
+        return _run_line_log(repo, args, mode="log")
     # Builtin formats honour the mailmap by default; --no-use-mailmap disables it.
     from . import mailmap as _mailmap
     mm_log = None if args.no_use_mailmap else _mailmap.load(repo)
@@ -4692,8 +5150,15 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--use-mailmap", "--mailmap", dest="use_mailmap", action="store_true")
     ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="no_use_mailmap", action="store_true")
+    ap.add_argument("-L", dest="line_ranges", action="append", default=None)
     ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
+    if args.line_ranges:
+        # `show -L` digs from a single commit and renders only it; -s/-q suppress
+        # the patch.  Map show's flags onto the shared line-log driver.
+        args.no_patch = args.no_patch or args.quiet
+        args.pos = args.rev
+        return _run_line_log(_repo(), args, mode="show")
     # NO_OUTPUT (from -q/--quiet) collides with the NAME / NAME_STATUS output
     # formats in diff_setup_done(); git rejects the combination with rc 128.
     # --stat/--raw clear NO_OUTPUT before that check, so the conflict only
@@ -5076,9 +5541,53 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
             _print(line)
 
 
-def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None) -> None:
-    rows: list[tuple[str, int, int, int]] = []  # path, ins, del, total
+def _pprint_rename(a: str, b: str) -> str:
+    """Port of diff.c pprint_rename: render 'a => b' compactly by factoring out a
+    common directory prefix and suffix, e.g. 'dir/{x => y}' or '{a => b}/sfx'."""
+    # If either path needs C-style quoting, git falls back to 'a => b'.
+    len_a, len_b = len(a), len(b)
+    # common prefix ending at a slash
+    pfx_length = 0
+    i = 0
+    while i < len_a and i < len_b and a[i] == b[i]:
+        if a[i] == "/":
+            pfx_length = i + 1
+        i += 1
+    # common suffix (may run 1 into the prefix slash)
+    pfx_adjust = 1 if pfx_length else 0
+    sfx_length = 0
+    oa = len_a
+    ob = len_b
+    while (pfx_length - pfx_adjust <= oa - 1 and
+           pfx_length - pfx_adjust <= ob - 1 and
+           oa - 1 >= 0 and ob - 1 >= 0 and a[oa - 1] == b[ob - 1]):
+        if a[oa - 1] == "/":
+            sfx_length = len_a - (oa - 1)
+        oa -= 1
+        ob -= 1
+    a_mid = max(0, len_a - pfx_length - sfx_length)
+    b_mid = max(0, len_b - pfx_length - sfx_length)
+    out = []
+    if pfx_length + sfx_length:
+        out.append(a[:pfx_length])
+        out.append("{")
+    out.append(a[pfx_length:pfx_length + a_mid])
+    out.append(" => ")
+    out.append(b[pfx_length:pfx_length + b_mid])
+    if pfx_length + sfx_length:
+        out.append("}")
+        out.append(a[len_a - sfx_length:])
+    return "".join(out)
+
+
+def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None,
+               complete=None, order=None) -> None:
+    # rows carry (sort_key, name, ins, del, total); sort_key orders the output
+    # by the diff queue (via ``order`` map keyed on dst/path) when provided.
+    rows: list[tuple, ...] = []
     total_ins = total_del = 0
+    complete = complete or {}
+    order = order or {}
     for src, dst, _sim, src_side, dst_side in (renames or []):
         a_lines = (src_side.data or b"").decode("utf-8", errors="replace").splitlines()
         b_lines = (dst_side.data or b"").decode("utf-8", errors="replace").splitlines()
@@ -5088,31 +5597,36 @@ def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None) -> None:
                 ins += 1
             elif op[0] == "del":
                 dele += 1
-        rows.append((f"{src} => {dst}", ins, dele, ins + dele))
+        rows.append((order.get(dst, len(rows)), _pprint_rename(src, dst), ins, dele, ins + dele))
         total_ins += ins
         total_del += dele
     for path, a, b in changes:
         if a.sha == b.sha and a.mode == b.mode:
             continue
         if _is_binary(a.data) or _is_binary(b.data):
-            rows.append((path, -1, -1, -1))
+            rows.append((order.get(path, len(rows)), path, -1, -1, -1))
             continue
-        a_lines = (a.data or b"").decode("utf-8", errors="replace").splitlines()
-        b_lines = (b.data or b"").decode("utf-8", errors="replace").splitlines()
-        ins = dele = 0
-        for op in diff_mod.diff_lines(a_lines, b_lines):
-            if op[0] == "ins":
-                ins += 1
-            elif op[0] == "del":
-                dele += 1
-        rows.append((path, ins, dele, ins + dele))
+        if path in complete:
+            ins, dele = complete[path]
+        else:
+            a_lines = (a.data or b"").decode("utf-8", errors="replace").splitlines()
+            b_lines = (b.data or b"").decode("utf-8", errors="replace").splitlines()
+            ins = dele = 0
+            for op in diff_mod.diff_lines(a_lines, b_lines):
+                if op[0] == "ins":
+                    ins += 1
+                elif op[0] == "del":
+                    dele += 1
+        rows.append((order.get(path, len(rows)), path, ins, dele, ins + dele))
         total_ins += ins
         total_del += dele
     if not rows:
         return
-    name_w = max(len(p) for p, *_ in rows)
+    if order:
+        rows.sort(key=lambda r: r[0])
+    name_w = max(len(r[1]) for r in rows)
     count_w = max(len(str(t if t >= 0 else 0)) for *_, t in rows)
-    for path, ins, dele, total in rows:
+    for _k, path, ins, dele, total in rows:
         if total < 0:
             _print(f" {path:<{name_w}} | Bin")
             continue
@@ -5403,20 +5917,53 @@ def _diff_counts(a: _Side, b: _Side) -> tuple[int, int]:
     return ins, dele
 
 
-def _diff_numstat(changes: list) -> None:
-    for path, a, b in changes:
-        ins, dele = _diff_counts(a, b)
-        if ins < 0:
-            _print(f"-\t-\t{path}")
+def _diff_numstat(changes: list, renames=None, nul: bool = False,
+                  complete=None, order=None) -> None:
+    # In -z mode renames emit 'ins<TAB>del<TAB>\0src\0dst\0'; otherwise the
+    # compact 'src => dst' name terminated by newline. ``order`` (dst/path ->
+    # queue index) reorders output to match the diff queue when provided.
+    complete = complete or {}
+    order = order or {}
+    out: list[tuple[int, str]] = []
+    for src, dst, _sim, sa, db in (renames or []):
+        ins, dele = _diff_counts(sa, db)
+        cnt = "-\t-\t" if ins < 0 else f"{ins}\t{dele}\t"
+        if nul:
+            line = f"{cnt}\0{src}\0{dst}\0" if src != dst else f"{cnt}{dst}\0"
         else:
-            _print(f"{ins}\t{dele}\t{path}")
+            name = _pprint_rename(src, dst) if src != dst else dst
+            line = f"{cnt}{name}\n"
+        out.append((order.get(dst, len(out)), line))
+    for path, a, b in changes:
+        if path in complete and not (_is_binary(a.data) or _is_binary(b.data)):
+            ins, dele = complete[path]
+        else:
+            ins, dele = _diff_counts(a, b)
+        cnt = "-\t-\t" if ins < 0 else f"{ins}\t{dele}\t"
+        line = f"{cnt}{path}\0" if nul else f"{cnt}{path}\n"
+        out.append((order.get(path, len(out)), line))
+    if order:
+        out.sort(key=lambda r: r[0])
+    for _k, line in out:
+        sys.stdout.write(line)
 
 
-def _diff_shortstat(changes: list) -> None:
+def _diff_shortstat(changes: list, renames=None, complete=None) -> None:
     files = total_ins = total_del = 0
-    for _path, a, b in changes:
+    complete = complete or {}
+    for _src, _dst, _sim, sa, db in (renames or []):
         files += 1
-        ins, dele = _diff_counts(a, b)
+        ins, dele = _diff_counts(sa, db)
+        if ins > 0:
+            total_ins += ins
+        if dele > 0:
+            total_del += dele
+    for path, a, b in changes:
+        files += 1
+        if path in complete and not (_is_binary(a.data) or _is_binary(b.data)):
+            ins, dele = complete[path]
+        else:
+            ins, dele = _diff_counts(a, b)
         if ins > 0:
             total_ins += ins
         if dele > 0:
@@ -7958,75 +8505,263 @@ def cmd_reflog(argv: list[str]) -> int:
     return 0
 
 
+def _stash_push(argv: list[str], save: bool) -> int:
+    """Handle `git stash push` / `git stash save` (non-interactive subset)."""
+    from . import stash
+    quiet = False
+    keep_index = False
+    include_untracked = 0  # 0 none, 1 -u, 2 -a/--all
+    only_staged = False
+    patch_mode = False
+    message = ""
+    pathspec_from_file = None
+    pathspec_file_nul = False
+    pathspecs: list[str] = []
+
+    i = 0
+    seen_dashdash = False
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if seen_dashdash:
+            pathspecs.append(a)
+            i += 1
+            continue
+        if a == "--":
+            seen_dashdash = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a in ("-k", "--keep-index"):
+            keep_index = True
+        elif a == "--no-keep-index":
+            keep_index = False
+        elif a in ("-u", "--include-untracked"):
+            include_untracked = stash.INCLUDE_UNTRACKED
+        elif a in ("-a", "--all"):
+            include_untracked = stash.INCLUDE_ALL_FILES
+        elif a in ("-S", "--staged"):
+            only_staged = True
+        elif a in ("-p", "--patch"):
+            patch_mode = True
+        elif a in ("-m", "--message"):
+            i += 1
+            message = argv[i] if i < n else ""
+        elif a.startswith("--message="):
+            message = a[len("--message="):]
+        elif a.startswith("-m") and len(a) > 2:
+            message = a[2:]
+        elif a == "--pathspec-from-file":
+            i += 1
+            pathspec_from_file = argv[i] if i < n else ""
+        elif a.startswith("--pathspec-from-file="):
+            pathspec_from_file = a[len("--pathspec-from-file="):]
+        elif a == "--pathspec-file-nul":
+            pathspec_file_nul = True
+        elif save and not a.startswith("-"):
+            # `git stash save <message...>` joins the rest as the message.
+            message = " ".join(argv[i:])
+            break
+        elif not a.startswith("-"):
+            pathspecs.append(a)
+        else:
+            _err(f"error: unknown option `{a[2:] if a.startswith('--') else a[1:]}'")
+            return 129
+        i += 1
+
+    # --patch (interactive) is deferred.
+    if patch_mode:
+        _err("fatal: pygit: stash --patch (interactive) is not supported")
+        return 128
+
+    # Flag conflicts (match builtin/stash.c do_push_stash / push_stash).
+    if pathspec_from_file is not None:
+        if only_staged:
+            _err("fatal: options '--pathspec-from-file' and '--staged' cannot be used together")
+            return 128
+        if pathspecs:
+            _err("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together")
+            return 128
+    elif pathspec_file_nul:
+        _err("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'")
+        return 128
+
+    if only_staged and include_untracked:
+        _err("Can't use --staged and --include-untracked or --all at the same time")
+        return 1
+
+    # Pathspec-scoped stash is deferred (the restore machinery cannot be made
+    # byte-exact yet); reject rather than silently diverge.
+    if pathspecs or pathspec_from_file is not None:
+        _err("fatal: pygit: stash with pathspecs is not supported")
+        return 128
+
+    repo = _repo()
+    result = stash.push(repo, message, keep_index=keep_index,
+                        include_untracked=include_untracked,
+                        only_staged=only_staged)
+    if result == "no-staged":
+        if not quiet:
+            _err("No staged changes")
+        return 1
+    if result is None:
+        if not quiet:
+            _print("No local changes to save")
+        return 0
+    if not quiet:
+        stashes = stash.list_stashes(repo)
+        saved_msg = stashes[0][2] if stashes else f"WIP on HEAD: {result[:7]}"
+        _print(f"Saved working directory and index state {saved_msg}")
+    return 0
+
+
+def _stash_export(argv: list[str]) -> int:
+    from . import stash
+    action = None  # "print" | "to-ref"
+    ref = None
+    revs: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--print":
+            action = "print" if action is None else action
+        elif a == "--to-ref":
+            i += 1
+            ref = argv[i] if i < n else ""
+        elif a.startswith("--to-ref="):
+            ref = a[len("--to-ref="):]
+        elif a == "--":
+            pass
+        else:
+            revs.append(a)
+        i += 1
+
+    if ref and action is None:
+        action = "to-ref"
+    if action is None or (ref and action == "print"):
+        _err("error: exactly one of --print and --to-ref is required")
+        return 1
+
+    repo = _repo()
+    tip = stash.export_stash(repo, revs)
+    if tip is None:
+        return 1
+    if action == "print":
+        _print(tip)
+    else:
+        refs_mod.update_ref(repo, ref, tip)
+    return 0
+
+
+def _stash_show(argv: list[str]) -> int:
+    patch = False
+    unified = 3
+    show_untracked = 0  # 0 none, 1 include, 2 only
+    ref = None
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a in ("-p", "--patch"):
+            patch = True
+        elif a in ("-u", "--include-untracked"):
+            show_untracked = 1
+        elif a == "--only-untracked":
+            show_untracked = 2
+        elif a in ("-U", "--unified"):
+            i += 1
+            unified = int(argv[i]) if i < n else 3
+        elif a.startswith("-U"):
+            unified = int(a[2:])
+        elif a.startswith("--unified="):
+            unified = int(a[len("--unified="):])
+        elif a == "--":
+            pass
+        elif not a.startswith("-"):
+            ref = a
+        i += 1
+    ref = ref or "stash@{0}"
+    repo = _repo()
+    sha = refs_mod.rev_parse(repo, ref)
+    if not sha:
+        _err(f"fatal: ambiguous argument '{ref}': unknown revision or path not in the working tree.")
+        _err("Use '--' to separate paths from revisions, like this:")
+        _err("'git <command> [<revision>...] -- [<file>...]'")
+        return 128
+    c = objs.parse_commit(objs.read_object(repo, sha)[1])
+    base_tree = _commit_tree(repo, c.parents[0]) if c.parents else None
+    # u_tree is parent[2]'s tree, if present.
+    u_tree = None
+    if len(c.parents) >= 3:
+        u_tree = _commit_tree(repo, c.parents[2])
+
+    if show_untracked == 2:
+        # --only-untracked: diff the empty tree against u_tree.
+        if u_tree is not None:
+            if patch:
+                _emit_tree_patch(repo, None, u_tree, unified)
+            else:
+                _diff_stat(_tree_changes(repo, None, u_tree))
+        return 0
+
+    target_tree = c.tree
+    if show_untracked == 1 and u_tree is not None:
+        # Merge w_tree and u_tree (disjoint paths) into one virtual tree.
+        merged: dict[str, tuple[str, str]] = {}
+        for path, mode, blob in workdir.iter_tree_files(repo, c.tree):
+            merged[path] = (mode, blob)
+        for path, mode, blob in workdir.iter_tree_files(repo, u_tree):
+            merged[path] = (mode, blob)
+        target_tree = _stash_build_tree(repo, merged)
+
+    if patch:
+        _emit_tree_patch(repo, base_tree, target_tree, unified)
+    else:
+        _diff_stat(_tree_changes(repo, base_tree, target_tree))
+    return 0
+
+
+def _stash_build_tree(repo: Repository, files: dict[str, tuple[str, str]]) -> str:
+    from . import stash
+    return stash._build_tree_from_blobs(repo, {p: (int(m, 8), s) for p, (m, s) in files.items()})
+
+
 def cmd_stash(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit stash")
-    sub = ap.add_subparsers(dest="action")
-    p_push = sub.add_parser("push")
-    p_push.add_argument("-m", "--message", default="")
-    p_push.add_argument("-q", "--quiet", action="store_true")
-    p_push.add_argument("-k", "--keep-index", dest="keep_index", action="store_true")
-    p_save = sub.add_parser("save")
-    p_save.add_argument("-q", "--quiet", action="store_true")
-    p_save.add_argument("-k", "--keep-index", dest="keep_index", action="store_true")
-    p_save.add_argument("message", nargs="?", default="")
-    sub.add_parser("list")
-    p_apply = sub.add_parser("apply")
-    p_apply.add_argument("-q", "--quiet", action="store_true")
-    p_apply.add_argument("index", nargs="?", type=int, default=0)
-    p_pop = sub.add_parser("pop")
-    p_pop.add_argument("-q", "--quiet", action="store_true")
-    p_pop.add_argument("index", nargs="?", type=int, default=0)
-    p_show = sub.add_parser("show")
-    p_show.add_argument("-p", "--patch", action="store_true")
-    p_show.add_argument("-U", "--unified", type=int, default=3)
-    p_show.add_argument("stash", nargs="?", default="stash@{0}")
-    # `git stash` defaults to the `push` subcommand, so bare options/pathspecs
-    # (e.g. `stash -q`, `stash -m msg`) are treated as `stash push ...`.
+    from . import stash
     _stash_subs = {"push", "save", "list", "apply", "pop", "show", "drop",
                    "clear", "branch", "create", "store", "export", "import"}
     if not argv:
-        argv = ["push"]
-    elif argv[0] not in _stash_subs:
-        argv = ["push"] + argv
-    args = ap.parse_args(argv)
+        action, rest = "push", []
+    elif argv[0] in _stash_subs:
+        action, rest = argv[0], argv[1:]
+    else:
+        action, rest = "push", argv
+
+    if action == "push":
+        return _stash_push(rest, save=False)
+    if action == "save":
+        return _stash_push(rest, save=True)
+    if action == "export":
+        return _stash_export(rest)
+    if action == "show":
+        return _stash_show(rest)
+
     repo = _repo()
-    from . import stash
-    action = args.action or "push"
-    if action in ("push", "save"):
-        sha = stash.push(repo, getattr(args, "message", "") or "",
-                         keep_index=getattr(args, "keep_index", False))
-        if sha is None:
-            if not getattr(args, "quiet", False):
-                _print("No local changes to save")
-            return 0
-        if not getattr(args, "quiet", False):
-            stashes = stash.list_stashes(repo)
-            saved_msg = stashes[0][2] if stashes else f"WIP on HEAD: {sha[:7]}"
-            _print(f"Saved working directory and index state {saved_msg}")
-    elif action == "list":
+    if action == "list":
         for i, sha, msg in stash.list_stashes(repo):
             _print(f"stash@{{{i}}}: {msg}")
-    elif action == "apply":
-        ok = stash.apply(repo, args.index, pop=False)
+        return 0
+    if action == "apply":
+        idx = int(rest[-1]) if rest and not rest[-1].startswith("-") else 0
+        ok = stash.apply(repo, idx, pop=False)
         return 0 if ok else 1
-    elif action == "pop":
-        ok = stash.apply(repo, args.index, pop=True)
+    if action == "pop":
+        idx = int(rest[-1]) if rest and not rest[-1].startswith("-") else 0
+        ok = stash.apply(repo, idx, pop=True)
         return 0 if ok else 1
-    elif action == "show":
-        ref = getattr(args, "stash", None) or "stash@{0}"
-        sha = refs_mod.rev_parse(repo, ref)
-        if not sha:
-            _err(f"fatal: ambiguous argument '{ref}': unknown revision or path not in the working tree.")
-            _err("Use '--' to separate paths from revisions, like this:")
-            _err("'git <command> [<revision>...] -- [<file>...]'")
-            return 128
-        c = objs.parse_commit(objs.read_object(repo, sha)[1])
-        base_tree = _commit_tree(repo, c.parents[0]) if c.parents else None
-        if args.patch:
-            _emit_tree_patch(repo, base_tree, c.tree, args.unified)
-        else:
-            _diff_stat(_tree_changes(repo, base_tree, c.tree))
-    return 0
+    # drop / clear / branch / create / store / import are not implemented here.
+    _err(f"fatal: pygit: stash {action} is not supported")
+    return 128
 
 
 def cmd_fetch(argv: list[str]) -> int:
@@ -15846,6 +16581,38 @@ def cmd_diff_tree(argv: list[str]) -> int:
     return 0
 
 
+class _DFPair:
+    """A diff-files filepair (index side `one`, worktree side `two`). For a
+    rename/copy the two sides have different paths; ``score`` carries the
+    rename/copy/break similarity (0 = none); ``status`` is the resolved letter."""
+    __slots__ = ("a_path", "b_path", "one", "two", "status", "score", "broken",
+                 "two_oid_valid")
+
+    def __init__(self, a_path, b_path, one, two, status, score=0, broken=False):
+        self.a_path = a_path
+        self.b_path = b_path
+        self.one = one          # _Side (index/source)
+        self.two = two          # _Side (worktree/dest)
+        self.status = status    # 'M','A','D','R','C','T'
+        self.score = score
+        self.broken = broken
+        # When rename/copy detection runs, every destination filespec is hashed
+        # (find_exact_renames), so its worktree oid becomes valid and is shown
+        # in raw output even for an unmatched addition.
+        self.two_oid_valid = False
+
+
+def _df_extract_value(argv, i, opt):
+    """Helper for parsing diff-files options that take a separate-or-attached
+    value (-S/-G/-O). Returns (value, next_index) or raises on missing."""
+    a = argv[i]
+    if len(a) > len(opt):
+        return a[len(opt):], i + 1
+    if i + 1 < len(argv):
+        return argv[i + 1], i + 2
+    return None, i + 1
+
+
 def cmd_diff_files(argv: list[str]) -> int:
     """Show the diff between the index and the working tree (plumbing)."""
     ap = argparse.ArgumentParser(prog="pygit diff-files", add_help=False)
@@ -15864,84 +16631,653 @@ def cmd_diff_files(argv: list[str]) -> int:
     ap.add_argument("-a", "--text", dest="text", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
+    # rename/copy/break/pickaxe/order/limit options
+    ap.add_argument("--no-renames", dest="no_renames", action="store_true")
+    ap.add_argument("--find-copies-harder", dest="find_copies_harder", action="store_true")
+    ap.add_argument("--pickaxe-all", dest="pickaxe_all", action="store_true")
+    ap.add_argument("--pickaxe-regex", dest="pickaxe_regex", action="store_true")
     ap.add_argument("paths", nargs="*")
+
+    from . import diffcore
     argv = ["--abbrev=7" if a == "--abbrev" else a for a in argv]
-    args = ap.parse_args(argv)
+    # Pre-scan to peel off the diffcore-style flags whose value semantics differ
+    # from argparse (attached -M50/-Sneedle, separate -S needle / -O file, etc.).
+    rest: list[str] = []
+    detect_rename = None        # None=off, 'M'=renames, 'C'=copies
+    rename_score = 0            # 0 = default threshold
+    break_opt = None            # None = no -B
+    pickaxe = None
+    pickaxe_kind = None         # 'S' or 'G'
+    orderfile = None
+    rename_limit = -1           # OPT_INTEGER default before diff std sets 1000
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-M" or a == "--find-renames" or a.startswith("-M") or a.startswith("--find-renames="):
+            if a.startswith("--find-renames="):
+                val = a.split("=", 1)[1]
+            elif a == "-M" or a == "--find-renames":
+                val = None
+            else:
+                val = a[2:]
+            sc, err = diffcore.parse_rename_score(val)
+            if sc is None:
+                _err("error: invalid argument to find-renames")
+                return 129
+            detect_rename = "M"
+            rename_score = sc
+            i += 1
+            continue
+        if a == "-C" or a == "--find-copies" or a.startswith("-C") or a.startswith("--find-copies="):
+            if a.startswith("--find-copies="):
+                val = a.split("=", 1)[1]
+            elif a == "-C" or a == "--find-copies":
+                val = None
+            else:
+                val = a[2:]
+            sc, err = diffcore.parse_rename_score(val)
+            if sc is None:
+                _err("error: invalid argument to find-copies")
+                return 129
+            detect_rename = "C"
+            rename_score = sc
+            i += 1
+            continue
+        if a == "-B" or a == "--break-rewrites" or a.startswith("-B") or a.startswith("--break-rewrites="):
+            if a.startswith("--break-rewrites="):
+                val = a.split("=", 1)[1]
+            elif a == "-B" or a == "--break-rewrites":
+                val = None
+            else:
+                val = a[2:]
+            bo, err = diffcore.parse_break_opt(val)
+            if bo is None:
+                _err(f"error: {err}")
+                return 129
+            break_opt = bo
+            i += 1
+            continue
+        if a == "-S" or a.startswith("-S"):
+            val, ni = _df_extract_value(argv, i, "-S")
+            if val is None:
+                _err("error: switch `S' requires a value")
+                return 129
+            pickaxe, pickaxe_kind = val, "S"
+            i = ni
+            continue
+        if a == "-G" or a.startswith("-G"):
+            val, ni = _df_extract_value(argv, i, "-G")
+            if val is None:
+                _err("error: switch `G' requires a value")
+                return 129
+            pickaxe, pickaxe_kind = val, "G"
+            i = ni
+            continue
+        if a == "-O" or a.startswith("-O"):
+            val, ni = _df_extract_value(argv, i, "-O")
+            if val is None:
+                _err("error: switch `O' requires a value")
+                return 129
+            orderfile = val
+            i = ni
+            continue
+        if a == "-l" or a.startswith("-l"):
+            if len(a) > 2:
+                lv = a[2:]
+                i += 1
+            elif i + 1 < len(argv):
+                lv = argv[i + 1]
+                i += 2
+            else:
+                _err("error: switch `l' requires a value")
+                return 129
+            try:
+                rename_limit = int(lv)
+            except ValueError:
+                _err("error: switch `l' expects an integer value with an "
+                     "optional k/m/g suffix")
+                return 129
+            continue
+        rest.append(a)
+        i += 1
+
+    args = ap.parse_args(rest)
+    if args.no_renames:
+        detect_rename = None
     repo = _repo()
     from .index import read_index
     idx = read_index(repo)
 
-    # Build the index-vs-worktree change set. The worktree blob is unstored, so
-    # its raw id is all-zero (diff-files convention).
-    changes: list[tuple[str, _Side, _Side]] = []
+    # Build index-vs-worktree filepairs. Intent-to-add entries are treated as
+    # new files (ita_invisible_in_index), so their index side is absent.
+    pairs: list[_DFPair] = []
+    all_index: dict[str, tuple[int, str]] = {}   # path -> (mode, sha) for copy sources
     for e in idx.entries:
         if getattr(e, "stage", 0) != 0:
             continue
         full = repo.path / e.path
-        a = _side_from_object(repo, e.mode_str(), e.sha)
-        b = _side_from_worktree(repo, e.path) if (full.exists() or full.is_symlink()) else _ABSENT
-        if a.sha != b.sha or a.mode != b.mode:
-            changes.append((e.path, a, b))
+        present = full.exists() or full.is_symlink()
+        ita = getattr(e, "intent_to_add", False)
+        a = _ABSENT if ita else _side_from_object(repo, e.mode_str(), e.sha)
+        b = _side_from_worktree(repo, e.path) if present else _ABSENT
+        if not ita:
+            all_index[e.path] = (int(e.mode_str(), 8), e.sha)
+        if a.sha == b.sha and a.mode == b.mode:
+            continue
+        status = "A" if not a.present else ("D" if not b.present else "M")
+        pairs.append(_DFPair(e.path, e.path, a, b, status))
+
+    # -R reverses the diff: each pair's two sides are swapped BEFORE diffcore
+    # runs (diff.c applies reverse_diff at queue-build time), so rename/copy/
+    # break detection sees the reversed source/destination roles.
+    if args.reverse:
+        for p in pairs:
+            p.one, p.two = p.two, p.one
+            p.status = "A" if not p.one.present else ("D" if not p.two.present else "M")
+
+    # --- diffcore pipeline: break -> rename/copy -> merge_broken -> pickaxe
+    #     -> order ---
+    if break_opt is not None:
+        pairs = _df_break(repo, pairs, break_opt)
+    if detect_rename is not None:
+        pairs = _df_detect_renames(repo, pairs, all_index, detect_rename,
+                                   rename_score, rename_limit,
+                                   args.find_copies_harder)
+    if break_opt is not None:
+        pairs = _df_merge_broken(pairs)
+    if pickaxe is not None:
+        pairs = _df_pickaxe(repo, pairs, pickaxe, pickaxe_kind,
+                            args.pickaxe_all, args.pickaxe_regex, args.text,
+                            args.unified)
+    if orderfile is not None:
+        rc = _df_order(pairs, orderfile)
+        if rc is not None:
+            return rc
+
     if args.paths:
-        changes = [c for c in changes if c[0] in set(args.paths)
-                   or any(c[0].startswith(w.rstrip("/") + "/") for w in args.paths)]
+        wanted = set(args.paths)
+        def _match(p):
+            return (p.b_path in wanted or p.a_path in wanted or
+                    any(p.b_path.startswith(w.rstrip("/") + "/") or
+                        p.a_path.startswith(w.rstrip("/") + "/") for w in args.paths))
+        pairs = [p for p in pairs if _match(p)]
     # -q is a no-op in diff-files (it is not --quiet); output is unaffected.
 
+    # Separate rename/copy pairs (they render as 'src => dst' in stat output)
+    # from plain (path, a, b) changes used by the stat helpers. Broken (-B)
+    # complete-rewrite M pairs (score>0) count as full file delete+add.
+    rn = [(p.a_path, p.b_path, int(p.score * 100 / 60000.0), p.one, p.two)
+          for p in pairs if p.status in ("R", "C")]
+    cr = {id(p): (_count_lines(p.two.data or b""), _count_lines(p.one.data or b""))
+          for p in pairs if p.status == "M" and p.score}
+    changes = [(p.b_path, p.one, p.two) for p in pairs if p.status not in ("R", "C")]
+    cr_counts = {p.b_path: cr[id(p)] for p in pairs if id(p) in cr}
+    # Queue order (by destination path) so stat/numstat interleave renames and
+    # plain changes the way the diff queue does.
+    order = {p.b_path: i for i, p in enumerate(pairs)}
+
+    # Sides are already oriented for -R (pre-swapped), so the stat helpers see
+    # the correct direction and naturally flip insertions/deletions.
     if args.stat or args.patch_with_stat:
-        _diff_stat([(p, b, a) for p, a, b in changes] if args.reverse else changes)
+        _diff_stat(changes, rn, cr_counts, order=order)
         if not args.patch_with_stat:
             return 0
     if args.numstat:
-        _diff_numstat([(p, b, a) for p, a, b in changes] if args.reverse else changes)
+        _diff_numstat(changes, rn, nul=args.nul, complete=cr_counts, order=order)
         return 0
     if args.shortstat:
-        _diff_shortstat(changes)
+        _diff_shortstat(changes, rn, complete=cr_counts)
         return 0
     sep = "\0" if args.nul else "\t"
     term = "\0" if args.nul else "\n"
     if args.name_only:
-        for p, _a, _b in changes:
-            sys.stdout.write(p + term)
+        for p in pairs:
+            sys.stdout.write(p.b_path + term)
         return 0
     if args.name_status:
-        for p, a, b in changes:
-            st = "A" if not a.present else ("D" if not b.present else "M")
-            if args.reverse:
-                st = {"A": "D", "D": "A"}.get(st, st)
-            sys.stdout.write(st + sep + p + term)
+        for p in pairs:
+            sys.stdout.write(_df_name_status(p, sep, args.reverse) + term)
         return 0
     if args.patch or args.patch_with_raw or args.patch_with_stat:
         if args.patch_with_raw:
-            for p, a, b in changes:
-                sys.stdout.write(_df_raw_line(p, a, b, args.abbrev, args.full_index, args.reverse) + sep + p + term)
+            for p in pairs:
+                sys.stdout.write(_df_raw_line(p, args.abbrev, args.full_index, args.reverse, sep))
             _print("")
-        for p, a, b in changes:
-            # -R swaps the sides (content) and flips the a/b prefix labels.
-            if args.reverse:
-                _emit_file_diff(p, b, a, True, args.unified)
-            else:
-                _emit_file_diff(p, a, b, False, args.unified)
+        for p in pairs:
+            _df_emit_patch(p, args.reverse, args.unified)
         return 0
     # Default: the raw diff line per change.
-    for p, a, b in changes:
-        sys.stdout.write(_df_raw_line(p, a, b, args.abbrev, args.full_index, args.reverse) + sep + p + term)
+    for p in pairs:
+        sys.stdout.write(_df_raw_line(p, args.abbrev, args.full_index, args.reverse, sep))
     return 0
 
 
-def _df_raw_line(path: str, idx_side: "_Side", wt_side: "_Side", abbrev: Optional[int],
-                 full_index: bool, reverse: bool) -> str:
-    """A diff-files raw prefix ':MODE MODE ID ID STATUS' (no path). The worktree
-    side id is always zero (unstored); ``reverse`` swaps the two columns."""
-    width = 40 if (full_index or abbrev is None) else max(4, abbrev)
+def _df_break(repo: Repository, pairs: list["_DFPair"], break_opt: int) -> list["_DFPair"]:
+    """Port of diffcore_break: split in-place edits that are complete rewrites
+    into delete+create broken pairs (score below merge_score is zeroed)."""
+    from . import diffcore
+    merge_score = (break_opt >> 16) & 0xFFFF or diffcore.DEFAULT_MERGE_SCORE
+    break_score = (break_opt & 0xFFFF) or diffcore.DEFAULT_BREAK_SCORE
+    out: list[_DFPair] = []
+    for p in pairs:
+        if (p.one.present and p.two.present and p.a_path == p.b_path and
+                p.status == "M"):
+            # Supply data directly: the worktree side's oid is not in the store.
+            src = diffcore.Filespec(repo, p.a_path, p.one.sha, int(p.one.mode, 8),
+                                    data=p.one.data if p.one.worktree else None)
+            dst = diffcore.Filespec(repo, p.b_path, p.two.sha, int(p.two.mode, 8),
+                                    data=p.two.data if p.two.worktree else None)
+            do_break, score = diffcore.should_break(repo, src, dst, break_score)
+            if do_break:
+                if score < merge_score:
+                    score = 0
+                # deletion of one
+                out.append(_DFPair(p.a_path, p.a_path, p.one, _ABSENT, "D",
+                                   score=score, broken=True))
+                # creation of two
+                out.append(_DFPair(p.b_path, p.b_path, _ABSENT, p.two, "A",
+                                   score=score, broken=True))
+                continue
+        out.append(p)
+    return out
+
+
+def _df_merge_broken(pairs: list["_DFPair"]) -> list["_DFPair"]:
+    """Port of diffcore_merge_broken: a broken delete+create pair that survived
+    rename/copy with its peer still present (same path) merges back to one M."""
+    out: list[_DFPair] = []
+    used = [False] * len(pairs)
+    for i, p in enumerate(pairs):
+        if used[i]:
+            continue
+        if p.broken and p.a_path == p.b_path:
+            peer = -1
+            for j in range(i + 1, len(pairs)):
+                q = pairs[j]
+                if used[j]:
+                    continue
+                if q.broken and q.a_path == q.b_path and q.b_path == p.a_path:
+                    peer = j
+                    break
+            if peer >= 0:
+                q = pairs[peer]
+                # one is the delete half (one valid), other is create half.
+                d = p if p.one.present else q
+                c = q if p.one.present else p
+                merged = _DFPair(d.a_path, c.b_path, d.one, c.two, "M",
+                                 score=p.score, broken=True)
+                out.append(merged)
+                used[peer] = True
+                continue
+        out.append(p)
+    return out
+
+
+def _df_detect_renames(repo: Repository, pairs: list["_DFPair"], all_index: dict,
+                       mode: str, rename_score: int, rename_limit: int,
+                       find_copies_harder: bool) -> list["_DFPair"]:
+    """Run rename/copy detection over the broken/plain pairs and rewrite matched
+    deletions+additions into R/C pairs. Emits the rename-limit warning when the
+    inexact matrix is skipped."""
+    from . import diffcore
+    src_map: dict[str, tuple[int, str]] = {}
+    dst_map: dict[str, tuple[int, str]] = {}
+    by_dst: dict[str, _DFPair] = {}
+    by_src: dict[str, _DFPair] = {}
+    src_side_map: dict[str, _Side] = {}     # path -> source-side _Side
+    data_map: dict[str, bytes] = {}         # worktree blob content by path
+    for p in pairs:
+        if p.one.present and not p.two.present:
+            src_map[p.a_path] = (int(p.one.mode, 8), p.one.sha)
+            by_src[p.a_path] = p
+            src_side_map[p.a_path] = p.one
+            # A worktree-side source (under -R) has an unstored oid; supply its
+            # content so similarity estimation can read it.
+            if p.one.worktree:
+                data_map[p.a_path] = p.one.data or b""
+        elif p.two.present and not p.one.present:
+            dst_map[p.b_path] = (int(p.two.mode, 8), p.two.sha)
+            by_dst[p.b_path] = p
+            data_map[p.b_path] = p.two.data or b""
+    if not dst_map:
+        return pairs
+
+    copy_sources: dict[str, tuple[int, str]] = {}
+    if mode == "C":
+        # Copy sources = modified entries (their index/original blob). With
+        # --find-copies-harder, every unmodified index entry is a source too.
+        for p in pairs:
+            if p.one.present and p.two.present and p.a_path == p.b_path:
+                copy_sources[p.a_path] = (int(p.one.mode, 8), p.one.sha)
+                src_side_map[p.a_path] = p.one
+        if find_copies_harder:
+            modified = {p.a_path for p in pairs}
+            for path, (m, sha) in all_index.items():
+                if path not in modified and path not in src_map:
+                    copy_sources[path] = (m, sha)
+                    src_side_map[path] = _side_from_object(repo, f"{m:06o}", sha)
+
+    eff_limit = 1000 if rename_limit < 0 else rename_limit
+    detect_copies = (mode == "C")
+    # If detection has any source to consider, every destination filespec gets
+    # hashed (find_exact_renames), so its worktree oid is shown in raw output.
+    has_sources = bool(src_map) or (detect_copies and bool(copy_sources))
+    if has_sources:
+        for dp in by_dst.values():
+            dp.two_oid_valid = True
+    detected, needed = diffcore.detect_renames_copies(
+        repo, src_map, dst_map,
+        copy_sources=copy_sources if detect_copies else None,
+        data_map=data_map, want_copies=detect_copies,
+        rename_limit=eff_limit, minimum_score=rename_score)
+
+    if needed > 0:
+        _err("warning: exhaustive rename detection was skipped due to too many files.")
+        _err("warning: you may want to set your diff.renameLimit variable to at "
+             f"least {needed} and retry the command.")
+
+    # Map each matched destination path to its resolved rename/copy pair, and
+    # collect consumed source paths (renames drop their deletion record).
+    rename_by_dst: dict[str, _DFPair] = {}
+    matched_src: set[str] = set()
+    for rp in detected:
+        sp = rp.src.path
+        dp = rp.dst.path
+        src_side = src_side_map.get(
+            sp, _side_from_object(repo, f"{rp.src.mode:06o}", rp.src.oid))
+        dst_side = by_dst[dp].two if dp in by_dst else _ABSENT
+        status = "C" if rp.is_copy else "R"
+        rename_by_dst[dp] = _DFPair(sp, dp, src_side, dst_side, status,
+                                    score=rp.score)
+        if not rp.is_copy:
+            matched_src.add(sp)
+
+    # Write back in the original queue order: a creation that became a
+    # rename/copy destination is replaced in place; a deletion consumed as a
+    # rename source is dropped (diffcore-rename.c write-back).
+    out: list[_DFPair] = []
+    for p in pairs:
+        if p.two.present and not p.one.present and p.b_path in rename_by_dst:
+            out.append(rename_by_dst[p.b_path])
+            continue
+        if p.one.present and not p.two.present and p.a_path in matched_src:
+            continue
+        out.append(p)
+    return out
+
+
+def _df_pickaxe(repo: Repository, pairs: list["_DFPair"], needle: str, kind: str,
+                pickaxe_all: bool, pickaxe_regex: bool, text: bool,
+                context: int) -> list["_DFPair"]:
+    """Port of diffcore_pickaxe: keep only pairs where the needle changes count
+    (-S) or matches a +/- line (-G). --pickaxe-all shows the whole set if any
+    pair matches."""
+    import re as _re
+    regexp = None
+    if kind == "G" or pickaxe_regex:
+        regexp = _re.compile(needle.encode("utf-8", "replace"), _re.MULTILINE)
+
+    def _contains(data: bytes) -> int:
+        if not data:
+            return 0
+        if regexp is not None:
+            cnt = 0
+            pos = 0
+            while pos <= len(data):
+                m = regexp.search(data, pos)
+                if not m:
+                    break
+                cnt += 1
+                if m.end() == m.start():
+                    pos = m.end() + 1
+                else:
+                    pos = m.end()
+            return cnt
+        nd = needle.encode("utf-8", "replace")
+        if not nd:
+            return 0
+        cnt = 0
+        pos = 0
+        while True:
+            k = data.find(nd, pos)
+            if k < 0:
+                break
+            cnt += 1
+            pos = k + len(nd)
+        return cnt
+
+    def _has_changes(a: _Side, b: _Side) -> bool:
+        c1 = _contains(a.data or b"") if a.present else 0
+        c2 = _contains(b.data or b"") if b.present else 0
+        return c1 != c2
+
+    def _diff_grep(a: _Side, b: _Side) -> bool:
+        if (not text and ((a.present and _is_binary(a.data)) or
+                          (b.present and _is_binary(b.data)))):
+            return False
+        a_text = (a.data or b"").decode("utf-8", "replace") if a.present else ""
+        b_text = (b.data or b"").decode("utf-8", "replace") if b.present else ""
+        a_lines = a_text.splitlines()
+        b_lines = b_text.splitlines()
+        for kind2, ai, bi in diff_mod.diff_lines(a_lines, b_lines):
+            if kind2 == "ins":
+                if regexp.search(b_lines[bi].encode("utf-8", "replace")):
+                    return True
+            elif kind2 == "del":
+                if regexp.search(a_lines[ai].encode("utf-8", "replace")):
+                    return True
+        return False
+
+    def _match(p: _DFPair) -> bool:
+        if not p.one.present and not p.two.present:
+            return False
+        # unmodified pair (same content) never matches
+        if (p.one.present and p.two.present and p.one.sha == p.two.sha):
+            return False
+        if kind == "G":
+            if (not text and ((p.one.present and _is_binary(p.one.data)) or
+                              (p.two.present and _is_binary(p.two.data)))):
+                return False
+            return _diff_grep(p.one, p.two)
+        return _has_changes(p.one, p.two)
+
+    if pickaxe_all:
+        for p in pairs:
+            if _match(p):
+                return pairs
+        return []
+    return [p for p in pairs if _match(p)]
+
+
+def _df_order(pairs: list["_DFPair"], orderfile: str):
+    """Port of diffcore_order: reorder pairs by orderfile pattern match against
+    the destination path (stable within an order index)."""
+    import fnmatch
+    try:
+        with open(orderfile, "rb") as f:
+            raw = f.read()
+    except IsADirectoryError:
+        _err(f"fatal: failed to read orderfile '{orderfile}': Is a directory")
+        return 128
+    except FileNotFoundError:
+        _err(f"fatal: failed to read orderfile '{orderfile}': No such file or directory")
+        return 128
+    except OSError as e:
+        _err(f"fatal: failed to read orderfile '{orderfile}': {e.strerror}")
+        return 128
+    patterns: list[str] = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        if line == "" or line.startswith("#"):
+            continue
+        patterns.append(line)
+
+    def _wildmatch(pat: str, path: str) -> bool:
+        # git wildmatch: '*' does not cross '/', but diffcore-order also tries
+        # successive leading-directory strips. Use fnmatch on each strip.
+        p = path
+        while p:
+            if fnmatch.fnmatch(p, pat):
+                return True
+            k = p.rfind("/")
+            if k < 0:
+                break
+            p = p[:k]
+        return False
+
+    def _match_order(path: str) -> int:
+        for idx, pat in enumerate(patterns):
+            if _wildmatch(pat, path):
+                return idx
+        return len(patterns)
+
+    decorated = [(_match_order(p.b_path), orig, p) for orig, p in enumerate(pairs)]
+    decorated.sort(key=lambda t: (t[0], t[1]))
+    pairs[:] = [t[2] for t in decorated]
+    return None
+
+
+def _df_name_status(p: "_DFPair", sep: str, reverse: bool) -> str:
+    # Sides are pre-swapped for -R, so the status letter is already correct.
+    if p.status in ("R", "C"):
+        sim = int(p.score * 100 / 60000.0)
+        return f"{p.status}{sim:03d}{sep}{p.a_path}{sep}{p.b_path}"
+    st = p.status
+    if p.score:
+        st = f"{st}{int(p.score * 100 / 60000.0):03d}"
+    return st + sep + p.b_path
+
+
+def _df_raw_id(side: "_Side", width: int, oid_valid: bool) -> str:
+    """The raw-output object id for one side: the working-tree side reads zero
+    unless its oid was made valid by rename/copy detection."""
     zero = "0" * width
-    idx_mode = idx_side.mode if idx_side.present else "000000"
-    wt_mode = wt_side.mode if wt_side.present else "000000"
-    idx_id = (idx_side.sha[:width] if width < 40 else idx_side.sha) if idx_side.present else zero
-    st = "D" if not wt_side.present else ("A" if not idx_side.present else "M")
-    if reverse:
-        st = {"A": "D", "D": "A"}.get(st, st)
-        return f":{wt_mode} {idx_mode} {zero} {idx_id} {st}"
-    return f":{idx_mode} {wt_mode} {idx_id} {zero} {st}"
+    if not side.present or side.sha is None:
+        return zero
+    if side.worktree and not oid_valid:
+        return zero
+    return side.sha if width >= 40 else side.sha[:width]
+
+
+def _df_raw_line(p: "_DFPair", abbrev: Optional[int], full_index: bool,
+                 reverse: bool, sep: str) -> str:
+    """Render a diff-files raw line ':MODE MODE ID ID STATUS<sep>path[...]'.
+    The working-tree side id is zero unless rename/copy detection hashed it."""
+    width = 40 if (full_index or abbrev is None) else max(4, abbrev)
+    a_mode = p.one.mode if p.one.present else "000000"
+    b_mode = p.two.mode if p.two.present else "000000"
+    term = "\0" if sep == "\0" else "\n"
+    if p.status in ("R", "C"):
+        # Both sides of a rename/copy are hashed during detection, so their
+        # real (possibly worktree-computed) oids are always shown.
+        a_id = _df_raw_id(p.one, width, True)
+        b_id = _df_raw_id(p.two, width, True)
+        sim = int(p.score * 100 / 60000.0)
+        return (f":{a_mode} {b_mode} {a_id} {b_id} {p.status}{sim:03d}"
+                f"{sep}{p.a_path}{sep}{p.b_path}{term}")
+    a_id = _df_raw_id(p.one, width, p.two_oid_valid)
+    b_id = _df_raw_id(p.two, width, p.two_oid_valid)
+    st = p.status
+    if p.score:
+        st = f"{st}{int(p.score * 100 / 60000.0):03d}"
+    return f":{a_mode} {b_mode} {a_id} {b_id} {st}{sep}{p.b_path}{term}"
+
+
+def _df_emit_patch(p: "_DFPair", reverse: bool, context: int) -> None:
+    """Emit a diff-files patch for one pair, including rename/copy headers and
+    the -B 'dissimilarity index' header. Sides are pre-swapped for -R, so only
+    the a/b prefix labels are flipped here."""
+    pa, pb = ("b", "a") if reverse else ("a", "b")
+    if p.status in ("R", "C"):
+        src, dst = p.a_path, p.b_path
+        sim = int(p.score * 100 / 60000.0)
+        _print(f"diff --git {pa}/{src} {pb}/{dst}")
+        verb = "copy" if p.status == "C" else "rename"
+        _print(f"similarity index {sim}%")
+        _print(f"{verb} from {src}")
+        _print(f"{verb} to {dst}")
+        a_side, b_side = p.one, p.two
+        if a_side.sha == b_side.sha and a_side.mode == b_side.mode:
+            return
+        a_abbrev = (a_side.sha or "0" * 40)[:7]
+        b_abbrev = (b_side.sha or "0" * 40)[:7]
+        suffix = f" {b_side.mode}" if a_side.mode == b_side.mode else ""
+        _print(f"index {a_abbrev}..{b_abbrev}{suffix}")
+        if _is_binary(a_side.data) or _is_binary(b_side.data):
+            _print(f"Binary files {pa}/{src} and {pb}/{dst} differ")
+            return
+        a_text = (a_side.data or b"").decode("utf-8", "replace")
+        b_text = (b_side.data or b"").decode("utf-8", "replace")
+        _print(f"--- {pa}/{src}")
+        _print(f"+++ {pb}/{dst}")
+        for line in diff_mod.format_hunks(
+                a_text.splitlines(), b_text.splitlines(), context,
+                a_no_newline=bool(a_text) and not a_text.endswith("\n"),
+                b_no_newline=bool(b_text) and not b_text.endswith("\n")):
+            _print(line)
+        return
+    # M/A/D, possibly broken (-B) with a dissimilarity index.
+    if p.score and p.status == "M":
+        _df_emit_dissimilar(p, pa, pb, context)
+        return
+    # Plain change: sides already oriented; pass prefixes, no further reverse.
+    _emit_file_diff(p.b_path, p.one, p.two, False, context,
+                    a_prefix=pa, b_prefix=pb)
+
+
+def _count_lines(data: bytes) -> int:
+    """Port of diff.c count_lines: count newlines, +1 for a final line lacking a
+    trailing newline; 0 for completely empty content."""
+    if not data:
+        return 0
+    count = data.count(b"\n")
+    if not data.endswith(b"\n"):
+        count += 1
+    return count
+
+
+def _add_line_count(count: int) -> str:
+    if count == 0:
+        return "0,0"
+    if count == 1:
+        return "1"
+    return f"1,{count}"
+
+
+def _df_emit_dissimilar(p: "_DFPair", pa: str, pb: str, context: int) -> None:
+    """Emit a -B broken (complete-rewrite) M patch: a 'dissimilarity index' line
+    and a single hunk deleting the whole old file and adding the whole new file
+    (diff.c emit_rewrite_diff)."""
+    a, b = p.one, p.two
+    path = p.b_path
+    sim = int(p.score * 100 / 60000.0)
+    _print(f"diff --git {pa}/{path} {pb}/{path}")
+    _print(f"dissimilarity index {sim}%")
+    a_abbrev = (a.sha or "0" * 40)[:7]
+    b_abbrev = (b.sha or "0" * 40)[:7]
+    suffix = f" {a.mode}" if a.mode == b.mode else ""
+    _print(f"index {a_abbrev}..{b_abbrev}{suffix}")
+    if _is_binary(a.data) or _is_binary(b.data):
+        _print(f"Binary files {pa}/{path} and {pb}/{path} differ")
+        return
+    a_data = a.data or b""
+    b_data = b.data or b""
+    lc_a = _count_lines(a_data)
+    lc_b = _count_lines(b_data)
+    _print(f"--- {pa}/{path}")
+    _print(f"+++ {pb}/{path}")
+    _print(f"@@ -{_add_line_count(lc_a)} +{_add_line_count(lc_b)} @@")
+    a_text = a_data.decode("utf-8", "replace")
+    b_text = b_data.decode("utf-8", "replace")
+    if lc_a:
+        for ln in a_text.splitlines():
+            _print(f"-{ln}")
+        if a_text and not a_text.endswith("\n"):
+            _print("\\ No newline at end of file")
+    if lc_b:
+        for ln in b_text.splitlines():
+            _print(f"+{ln}")
+        if b_text and not b_text.endswith("\n"):
+            _print("\\ No newline at end of file")
 
 
 def cmd_diff_index(argv: list[str]) -> int:
