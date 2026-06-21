@@ -77,9 +77,11 @@ def main() -> int:
         check(rc == 0, "checkout-index -fa")
         check((tmp / "a.txt").read_text() == "hello\n", "checkout-index restored file")
 
-        # fmt-merge-msg
+        # fmt-merge-msg: a well-formed FETCH_HEAD line is "<sha>\t<flag>\t<desc>";
+        # git rejects an unresolvable/short id with rc 128, so feed the real sha.
+        head_sha = (tmp / ".git" / "refs" / "heads" / "main").read_text().strip()
         old_stdin = sys.stdin
-        sys.stdin = FakeStdin("abc123\tbranch 'feat' of example.com\n")
+        sys.stdin = FakeStdin(f"{head_sha}\t\tbranch 'feat' of example.com\n")
         try:
             rc = run("fmt-merge-msg")
             check(rc == 0, "fmt-merge-msg from stdin")

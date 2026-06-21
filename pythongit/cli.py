@@ -8536,10 +8536,13 @@ def _ref_tips(repo: Repository) -> set[str]:
     return tips
 
 
-def _reachable(repo: Repository) -> set[str]:
+def _reachable(repo: Repository, extra_roots: Optional[list[str]] = None) -> set[str]:
     from . import objects as _o
     tips = _ref_tips(repo)
-    if tips:
+    if extra_roots:
+        tips = set(tips)
+        tips.update(extra_roots)
+    if tips and not extra_roots:
         import zlib
         try:
             from . import pack as _p
@@ -8777,23 +8780,158 @@ def cmd_repack(argv: list[str]) -> int:
     return 0
 
 
+_TIME_MAX = (1 << 63) - 1
+
+_PRUNE_USAGE = (
+    "usage: git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]\n"
+    "\n"
+    "    -n, --[no-]dry-run    do not remove, show only\n"
+    "    -v, --[no-]verbose    report pruned objects\n"
+    "    --[no-]progress       show progress\n"
+    "    --[no-]expire <expiry-date>\n"
+    "                          expire objects older than <time>\n"
+    "    --[no-]exclude-promisor-objects\n"
+    "                          limit traversal to objects outside promisor packfiles\n"
+    "\n"
+)
+
+
+def _parse_expiry_date(value: str) -> int:
+    """Parse a --expire <time> argument into a unix timestamp.
+
+    Mirrors git's OPT_EXPIRY_DATE / parse_expiry_date for the deterministic
+    cases. Returns the timestamp; raises ValueError for malformed input so the
+    caller can emit git's "malformed expiration date" fatal.
+    """
+    import calendar
+    import datetime as _dt
+
+    v = value.strip()
+    if v == "":
+        raise ValueError(value)
+    low = v.lower()
+    if low == "never":
+        return 0
+    if low in ("now", "all"):
+        return int(time.time())
+    # @<epoch> or bare integer epoch.
+    epoch = v[1:] if v.startswith("@") else v
+    if epoch and (epoch.lstrip("+-")).isdigit():
+        try:
+            return int(epoch)
+        except ValueError:
+            raise ValueError(value)
+    # Absolute ISO-ish dates (interpreted in UTC under TZ=UTC parity env).
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+    ):
+        try:
+            dt = _dt.datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+        return calendar.timegm(dt.timetuple())
+    raise ValueError(value)
+
+
 def cmd_prune(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit prune")
-    ap.add_argument("-n", "--dry-run", action="store_true")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    reach = _reachable(repo)
-    removed = 0
-    for sha in _iter_loose_shas(repo):
-        if sha not in reach:
-            p = repo.gitdir / "objects" / sha[:2] / sha[2:]
-            if args.dry_run:
-                _print(f"would prune {sha}")
+    show_only = False
+    verbose = False
+    expire = _TIME_MAX
+    heads: list[str] = []
+    i = 0
+    saw_dashdash = False
+    while i < len(argv):
+        a = argv[i]
+        if saw_dashdash:
+            heads.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dashdash = True
+        elif a in ("-n", "--dry-run"):
+            show_only = True
+        elif a == "--no-dry-run":
+            show_only = False
+        elif a in ("-v", "--verbose"):
+            verbose = True
+        elif a == "--no-verbose":
+            verbose = False
+        elif a in ("--progress", "--no-progress"):
+            # Connectivity progress is a delayed meter on stderr; under the
+            # parity env (never a tty) it produces no output either way.
+            pass
+        elif a == "--expire" or a.startswith("--expire="):
+            if a.startswith("--expire="):
+                val = a[len("--expire="):]
             else:
-                p.unlink(missing_ok=True)
-                removed += 1
-    if not args.dry_run:
-        _print(f"pruned {removed}")
+                i += 1
+                if i >= len(argv):
+                    _err("error: option `expire' requires a value")
+                    return 129
+                val = argv[i]
+            try:
+                expire = _parse_expiry_date(val)
+            except ValueError:
+                _err(f"fatal: malformed expiration date '{val}'")
+                return 128
+        elif a == "--no-expire":
+            expire = 0
+        elif a in ("--exclude-promisor-objects", "--no-exclude-promisor-objects"):
+            pass
+        elif a.startswith("--"):
+            _err(f"error: unknown option `{a[2:]}'")
+            sys.stderr.write(_PRUNE_USAGE)
+            return 129
+        elif a.startswith("-") and a != "-":
+            _err(f"error: unknown switch `{a[1]}'")
+            sys.stderr.write(_PRUNE_USAGE)
+            return 129
+        else:
+            heads.append(a)
+        i += 1
+
+    repo = _repo()
+
+    extra_roots: list[str] = []
+    for name in heads:
+        try:
+            sha = refs_mod.rev_parse(repo, name)
+        except (OSError, ValueError):
+            sha = None
+        if not sha:
+            _err(f"fatal: unrecognized argument: {name}")
+            return 128
+        extra_roots.append(sha)
+
+    reach = _reachable(repo, extra_roots) if extra_roots else _reachable(repo)
+    objects_dir = repo.gitdir / "objects"
+    for sha in _iter_loose_shas(repo):
+        if sha in reach:
+            continue
+        p = objects_dir / sha[:2] / sha[2:]
+        try:
+            # git compares st_mtime (whole seconds) against the expiry.
+            mtime = int(p.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime > expire:
+            continue
+        if show_only or verbose:
+            import zlib as _zlib
+            from . import objects as _o
+
+            try:
+                otype, _ = _o.read_object(repo, sha)
+            except (OSError, KeyError, ValueError, _zlib.error):
+                otype = "unknown"
+            _print(f"{sha} {otype}")
+        if not show_only:
+            p.unlink(missing_ok=True)
     return 0
 
 
@@ -10025,33 +10163,85 @@ def cmd_stripspace(argv: list[str]) -> int:
     return 0
 
 
+def _all_refs(repo: Repository) -> dict[str, str]:
+    """Collect every ref (loose + packed) as name -> sha, like for_each_ref."""
+    all_refs: dict[str, str] = {}
+    refs_root = repo.gitdir / "refs"
+    if refs_root.exists():
+        for f in refs_root.rglob("*"):
+            if f.is_file():
+                rel = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
+                s = refs_mod.read_ref(repo, rel)
+                if s:
+                    all_refs[rel] = s
+    for ref, s in refs_mod.read_packed_refs(repo).items():
+        all_refs.setdefault(ref, s)
+    return all_refs
+
+
+def _peel_to_non_tag(repo: Repository, sha: str) -> Optional[str]:
+    """Follow tag objects until a non-tag object is reached; return its sha."""
+    seen: set[str] = set()
+    cur = sha
+    while cur and cur not in seen:
+        seen.add(cur)
+        try:
+            t, data = objs.read_object(repo, cur)
+        except (KeyError, Exception):  # noqa: BLE001 - missing/corrupt object
+            return None
+        if t != "tag":
+            return cur
+        target = None
+        for raw in data.split(b"\n"):
+            if raw.startswith(b"object "):
+                target = raw[len(b"object "):].decode("ascii", "replace").strip()
+                break
+            if raw == b"":
+                break
+        if not target:
+            return None
+        cur = target
+    return None
+
+
 def cmd_update_server_info(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit update-server-info")
-    ap.parse_args(argv)
+    # -f / --force only controls whether files are rewritten from scratch; the
+    # resulting content is identical either way, so it is accepted as a no-op
+    # with respect to output (matching C git's behaviour for our purposes).
+    ap = argparse.ArgumentParser(prog="pygit update-server-info", add_help=False)
+    ap.add_argument("-f", "--force", dest="force", action="store_true", default=False)
+    ap.add_argument("--no-force", dest="force", action="store_false")
+    args = ap.parse_args(argv)
+    _ = args.force
     repo = _repo()
-    # info/refs: list all refs
+
+    # info/refs: every ref, sorted by name, with peeled lines for tag objects.
     info_dir = repo.gitdir / "info"
-    info_dir.mkdir(exist_ok=True)
-    lines = []
-    for kind in ("refs/heads", "refs/tags", "refs/remotes"):
-        root = repo.gitdir / kind
-        if root.exists():
-            for f in root.rglob("*"):
-                if f.is_file():
-                    rel = str(f.relative_to(repo.gitdir)).replace(os.sep, "/")
-                    s = refs_mod.read_ref(repo, rel)
-                    if s:
-                        lines.append(f"{s}\t{rel}")
-    (info_dir / "refs").write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
-    # objects/info/packs: list of packs
+    info_dir.mkdir(parents=True, exist_ok=True)
+    all_refs = _all_refs(repo)
+    out: list[str] = []
+    for name in sorted(all_refs):
+        sha = all_refs[name]
+        out.append(f"{sha}\t{name}\n")
+        try:
+            t, _data = objs.read_object(repo, sha)
+        except (KeyError, Exception):  # noqa: BLE001
+            t = None
+        if t == "tag":
+            peeled = _peel_to_non_tag(repo, sha)
+            if peeled:
+                out.append(f"{peeled}\t{name}^{{}}\n")
+    (info_dir / "refs").write_text("".join(out), encoding="utf-8")
+
+    # objects/info/packs: "P <name>\n" per local pack, then a trailing blank line.
     pack_dir = repo.gitdir / "objects" / "pack"
     pack_info_dir = repo.gitdir / "objects" / "info"
     pack_info_dir.mkdir(parents=True, exist_ok=True)
-    pack_lines = []
+    pack_lines: list[str] = []
     if pack_dir.exists():
         for f in sorted(pack_dir.glob("pack-*.pack")):
-            pack_lines.append(f"P {f.name}")
-    (pack_info_dir / "packs").write_text("\n".join(pack_lines) + ("\n" if pack_lines else ""), encoding="utf-8")
+            pack_lines.append(f"P {f.name}\n")
+    (pack_info_dir / "packs").write_text("".join(pack_lines) + "\n", encoding="utf-8")
     return 0
 
 
@@ -12127,32 +12317,829 @@ def cmd_checkout_index(argv: list[str]) -> int:
     return 0
 
 
+DEFAULT_MERGE_LOG_LEN = 20
+
+_FMM_USAGE = (
+    "usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]\n"
+    "\n"
+    "    --[no-]log[=<n>]      populate log with at most <n> entries from shortlog\n"
+    "    -m, --[no-]message <text>\n"
+    "                          use <text> as start of message\n"
+    "    --[no-]into-name <name>\n"
+    "                          use <name> instead of the real target branch\n"
+    "    -F, --[no-]file <file>\n"
+    "                          file to read from\n"
+    "\n"
+)
+
+
+class _FmtMergeMsgError(Exception):
+    """Raised to signal a die() with a specific message (rc 128)."""
+
+
+def _fmm_complete_line(buf: list[str]) -> None:
+    """Mirror strbuf_complete_line: ensure the accumulated text ends in '\\n'.
+
+    `buf` is a list of strings joined later; we keep a sentinel by inspecting
+    the last non-empty char.
+    """
+    joined = "".join(buf)
+    if joined and not joined.endswith("\n"):
+        buf.append("\n")
+
+
+def _fmm_commented_lines(text: str, comment: str) -> str:
+    """Mirror strbuf_add_commented_lines: prefix each line with '<comment> ',
+    or just '<comment>' for blank lines, completing a trailing line."""
+    out = []
+    bp = 0
+    n = len(text)
+    while bp < n:
+        nl = text.find("\n", bp)
+        if nl == -1:
+            line = text[bp:]
+            bp = n
+            had_nl = False
+        else:
+            line = text[bp:nl]
+            bp = nl + 1
+            had_nl = True
+        if line:
+            out.append(comment + " " + line)
+        else:
+            out.append(comment)
+        out.append("\n")
+        if not had_nl:
+            break
+    return "".join(out)
+
+
 def cmd_fmt_merge_msg(argv: list[str]) -> int:
-    """Read FETCH_HEAD or a list of refs from stdin and produce a merge message."""
-    ap = argparse.ArgumentParser(prog="pygit fmt-merge-msg")
-    ap.add_argument("--file", default=None)
-    args = ap.parse_args(argv)
+    """Produce a merge commit message from a list of merged refs (FETCH_HEAD
+    format) read from stdin or a file. Faithful port of builtin/fmt-merge-msg.c
+    plus fmt-merge-msg.c."""
+    ap = argparse.ArgumentParser(prog="pygit fmt-merge-msg", add_help=False)
+    ap.add_argument("--log", dest="log", nargs="?", const="__DEFAULT__", default=None)
+    ap.add_argument("--summary", dest="log", nargs="?", const="__DEFAULT__")
+    ap.add_argument("--no-log", dest="log", action="store_const", const="__NO__")
+    ap.add_argument("--no-summary", dest="log", action="store_const", const="__NO__")
+    ap.add_argument("-m", "--message", dest="message", default=None)
+    ap.add_argument("--into-name", dest="into_name", default=None)
+    ap.add_argument("-F", "--file", dest="file", default=None)
+    args, extra = ap.parse_known_args(argv)
+    if extra:
+        unknown = next((a for a in extra if a.startswith("--")), None)
+        if unknown is not None:
+            sys.stderr.write(f"error: unknown option `{unknown[2:]}'\n")
+        else:
+            short = next((a for a in extra if a.startswith("-") and len(a) > 1
+                          and not a[1:2].isdigit()), None)
+            if short is not None:
+                sys.stderr.write(f"error: unknown switch `{short[1]}'\n")
+        sys.stderr.write(_FMM_USAGE)
+        return 129
+
     repo = _repo()
-    if args.file:
-        text = Path(args.file).read_text(encoding="utf-8", errors="replace")
-    elif (repo.gitdir / "FETCH_HEAD").exists():
-        text = (repo.gitdir / "FETCH_HEAD").read_text(encoding="utf-8", errors="replace")
+
+    # config: merge.log / merge.summary
+    merge_log_config = -1
+    comment = "#"
+    try:
+        cp = repo.config()
+        for sect in ("merge",):
+            if cp.has_section(sect):
+                for key in ("log", "summary"):
+                    val = cp.get(sect, key, fallback=None)
+                    if val is None:
+                        continue
+                    merge_log_config = _fmm_config_log(val)
+        if cp.has_section("core"):
+            cc = cp.get("core", "commentChar", fallback=None)
+            if cc is not None:
+                cc = _fmm_dequote_config(cc)
+            if cc and cc != "auto":
+                comment = cc
+    except Exception:
+        pass
+
+    # resolve shortlog_len. The C code keeps shortlog_len = -1 unless --log/
+    # --no-log/--summary set it; after parsing, a value < 0 falls back to the
+    # config (or 0).
+    if args.log == "__NO__":
+        shortlog_len = 0
+    elif args.log == "__DEFAULT__":
+        shortlog_len = DEFAULT_MERGE_LOG_LEN
+    elif args.log is not None:
+        parsed = _fmm_parse_int(args.log)
+        if parsed is None:
+            sys.stderr.write(
+                "error: option `log' expects an integer value with an "
+                "optional k/m/g suffix\n"
+            )
+            return 129
+        shortlog_len = parsed
     else:
-        text = sys.stdin.read()
-    branches = []
-    for line in text.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            ref = parts[-1].strip()
-            branches.append(ref)
-    if not branches:
-        _print("Merge")
-        return 0
-    if len(branches) == 1:
-        _print(f"Merge {branches[0]}")
+        shortlog_len = -1
+    if shortlog_len < 0:
+        shortlog_len = merge_log_config if merge_log_config > 0 else 0
+
+    # read input
+    if args.file and args.file != "-":
+        try:
+            data = Path(args.file).read_bytes()
+        except OSError:
+            sys.stderr.write(
+                f"fatal: cannot open '{args.file}': No such file or directory\n"
+            )
+            return 128
+        text = data.decode("utf-8", errors="surrogateescape")
     else:
-        _print("Merge " + ", ".join(branches[:-1]) + ", and " + branches[-1])
+        text = sys.stdin.buffer.read().decode("utf-8", errors="surrogateescape")
+
+    message = args.message
+    out: list[str] = []
+    if message is not None:
+        out.append(message)
+
+    try:
+        _fmt_merge_msg(
+            repo,
+            text,
+            out,
+            add_title=(message is None),
+            credit=True,
+            shortlog_len=shortlog_len,
+            into_name=args.into_name,
+            comment=comment,
+        )
+    except _FmtMergeMsgError as e:
+        sys.stderr.write(f"fatal: {e}\n")
+        return 128
+
+    sys.stdout.write("".join(out))
     return 0
+
+
+def _fmm_parse_int(s: str):
+    """Mirror git's OPTION_INTEGER value parsing (git_parse_int): optional
+    leading whitespace, sign, decimal/0x-hex/octal base, optional k/m/g unit
+    suffix. Returns int or None on failure (trailing junk, empty)."""
+    i = 0
+    n = len(s)
+    while i < n and s[i] in " \t\n":
+        i += 1
+    rest = s[i:]
+    if not rest:
+        return None
+    # strtol with base 0: handles +/-, 0x, leading 0 octal.
+    j = 0
+    m = len(rest)
+    sign = 1
+    if j < m and rest[j] in "+-":
+        if rest[j] == "-":
+            sign = -1
+        j += 1
+    base = 10
+    digits_start = j
+    if j < m and rest[j] == "0":
+        if j + 1 < m and rest[j + 1] in "xX":
+            base = 16
+            j += 2
+            digits_start = j
+        else:
+            base = 8
+            digits_start = j
+    valid = "0123456789abcdef"[:base] if base != 8 else "01234567"
+    if base == 16:
+        valid = "0123456789abcdef"
+    k = j
+    while k < m and rest[k].lower() in valid:
+        k += 1
+    if k == digits_start:
+        return None
+    try:
+        val = sign * int(rest[digits_start:k], base)
+    except ValueError:
+        return None
+    suffix = rest[k:]
+    factor = 1
+    if suffix:
+        if suffix in ("k", "K"):
+            factor = 1024
+        elif suffix in ("m", "M"):
+            factor = 1024 * 1024
+        elif suffix in ("g", "G"):
+            factor = 1024 * 1024 * 1024
+        else:
+            return None
+    return val * factor
+
+
+def _fmm_dequote_config(value: str) -> str:
+    """Remove git-config double-quote quoting from a value, handling backslash
+    escapes inside quoted regions (git quotes values containing ; or # etc.)."""
+    out = []
+    i = 0
+    n = len(value)
+    in_q = False
+    while i < n:
+        c = value[i]
+        if c == "\\" and i + 1 < n:
+            nxt = value[i + 1]
+            mapping = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
+            out.append(mapping.get(nxt, nxt))
+            i += 2
+            continue
+        if c == '"':
+            in_q = not in_q
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _fmm_config_log(value: str) -> int:
+    """Mirror fmt_merge_msg_config for merge.log/merge.summary."""
+    v = value.strip()
+    low = v.lower()
+    if low in ("true", "yes", "on", ""):
+        return DEFAULT_MERGE_LOG_LEN
+    if low in ("false", "no", "off"):
+        return 0
+    try:
+        n = int(v)
+    except ValueError:
+        return DEFAULT_MERGE_LOG_LEN
+    if n:
+        return n
+    return 0
+
+
+def _fmm_ident_name(repo: Repository, which: str) -> Optional[str]:
+    """Return the running author/committer name (no date), like git_author_info."""
+    name = None
+    email = None
+    try:
+        cp = repo.config()
+        if cp.has_section("user"):
+            name = cp.get("user", "name", fallback=None)
+            email = cp.get("user", "email", fallback=None)
+    except Exception:
+        pass
+    if which == "a":
+        name = os.environ.get("GIT_AUTHOR_NAME") or name
+        email = os.environ.get("GIT_AUTHOR_EMAIL") or email
+    else:
+        name = os.environ.get("GIT_COMMITTER_NAME") or name
+        email = os.environ.get("GIT_COMMITTER_EMAIL") or email
+    name = os.environ.get("GIT_AUTHOR_NAME") if name is None and which == "a" else name
+    if name is None:
+        name = "pythongit"
+    if email is None:
+        email = "pythongit@example.invalid"
+    return f"{name} <{email}>"
+
+
+class _SrcData:
+    __slots__ = ("branch", "tag", "r_branch", "generic", "head_status")
+
+    def __init__(self):
+        self.branch: list[str] = []
+        self.tag: list[str] = []
+        self.r_branch: list[str] = []
+        self.generic: list[str] = []
+        self.head_status = 0
+
+
+def _fmm_print_joined(singular: str, plural: str, items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return singular + items[0]
+    parts = [plural]
+    for i in range(len(items) - 1):
+        parts.append(("" if i == 0 else ", ") + items[i])
+    parts.append(" and " + items[-1])
+    return "".join(parts)
+
+
+def _fmt_merge_msg(repo, text, out, *, add_title, credit, shortlog_len,
+                   into_name, comment):
+    from . import merge as merge_mod
+
+    hexsz = 64 if repo.object_format() == "sha256" else 40
+
+    # learn HEAD oid and current branch name
+    head_sym, head_oid = refs_mod.read_head(repo)
+    if head_oid is None and head_sym is None:
+        raise _FmtMergeMsgError("No current branch")
+    if into_name is not None:
+        current_branch = into_name
+    elif head_sym and head_sym.startswith("refs/heads/"):
+        current_branch = head_sym[len("refs/heads/"):]
+    elif head_sym:
+        current_branch = head_sym
+    else:
+        current_branch = "HEAD"
+
+    # suppress_dest patterns default to main/master
+    suppress_patterns = ["main", "master"]
+
+    # --- find_merge_parents: determine which tips are non-redundant ---
+    lines = _fmm_splitlines(text)
+    given_to_commit: dict[str, str] = {}
+    parent_commits: list[str] = []
+    order: list[str] = []  # given oids in order, deduped
+    for ln in lines:
+        if len(ln) < hexsz + 2 or ln[hexsz] != "\t" or ln[hexsz + 1] != "\t":
+            continue
+        oid = ln[:hexsz]
+        if not _fmm_is_hex(oid):
+            continue
+        commit = _fmm_peel_to_commit(repo, oid)
+        if commit is None:
+            continue
+        if oid not in given_to_commit:
+            given_to_commit[oid] = commit
+            order.append(oid)
+        parent_commits.append(commit)
+
+    used: set[str] = set()
+    if head_oid is not None or order:
+        cand = list(parent_commits)
+        if head_oid is not None:
+            cand.append(head_oid)
+        reduced = _fmm_reduce_heads(repo, cand, merge_mod)
+        for oid in order:
+            if given_to_commit[oid] in reduced:
+                used.add(oid)
+
+    # --- handle_line for each input line, building srcs/origins ---
+    srcs: list[tuple[str, _SrcData]] = []  # (src_name, data) unsorted
+    srcs_idx: dict[str, int] = {}
+    origins: list[tuple[str, str]] = []  # (origin_string, given_oid)
+
+    i = 0
+    for raw in lines:
+        i += 1
+        ln = raw
+        rc = _fmm_handle_line(ln, hexsz, used, srcs, srcs_idx, origins)
+        if rc:
+            raise _FmtMergeMsgError(f"error in line {i}: {raw}")
+
+    # --- title ---
+    if add_title and srcs:
+        out.append(_fmm_title(srcs, current_branch, suppress_patterns))
+
+    # --- tag bodies / signatures ---
+    if origins:
+        _fmm_sigs(repo, origins, out, comment)
+
+    # --- shortlog ---
+    if shortlog_len:
+        _fmm_complete_line(out)
+        for origin_str, given_oid in origins:
+            _fmm_shortlog(repo, origin_str, given_oid, head_oid, shortlog_len,
+                          credit, out, comment, merge_mod)
+
+    _fmm_complete_line(out)
+
+
+def _fmm_splitlines(text: str) -> list[str]:
+    """Split like the C code: each segment up to '\\n' (newline stripped),
+    keeping a trailing segment without newline."""
+    res = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        nl = text.find("\n", pos)
+        if nl == -1:
+            res.append(text[pos:])
+            break
+        res.append(text[pos:nl])
+        pos = nl + 1
+    return res
+
+
+def _fmm_is_hex(s: str) -> bool:
+    if not s:
+        return False
+    try:
+        int(s, 16)
+    except ValueError:
+        return False
+    return all(c in "0123456789abcdef" for c in s)
+
+
+def _fmm_peel_to_commit(repo, oid: str) -> Optional[str]:
+    """Resolve oid to a commit, peeling tags. Return commit oid or None."""
+    seen = 0
+    cur = oid
+    while seen < 10:
+        seen += 1
+        try:
+            t, data = objs.read_object(repo, cur)
+        except (KeyError, Exception):
+            return None
+        if t == "commit":
+            return cur
+        if t == "tag":
+            target = None
+            for line in data.decode("utf-8", errors="replace").splitlines():
+                if line.startswith("object "):
+                    target = line[len("object "):].strip()
+                    break
+                if line == "":
+                    break
+            if target is None:
+                return None
+            cur = target
+            continue
+        return None
+    return None
+
+
+def _fmm_reduce_heads(repo, commits: list[str], merge_mod) -> set[str]:
+    """Mirror reduce_heads_replace: keep only commits that are not ancestors of
+    any other commit in the list."""
+    uniq = []
+    seen = set()
+    for c in commits:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    result = set(uniq)
+    for a in uniq:
+        for b in uniq:
+            if a == b:
+                continue
+            if a not in result or b not in result:
+                continue
+            # if a is an ancestor of b, drop a
+            if merge_mod.is_ancestor(repo, a, b):
+                result.discard(a)
+    return result
+
+
+def _fmm_handle_line(line, hexsz, used, srcs, srcs_idx, origins) -> int:
+    length = len(line)
+    if length < hexsz + 3 or (len(line) <= hexsz or line[hexsz] != "\t"):
+        return 1
+    if line[hexsz + 1:].startswith("not-for-merge"):
+        return 0
+    if line[hexsz + 1] != "\t":
+        return 2
+    oid = line[:hexsz]
+    if not _fmm_is_hex(oid):
+        return 3
+    if oid not in used:
+        return 0  # subsumed by other parents
+
+    is_local_branch = False
+    rest = line[hexsz + 2:]
+
+    # find " of "
+    of_idx = rest.find(" of ")
+    if of_idx != -1:
+        src = rest[of_idx + 4:]
+        line_part = rest[:of_idx]
+        pulling_head = False
+    else:
+        src = rest
+        line_part = rest
+        pulling_head = True
+
+    if src in srcs_idx:
+        sd = srcs[srcs_idx[src]][1]
+    else:
+        sd = _SrcData()
+        srcs_idx[src] = len(srcs)
+        srcs.append((src, sd))
+
+    if pulling_head:
+        origin = src
+        sd.head_status |= 1
+    elif line_part.startswith("branch "):
+        is_local_branch = True
+        origin = line_part[len("branch "):]
+        sd.branch.append(origin)
+        sd.head_status |= 2
+    elif line_part.startswith("tag "):
+        origin = line_part
+        sd.tag.append(line_part[len("tag "):])
+        sd.head_status |= 2
+    elif line_part.startswith("remote-tracking branch "):
+        origin = line_part[len("remote-tracking branch "):]
+        sd.r_branch.append(origin)
+        sd.head_status |= 2
+    else:
+        origin = src
+        sd.generic.append(line_part)
+        sd.head_status |= 2
+
+    if src == "." or src == origin:
+        olen = len(origin)
+        if olen >= 2 and origin[0] == "'" and origin[olen - 1] == "'":
+            origin = origin[1:olen - 1]
+    else:
+        origin = f"{origin} of {src}"
+    origins.append((origin, oid))
+    return 0
+
+
+def _fmm_title(srcs, current_branch, suppress_patterns) -> str:
+    out = ["Merge "]
+    sep = ""
+    for src_name, sd in srcs:
+        subsep = ""
+        out.append(sep)
+        sep = "; "
+        if sd.head_status == 1:
+            out.append(src_name)
+            continue
+        if sd.head_status == 3:
+            subsep = ", "
+            out.append("HEAD")
+        if sd.branch:
+            out.append(subsep)
+            subsep = ", "
+            out.append(_fmm_print_joined("branch ", "branches ", sd.branch))
+        if sd.r_branch:
+            out.append(subsep)
+            subsep = ", "
+            out.append(_fmm_print_joined(
+                "remote-tracking branch ", "remote-tracking branches ", sd.r_branch))
+        if sd.tag:
+            out.append(subsep)
+            subsep = ", "
+            out.append(_fmm_print_joined("tag ", "tags ", sd.tag))
+        if sd.generic:
+            out.append(subsep)
+            out.append(_fmm_print_joined("commit ", "commits ", sd.generic))
+        if src_name != ".":
+            out.append(f" of {src_name}")
+    if not _fmm_dest_suppressed(current_branch, suppress_patterns):
+        out.append(f" into {current_branch}")
+    out.append("\n")
+    return "".join(out)
+
+
+def _fmm_dest_suppressed(dest, patterns) -> bool:
+    import fnmatch
+    for pat in patterns:
+        # WM_PATHNAME: '*' does not match '/'. branch names rarely contain '/'.
+        if fnmatch.fnmatchcase(dest, pat):
+            return True
+    return False
+
+
+def _fmm_sigs(repo, origins, out, comment):
+    """Mirror fmt_merge_msg_sigs: append annotated-tag bodies (and would-be
+    signature verification, which we treat as merely-annotated)."""
+    tagbuf: list[str] = []
+    tag_number = 0
+    first_tag_str = None
+    for origin_str, given_oid in origins:
+        try:
+            t, data = objs.read_object(repo, given_oid)
+        except Exception:
+            continue
+        if t != "tag":
+            continue
+        body = data.decode("utf-8", errors="surrogateescape")
+        # strip a trailing PGP signature block if present (merely-annotated path
+        # keeps body as-is; signed tags would be commented, which we cannot
+        # verify, so we keep just the payload body).
+        payload = body
+        sig_start = body.find("\n-----BEGIN PGP SIGNATURE-----\n")
+        if sig_start != -1:
+            payload = body[:sig_start + 1]
+        if tag_number == 0:
+            _fmm_tag_signature(tagbuf, payload)
+            first_tag_str = origin_str
+            tag_number = 1
+        else:
+            if tag_number == 1:
+                tagline = "\n" + _fmm_commented_lines(first_tag_str, comment)
+                tagbuf.insert(0, tagline)
+            tag_number += 1
+            tagbuf.append("\n")
+            tagbuf.append(_fmm_commented_lines(origin_str, comment))
+            _fmm_tag_signature(tagbuf, payload)
+    joined = "".join(tagbuf)
+    if joined:
+        out.append("\n")
+        out.append(joined)
+
+
+def _fmm_tag_signature(tagbuf: list[str], buf: str):
+    idx = buf.find("\n\n")
+    if idx != -1:
+        body = buf[idx + 2:]
+        tagbuf.append(body)
+    _fmm_complete_line(tagbuf)
+
+
+def _fmm_shortlog(repo, name, given_oid, head_oid, limit, credit, out, comment,
+                  merge_mod):
+    branch = _fmm_peel_to_commit(repo, given_oid)
+    if branch is None:
+        return
+
+    # walk commits reachable from branch but not from head, in commit-date
+    # descending order with FIFO tie-break (rev-list default order).
+    interesting = _fmm_rev_walk(repo, branch, head_oid)
+
+    subjects: list[str] = []
+    authors: dict[str, int] = {}
+    authors_order: list[str] = []
+    committers: dict[str, int] = {}
+    committers_order: list[str] = []
+    count = 0
+
+    for csha in interesting:
+        try:
+            t, data = objs.read_object(repo, csha)
+        except Exception:
+            continue
+        if t != "commit":
+            continue
+        c = objs.parse_commit(data)
+        is_merge = len(c.parents) > 1
+        if is_merge:
+            if credit:
+                _fmm_record_person("c", committers, committers_order, data)
+            continue
+        if count == 0 and credit:
+            _fmm_record_person("c", committers, committers_order, data)
+        if credit:
+            _fmm_record_person("a", authors, authors_order, data)
+        count += 1
+        if len(subjects) > limit:
+            continue
+        subject = _fmm_format_subject(c.message)
+        if not subject:
+            subjects.append(csha)
+        else:
+            subjects.append(subject)
+
+    if credit:
+        _fmm_add_people_info(out, authors, authors_order, committers,
+                             committers_order, comment, repo)
+    if count > limit:
+        out.append(f"\n* {name}: ({count} commits)\n")
+    else:
+        out.append(f"\n* {name}:\n")
+
+    for idx, subj in enumerate(subjects):
+        if idx >= limit:
+            out.append("  ...\n")
+        else:
+            out.append(f"  {subj}\n")
+
+
+def _fmm_format_subject(message: str) -> str:
+    """Mirror %s formatting then strbuf_ltrim."""
+    # %s = first paragraph collapsed to a single line (subject).
+    msg = message
+    # Find the subject: text up to first blank line, with internal newlines
+    # folded to spaces (git's format_subject).
+    end = msg.find("\n\n")
+    if end == -1:
+        subj_src = msg
+        # trailing single newline trimmed by %s logic
+        if subj_src.endswith("\n"):
+            subj_src = subj_src[:-1]
+    else:
+        subj_src = msg[:end]
+    # fold newlines to single spaces
+    parts = subj_src.split("\n")
+    folded = " ".join(p for p in parts)
+    # collapse the join: git replaces line breaks with a single space
+    folded = " ".join(filter(None, [folded]))
+    subj = folded.lstrip()
+    return subj
+
+
+def _fmm_record_person(which, people, order, commit_data):
+    field = b"\nauthor " if which == "a" else b"\ncommitter "
+    idx = commit_data.find(field)
+    if idx == -1:
+        return
+    start = idx + len(field)
+    lt = commit_data.find(b"<", start)
+    if lt == -1:
+        name_end = len(commit_data)
+    else:
+        name_end = lt - 1
+    # trim trailing whitespace
+    while name_end >= start and commit_data[name_end:name_end + 1].isspace():
+        name_end -= 1
+    if name_end < start:
+        return
+    name = commit_data[start:name_end + 1].decode("utf-8", errors="surrogateescape")
+    if name not in people:
+        people[name] = 0
+        order.append(name)
+    people[name] += 1
+
+
+def _fmm_add_people_info(out, authors, authors_order, committers,
+                         committers_order, comment, repo):
+    # sort by name (string_list_insert keeps sorted), then stable by count desc
+    a_sorted = sorted(authors_order)
+    a_sorted = sorted(a_sorted, key=lambda n: -authors[n])
+    c_sorted = sorted(committers_order)
+    c_sorted = sorted(c_sorted, key=lambda n: -committers[n])
+    _fmm_credit_people(out, a_sorted, authors, "a", comment, repo)
+    _fmm_credit_people(out, c_sorted, committers, "c", comment, repo)
+
+
+def _fmm_credit_people(out, names, counts, kind, comment, repo):
+    if kind == "a":
+        label = "By"
+        me = _fmm_ident_name(repo, "a")
+    else:
+        label = "Via"
+        me = _fmm_ident_name(repo, "c")
+    if not names:
+        return
+    if len(names) == 1 and me is not None:
+        # suppress if the single person is the running identity:
+        # me starts with "<name> <"
+        prefix = names[0]
+        if me.startswith(prefix) and me[len(prefix):].startswith(" <"):
+            return
+    out.append(f"\n{comment} {label} ")
+    out.append(_fmm_people_count(names, counts))
+
+
+def _fmm_people_count(names, counts) -> str:
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} ({counts[names[0]]}) and {names[1]} ({counts[names[1]]})"
+    if names:
+        return f"{names[0]} ({counts[names[0]]}) and others"
+    return ""
+
+
+def _fmm_rev_walk(repo, tip: str, head_oid):
+    """Commits reachable from tip but not from head, in commit-date descending
+    order (FIFO tie-break), mirroring a default-order limited rev walk."""
+    import heapq
+
+    def ctime(sha):
+        try:
+            t, data = objs.read_object(repo, sha)
+        except Exception:
+            return 0
+        if t != "commit":
+            return 0
+        c = objs.parse_commit(data)
+        parts = c.committer.rsplit(" ", 2)
+        try:
+            return int(parts[-2])
+        except (ValueError, IndexError):
+            return 0
+
+    UNINTERESTING = 1
+    flags: dict[str, int] = {}
+    heap: list[tuple[int, int, str]] = []
+    ctr = 0
+    flags[tip] = 0
+    heapq.heappush(heap, (-ctime(tip), ctr, tip))
+    ctr += 1
+    if head_oid is not None:
+        flags[head_oid] = flags.get(head_oid, 0) | UNINTERESTING
+        heapq.heappush(heap, (-ctime(head_oid), ctr, head_oid))
+        ctr += 1
+
+    result: list[str] = []
+    popped: set[str] = set()
+    while heap:
+        # stop when only uninteresting commits remain
+        if all(flags.get(s, 0) & UNINTERESTING for _, _, s in heap):
+            break
+        negd, _c, sha = heapq.heappop(heap)
+        if sha in popped:
+            continue
+        popped.add(sha)
+        f = flags.get(sha, 0)
+        info = _commit_tree_parents(repo, sha)
+        parents = info[1] if info else ()
+        if not (f & UNINTERESTING):
+            result.append(sha)
+        for p in parents:
+            pf = flags.get(p, 0)
+            newf = pf | (f & UNINTERESTING)
+            if p in flags and (pf & UNINTERESTING) == (newf & UNINTERESTING) and p in popped:
+                continue
+            flags[p] = newf
+            heapq.heappush(heap, (-ctime(p), ctr, p))
+            ctr += 1
+    return result
 
 
 def cmd_fetch_pack(argv: list[str]) -> int:
@@ -12307,11 +13294,52 @@ def cmd_pack_redundant(argv: list[str]) -> int:
     return 0
 
 
+_PRUNE_PACKED_USAGE = (
+    "usage: git prune-packed [-n | --dry-run] [-q | --quiet]\n"
+    "\n"
+    "    -n, --[no-]dry-run    dry run\n"
+    "    -q, --[no-]quiet      be quiet\n"
+    "\n"
+)
+
+
 def cmd_prune_packed(argv: list[str]) -> int:
     """Remove loose objects that are also present in a pack."""
-    ap = argparse.ArgumentParser(prog="pygit prune-packed")
-    ap.add_argument("-n", "--dry-run", action="store_true")
-    args = ap.parse_args(argv)
+    dry_run = False
+    # quiet only toggles progress, which goes to stderr and is suppressed when
+    # stderr is not a TTY; we accept it for parity but emit no progress.
+    extra: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            extra.extend(argv[i + 1:])
+            break
+        if a in ("-n", "--dry-run"):
+            dry_run = True
+        elif a == "--no-dry-run":
+            dry_run = False
+        elif a in ("-q", "--quiet", "--no-quiet"):
+            pass
+        elif a in ("-h", "--help"):
+            sys.stdout.write(_PRUNE_PACKED_USAGE)
+            return 129
+        elif a.startswith("--"):
+            sys.stderr.write(f"error: unknown option `{a[2:]}'\n")
+            sys.stderr.write(_PRUNE_PACKED_USAGE)
+            return 129
+        elif a.startswith("-") and a != "-":
+            sys.stderr.write(f"error: unknown switch `{a[1:2]}'\n")
+            sys.stderr.write(_PRUNE_PACKED_USAGE)
+            return 129
+        else:
+            extra.append(a)
+        i += 1
+    if extra:
+        sys.stderr.write("fatal: too many arguments\n\n")
+        sys.stderr.write(_PRUNE_PACKED_USAGE)
+        return 129
+
     repo = _repo()
     from . import pack as _p
     midx = _p.read_midx(repo)
@@ -12321,16 +13349,25 @@ def cmd_prune_packed(argv: list[str]) -> int:
         in_packs = set()
         for pk in _p._iter_packs(repo):
             in_packs.update(pk.shas)
-    removed = 0
+
+    obj_root = repo.gitdir / "objects"
+    rel_root = os.path.relpath(obj_root, repo.path)
     for sha in _iter_loose_shas(repo):
         if sha in in_packs:
-            if args.dry_run:
-                _print(f"would prune {sha}")
+            rel_path = os.path.join(rel_root, sha[:2], sha[2:])
+            if dry_run:
+                _print(f"rm -f {rel_path}")
             else:
-                (repo.gitdir / "objects" / sha[:2] / sha[2:]).unlink(missing_ok=True)
-                removed += 1
-    if not args.dry_run:
-        _print(f"pruned {removed}")
+                (obj_root / sha[:2] / sha[2:]).unlink(missing_ok=True)
+    if not dry_run:
+        # Remove now-empty fanout subdirectories, mirroring git's rmdir().
+        for i in range(256):
+            d = obj_root / f"{i:02x}"
+            if d.is_dir():
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
     return 0
 
 

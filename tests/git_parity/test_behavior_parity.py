@@ -1781,6 +1781,30 @@ CASES: list[tuple] = [
     ("stash-bare-q", BASE + [("write", "a.txt", "mod\n")], ["stash", "-q"]),
     ("stash-bare-m",
      BASE + [("write", "a.txt", "mod\n"), ["stash", "-m", "bare msg"]], ["stash", "list"]),
+    # --- workflow batch 1: update-server-info / prune-packed / prune ---
+    ('update-server-info-force-basic', BASE, ["update-server-info", "-f"]),
+    ('update-server-info-force-long', BASE, ["update-server-info", "--force"]),
+    ('update-server-info-no-force', BASE, ["update-server-info", "--no-force"]),
+    ('update-server-info-bare', BASE, ["update-server-info"]),
+    ('update-server-info-tags-force', BASE + [["tag", "light"], ["tag", "-a", "-m", "ann", "annot"], ["branch", "feature"]], ["update-server-info", "-f"]),
+    ('prune-packed-dry-run', BASE + [["repack", "-a"]], ["prune-packed", "-n"]),
+    ('prune-packed-dry-run-long', BASE + [["repack", "-a"]], ["prune-packed", "--dry-run"]),
+    ('prune-packed-quiet-dry-run', BASE + [["repack", "-a"]], ["prune-packed", "-q", "-n"]),
+    ('prune-packed-actual', BASE + [["repack", "-a"]], ["prune-packed"]),
+    ('prune-packed-quiet-actual', BASE + [["repack", "-a"]], ["prune-packed", "-q"]),
+    ('prune-packed-no-duplicates', BASE, ["prune-packed", "-n"]),
+    ('prune-packed-too-many-args', BASE, ["prune-packed", "foo"]),
+    ('prune-packed-unknown-option', BASE, ["prune-packed", "--bogus"]),
+    ('prune-packed-unknown-switch', BASE, ["prune-packed", "-x"]),
+    ('prune-packed-help', BASE, ["prune-packed", "-h"]),
+    ('prune-dry-run-lists-dangling', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune", "-n"]),
+    ('prune-verbose-removes-and-lists', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune", "-v"]),
+    ('prune-default-silent', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune"]),
+    ('prune-expire-never-keeps', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune", "-n", "--expire=never"]),
+    ('prune-expire-future-prunes', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune", "-n", "--expire=2099-01-01"]),
+    ('prune-expire-malformed', BASE, ["prune", "-n", "--expire=bogus"]),
+    ('prune-bad-head-arg', BASE, ["prune", "-n", "notarev"]),
+    ('prune-no-progress', BASE + [("write","x.txt","x\n"),["hash-object","-w","x.txt"]], ["prune", "-n", "--no-progress"]),
 ]
 
 
@@ -1954,4 +1978,73 @@ def test_pack_refs_state_parity(case, tmp_path: Path, git_254_oracle: str):
         proc = subprocess.run([*base, *probe], cwd=repo, env=env, capture_output=True, text=True)
         results[tool] = (proc.returncode, proc.stdout, proc.stderr, *snapshot(repo))
 
+    assert results["pygit"] == results["oracle"]
+
+
+# fmt-merge-msg reads FETCH_HEAD-format lines whose first field is a real commit
+# id, so its inputs can't be a static literal — this resolves the placeholder to
+# the actual (deterministic) sha before feeding stdin to both binaries.
+FMT_MERGE_MSG_CASES = [
+    ("fmt-merge-msg-branch-title",
+     BASE + [["checkout", "-b", "feature"], ("write", "f.txt", "x\n"), ["add", "-A"],
+             ["commit", "-m", "add f"], ["checkout", "main"]],
+     {"SHA": "feature"}, "{SHA}\t\tbranch 'feature' of .\n", ["fmt-merge-msg"]),
+    ("fmt-merge-msg-log",
+     BASE + [["checkout", "-b", "feature"], ("write", "f1.txt", "1\n"), ["add", "-A"],
+             ["commit", "-m", "c1"], ("write", "f2.txt", "2\n"), ["add", "-A"],
+             ["commit", "-m", "c2"], ["checkout", "main"]],
+     {"SHA": "feature"}, "{SHA}\t\tbranch 'feature' of .\n", ["fmt-merge-msg", "--log"]),
+    ("fmt-merge-msg-no-log",
+     BASE + [["checkout", "-b", "feature"], ("write", "f.txt", "x\n"), ["add", "-A"],
+             ["commit", "-m", "c1"], ["checkout", "main"]],
+     {"SHA": "feature"}, "{SHA}\t\tbranch 'feature' of .\n", ["fmt-merge-msg", "--no-log"]),
+    ("fmt-merge-msg-m",
+     BASE + [["checkout", "-b", "feature"], ("write", "f.txt", "x\n"), ["add", "-A"],
+             ["commit", "-m", "c1"], ["checkout", "main"]],
+     {"SHA": "feature"}, "{SHA}\t\tbranch 'feature' of .\n", ["fmt-merge-msg", "-m", "custom start"]),
+    ("fmt-merge-msg-two-branches",
+     BASE + [["checkout", "-b", "b1"], ("write", "x.txt", "1\n"), ["add", "-A"], ["commit", "-m", "x1"],
+             ["checkout", "main"], ["checkout", "-b", "b2"], ("write", "y.txt", "2\n"), ["add", "-A"],
+             ["commit", "-m", "x2"], ["checkout", "main"]],
+     {"B1": "b1", "B2": "b2"}, "{B1}\t\tbranch 'b1' of .\n{B2}\t\tbranch 'b2' of .\n", ["fmt-merge-msg"]),
+    ("fmt-merge-msg-not-for-merge",
+     BASE + [["checkout", "-b", "feature"], ("write", "f.txt", "x\n"), ["add", "-A"],
+             ["commit", "-m", "c1"], ["checkout", "main"]],
+     {"SHA": "feature"}, "{SHA}\tnot-for-merge\tbranch 'feature' of .\n", ["fmt-merge-msg"]),
+    ("fmt-merge-msg-error-bad-line", BASE, {}, "short\n", ["fmt-merge-msg"]),
+    ("fmt-merge-msg-empty-input", BASE, {}, "", ["fmt-merge-msg"]),
+    ("fmt-merge-msg-log-bad-int", BASE, {}, "", ["fmt-merge-msg", "--log=abc"]),
+]
+
+
+@pytest.mark.parametrize("case", FMT_MERGE_MSG_CASES, ids=[c[0] for c in FMT_MERGE_MSG_CASES])
+def test_fmt_merge_msg_parity(case, tmp_path: Path, git_254_oracle: str):
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, placeholders, stdin_tmpl, argv = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).parent.mkdir(parents=True, exist_ok=True)
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        # Resolve placeholders to real shas with the oracle so both inputs match.
+        subs = {}
+        for key, rev in placeholders.items():
+            sha = subprocess.run([git_254_oracle, "rev-parse", rev], cwd=repo, env=env,
+                                 capture_output=True, text=True).stdout.strip()
+            subs[key] = sha
+        stdin = stdin_tmpl.format(**subs)
+        proc = subprocess.run([*base, *argv], cwd=repo, env=env, input=stdin,
+                              capture_output=True, text=True)
+        results[tool] = (proc.returncode, proc.stdout, proc.stderr)
     assert results["pygit"] == results["oracle"]
