@@ -203,7 +203,11 @@ def add_paths(repo: Repository, paths: Iterable[str], *,
         sha = objs.write_object(repo, "blob", data)
         st = full.lstat()
         entry = stat_to_entry(rel, st, sha, _mode_for(full))
-        # clear conflict stages (1/2/3) on add — resolution
+        # clear conflict stages (1/2/3) on add — resolution. Record the dropped
+        # stages into resolve-undo first (git's record_resolve_undo), so a later
+        # `update-index --unresolve` can restore them.
+        for stage_e in [e for e in idx.entries if e.path == rel and e.stage != 0]:
+            idx.record_resolve_undo(stage_e)
         idx.remove(rel, stage=1)
         idx.remove(rel, stage=2)
         idx.remove(rel, stage=3)

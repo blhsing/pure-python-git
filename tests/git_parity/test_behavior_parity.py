@@ -2303,3 +2303,173 @@ def test_batch4_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch4_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+BATCH5_CASES = [
+    ('bugreport-suffix-missing-value', [], ['bugreport', '-s']),
+    ('bugreport-long-suffix-missing-value', [], ['bugreport', '--suffix']),
+    ('bugreport-output-dir-missing-value', [], ['bugreport', '-o']),
+    ('bugreport-long-output-dir-missing-value', [], ['bugreport', '--output-directory']),
+    ('bugreport-unknown-argument', [], ['bugreport', 'stray']),
+    ('bugreport-unknown-option', [], ['bugreport', '--bogus']),
+    ('bugreport-unknown-switch', [], ['bugreport', '-z']),
+    ('bugreport-diagnose-invalid-value', [], ['bugreport', '--diagnose=bogus']),
+    ('bugreport-diagnose-empty-value', [], ['bugreport', '--diagnose=']),
+    ('bugreport-help', [], ['bugreport', '-h']),
+    ('diagnose-invalid-mode-eq', [], ['diagnose', '--mode=bogus', '-s', 'foo']),
+    ('diagnose-invalid-mode-empty', [], ['diagnose', '--mode=', '-s', 'foo']),
+    ('diagnose-invalid-mode-separate', [], ['diagnose', '--mode', 'bogus', '-s', 'foo']),
+    ('diagnose-invalid-mode-none', [], ['diagnose', '--mode=none', '-s', 'foo']),
+    ('diagnose-mode-requires-value-last', [], ['diagnose', '--mode']),
+    ('diagnose-mode-eats-next-option', [], ['diagnose', '--mode', '-s', 'foo']),
+    ('diagnose-suffix-short-requires-value', [], ['diagnose', '-s']),
+    ('diagnose-suffix-long-requires-value', [], ['diagnose', '--suffix']),
+    ('diagnose-output-short-requires-value', [], ['diagnose', '-o']),
+    ('diagnose-output-long-requires-value', [], ['diagnose', '--output-directory']),
+    ('diagnose-no-mode-unknown', [], ['diagnose', '--no-mode', '-s', 'foo']),
+    ('diagnose-unknown-long-option', [], ['diagnose', '--foo']),
+    ('diagnose-unknown-short-switch', [], ['diagnose', '-z']),
+    ('diagnose-help-short', [], ['diagnose', '-h']),
+    ('init-ref-format-files', [], ['init', '--ref-format=files', 'myrepo']),
+    ('init-ref-format-unknown-fatal', [], ['init', '--ref-format=bogus']),
+    ('init-ref-format-unknown-after-path', [], ['init', 'mydir', '--ref-format=bogus']),
+    ('init-ref-format-empty-value-fatal', [], ['init', '--ref-format=']),
+    ('init-ref-format-missing-value-usage', [], ['init', '--ref-format']),
+    ('init-db-ref-format-files', [], ['init-db', '--ref-format=files', 'dbrepo']),
+    ('init-db-ref-format-unknown-fatal', [], ['init-db', '--ref-format=bogus']),
+    ('init-db-ref-format-missing-value-usage', [], ['init-db', '--ref-format']),
+    ('fast-export-no-data-linear', [('write', 'f.txt', 'one\n'), ['add', 'f.txt'], ['commit', '-m', 'one'], ('write', 'f.txt', 'two\n'), ['add', 'f.txt'], ['commit', '-m', 'two'], ['branch', '-M', 'main']], ['fast-export', '--no-data', 'HEAD']),
+    ('fast-export-data-linear', [('write', 'f.txt', 'one\n'), ['add', 'f.txt'], ['commit', '-m', 'one'], ('write', 'f.txt', 'two\n'), ['add', 'f.txt'], ['commit', '-m', 'two'], ['branch', '-M', 'main']], ['fast-export', '--data', 'HEAD']),
+    ('fast-export-no-data-add-modify-delete', [('write', 'a.txt', 'hello\n'), ('write', 'b.txt', 'world\n'), ['add', 'a.txt', 'b.txt'], ['commit', '-m', 'first commit'], ('write', 'a.txt', 'hello again\n'), ('write', 'c.txt', 'extra\n'), ['add', 'a.txt', 'c.txt'], ('rm', 'b.txt'), ['commit', '-m', 'second commit'], ['branch', '-M', 'main']], ['fast-export', '--no-data', 'HEAD']),
+    ('fast-export-no-data-subdir', [('write', 'dir/a.txt', 'a\n'), ('write', 'top.txt', 'top\n'), ['add', '.'], ['commit', '-m', 'c1'], ('write', 'dir/b.txt', 'b\n'), ['add', '.'], ['commit', '-m', 'c2'], ['branch', '-M', 'main']], ['fast-export', '--no-data', 'HEAD']),
+    ('fast-export-data-no-data-last-wins', [('write', 'f.txt', 'one\n'), ['add', 'f.txt'], ['commit', '-m', 'one'], ('write', 'f.txt', 'two\n'), ['add', 'f.txt'], ['commit', '-m', 'two'], ['branch', '-M', 'main']], ['fast-export', '--data', '--no-data', 'HEAD']),
+    ('fast-export-no-data-data-last-wins', [('write', 'f.txt', 'one\n'), ['add', 'f.txt'], ['commit', '-m', 'one'], ('write', 'f.txt', 'two\n'), ['add', 'f.txt'], ['commit', '-m', 'two'], ['branch', '-M', 'main']], ['fast-export', '--no-data', '--data', 'HEAD']),
+    ('update-index-unresolve-restores-stages', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'other'], ('write', 'f.txt', 'a\nX\nc\n'), ['commit', '-am', 'other'], ['checkout', 'main'], ('write', 'f.txt', 'a\nY\nc\n'), ['commit', '-am', 'main2'], ['merge', 'other'], ('write', 'f.txt', 'a\nZ\nc\n'), ['add', 'f.txt'], ['update-index', '--unresolve', 'f.txt']], ['ls-files', '-u']),
+    ('update-index-unresolve-twice-second-is-noop', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'other'], ('write', 'f.txt', 'a\nX\nc\n'), ['commit', '-am', 'other'], ['checkout', 'main'], ('write', 'f.txt', 'a\nY\nc\n'), ['commit', '-am', 'main2'], ['merge', 'other'], ('write', 'f.txt', 'a\nZ\nc\n'), ['add', 'f.txt'], ['update-index', '--unresolve', 'f.txt'], ['update-index', '--unresolve', 'f.txt']], ['ls-files', '-u']),
+    ('update-index-clear-resolve-undo-then-unresolve-noop', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'other'], ('write', 'f.txt', 'a\nX\nc\n'), ['commit', '-am', 'other'], ['checkout', 'main'], ('write', 'f.txt', 'a\nY\nc\n'), ['commit', '-am', 'main2'], ['merge', 'other'], ('write', 'f.txt', 'a\nZ\nc\n'), ['add', 'f.txt'], ['update-index', '--clear-resolve-undo'], ['update-index', '--unresolve', 'f.txt']], ['ls-files', '-u']),
+    ('update-index-unresolve-no-record-is-noop', [('write', 'a.txt', 'x\n'), ['add', 'a.txt'], ['commit', '-m', 'base']], ['update-index', '--unresolve', 'a.txt']),
+    ('update-index-unresolve-no-paths-noop', [], ['update-index', '--unresolve']),
+    ('update-index-clear-resolve-undo-empty-noop', [], ['update-index', '--clear-resolve-undo']),
+    ('update-index-fsmonitor-valid-existing-path', [('write', 'a.txt', 'x\n'), ['add', 'a.txt']], ['update-index', '--fsmonitor-valid', 'a.txt']),
+    ('update-index-no-fsmonitor-valid-existing-path', [('write', 'a.txt', 'x\n'), ['add', 'a.txt']], ['update-index', '--no-fsmonitor-valid', 'a.txt']),
+    ('update-index-fsmonitor-valid-missing-path-dies', [], ['update-index', '--fsmonitor-valid', 'missing.txt']),
+    ('update-index-no-fsmonitor-valid-missing-path-dies', [], ['update-index', '--no-fsmonitor-valid', 'missing.txt']),
+    ('update-index-fsmonitor-valid-no-path-noop', [], ['update-index', '--fsmonitor-valid']),
+    ('backfill-bare-noop', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill']),
+    ('backfill-min-batch-size-eq', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=100']),
+    ('backfill-min-batch-size-separate', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size', '100']),
+    ('backfill-min-batch-size-zero', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=0']),
+    ('backfill-min-batch-size-k-suffix', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=1k']),
+    ('backfill-min-batch-size-m-suffix', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=2m']),
+    ('backfill-min-batch-size-hex', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=0x10']),
+    ('backfill-min-batch-size-octal', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=010']),
+    ('backfill-min-batch-size-plus', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=+5']),
+    ('backfill-min-batch-size-no-value', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size']),
+    ('backfill-min-batch-size-empty', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=']),
+    ('backfill-min-batch-size-abc', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=abc']),
+    ('backfill-min-batch-size-negative', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=-5']),
+    ('backfill-min-batch-size-bad-suffix', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=5z']),
+    ('backfill-min-batch-size-bare-0x', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=0x']),
+    ('backfill-min-batch-size-dotted', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=1.5']),
+    ('backfill-min-batch-size-overflow', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=999999999999999999999']),
+    ('backfill-no-sparse', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--no-sparse']),
+    ('backfill-min-batch-size-then-no-sparse', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--min-batch-size=10', '--no-sparse']),
+    ('backfill-unknown-flag', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '--bogus']),
+    ('backfill-help-h', [('write', 'f.txt', 'hi\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['backfill', '-h']),
+    ('archive-exec-eq-no-remote', [('write', 'f.txt', 'hello\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['archive', '--exec=foo', '--format=tar', 'HEAD']),
+    ('archive-exec-space-no-remote', [('write', 'f.txt', 'hello\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['archive', '--exec', 'foo', '--format=tar', 'HEAD']),
+    ('archive-exec-empty-value-no-remote', [('write', 'f.txt', 'hello\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['archive', '--exec=', '--format=tar', 'HEAD']),
+    ('archive-exec-with-verbose-no-remote', [('write', 'f.txt', 'hello\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['archive', '--exec=foo', '-v', '--format=tar', 'HEAD']),
+    ('archive-exec-default-name-no-remote', [('write', 'f.txt', 'hello\n'), ['add', 'f.txt'], ['commit', '-m', 'init']], ['archive', '--exec=git-upload-archive', '--format=tar', 'HEAD']),
+]
+
+BATCH5_STDIN_CASES = [
+    ('follow-in-tree-link-batch', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:link\n'),
+    ('follow-in-tree-link-batch-check', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch-check', '--follow-symlinks'], 'HEAD:link\n'),
+    ('follow-subdir-up-link', [('write', 'target.txt', 'hello\n'), ('write', 'sub/inner.txt', 'inside sub\n'), ('write', '_lc_up', '../target.txt'), ['add', 'target.txt', 'sub/inner.txt', '_lc_up'], ['update-index', '--add', '--cacheinfo', '120000', 'f9b1b32e6647369a82e9f90b38393d3cbe785a10', 'sub/up'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:sub/up\n'),
+    ('follow-dir-link-with-path', [('write', 'sub/inner.txt', 'inside sub\n'), ('write', '_lc_dlink', 'sub'), ['add', 'sub/inner.txt', '_lc_dlink'], ['update-index', '--add', '--cacheinfo', '120000', '3de0f365ba57c94daac626bf53a7da269b65f57c', 'dlink'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:dlink/inner.txt\n'),
+    ('follow-dir-link-alone-check', [('write', 'sub/inner.txt', 'inside sub\n'), ('write', '_lc_dlink', 'sub'), ['add', 'sub/inner.txt', '_lc_dlink'], ['update-index', '--add', '--cacheinfo', '120000', '3de0f365ba57c94daac626bf53a7da269b65f57c', 'dlink'], ['commit', '-m', 'c1']], ['cat-file', '--batch-check', '--follow-symlinks'], 'HEAD:dlink\n'),
+    ('follow-dangling', [('write', '_lc_dang', 'nope.txt'), ['add', '_lc_dang'], ['update-index', '--add', '--cacheinfo', '120000', '993250523c8e84d9bc926cebba36cc938c1ab8bf', 'dangling'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:dangling\n'),
+    ('follow-absolute', [('write', '_lc_abs', '/etc/hostname'), ['add', '_lc_abs'], ['update-index', '--add', '--cacheinfo', '120000', '48980ad58db1b502c17dd015c92dd262ee8092af', 'abs'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:abs\n'),
+    ('follow-absolute-check', [('write', '_lc_abs', '/etc/hostname'), ['add', '_lc_abs'], ['update-index', '--add', '--cacheinfo', '120000', '48980ad58db1b502c17dd015c92dd262ee8092af', 'abs'], ['commit', '-m', 'c1']], ['cat-file', '--batch-check', '--follow-symlinks'], 'HEAD:abs\n'),
+    ('follow-escape-root-dotdot', [('write', '_lc_esc', '../outside.txt'), ['add', '_lc_esc'], ['update-index', '--add', '--cacheinfo', '120000', 'bfca5af2d1b24387484c9d566024f01eb8de7a25', 'esc'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:esc\n'),
+    ('follow-loop', [('write', '_lc_la', 'lb'), ('write', '_lc_lb', 'la'), ['add', '_lc_la', '_lc_lb'], ['update-index', '--add', '--cacheinfo', '120000', '8d8be316182c78d1fff99ecce277b4b61b1cde01', 'la'], ['update-index', '--add', '--cacheinfo', '120000', '3e6885e8ee1df290562f84604b0d259d89372cf7', 'lb'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:la\n'),
+    ('follow-notdir-via-symlink', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:link/x\n'),
+    ('follow-notdir-plain-regular', [('write', 'target.txt', 'hello\n'), ['add', 'target.txt'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:target.txt/x\n'),
+    ('follow-missing-path', [('write', 'target.txt', 'hello\n'), ['add', 'target.txt'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'HEAD:nope\n'),
+    ('follow-bad-rev', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], 'NOPE:link\n'),
+    ('follow-index-form-no-follow', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '--follow-symlinks'], ':link\n'),
+    ('follow-nul-delim-absolute', [('write', '_lc_abs', '/etc/hostname'), ['add', '_lc_abs'], ['update-index', '--add', '--cacheinfo', '120000', '48980ad58db1b502c17dd015c92dd262ee8092af', 'abs'], ['commit', '-m', 'c1']], ['cat-file', '--batch', '-Z', '--follow-symlinks'], 'HEAD:abs\x00'),
+    ('follow-batch-command-info-loop', [('write', '_lc_la', 'lb'), ('write', '_lc_lb', 'la'), ['add', '_lc_la', '_lc_lb'], ['update-index', '--add', '--cacheinfo', '120000', '8d8be316182c78d1fff99ecce277b4b61b1cde01', 'la'], ['update-index', '--add', '--cacheinfo', '120000', '3e6885e8ee1df290562f84604b0d259d89372cf7', 'lb'], ['commit', '-m', 'c1']], ['cat-file', '--batch-command', '--follow-symlinks'], 'info HEAD:la\n'),
+    ('follow-batch-command-contents-link', [('write', 'target.txt', 'hello\n'), ('write', '_lc_link', 'target.txt'), ['add', 'target.txt', '_lc_link'], ['update-index', '--add', '--cacheinfo', '120000', '4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15', 'link'], ['commit', '-m', 'c1']], ['cat-file', '--batch-command', '--follow-symlinks'], 'contents HEAD:link\n'),
+]
+
+@pytest.mark.parametrize("case", BATCH5_CASES, ids=[c[0] for c in BATCH5_CASES])
+def test_batch5_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH5_STDIN_CASES, ids=[c[0] for c in BATCH5_STDIN_CASES])
+def test_batch5_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# Branch rename (-m/-M) is mostly transparent to ref-reading commands, but its
+# correctness — including the same-name no-op move that must NOT delete the ref —
+# is only fully observable by diffing the on-disk refs AND reflogs. A same-name
+# `branch -M main` is a common idiom (e.g. after `init`), and an earlier bug
+# deleted refs/heads/main outright; these lock the byte-exact ref+reflog state.
+_BR_BASE = [("write", "a.txt", "1\n"), ["add", "-A"], ["commit", "-m", "c1"]]
+BRANCH_RENAME_STATE_CASES = [
+    ("force-move-same-name", _BR_BASE, ["branch", "-M", "main"]),
+    ("move-same-name", _BR_BASE, ["branch", "-m", "main"]),
+    ("force-move-current-newname", _BR_BASE, ["branch", "-M", "dev"]),
+    ("move-current-to-other", _BR_BASE, ["branch", "-m", "main", "trunk"]),
+]
+
+
+@pytest.mark.parametrize("case", BRANCH_RENAME_STATE_CASES,
+                         ids=[c[0] for c in BRANCH_RENAME_STATE_CASES])
+def test_branch_rename_state_parity(case, tmp_path: Path, git_254_oracle: str):
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, probe = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    def snapshot(repo: Path):
+        gd = repo / ".git"
+        pf = gd / "packed-refs"
+        packed = pf.read_text() if pf.exists() else "<no-packed-refs>"
+        refs = {
+            str(p.relative_to(gd)).replace("\\", "/"): p.read_text()
+            for p in (gd / "refs").rglob("*") if p.is_file()
+        }
+        logs = {}
+        logdir = gd / "logs"
+        if logdir.exists():
+            logs = {
+                str(p.relative_to(gd)).replace("\\", "/"): p.read_text()
+                for p in logdir.rglob("*") if p.is_file()
+            }
+        head = (gd / "HEAD").read_text() if (gd / "HEAD").exists() else "<no-HEAD>"
+        return packed, sorted(refs.items()), sorted(logs.items()), head
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, capture_output=True, text=True)
+        results[tool] = (proc.returncode, proc.stdout, proc.stderr, *snapshot(repo))
+
+    assert results["pygit"] == results["oracle"]

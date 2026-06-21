@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 283 flags across 28 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 264 flags across 20 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -13,23 +13,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## apply (10)
   -p --no-add --add -N --intent-to-add --ours --theirs --union -z -C
 
-## archive (2)
-  --remote --exec
-
-## backfill (1)
-  --min-batch-size
-
-## bugreport (4)
-  -s --suffix --no-suffix --diagnose
-
-## cat-file (1)
-  --follow-symlinks
-
 ## commit (8)
   --interactive --patch -S -t -p -U --unified --inter-hunk-context
-
-## diagnose (3)
-  -s --suffix --mode
 
 ## diff-files (10)
   -c --cc -B -M -C --find-copies-harder -l -O -S --pickaxe-all
@@ -40,8 +25,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## difftool (7)
   -g -d -y --no-prompt -x --no-index --index
 
-## fast-export (3)
-  --no-data --data --anonymize-map
+## fast-export (1)
+  --anonymize-map
 
 ## fast-import (6)
   --date-format --max-pack-size --big-file-threshold --depth --active-branches --export-marks
@@ -51,12 +36,6 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 
 ## hash-object (1)
   --filters
-
-## init (1)
-  --ref-format
-
-## init-db (1)
-  --ref-format
 
 ## log (1)
   -L
@@ -84,6 +63,3 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 
 ## stash (14)
   -u --include-untracked --only-untracked --index -p --patch -S --staged -a --all --pathspec-from-file --pathspec-file-nul --print --to-ref
-
-## update-index (4)
-  --unresolve --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid

@@ -505,7 +505,42 @@ def _split_optarg(argv: list[str], name: str) -> "tuple[list[str], object]":
 _NO_FLAG = object()
 
 
+def _extract_ref_format(argv: list[str]) -> "tuple[list[str], object]":
+    """Extract git's ``--ref-format=<format>`` (OPT_STRING) from argv.
+
+    Returns (remaining_argv, value) where value is ``_NO_FLAG`` if the option
+    was absent, otherwise the string format. Like C parse-options, a bare
+    ``--ref-format`` consumes the following token as its value; if no token
+    follows it raises ``_SwitchParseError`` ("requires a value", rc 129)."""
+    out: list[str] = []
+    value: object = _NO_FLAG
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--ref-format":
+            i += 1
+            if i >= n:
+                raise _SwitchParseError("error: option `ref-format' requires a value")
+            value = argv[i]
+        elif tok.startswith("--ref-format="):
+            value = tok[len("--ref-format="):]
+        else:
+            out.append(tok)
+        i += 1
+    return out, value
+
+
 def cmd_init(argv: list[str]) -> int:
+    # --ref-format uses OPT_STRING: a bare "--ref-format" consumes the next
+    # token as its value (rc 129 if none follows). Pull it before argparse so
+    # the value is not mistaken for the path positional.
+    try:
+        argv, ref_format = _extract_ref_format(list(argv))
+    except _SwitchParseError as exc:
+        _err(exc.message)
+        return exc.rc
+
     # --shared uses PARSE_OPT_OPTARG (value only via "--shared=x"); argparse's
     # nargs='?' would wrongly swallow a following token, so split it by hand.
     argv, shared_arg = _split_optarg(list(argv), "--shared")
@@ -526,6 +561,18 @@ def cmd_init(argv: list[str]) -> int:
     if args.separate_git_dir is not None and args.bare:
         _err("fatal: options '--separate-git-dir' and '--bare' cannot be used together")
         return 128
+
+    # --ref-format: only the "files" backend is reproducible byte-for-byte.
+    # "reftable" is a valid git format but a different on-disk layout pygit
+    # cannot replicate, so reject it rather than silently produce a files repo.
+    # Any other value matches git's "unknown ref storage format" fatal (rc 128).
+    if ref_format is not _NO_FLAG:
+        if ref_format == "reftable":
+            _err("fatal: pygit does not support the 'reftable' ref storage format")
+            return 128
+        if ref_format != "files":
+            _err(f"fatal: unknown ref storage format '{ref_format}'")
+            return 128
 
     # Resolve the shared-repository setting (None means the flag was absent).
     shared = 0
@@ -840,6 +887,141 @@ def _read_delimited_stdin(input_delim: str):
         yield p.decode("utf-8", "surrogateescape")
 
 
+def _split_rev_colon_path(name: str):
+    """Split ``<rev>:<path>`` at the first ``:`` that is not inside an ``@{``/
+    ``^{`` bracket group, mirroring git's get_oid_with_context_1 scan. Returns
+    ``(rev, path)`` or None when there is no such colon."""
+    depth = 0
+    i = 0
+    n = len(name)
+    while i < n:
+        c = name[i]
+        if c in "@^" and i + 1 < n and name[i + 1] == "{":
+            i += 2
+            depth += 1
+            continue
+        if depth and c == "}":
+            depth -= 1
+        elif not depth and c == ":":
+            return name[:i], name[i + 1:]
+        i += 1
+    return None
+
+
+# Git follows at most this many symlinks before declaring a loop
+# (GET_TREE_ENTRY_FOLLOW_SYMLINKS_MAX_LINKS in tree-walk.c).
+_FOLLOW_SYMLINKS_MAX = 40
+
+
+def _follow_symlinks_in_tree(repo, root_tree_sha: str, name: str):
+    """Resolve ``name`` within the tree ``root_tree_sha`` following in-tree
+    symlinks, mirroring git's get_tree_entry_follow_symlinks.
+
+    Returns one of:
+      ("found", sha, mode_int)  -- in-tree object (mode != 0)
+      ("symlink", path)         -- chain left the tree (absolute/escaping ..)
+      ("dangling",)             -- a symlink target does not exist in the tree
+      ("loop",)                 -- too many symlinks followed
+      ("notdir",)               -- a path component was a non-dir with remainder
+      ("missing",)              -- component not found / no symlink involved
+    """
+    # parents[i] = (tree_data, tree_sha); parents[-1] is the current tree.
+    parents: list[tuple[bytes, str]] = []
+    namebuf = name
+    current_tree_sha = root_tree_sha
+    t_loaded = False
+    follows_remaining = _FOLLOW_SYMLINKS_MAX
+    # On error after at least one symlink follow, git reports DANGLING_SYMLINK.
+    followed_any = False
+
+    def load_tree(sha):
+        try:
+            ot, data = objs.read_object(repo, sha)
+        except KeyError:
+            return None
+        if ot != "tree":
+            return None
+        return data
+
+    while True:
+        if not t_loaded:
+            tree = load_tree(current_tree_sha)
+            if tree is None:
+                return ("dangling",) if followed_any else ("missing",)
+            parents.append((tree, current_tree_sha))
+            if namebuf == "":
+                return ("found", current_tree_sha, 0o040000)
+            if not tree:
+                return ("dangling",) if followed_any else ("missing",)
+            t_loaded = True
+
+        # Strip leading slashes (symlinks to e.g. a//b).
+        while namebuf.startswith("/"):
+            namebuf = namebuf[1:]
+
+        slash = namebuf.find("/")
+        if slash >= 0:
+            first = namebuf[:slash]
+            remainder = namebuf[slash + 1:]
+        else:
+            first = namebuf
+            remainder = None
+
+        if first == "..":
+            if len(parents) == 1:
+                # Escaped the root of the tree.
+                return ("symlink", namebuf)
+            parents.pop()
+            current_tree_sha = parents[-1][1]
+            namebuf = namebuf[3:] if remainder is not None else namebuf[2:]
+            t_loaded = True
+            continue
+
+        if first == "":
+            # Reached here via a symlink to dir/.. -> the current tree.
+            return ("found", parents[-1][1], 0o040000)
+
+        tree_data = parents[-1][0]
+        entry = next((e for e in objs.parse_tree(tree_data, repo.hash_len)
+                      if e.name == first), None)
+        if entry is None:
+            return ("dangling",) if followed_any else ("missing",)
+
+        mode = int(entry.mode, 8)
+        if entry.is_dir():
+            if remainder is None:
+                return ("found", entry.sha, mode)
+            current_tree_sha = entry.sha
+            namebuf = remainder
+            t_loaded = False
+            continue
+        # 0o170000 == S_IFMT
+        ftype = mode & 0o170000
+        if ftype == 0o120000:
+            # symlink
+            if follows_remaining == 0:
+                return ("loop",)
+            follows_remaining -= 1
+            followed_any = True
+            try:
+                lt, contents = objs.read_object(repo, entry.sha)
+            except KeyError:
+                return ("dangling",)
+            link = contents.decode("utf-8", "surrogateescape")
+            if link.startswith("/"):
+                return ("symlink", link)
+            # Splice the link target in place of the consumed component.
+            namebuf = link + ("/" + remainder if remainder is not None else "")
+            # Re-resolve from the directory containing the symlink.
+            current_tree_sha = parents[-1][1]
+            t_loaded = True
+            continue
+        # regular file (or gitlink)
+        if remainder is None:
+            return ("found", entry.sha, mode)
+        return ("notdir",)
+
+
 def _batch_resolve(repo: Repository, name: str, mm=None):
     """Resolve ``name`` for batch mode. Returns (sha, type, size, data) where
     ``data`` is the (mailmap-rewritten) object contents, or None if missing.
@@ -872,9 +1054,66 @@ def _batch_write_record(info: str, data, check_only: bool, output_delim: str,
         out.flush()
 
 
+def _batch_follow_resolve(repo: Repository, name: str, mm=None):
+    """Resolve ``name`` for batch mode with --follow-symlinks.
+
+    Returns either:
+      - a (status_word, payload) tuple for the special follow outputs
+        ("dangling"/"loop"/"notdir" -> payload is ``name`` itself;
+         "symlink" -> payload is the out-of-tree link path), to be emitted as
+        ``<status> <len(payload)> <payload>``; or
+      - the normal (sha, type, size, data) 4-tuple for a found object; or
+      - None when the object is missing.
+
+    Only ``<rev>:<path>`` names with a non-empty rev follow symlinks; every
+    other name (plain rev, abbrev sha, ``:path`` index form) resolves exactly
+    as ordinary batch mode."""
+    split = _split_rev_colon_path(name)
+    if split is None or split[0] == "":
+        return _batch_resolve(repo, name, mm)
+    rev, path = split
+    base_sha = refs_mod._resolve_revision(repo, rev)
+    if base_sha is None:
+        return None
+    tree_sha = refs_mod._peel_to_type(repo, base_sha, "tree")
+    if tree_sha is None:
+        return None
+    res = _follow_symlinks_in_tree(repo, tree_sha, path)
+    tag = res[0]
+    if tag == "missing":
+        return None
+    if tag in ("dangling", "loop", "notdir"):
+        return (tag, name)
+    if tag == "symlink":
+        return ("symlink", res[1])
+    # found
+    sha = res[1]
+    if not objs.object_exists(repo, sha):
+        return None
+    t, data = objs.read_object(repo, sha)
+    if mm is not None and t in ("commit", "tag"):
+        data = _replace_idents_using_mailmap(data, mm)
+    return sha, t, len(data), data
+
+
+def _write_follow_special(status: str, payload: str, output_delim: str,
+                          buffer: bool) -> None:
+    """Emit a follow-symlinks special line: ``<status> <len> <payload>``,
+    where lengths/payload use the configured output delimiter (matching git's
+    ``printf("%s %zu%c%s%c", ...)``)."""
+    out = sys.stdout.buffer
+    pb = payload.encode("utf-8", "surrogateescape")
+    out.write(f"{status} {len(pb)}".encode("utf-8"))
+    out.write(output_delim.encode("latin-1"))
+    out.write(pb)
+    out.write(output_delim.encode("latin-1"))
+    if not buffer:
+        out.flush()
+
+
 def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
                     mm=None, input_delim="\n", output_delim="\n",
-                    buffer=False) -> int:
+                    buffer=False, follow_symlinks=False) -> int:
     if fmt is None:
         fmt = "%(objectname) %(objecttype) %(objectsize)"
     source = names if names is not None else _read_delimited_stdin(input_delim)
@@ -882,12 +1121,16 @@ def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
     for name in source:
         if names is None and not name:
             continue
-        resolved = _batch_resolve(repo, name, mm)
+        resolved = (_batch_follow_resolve(repo, name, mm) if follow_symlinks
+                    else _batch_resolve(repo, name, mm))
         if resolved is None:
             out.write((f"{name} missing").encode("utf-8", "surrogateescape"))
             out.write(output_delim.encode("latin-1"))
             if not buffer:
                 out.flush()
+            continue
+        if resolved[0] in ("dangling", "loop", "notdir", "symlink"):
+            _write_follow_special(resolved[0], resolved[1], output_delim, buffer)
             continue
         sha, t, size, data = resolved
         info = _expand_batch_atoms(fmt, sha, t, size)
@@ -899,7 +1142,7 @@ def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
 
 def _cat_file_batch_command(repo: Repository, fmt=None, mm=None,
                             input_delim="\n", output_delim="\n",
-                            buffer=False) -> int:
+                            buffer=False, follow_symlinks=False) -> int:
     """cat-file --batch-command: per-line `info`/`contents`/`flush` requests.
 
     Without --buffer each command is run immediately; `flush` is rejected. With
@@ -910,11 +1153,17 @@ def _cat_file_batch_command(repo: Repository, fmt=None, mm=None,
     out = sys.stdout.buffer
 
     def run(kind: str, arg: str) -> None:
-        resolved = _batch_resolve(repo, arg, mm)
+        resolved = (_batch_follow_resolve(repo, arg, mm) if follow_symlinks
+                    else _batch_resolve(repo, arg, mm))
         if resolved is None:
             out.write((f"{arg} missing").encode("utf-8", "surrogateescape"))
             out.write(output_delim.encode("latin-1"))
             out.flush()
+            return
+        if resolved[0] in ("dangling", "loop", "notdir", "symlink"):
+            _write_follow_special(resolved[0], resolved[1], output_delim, buffer)
+            if not buffer:
+                out.flush()
             return
         sha, t, size, data = resolved
         info = _expand_batch_atoms(fmt, sha, t, size)
@@ -989,9 +1238,13 @@ def cmd_cat_file(argv: list[str]) -> int:
     ap.add_argument("--no-buffer", dest="buffer", action="store_false")
     ap.add_argument("--unordered", dest="unordered", action="store_true", default=False)
     ap.add_argument("--no-unordered", dest="unordered", action="store_false")
-    # --follow-symlinks (in-tree symlink resolution) is NOT implemented; it is
-    # left unrecognized so it is honestly reported as a gap rather than accepted
-    # and silently returning the symlink blob instead of the target.
+    # --follow-symlinks: in batch modes, resolve <rev>:<path> through in-tree
+    # symlinks (mode 120000) to the target object; out-of-tree/dangling/loop
+    # links emit git's special symlink/dangling/loop/notdir lines.
+    ap.add_argument("--follow-symlinks", dest="follow_symlinks",
+                    action="store_true", default=False)
+    ap.add_argument("--no-follow-symlinks", dest="follow_symlinks",
+                    action="store_false")
     ap.add_argument("-Z", dest="nul", action="store_true")
     ap.add_argument("-z", dest="nul_in", action="store_true")
     ap.add_argument("pos", nargs="*")
@@ -1015,8 +1268,10 @@ def cmd_cat_file(argv: list[str]) -> int:
     repo = _repo()
 
     batch_enabled = args.batch or args.batch_check or args.batch_command
-    # --buffer/-Z/-z/--unordered/--batch-all-objects all require a batch mode.
-    for flag, val in (("--buffer", args.buffer is not None),
+    # --follow-symlinks/--buffer/-Z/-z/--batch-all-objects all require a batch
+    # mode. Order matches builtin/cat-file.c so the reported flag is the same.
+    for flag, val in (("--follow-symlinks", args.follow_symlinks),
+                      ("--buffer", args.buffer is not None),
                       ("--batch-all-objects", args.batch_all),
                       ("-z", args.nul_in),
                       ("-Z", args.nul)):
@@ -1044,7 +1299,8 @@ def cmd_cat_file(argv: list[str]) -> int:
     if args.batch_command:
         return _cat_file_batch_command(repo, fmt=batch_fmt, mm=mm,
                                        input_delim=input_delim,
-                                       output_delim=output_delim, buffer=buffer)
+                                       output_delim=output_delim, buffer=buffer,
+                                       follow_symlinks=args.follow_symlinks)
     if args.batch or args.batch_check:
         if args.batch_all:
             names = (_all_object_shas_unordered(repo) if args.unordered
@@ -1053,7 +1309,8 @@ def cmd_cat_file(argv: list[str]) -> int:
             names = None
         return _cat_file_batch(repo, check_only=args.batch_check, names=names,
                                fmt=batch_fmt, mm=mm, input_delim=input_delim,
-                               output_delim=output_delim, buffer=buffer)
+                               output_delim=output_delim, buffer=buffer,
+                               follow_symlinks=args.follow_symlinks)
 
     # --textconv / --filters: with no configured drivers these are the identity
     # transform, so just stream the blob content (resolving <rev>:<path>).
@@ -5318,14 +5575,24 @@ def cmd_branch(argv: list[str]) -> int:
         if sha is None:
             _err(f"fatal: Branch '{src}' not found.")
             return 128
-        refs_mod.update_ref(repo, f"refs/heads/{dst}", sha)
+        # A same-name rename (e.g. `branch -M main` while already on main) is a
+        # no-op move in git: the ref already points at sha, so re-writing it
+        # would inject a spurious "update:" reflog entry that the moved-log path
+        # normally overwrites. Skip the update for that case.
+        same_name_move = (args.move or args.force_move) and src == dst
+        if not same_name_move:
+            refs_mod.update_ref(repo, f"refs/heads/{dst}", sha)
         if args.move or args.force_move:
-            old_log = repo.gitdir / "logs" / "refs" / "heads" / src
-            new_log = repo.gitdir / "logs" / "refs" / "heads" / dst
-            if old_log.exists():
-                new_log.parent.mkdir(parents=True, exist_ok=True)
-                old_log.replace(new_log)
-            refs_mod.delete_ref(repo, f"refs/heads/{src}")
+            # Moving/deleting the source for a same-name rename would destroy the
+            # (identical) destination ref and its reflog, so skip it; only the
+            # rename reflog entries below are appended.
+            if src != dst:
+                old_log = repo.gitdir / "logs" / "refs" / "heads" / src
+                new_log = repo.gitdir / "logs" / "refs" / "heads" / dst
+                if old_log.exists():
+                    new_log.parent.mkdir(parents=True, exist_ok=True)
+                    old_log.replace(new_log)
+                refs_mod.delete_ref(repo, f"refs/heads/{src}")
             # git records the rename in the reflog: a no-op (old==new) entry on
             # the renamed branch's own log, plus a delete/create pair on HEAD
             # when the current branch is the one being renamed.
@@ -5334,8 +5601,13 @@ def cmd_branch(argv: list[str]) -> int:
             zero = repo.null_oid()
             _reflog.append(repo, f"refs/heads/{dst}", sha, sha, rename_msg)
             if cur == src:
+                # The HEAD reflog records the value HEAD resolved to just before
+                # the symref is re-pointed. For a real rename the source ref was
+                # deleted, so that value is zero; for a same-name move the source
+                # ref still resolves to sha, so the second entry is sha->sha.
                 _reflog.append(repo, "HEAD", sha, zero, rename_msg)
-                _reflog.append(repo, "HEAD", zero, sha, rename_msg)
+                head_old = sha if src == dst else zero
+                _reflog.append(repo, "HEAD", head_old, sha, rename_msg)
                 refs_mod.set_head(repo, f"refs/heads/{dst}")
         return 0
 
@@ -9833,8 +10105,19 @@ def cmd_archive(argv: list[str]) -> int:
     ap.add_argument("--prefix", default="")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--mtime", default=None)
+    # --remote=<repo> drives the archive over the git-upload-archive protocol
+    # (pkt-line + sideband). Reproducing it byte-exact would require replicating
+    # recv_sideband's terminal-width padding (e.g. "remote: f.txt   ...\n" for
+    # -v) and the remote-error relaying, so it is DEFERRED and rejected below.
+    # --exec=<cmd> only names the remote upload-archive binary; C Git silently
+    # ignores it when --remote is absent, so we accept and ignore it there.
+    ap.add_argument("--remote", default=None)
+    ap.add_argument("--exec", dest="exec_cmd", default=None)
     ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
+    if args.remote is not None:
+        _err("fatal: archive --remote is not supported")
+        return 128
     if args.list_formats:
         for f in ("tar", "tgz", "tar.gz", "zip"):
             _print(f)
@@ -10264,6 +10547,25 @@ def cmd_mktree(argv: list[str]) -> int:
     return 0
 
 
+def _unmerge_index_entry(idx, path: str, rec: dict) -> None:
+    """Replace the stage-0 entry for *path* (if any) with the conflicted stage
+    1/2/3 entries from a resolve-undo record. Mirrors C git's
+    unmerge_index_entry(): an already-unmerged path is left untouched."""
+    from .index import IndexEntry
+    stages = {e.stage for e in idx.entries if e.path == path}
+    if stages and stages != {0}:
+        # already unmerged — nothing to do
+        return
+    idx.remove(path, stage=0)
+    for stage in (1, 2, 3):
+        mode, sha = rec.get(stage, (0, ""))
+        if not mode:
+            continue
+        e = IndexEntry(mode=mode, sha=sha, path=path)
+        e.stage = stage
+        idx.upsert(e)
+
+
 def cmd_update_index(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit update-index", add_help=False)
     ap.add_argument("--add", action="store_true")
@@ -10282,6 +10584,10 @@ def cmd_update_index(argv: list[str]) -> int:
     ap.add_argument("--index-info", dest="index_info", action="store_true")
     ap.add_argument("--show-index-version", dest="show_index_version", action="store_true")
     ap.add_argument("-g", "--again", dest="again", action="store_true")
+    ap.add_argument("--unresolve", dest="unresolve", action="store_true")
+    ap.add_argument("--clear-resolve-undo", dest="clear_resolve_undo", action="store_true")
+    ap.add_argument("--fsmonitor-valid", dest="fsmonitor_valid", action="store_true")
+    ap.add_argument("--no-fsmonitor-valid", dest="no_fsmonitor_valid", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -10360,6 +10666,27 @@ def cmd_update_index(argv: list[str]) -> int:
         if changed:
             workdir.add_paths(repo, changed, update_only=True)
         return 0
+    # --unresolve <path>...: restore the stage 1/2/3 entries recorded in
+    # resolve-undo for each path (consuming the record), mirroring C git's
+    # do_unresolve(). Paths come from the command line only (not --stdin).
+    if args.unresolve:
+        changed = False
+        for p in args.paths:
+            rec = idx.resolve_undo.get(p)
+            if rec is None:
+                continue  # no resolve-undo record for the path
+            _unmerge_index_entry(idx, p, rec)
+            del idx.resolve_undo[p]
+            changed = True
+        if changed:
+            write_index(repo, idx)
+        return 0
+    # --clear-resolve-undo: drop all resolve-undo records.
+    if args.clear_resolve_undo and not args.paths:
+        if idx.resolve_undo:
+            idx.resolve_undo = {}
+            write_index(repo, idx)
+        return 0
     # Gather target paths from the command line and/or stdin (-z → NUL).
     paths = list(args.paths)
     if args.stdin:
@@ -10390,6 +10717,19 @@ def cmd_update_index(argv: list[str]) -> int:
                 return 128
             e.skip_worktree = bool(args.skip_worktree)
             idx.upsert(e)
+        write_index(repo, idx)
+        return 0
+    # --fsmonitor-valid / --no-fsmonitor-valid toggle the in-core
+    # CE_FSMONITOR_VALID bit. That bit is NOT part of CE_EXTENDED_FLAGS, so it
+    # is never serialized to the on-disk index; the only externally visible
+    # effects are the success/no-op exit and the die() on a path that has no
+    # index entry. We still rewrite the index to match git's cache_changed path.
+    if args.fsmonitor_valid or args.no_fsmonitor_valid:
+        by_path = idx.by_path()
+        for p in paths:
+            if by_path.get(p) is None:
+                _err(f"fatal: Unable to mark file {p}")
+                return 128
         write_index(repo, idx)
         return 0
     args.paths = paths
@@ -13297,8 +13637,13 @@ def cmd_merge_file(argv: list[str]) -> int:
 
 def cmd_fast_export(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit fast-export")
+    # --no-data is an OPT_BOOL; --data is its parse-options auto-negation
+    # (sets no_data back to its default of 0). Both are last-one-wins.
+    ap.add_argument("--no-data", dest="no_data", action="store_true", default=False)
+    ap.add_argument("--data", dest="no_data", action="store_false")
     ap.add_argument("revs", nargs="*", default=["HEAD"])
     args = ap.parse_args(argv)
+    no_data = args.no_data
     repo = _repo()
     # collect commits in topological order (oldest first)
     tips = []
@@ -13342,14 +13687,17 @@ def cmd_fast_export(argv: list[str]) -> int:
         changes = _tree_changes(repo, parent_tree, c.tree)
 
         # Emit any new blobs referenced by this commit, in path order.
-        for path, _a, b in changes:
-            if b.present and b.sha not in blob_mark:
-                _, data = objs.read_object(repo, b.sha)
-                blob_mark[b.sha] = next_mark
-                w(f"blob\nmark :{next_mark}\ndata {len(data)}\n")
-                out.extend(data)
-                w("\n")
-                next_mark += 1
+        # With --no-data, blob contents are skipped entirely and the M line
+        # references the object by its full hex id instead of a mark.
+        if not no_data:
+            for path, _a, b in changes:
+                if b.present and b.sha not in blob_mark:
+                    _, data = objs.read_object(repo, b.sha)
+                    blob_mark[b.sha] = next_mark
+                    w(f"blob\nmark :{next_mark}\ndata {len(data)}\n")
+                    out.extend(data)
+                    w("\n")
+                    next_mark += 1
 
         if not reset_emitted:
             w(f"reset {ref}\n")
@@ -13368,7 +13716,10 @@ def cmd_fast_export(argv: list[str]) -> int:
                 w(f"merge :{commit_mark[p]}\n")
         for path, a, b in changes:
             if b.present:
-                w(f"M {b.mode} :{blob_mark[b.sha]} {path}\n")
+                if no_data:
+                    w(f"M {b.mode} {b.sha} {path}\n")
+                else:
+                    w(f"M {b.mode} :{blob_mark[b.sha]} {path}\n")
             else:
                 w(f"D {path}\n")
         w("\n")
@@ -18226,54 +18577,527 @@ def cmd_request_pull(argv: list[str]) -> int:
     return cmd_shortlog([end])
 
 
+_DIAGNOSE_USAGE = (
+    "usage: git diagnose [(-o | --output-directory) <path>] "
+    "[(-s | --suffix) <format>]\n"
+    "                    [--mode=<mode>]\n"
+    "\n"
+    "    -o, --[no-]output-directory <path>\n"
+    "                          specify a destination for the diagnostics archive\n"
+    "    -s, --[no-]suffix <format>\n"
+    "                          specify a strftime format suffix for the filename\n"
+    "    --mode (stats|all)    specify the content of the diagnostic archive\n"
+    "\n"
+)
+
+
 def cmd_diagnose(argv: list[str]) -> int:
-    """Print diagnostic info about the repo (sizes, refs, packs)."""
-    ap = argparse.ArgumentParser(prog="pygit diagnose")
-    ap.add_argument("-o", "--output-directory", default=None)
-    args = ap.parse_args(argv)
+    """Collect diagnostic info into a git-diagnostics-<suffix>.zip archive."""
+    # Hand-rolled parse-options to reproduce C Git's diagnose error messages
+    # (rc 129) byte-for-byte.  C Git's --mode accepts only "stats" and "all";
+    # the internal DIAGNOSE_NONE value is not selectable from the command line.
+    option_output = ""
+    option_suffix = "%Y-%m-%d-%H%M"
+    mode = "stats"
+
+    def _unknown(msg: str) -> int:
+        sys.stderr.write(f"error: {msg}\n")
+        sys.stderr.write(_DIAGNOSE_USAGE)
+        return 129
+
+    def _needs_value(msg: str) -> int:
+        sys.stderr.write(f"error: {msg}\n")
+        return 129
+
+    def _parse_mode(val: str):
+        nonlocal mode
+        if val in ("stats", "all"):
+            mode = val
+            return None
+        sys.stderr.write(f"error: invalid --mode value '{val}'\n")
+        return 129
+
+    _long_value = ("output-directory", "suffix")
+    _positives = list(_long_value) + ["mode"]
+
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "-h":
+            # parse-options prints -h usage to stdout (errors go to stderr).
+            # (--help is handled like other pygit commands: as an unknown
+            # option, since the manpage C Git would show is out of scope.)
+            sys.stdout.write(_DIAGNOSE_USAGE)
+            return 129
+        if a == "--":
+            i += 1
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            has_val = bool(eq)
+            # Resolve canonical long option (with unique-prefix abbreviation).
+            if name.startswith("no-") and name[3:] in _positives:
+                canon, negated = name[3:], True
+            elif name in _positives:
+                canon, negated = name, False
+            else:
+                matches = [c for c in _positives if c.startswith(name)]
+                if len(matches) == 1:
+                    canon, negated = matches[0], False
+                elif len(matches) > 1:
+                    joined = " or ".join("--" + m for m in matches)
+                    sys.stderr.write(
+                        f"error: ambiguous option: {name} (could be {joined})\n")
+                    return 129
+                else:
+                    return _unknown(f"unknown option `{name}'")
+            if canon == "mode":
+                # --mode is PARSE_OPT_NONEG and its value is required.
+                if negated:
+                    return _unknown(f"unknown option `{name}'")
+                if not has_val:
+                    if i + 1 >= n:
+                        return _needs_value("option `mode' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                rc = _parse_mode(val)
+                if rc is not None:
+                    return rc
+            elif canon == "output-directory":
+                if negated:
+                    option_output = ""
+                else:
+                    if not has_val:
+                        if i + 1 >= n:
+                            return _needs_value(
+                                "option `output-directory' requires a value")
+                        val = argv[i + 1]
+                        i += 1
+                    option_output = val
+            elif canon == "suffix":
+                if negated:
+                    option_suffix = "%Y-%m-%d-%H%M"
+                else:
+                    if not has_val:
+                        if i + 1 >= n:
+                            return _needs_value(
+                                "option `suffix' requires a value")
+                        val = argv[i + 1]
+                        i += 1
+                    option_suffix = val
+            i += 1
+            continue
+        if a.startswith("-") and a != "-":
+            j = 1
+            consumed_next = False
+            while j < len(a):
+                c = a[j]
+                if c == "o" or c == "s":
+                    rest = a[j + 1:]
+                    if rest:
+                        val = rest
+                    elif i + 1 < n:
+                        val = argv[i + 1]
+                        consumed_next = True
+                    else:
+                        return _needs_value(f"switch `{c}' requires a value")
+                    if c == "o":
+                        option_output = val
+                    else:
+                        option_suffix = val
+                    break
+                else:
+                    return _unknown(f"unknown switch `{c}'")
+                j += 1
+            i += 2 if consumed_next else 1
+            continue
+        # Non-option positional args are ignored by C Git's diagnose.
+        i += 1
+
     repo = _repo()
-    lines = []
+
+    import time as _time
+    suffix = _time.strftime(option_suffix, _time.localtime())
+    prefix = option_output
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+    zip_path = f"{prefix}git-diagnostics-{suffix}.zip"
+
+    # Create leading directories for the archive (matches C Git's
+    # safe_create_leading_directories).
+    parent = os.path.dirname(zip_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    # The "Collecting diagnostic info" banner is written to stdout by C Git
+    # via the saved real stdout fd; the contents (build/version/disk info)
+    # are environment-specific and are not byte-reproducible here.
     from . import __version__ as _ppg_version
-    lines.append(f"pythongit version: {_ppg_version}")
-    lines.append(f"gitdir: {repo.gitdir}")
-    lines.append(f"worktree: {repo.path}")
-    lines.append(f"branches: {len(refs_mod.list_branches(repo))}")
-    lines.append(f"tags: {len(refs_mod.list_tags(repo))}")
-    loose_count, _loose_size = _loose_count_and_size(repo)
-    lines.append(f"loose objects: {loose_count}")
-    from . import pack as _p
-    packs = list(_p._iter_packs(repo))
-    lines.append(f"packs: {len(packs)}")
-    text = "\n".join(lines) + "\n"
-    if args.output_directory:
-        Path(args.output_directory).mkdir(parents=True, exist_ok=True)
-        (Path(args.output_directory) / "diagnose.txt").write_text(text, encoding="utf-8")
-    sys.stdout.write(text)
+    worktree = "(null)" if repo.bare else str(repo.path)
+    banner = []
+    banner.append("Collecting diagnostic info")
+    banner.append("")
+    banner.append(f"pygit version {_ppg_version}")
+    banner.append(f"Repository root: {worktree}")
+    sys.stdout.write("\n".join(banner) + "\n")
+
+    # Write a real zip archive containing the collected diagnostics.
+    import zipfile as _zipfile
+    log_lines = ["Collecting diagnostic info\n"]
+    # mode=all bundles a fixed list of .git metadata directories; C Git warns
+    # (to stderr) about each one that is missing, in this exact order.
+    archive_dirs = [
+        (".git", False),
+        (".git/hooks", False),
+        (".git/info", False),
+        (".git/logs", True),
+        (".git/objects/info", False),
+    ]
+    with _zipfile.ZipFile(zip_path, "w", _zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("diagnostics.log", "".join(log_lines))
+        zf.writestr("packs-local.txt", "")
+        zf.writestr("objects-local.txt", "")
+        if mode == "all":
+            for path, recurse in archive_dirs:
+                if not os.path.isdir(path):
+                    sys.stderr.write(
+                        f"warning: could not archive missing directory "
+                        f"'{path}'\n")
+                    continue
+                if recurse:
+                    walk = os.walk(path)
+                else:
+                    walk = [(path, [], sorted(os.listdir(path)))]
+                for root, _dirs, files in walk:
+                    for fn in files:
+                        fp = os.path.join(root, fn)
+                        if not os.path.isfile(fp):
+                            continue
+                        try:
+                            zf.write(fp, fp)
+                        except OSError:
+                            pass
+
+    sys.stderr.write(
+        "\n"
+        "Diagnostics complete.\n"
+        f"All of the gathered info is captured in '{zip_path}'\n")
+    return 0
+
+
+# Short usage emitted by git's usage() for stray arguments (builtin/bugreport.c
+# bugreport_usage[0]); continuation lines align under "git bugreport ".
+_BUGREPORT_USAGE = (
+    "usage: git bugreport [(-o | --output-directory) <path>]\n"
+    "              [(-s | --suffix) <format> | --no-suffix]\n"
+    "              [--diagnose[=<mode>]]"
+)
+
+# Full usage emitted by parse-options for -h / unknown option (usage_with_options):
+# the synopsis with deeper alignment, a blank line, then the option list.
+_BUGREPORT_USAGE_OPTS = (
+    "usage: git bugreport [(-o | --output-directory) <path>]\n"
+    "                     [(-s | --suffix) <format> | --no-suffix]\n"
+    "                     [--diagnose[=<mode>]]\n"
+    "\n"
+    "    --[no-]diagnose[=<mode>]\n"
+    "                          create an additional zip archive of detailed diagnostics (default 'stats')\n"
+    "    -o, --[no-]output-directory <path>\n"
+    "                          specify a destination for the bugreport file(s)\n"
+    "    -s, --[no-]suffix <format>\n"
+    "                          specify a strftime format suffix for the filename(s)\n"
+)
+
+
+class _BugreportUsageError(Exception):
+    # full=True   -> print the parse-options usage_with_options() block
+    # full=False  -> print the short usage() synopsis
+    # no_usage=True-> print only the error line (parse-options value errors)
+    # msg=None    -> -h: print the full usage to stdout, rc 129
+    def __init__(self, msg: Optional[str], *, full: bool = False, no_usage: bool = False):
+        self.msg = msg
+        self.full = full
+        self.no_usage = no_usage
+
+
+def _bugreport_git_editor() -> Optional[str]:
+    """Replicate git_editor() precedence from editor.c."""
+    term = os.environ.get("TERM")
+    dumb = (not term) or term == "dumb"
+    editor = os.environ.get("GIT_EDITOR")
+    if not editor:
+        repo = None
+        try:
+            repo = _repo()
+        except Exception:
+            repo = None
+        if repo is not None:
+            try:
+                cp = repo.config()
+                val = cp.get("core", "editor", fallback=None)
+                if val:
+                    editor = val
+            except Exception:
+                pass
+    if not editor and not dumb:
+        editor = os.environ.get("VISUAL")
+    if not editor:
+        editor = os.environ.get("EDITOR")
+    if not editor and dumb:
+        return None
+    if not editor:
+        editor = "vi"
+    return editor
+
+
+def _bugreport_launch_editor(path: str) -> int:
+    """Replicate launch_editor() from editor.c; returns 0 on success else 1."""
+    editor = _bugreport_git_editor()
+    if editor is None:
+        _err("error: Terminal is dumb, but EDITOR unset")
+        return 1
+    if editor == ":":
+        return 0
+    try:
+        realpath = os.path.realpath(path)
+    except Exception:
+        realpath = path
+    import subprocess as _sp
+    try:
+        proc = _sp.run(["sh", "-c", editor + ' "$@"', editor, realpath])
+    except Exception:
+        _err(f"error: unable to start editor '{editor}'")
+        return 1
+    if proc.returncode:
+        _err(f"error: there was a problem with the editor '{editor}'")
+        return 1
     return 0
 
 
 def cmd_bugreport(argv: list[str]) -> int:
-    """Print system+repo info suitable for a bug report."""
-    ap = argparse.ArgumentParser(prog="pygit bugreport")
-    ap.add_argument("-o", "--output-directory", default=None)
-    args = ap.parse_args(argv)
-    import platform
-    from . import __version__ as _ppg_version
-    lines = []
-    lines.append(f"pythongit: {_ppg_version}")
-    lines.append(f"python: {platform.python_version()}")
-    lines.append(f"platform: {platform.platform()}")
+    """Write a bug-report template file and report its path (builtin/bugreport.c)."""
+    option_output: Optional[str] = None
+    option_suffix: Optional[str] = "%Y-%m-%d-%H%M"
+    diagnose: Optional[str] = None  # None=off; "stats"/"all" when requested
+    rest: list[str] = []
+
+    diagnose_modes = ("stats", "all")
+
     try:
-        repo = _repo()
-        lines.append(f"gitdir: {repo.gitdir}")
-    except Exception:
-        lines.append("not inside a repository")
-    text = "\n".join(lines) + "\n"
-    if args.output_directory:
-        Path(args.output_directory).mkdir(parents=True, exist_ok=True)
-        (Path(args.output_directory) / "bugreport.txt").write_text(text, encoding="utf-8")
-    sys.stdout.write(text)
-    return 0
+        i = 0
+        n = len(argv)
+        while i < n:
+            a = argv[i]
+            if a == "--":
+                rest.extend(argv[i + 1:])
+                break
+            if a == "-h" or a == "--help":
+                raise _BugreportUsageError(None, full=True)
+            if a.startswith("--"):
+                name, eq, val = a[2:].partition("=")
+                has_val = bool(eq)
+                # Long-option abbreviation (parse-options style): accept any
+                # unambiguous prefix of a known long option.
+                canon = name
+                negate = False
+                base = name
+                if name.startswith("no-"):
+                    base = name[3:]
+                longs = ("diagnose", "output-directory", "suffix")
+                # Resolve abbreviation against the (possibly no-) base name.
+                matches = [o for o in longs if o == base] or [
+                    o for o in longs if o.startswith(base)
+                ]
+                if len(matches) == 1:
+                    canon = matches[0]
+                    negate = name.startswith("no-")
+                elif name in longs:
+                    canon = name
+                    negate = False
+                else:
+                    raise _BugreportUsageError(
+                        f"error: unknown option `{name}'", full=True
+                    )
+
+                if canon == "output-directory":
+                    if negate:
+                        option_output = None
+                    elif has_val:
+                        option_output = val
+                    else:
+                        i += 1
+                        if i >= n:
+                            raise _BugreportUsageError(
+                                "error: option `output-directory' requires a value",
+                                no_usage=True,
+                            )
+                        option_output = argv[i]
+                elif canon == "suffix":
+                    if negate:
+                        option_suffix = None
+                    elif has_val:
+                        option_suffix = val
+                    else:
+                        i += 1
+                        if i >= n:
+                            raise _BugreportUsageError(
+                                "error: option `suffix' requires a value",
+                                no_usage=True,
+                            )
+                        option_suffix = argv[i]
+                elif canon == "diagnose":
+                    if negate:
+                        diagnose = None
+                    elif has_val:
+                        if val not in diagnose_modes:
+                            raise _BugreportUsageError(
+                                f"error: invalid --diagnose value '{val}'",
+                                no_usage=True,
+                            )
+                        diagnose = val
+                    else:
+                        diagnose = "stats"
+                i += 1
+                continue
+            if a.startswith("-") and a != "-":
+                j = 1
+                while j < len(a):
+                    ch = a[j]
+                    if ch == "o":
+                        rest_inline = a[j + 1:]
+                        if rest_inline:
+                            option_output = rest_inline
+                        else:
+                            i += 1
+                            if i >= n:
+                                raise _BugreportUsageError(
+                                    "error: switch `o' requires a value",
+                                    no_usage=True,
+                                )
+                            option_output = argv[i]
+                        break
+                    elif ch == "s":
+                        rest_inline = a[j + 1:]
+                        if rest_inline:
+                            option_suffix = rest_inline
+                        else:
+                            i += 1
+                            if i >= n:
+                                raise _BugreportUsageError(
+                                    "error: switch `s' requires a value",
+                                    no_usage=True,
+                                )
+                            option_suffix = argv[i]
+                        break
+                    elif ch == "h":
+                        raise _BugreportUsageError(None, full=True)
+                    else:
+                        raise _BugreportUsageError(
+                            f"error: unknown switch `{ch}'", full=True
+                        )
+                    j += 1
+                i += 1
+                continue
+            rest.append(a)
+            i += 1
+    except _BugreportUsageError as exc:
+        if exc.msg is None:
+            # -h: full usage to stdout, rc 129.
+            sys.stdout.write(_BUGREPORT_USAGE_OPTS + "\n")
+            return 129
+        _err(exc.msg)
+        if not exc.no_usage:
+            # The full block already ends in a newline; add the trailing blank
+            # line git emits after usage_with_options().
+            _err(_BUGREPORT_USAGE_OPTS + "\n" if exc.full else _BUGREPORT_USAGE)
+        return 129
+
+    if rest:
+        _err(f"error: unknown argument `{rest[0]}'")
+        _err(_BUGREPORT_USAGE)
+        return 129
+
+    if diagnose is not None:
+        # The diagnostics archive bundles git-internal stats and a zip whose
+        # contents cannot be reproduced byte-for-byte; refuse rather than emit a
+        # divergent archive.
+        _err("fatal: --diagnose is not supported by this implementation")
+        return 128
+
+    # Build report path: <output>/git-bugreport[-<suffix>].txt
+    import time as _time
+    now = _time.localtime()
+    out_prefix = option_output if option_output else ""
+    if out_prefix and not out_prefix.endswith("/"):
+        out_prefix = out_prefix + "/"
+    report_path = out_prefix + "git-bugreport"
+    if option_suffix is not None:
+        report_path += "-" + _time.strftime(option_suffix, now)
+    report_path += ".txt"
+
+    # safe_create_leading_directories on the full report path.
+    parent = os.path.dirname(report_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            _err(f"fatal: could not create leading directories for '{report_path}'")
+            return 128
+
+    # Assemble the report body. Contents are not part of the parity contract
+    # (they embed host/build specifics), but we mirror git's template + headers.
+    import platform as _platform
+    from . import __version__ as _ppg_version
+    buf: list[str] = []
+    buf.append(
+        "Thank you for filling out a Git bug report!\n"
+        "Please answer the following questions to help us understand your issue.\n"
+        "\n"
+        "What did you do before the bug happened? (Steps to reproduce your issue)\n"
+        "\n"
+        "What did you expect to happen? (Expected behavior)\n"
+        "\n"
+        "What happened instead? (Actual behavior)\n"
+        "\n"
+        "What's different between what you expected and what actually happened?\n"
+        "\n"
+        "Anything else you want to add:\n"
+        "\n"
+        "Please review the rest of the bug report below.\n"
+        "You can delete any lines you don't wish to share.\n"
+    )
+    buf.append("\n\n[System Info]\n")
+    buf.append("git version:\n")
+    buf.append(f"pythongit version {_ppg_version}\n")
+    buf.append("uname: " + " ".join(_platform.uname()) + "\n")
+    buf.append(f"compiler info: python {_platform.python_version()}\n")
+    shell = os.environ.get("SHELL")
+    buf.append(
+        "$SHELL (typically, interactive shell): "
+        + (shell if shell else "<unset>")
+        + "\n"
+    )
+    buf.append("\n\n[Enabled Hooks]\n")
+    text = "".join(buf)
+
+    # O_CREAT | O_EXCL | O_WRONLY: fail if the file already exists.
+    try:
+        fd = os.open(report_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    except FileExistsError:
+        _err(f"fatal: unable to create '{report_path}': File exists")
+        return 128
+    except OSError as exc:
+        _err(f"fatal: unable to create '{report_path}': {exc.strerror}")
+        return 128
+    try:
+        os.write(fd, text.encode("utf-8", "surrogateescape"))
+    finally:
+        os.close(fd)
+
+    _err(f"Created new report at '{report_path}'.")
+
+    return _bugreport_launch_editor(report_path)
 
 
 def cmd_refs(argv: list[str]) -> int:
@@ -18338,11 +19162,129 @@ def cmd_replay(argv: list[str]) -> int:
     return 0
 
 
+_BACKFILL_USAGE = (
+    "usage: git backfill [--min-batch-size=<n>] [--[no-]sparse]\n"
+    "\n"
+    "    --min-batch-size <n>  Minimum number of objects to request at a time\n"
+    "    --[no-]sparse         Restrict the missing objects to the current sparse-checkout\n"
+    "\n"
+)
+
+
+def _backfill_parse_unsigned(value: str):
+    """Reproduce C Git's git_parse_unsigned(): base-0 strtoumax with an
+    optional k/m/g suffix.  Returns (ok, errno) where errno is 'EINVAL' or
+    'ERANGE' on failure (matching parse-options' OPT_UNSIGNED diagnostics)."""
+    # size_t target -> precision 8 -> upper bound is the full unsigned range.
+    upper_bound = (1 << 64) - 1
+    if not value:
+        return (False, "EINVAL")
+    # strtoumax would accept a leading '-' as wraparound; C Git rejects it.
+    if "-" in value:
+        return (False, "EINVAL")
+    # Mimic strtoumax(value, &end, 0): skip leading whitespace, optional '+',
+    # then a base-0 integer (0x.. hex, 0.. octal, otherwise decimal).
+    i = 0
+    n = len(value)
+    while i < n and value[i] in " \t\n\v\f\r":
+        i += 1
+    if i < n and value[i] == "+":
+        i += 1
+    digit_start = i
+    base = 10
+    if i < n and value[i] == "0":
+        if i + 1 < n and value[i + 1] in "xX":
+            base = 16
+            i += 2
+        else:
+            base = 8
+    num_start = i
+    if base == 16:
+        digits = "0123456789abcdefABCDEF"
+    elif base == 8:
+        digits = "01234567"
+    else:
+        digits = "0123456789"
+    while i < n and value[i] in digits:
+        i += 1
+    # No digits consumed at all -> end == value in C terms.
+    if i == digit_start or (base == 16 and i == num_start):
+        return (False, "EINVAL")
+    numtext = value[digit_start:i]
+    try:
+        val = int(numtext, base)
+    except ValueError:
+        return (False, "EINVAL")
+    suffix = value[i:]
+    factors = {"": 1, "k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}
+    factor = factors.get(suffix.lower())
+    if factor is None:
+        return (False, "EINVAL")
+    if val * factor > upper_bound:
+        return (False, "ERANGE")
+    return (True, val * factor)
+
+
 def cmd_backfill(argv: list[str]) -> int:
-    """Download missing blobs from a remote (partial clone). Minimal: no-op."""
-    ap = argparse.ArgumentParser(prog="pygit backfill")
-    ap.parse_args(argv)
-    _print("nothing to backfill")
+    """Download missing blobs from a remote (partial clone).
+
+    In a complete (non-partial-clone) repository backfill is an effective
+    no-op: C Git walks objects reachable from HEAD, finds every blob already
+    present, downloads nothing, and exits 0 silently.  We reproduce that exact
+    behaviour plus parse-options' OPT_UNSIGNED diagnostics for --min-batch-size.
+    """
+    def _opt_err(msg: str) -> int:
+        # parse-options option diagnostics print no usage block.
+        sys.stderr.write(f"error: {msg}\n")
+        return 129
+
+    upper_bound = (1 << 64) - 1
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "-h":
+            # show_usage_with_options_if_asked() writes the usage to stdout.
+            sys.stdout.write(_BACKFILL_USAGE)
+            return 129
+        if a == "--min-batch-size" or a.startswith("--min-batch-size="):
+            if "=" in a:
+                value = a.split("=", 1)[1]
+            else:
+                # Option requires a separate value argument.
+                if i + 1 >= n:
+                    return _opt_err("option `min-batch-size' requires a value")
+                i += 1
+                value = argv[i]
+            if value == "":
+                return _opt_err("option `min-batch-size' expects a numerical value")
+            ok, res = _backfill_parse_unsigned(value)
+            if not ok:
+                if res == "ERANGE":
+                    return _opt_err(
+                        f"value {value} for option `min-batch-size' "
+                        f"not in range [0,-1]"
+                    )
+                return _opt_err(
+                    "option `min-batch-size' expects a non-negative integer "
+                    "value with an optional k/m/g suffix"
+                )
+            i += 1
+            continue
+        if a == "--sparse" or a == "--no-sparse":
+            i += 1
+            continue
+        # PARSE_OPT_KEEP_UNKNOWN_OPT hands leftover dashed options to
+        # setup_revisions(), which (for a complete repo) ultimately reaches
+        # die("unrecognized argument: %s").
+        if a.startswith("-"):
+            sys.stderr.write(f"fatal: unrecognized argument: {a}\n")
+            return 128
+        # A bare positional is consumed by setup_revisions() as a revision and
+        # diagnosed there; we leave that path unhandled rather than emit a
+        # divergent message.
+        sys.stderr.write(f"fatal: unrecognized argument: {a}\n")
+        return 128
     return 0
 
 

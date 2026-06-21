@@ -76,6 +76,10 @@ class IndexEntry:
 class Index:
     version: int = 2
     entries: list[IndexEntry] = field(default_factory=list)
+    # Resolve-undo (REUC) extension: path -> {stage: (mode, sha)} for stages
+    # 1/2/3 that were present before a conflict was resolved. mode 0 means the
+    # stage was absent. Mirrors C git's resolve_undo string-list keyed by path.
+    resolve_undo: dict[str, dict[int, tuple[int, str]]] = field(default_factory=dict)
 
     def by_path(self) -> dict[str, IndexEntry]:
         """Stage-0 entries by path (for convenience). Use `entries` for the
@@ -112,6 +116,16 @@ class Index:
                 return
         self.entries.append(entry)
         self.entries.sort(key=lambda e: (e.path, e.stage))
+
+    def record_resolve_undo(self, entry: IndexEntry) -> None:
+        """Record a conflicted (stage 1/2/3) entry into resolve-undo before it
+        is dropped by a resolution. Stage-0 entries are ignored, matching C
+        git's record_resolve_undo()."""
+        stage = entry.stage
+        if not stage:
+            return
+        rec = self.resolve_undo.setdefault(entry.path, {1: (0, ""), 2: (0, ""), 3: (0, "")})
+        rec[stage] = (entry.mode, entry.sha)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +181,43 @@ def read_index(repo: Repository) -> Index:
                 sha_b.hex(), flags, path, ext_flags,
             )
         )
+    # Extensions follow the entries, terminated by the hash trailer. Each is a
+    # 4-byte signature + 4-byte big-endian size + payload. We understand REUC
+    # (resolve-undo); any other (optional, capital-letter) extension is skipped.
+    trailer = len(raw) - repo.hash_len
+    while pos + 8 <= trailer:
+        sig = raw[pos:pos + 4]
+        sz = struct.unpack(">I", raw[pos + 4:pos + 8])[0]
+        body = raw[pos + 8:pos + 8 + sz]
+        pos += 8 + sz
+        if sig == b"REUC":
+            idx.resolve_undo = _read_reuc(body, repo.hash_len)
     return idx
+
+
+def _read_reuc(data: bytes, rawsz: int) -> dict[str, dict[int, tuple[int, str]]]:
+    """Parse the REUC payload into {path: {stage: (mode, sha)}}."""
+    out: dict[str, dict[int, tuple[int, str]]] = {}
+    i = 0
+    n = len(data)
+    while i < n:
+        end = data.index(b"\0", i)
+        path = data[i:end].decode("utf-8", errors="replace")
+        i = end + 1
+        modes = [0, 0, 0]
+        for s in range(3):
+            mend = data.index(b"\0", i)
+            modes[s] = int(data[i:mend] or b"0", 8)
+            i = mend + 1
+        rec = {1: (0, ""), 2: (0, ""), 3: (0, "")}
+        for s in range(3):
+            if not modes[s]:
+                continue
+            sha = data[i:i + rawsz].hex()
+            i += rawsz
+            rec[s + 1] = (modes[s], sha)
+        out[path] = rec
+    return out
 
 
 def write_index(repo: Repository, idx: Index) -> None:
@@ -199,6 +249,22 @@ def write_index(repo: Repository, idx: Index) -> None:
         buf += path_bytes + b"\0"
         while (len(buf) - start) % 8 != 0:
             buf += b"\0"
+    # REUC (resolve-undo) extension, when present. C git records it sorted by
+    # path; our dict is built from the (sorted) index so iterate sorted to be
+    # byte-stable.
+    if idx.resolve_undo:
+        body = bytearray()
+        for path in sorted(idx.resolve_undo):
+            rec = idx.resolve_undo[path]
+            body += path.encode("utf-8") + b"\0"
+            for s in (1, 2, 3):
+                body += b"%o\0" % (rec.get(s, (0, ""))[0])
+            for s in (1, 2, 3):
+                mode, sha = rec.get(s, (0, ""))
+                if not mode:
+                    continue
+                body += bytes.fromhex(sha)
+        buf += b"REUC" + struct.pack(">I", len(body)) + bytes(body)
     buf += repo.hash_bytes(buf)
     p = _index_path(repo)
     tmp = p.with_suffix(".tmp")
