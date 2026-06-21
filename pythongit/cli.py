@@ -5699,7 +5699,11 @@ def cmd_branch(argv: list[str]) -> int:
     if not start:
         _err(f"fatal: Not a valid object name: '{args.start or 'HEAD'}'.")
         return 128
-    refs_mod.update_ref(repo, full, start)
+    # git records "branch: Created from <start_name>" (builtin/branch.c). The
+    # start name is the explicit start-point if given, else the current branch
+    # name, falling back to the literal "HEAD" when HEAD is detached.
+    start_name = args.start if args.start else (cur if cur else "HEAD")
+    refs_mod.update_ref(repo, full, start, message=f"branch: Created from {start_name}")
     # -t/--track sets the new branch to track its (local or remote) start point.
     if args.track is not None and args.start is not None:
         _set_branch_upstream(repo, args.name, args.start, args.quiet)

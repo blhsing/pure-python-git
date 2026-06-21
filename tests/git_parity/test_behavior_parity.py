@@ -2422,11 +2422,23 @@ def test_batch5_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
 # `branch -M main` is a common idiom (e.g. after `init`), and an earlier bug
 # deleted refs/heads/main outright; these lock the byte-exact ref+reflog state.
 _BR_BASE = [("write", "a.txt", "1\n"), ["add", "-A"], ["commit", "-m", "c1"]]
+_BR_BASE2 = _BR_BASE + [("write", "a.txt", "2\n"), ["add", "-A"], ["commit", "-m", "c2"]]
 BRANCH_RENAME_STATE_CASES = [
     ("force-move-same-name", _BR_BASE, ["branch", "-M", "main"]),
     ("move-same-name", _BR_BASE, ["branch", "-m", "main"]),
     ("force-move-current-newname", _BR_BASE, ["branch", "-M", "dev"]),
     ("move-current-to-other", _BR_BASE, ["branch", "-m", "main", "trunk"]),
+    # Branch *creation* records "branch: Created from <start>" where <start> is
+    # the explicit start-point, else the current branch name (literal HEAD when
+    # detached) — not the generic "update:" reflog message.
+    ("create-from-current-branch", _BR_BASE, ["branch", "foo"]),
+    ("create-from-named-branch", _BR_BASE, ["branch", "foo", "main"]),
+    ("create-from-rev", _BR_BASE2, ["branch", "foo", "HEAD~1"]),
+    ("create-from-head-literal", _BR_BASE, ["branch", "foo", "HEAD"]),
+    # Renaming a non-current branch: exercises both the create reflog (for the
+    # source branch) and the rename reflog, end to end.
+    ("rename-noncurrent-branch", _BR_BASE + [["branch", "other"]],
+     ["branch", "-m", "other", "renamed"]),
 ]
 
 
