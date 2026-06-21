@@ -88,9 +88,10 @@ def main() -> int:
         finally:
             sys.stdin = old_stdin
 
-        # pack-redundant (no packs -> nothing)
+        # pack-redundant: Git 2.54 deprecated it; bare invocation refuses to run
+        # without --i-still-use-this (rc 128), matching the oracle.
         rc = run("pack-redundant")
-        check(rc == 0, "pack-redundant (empty)")
+        check(rc == 128, "pack-redundant (deprecation gate)")
 
         # prune-packed
         run("pack-objects", "pack", "--all")

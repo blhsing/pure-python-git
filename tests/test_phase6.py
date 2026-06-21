@@ -24,6 +24,30 @@ class FakeStdin:
     def read(self) -> str:
         return self._text
 
+    @property
+    def buffer(self):
+        # Commands that read binary stdin (e.g. interpret-trailers) use
+        # sys.stdin.buffer; expose the text as a bytes stream for them.
+        return io.BytesIO(self._text.encode("utf-8"))
+
+
+class FakeStdout:
+    """Captures text writes AND binary writes via sys.stdout.buffer.
+
+    interpret-trailers emits bytes through sys.stdout.buffer.write (for
+    surrogate-safe, byte-exact output), so a plain io.StringIO — which has
+    no .buffer attribute — is insufficient as a capture target.
+    """
+    def __init__(self):
+        self.buffer = io.BytesIO()
+    def write(self, s: str) -> int:
+        self.buffer.write(s.encode("utf-8", "surrogateescape"))
+        return len(s)
+    def flush(self) -> None:
+        pass
+    def getvalue(self) -> str:
+        return self.buffer.getvalue().decode("utf-8", "surrogateescape")
+
 
 def main() -> int:
     failed = 0
@@ -86,7 +110,7 @@ def main() -> int:
         # interpret-trailers
         sys.stdin = FakeStdin("subject\n\nbody text\n")
         old_stdout = sys.stdout
-        out_buf = io.StringIO()
+        out_buf = FakeStdout()
         sys.stdout = out_buf
         try:
             rc = run("interpret-trailers", "--trailer", "Signed-off-by: t <t@e.com>")

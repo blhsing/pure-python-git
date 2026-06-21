@@ -1,6 +1,6 @@
 # pygit flag-parity gap manifest (vs git 2.54.0)
 
-Probed 147 commands; 1479 documented flags scanned; 323 flags across 33 commands are currently *rejected* by pygit.
+Probed 147 commands; 1479 documented flags scanned; 283 flags across 28 commands are currently *rejected* by pygit.
 
 NOTE: a flag absent here only means pygit's parser accepts it — not that its behaviour is byte-identical. This is a lower bound on remaining parity work.
 
@@ -13,8 +13,8 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## apply (10)
   -p --no-add --add -N --intent-to-add --ours --theirs --union -z -C
 
-## archive (4)
-  --remote --exec -v --mtime
+## archive (2)
+  --remote --exec
 
 ## backfill (1)
   --min-batch-size
@@ -24,9 +24,6 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 
 ## cat-file (1)
   --follow-symlinks
-
-## clean (5)
-  -i -q -e -X --exclude
 
 ## commit (8)
   --interactive --patch -S -t -p -U --unified --inter-hunk-context
@@ -55,20 +52,14 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## hash-object (1)
   --filters
 
-## init (4)
-  --template --separate-git-dir --ref-format --shared
+## init (1)
+  --ref-format
 
-## init-db (4)
-  --template --separate-git-dir --ref-format --shared
+## init-db (1)
+  --ref-format
 
-## interpret-trailers (6)
-  --in-place --trim-empty --parse --unfold --no-divider --divider
-
-## log (3)
-  -q --clear-decorations -L
-
-## pack-redundant (2)
-  --verbose --alt-odb
+## log (1)
+  -L
 
 ## pull (17)
   -v -q -r -n --ff-only -s -X -S -a -f -t -p -j -k --unshallow --refmap -o
@@ -79,17 +70,14 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## repack (25)
   -A -f -F -l -n -q -m --window --depth --threads --keep-pack --write-midx --name-hash-version --path-walk --cruft --combine-cruft-below-size --max-cruft-size --no-reuse-delta --no-reuse-object --local -i --delta-islands -k --max-pack-size -g
 
-## replace (7)
-  -f --edit --graft --convert-graft-file --format -e -g
-
 ## reset (5)
   --patch -p -U --unified --inter-hunk-context
 
 ## rev-list (1)
   --sparse
 
-## show (3)
-  -q --clear-decorations -L
+## show (1)
+  -L
 
 ## stage (6)
   -i -p -U --unified --inter-hunk-context -e
@@ -97,8 +85,5 @@ NOTE: a flag absent here only means pygit's parser accepts it — not that its b
 ## stash (14)
   -u --include-untracked --only-untracked --index -p --patch -S --staged -a --all --pathspec-from-file --pathspec-file-nul --print --to-ref
 
-## switch (6)
-  -C -q -m -d -t -f
-
-## update-index (6)
-  --unresolve -g --again --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid
+## update-index (4)
+  --unresolve --clear-resolve-undo --fsmonitor-valid --no-fsmonitor-valid

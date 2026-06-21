@@ -297,18 +297,263 @@ _DEFAULT_BRANCH_HINT = (
 )
 
 
+# Shared-repository permission classes, mirroring C Git's setup.h enum.
+_PERM_UMASK = 0
+_PERM_GROUP = 0o660
+_PERM_EVERYBODY = 0o664
+_OLD_PERM_GROUP = 1
+_OLD_PERM_EVERYBODY = 2
+
+
+class _BadBoolValue(Exception):
+    """Raised when git_config_bool would die() on an unparsable value."""
+
+
+def _git_parse_int(value: str) -> "int | None":
+    """Port of git_parse_int(): decimal int with an optional k/m/g scale."""
+    v = value.strip()
+    if not v:
+        return None
+    scale = 1
+    if v[-1] in "kKmMgG":
+        scale = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[v[-1].lower()]
+        v = v[:-1]
+    try:
+        return int(v, 10) * scale
+    except ValueError:
+        return None
+
+
+def _git_config_bool(value: str) -> bool:
+    """Port of C Git's git_config_bool(); raises _BadBoolValue when git dies."""
+    v = value.lower()
+    if value == "":
+        return False
+    if v in ("true", "yes", "on"):
+        return True
+    if v in ("false", "no", "off"):
+        return False
+    n = _git_parse_int(value)
+    if n is not None:
+        return n != 0
+    raise _BadBoolValue(value)
+
+
+def _git_config_perm(value: "str | None") -> int:
+    """Port of git_config_perm() in setup.c. Returns a shared-repository code:
+    0 (umask), 0o660 (group), 0o664 (everybody), or a negative -(mode & 0666)
+    for an explicit filemode. Raises ValueError for a forbidden filemode."""
+    if value is None:
+        return _PERM_GROUP
+    if value == "umask":
+        return _PERM_UMASK
+    if value == "group":
+        return _PERM_GROUP
+    if value in ("all", "world", "everybody"):
+        return _PERM_EVERYBODY
+
+    # Parse leading octal digits the way strtol(value, &endptr, 8) does.
+    s = value
+    sign = 1
+    idx = 0
+    if idx < len(s) and s[idx] in "+-":
+        if s[idx] == "-":
+            sign = -1
+        idx += 1
+    digit_start = idx
+    i = 0
+    while idx < len(s) and s[idx] in "01234567":
+        i = i * 8 + int(s[idx])
+        idx += 1
+    i *= sign
+    # strtol performs no conversion when no digits follow the optional sign; in
+    # that case endptr is reset to the start of the string. The conversion is
+    # "clean" (C's `*endptr == 0`) only when either at least one digit was read
+    # and nothing trails it, or the whole string was empty to begin with.
+    if idx == digit_start:
+        # No digits consumed: endptr == nptr (whole string). Clean only when "".
+        fully = s == ""
+    else:
+        fully = idx == len(s)
+
+    if not fully:
+        # Not a clean octal number: fall back to true/false parsing.
+        return _PERM_GROUP if _git_config_bool(value) else _PERM_UMASK
+
+    if i == _PERM_UMASK:
+        return _PERM_UMASK
+    if i == _OLD_PERM_GROUP:
+        return _PERM_GROUP
+    if i == _OLD_PERM_EVERYBODY:
+        return _PERM_EVERYBODY
+
+    # An explicit filemode value: owner must keep read+write.
+    if (i & 0o600) != 0o600:
+        raise ValueError(i)
+    return -(i & 0o666)
+
+
+def _calc_shared_perm(shared: int, mode: int) -> int:
+    """Port of calc_shared_perm() in path.c."""
+    import stat as _stat
+    tweak = -shared if shared < 0 else shared
+    if not (mode & _stat.S_IWUSR):
+        tweak &= ~0o222
+    if mode & _stat.S_IXUSR:
+        tweak |= (tweak & 0o444) >> 2
+    if shared < 0:
+        mode = (mode & ~0o777) | tweak
+    else:
+        mode |= tweak
+    return mode
+
+
+def _adjust_shared_perm(shared: int, path: "Path") -> None:
+    """Port of adjust_shared_perm() in path.c for a single path."""
+    import stat as _stat
+    if not shared:
+        return
+    try:
+        old_mode = path.lstat().st_mode
+    except OSError:
+        return
+    if _stat.S_ISLNK(old_mode):
+        return
+    new_mode = _calc_shared_perm(shared, old_mode)
+    if _stat.S_ISDIR(old_mode):
+        new_mode |= (new_mode & 0o444) >> 2
+        # FORCE_DIR_SET_GID: g+s on dirs whenever group access is granted, so
+        # new files inherit the group (matches C Git on Linux/most Unix).
+        if new_mode & 0o060:
+            new_mode |= _stat.S_ISGID
+    if (old_mode ^ new_mode) & ~0o170000:
+        try:
+            os.chmod(path, new_mode & ~0o170000)
+        except OSError:
+            pass
+
+
+def _adjust_shared_perm_recursive(shared: int, root: "Path") -> None:
+    """Apply shared permissions to the gitdir and everything beneath it.
+
+    C Git applies adjust_shared_perm per directory as it creates the layout
+    (safe_create_dir with share=1) and once more on the whole gitdir; the net
+    effect is that every directory and file gets the shared bits, which is what
+    we reproduce here over the finished tree."""
+    if not shared:
+        return
+    _adjust_shared_perm(shared, root)
+    for sub in sorted(root.rglob("*")):
+        _adjust_shared_perm(shared, sub)
+
+
+def _copy_templates(template_dir: "Path", gitdir: "Path") -> None:
+    """Port of copy_templates_1() in setup.c: copy template files into gitdir.
+
+    Skips dotfiles, recurses into directories, copies regular files and
+    symlinks, and leaves any file that already exists in the gitdir alone."""
+    import stat as _stat
+
+    def copy_file(dst: Path, src: Path, mode: int) -> None:
+        # C Git's copy_file(): executables become 0777, everything else 0666,
+        # both then masked by the active umask via the open() create mode.
+        create_mode = 0o777 if (mode & 0o111) else 0o666
+        data = src.read_bytes()
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, create_mode)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+
+    def walk(src: Path, dst: Path) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
+        for entry in os.scandir(src):
+            if entry.name.startswith("."):
+                continue
+            s = Path(entry.path)
+            d = dst / entry.name
+            st = s.lstat()
+            if _stat.S_ISDIR(st.st_mode):
+                walk(s, d)
+            elif d.exists() or d.is_symlink():
+                continue
+            elif _stat.S_ISLNK(st.st_mode):
+                os.symlink(os.readlink(s), d)
+            elif _stat.S_ISREG(st.st_mode):
+                copy_file(d, s, st.st_mode)
+
+    walk(template_dir, gitdir)
+
+
+def _split_optarg(argv: list[str], name: str) -> "tuple[list[str], object]":
+    """Extract a PARSE_OPT_OPTARG flag (value only via ``--name=value``) from
+    argv. Returns (remaining_argv, value) where value is the sentinel object
+    ``_NO_FLAG`` if absent, None if given bare, or the string after ``=``."""
+    out: list[str] = []
+    value: object = _NO_FLAG
+    prefix = name + "="
+    for tok in argv:
+        if tok == name:
+            value = None
+        elif tok.startswith(prefix):
+            value = tok[len(prefix):]
+        else:
+            out.append(tok)
+    return out, value
+
+
+_NO_FLAG = object()
+
+
 def cmd_init(argv: list[str]) -> int:
+    # --shared uses PARSE_OPT_OPTARG (value only via "--shared=x"); argparse's
+    # nargs='?' would wrongly swallow a following token, so split it by hand.
+    argv, shared_arg = _split_optarg(list(argv), "--shared")
+
     ap = argparse.ArgumentParser(prog="pygit init", add_help=False)
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--bare", action="store_true")
     ap.add_argument("--object-format", choices=["sha1", "sha256"], default="sha1")
+    ap.add_argument("--template", default=None)
+    ap.add_argument("--separate-git-dir", dest="separate_git_dir", default=None)
     ap.add_argument("-b", "--initial-branch", default=None)
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     from . import gitconfig
+
+    # --separate-git-dir and --bare are mutually exclusive.
+    if args.separate_git_dir is not None and args.bare:
+        _err("fatal: options '--separate-git-dir' and '--bare' cannot be used together")
+        return 128
+
+    # Resolve the shared-repository setting (None means the flag was absent).
+    shared = 0
+    if shared_arg is not _NO_FLAG:
+        try:
+            shared = _git_config_perm(shared_arg)
+        except ValueError as exc:
+            i = exc.args[0]
+            _err(
+                "fatal: problem with core.sharedRepository filemode value "
+                f"(0{i & 0o777:03o}).\nThe owner of files must always have "
+                "read and write permissions."
+            )
+            return 128
+        except _BadBoolValue as exc:
+            _err(f"fatal: bad boolean config value '{exc.args[0]}' for 'arg'")
+            return 128
+
     target = Path(args.path).resolve()
-    gitdir = target if args.bare else target / ".git"
+
+    # Where the real repository lives. --separate-git-dir relocates it and
+    # leaves a "gitdir:" pointer file in the work tree.
+    gitdir_override = None
+    if args.separate_git_dir is not None:
+        gitdir_override = Path(args.separate_git_dir).resolve()
+        gitdir = gitdir_override
+    else:
+        gitdir = target if args.bare else target / ".git"
     already = (gitdir / "HEAD").exists()
 
     show_hint = False
@@ -321,18 +566,63 @@ def cmd_init(argv: list[str]) -> int:
         else:
             branch = "master"
             advice = (gitconfig.get(None, "advice.defaultbranchname") or "").lower()
-            show_hint = not already and advice not in ("false", "0", "no", "off")
+            show_hint = (
+                not already
+                and not args.quiet
+                and advice not in ("false", "0", "no", "off")
+            )
 
-    repo = Repository.init(target, bare=args.bare, object_format=args.object_format)
+    # Copy templates before writing defaults so a template's description/exclude
+    # (or its absence) wins, exactly as C Git does. With a template supplied we
+    # never emit pygit's stand-in description/hooks/info-exclude.
+    template_dir = None
+    if args.template:
+        template_dir = Path(args.template).resolve()
+        if not template_dir.is_dir():
+            # git reports the resolved absolute path, not the raw argument.
+            _err(f"warning: templates not found in {template_dir}")
+            template_dir = None
+
+    repo = Repository.init(
+        target,
+        bare=args.bare,
+        object_format=args.object_format,
+        gitdir_override=gitdir_override,
+        write_default_extras=(args.template is None),
+    )
+    if template_dir is not None:
+        _copy_templates(template_dir, repo.gitdir)
     if not already:
         (repo.gitdir / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
+
+    # Record the shared-repository config the way C Git serialises it.
+    if shared:
+        if shared < 0:
+            buf = f"0{-shared:o}"
+        elif shared == _PERM_GROUP:
+            buf = str(_OLD_PERM_GROUP)
+        elif shared == _PERM_EVERYBODY:
+            buf = str(_OLD_PERM_EVERYBODY)
+        else:
+            buf = f"0{shared:o}"
+        cfg_path = repo.gitdir / "config"
+        gitconfig.write_value(cfg_path, "core", None, "sharedrepository", buf)
+        gitconfig.write_value(cfg_path, "receive", None, "denyNonFastforwards", "true")
+        _adjust_shared_perm_recursive(shared, repo.gitdir)
+
+    # Drop the gitdir pointer file into the work tree for --separate-git-dir.
+    if gitdir_override is not None:
+        (target / ".git").write_text(f"gitdir: {gitdir_override}\n", encoding="utf-8")
 
     if already and args.initial_branch is not None:
         _err(f"warning: re-init: ignored --initial-branch={args.initial_branch}")
     if show_hint:
         sys.stderr.write(_DEFAULT_BRANCH_HINT)
     if not args.quiet:
-        word = "Reinitialized existing" if already else "Initialized empty"
+        if already:
+            word = "Reinitialized existing shared" if shared else "Reinitialized existing"
+        else:
+            word = "Initialized empty shared" if shared else "Initialized empty"
         _print(f"{word} Git repository in {repo.gitdir}/")
     return 0
 
@@ -3361,12 +3651,21 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
     ap.add_argument("-p", "--patch", action="store_true")
+    # -q/--quiet sets the diff machinery's NO_OUTPUT format *before* the
+    # in-order diff options are parsed, so for log (whose default diff output
+    # is already empty) it is a near no-op: any -p/--stat/--raw overrides it.
+    # Its one observable effect is the diff_setup_done conflict against
+    # --name-only/--name-status (NO_OUTPUT and NAME[_STATUS] cannot coexist).
+    ap.add_argument("-q", "--quiet", dest="quiet", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
     ap.add_argument("--raw", action="store_true")
+    # --clear-decorations resets the (currently unsupported) --decorate-refs
+    # include/exclude filters; with no such filters in effect it is a no-op.
+    ap.add_argument("--clear-decorations", dest="clear_decorations", action="store_true")
     ap.add_argument("--no-merges", dest="no_merges", action="store_true")
     # The builtin formats honour the mailmap by default (log.mailmap=true);
     # --no-use-mailmap shows raw identities. %an/%ae stay raw regardless.
@@ -3420,6 +3719,16 @@ def cmd_log(argv: list[str]) -> int:
         return 128
     if args.walk_reflogs and args.reverse:
         _err("fatal: options '--reverse' and '--walk-reflogs' cannot be used together")
+        return 128
+    # NO_OUTPUT (from -q/--quiet) collides with the NAME / NAME_STATUS output
+    # formats in diff_setup_done(); git rejects the combination with rc 128.
+    # The patch/stat/raw output flags clear NO_OUTPUT before that check runs
+    # (they are OPT_BITOP/callbacks), so the conflict only fires when -q is the
+    # surviving format alongside a name listing.
+    clears_no_output = args.patch or args.stat or args.shortstat or args.raw
+    if args.quiet and (args.name_only or args.name_status) and not clears_no_output:
+        _err("fatal: options '--name-only', '--name-status', '--check', and '-s' "
+             "cannot be used together")
         return 128
 
     # Split positionals into revisions and pathspecs.
@@ -4108,10 +4417,16 @@ def _emit_commit_header(sha: str, c, *, style: str = "medium",
 def cmd_show(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit show", add_help=False)
     ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
+    # -q/--quiet sets the diff machinery's NO_OUTPUT format; for show (whose
+    # default output is a patch) this suppresses the diff exactly like -s.
+    ap.add_argument("-q", "--quiet", dest="quiet", action="store_true")
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
+    # --clear-decorations resets the (unsupported) --decorate-refs filters; a
+    # no-op here since show never applies decoration ref filters.
+    ap.add_argument("--clear-decorations", dest="clear_decorations", action="store_true")
     ap.add_argument("--oneline", action="store_true")
     ap.add_argument("--format", default=None)
     ap.add_argument("--pretty", nargs="?", const="medium", default=None)
@@ -4122,6 +4437,18 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="no_use_mailmap", action="store_true")
     ap.add_argument("rev", nargs="*")
     args = ap.parse_args(argv)
+    # NO_OUTPUT (from -q/--quiet) collides with the NAME / NAME_STATUS output
+    # formats in diff_setup_done(); git rejects the combination with rc 128.
+    # --stat/--raw clear NO_OUTPUT before that check, so the conflict only
+    # fires when -q is the surviving format alongside a name listing.
+    if (args.quiet and (args.name_only or args.name_status)
+            and not (args.stat or args.raw)):
+        _err("fatal: options '--name-only', '--name-status', '--check', and '-s' "
+             "cannot be used together")
+        return 128
+    # -q/--quiet suppresses the patch exactly like -s/--no-patch for show.
+    if args.quiet:
+        args.no_patch = True
     repo = _repo()
     from . import mailmap as _mailmap
     mm_show = None if args.no_use_mailmap else _mailmap.load(repo)
@@ -5506,21 +5833,533 @@ def cmd_checkout(argv: list[str]) -> int:
     return 0
 
 
+def _switch_describe_head(repo: Repository, msg: str, sha: str) -> None:
+    """Emit git's '<msg> <abbrev> <subject>' line for a commit (to stderr)."""
+    subject = ""
+    try:
+        t, data = objs.read_object(repo, sha)
+        if t == "commit":
+            lines = objs.parse_commit(data).message.splitlines()
+            subject = lines[0] if lines else ""
+    except Exception:
+        pass
+    _err(f"{msg} {sha[:7]} {subject}")
+
+
+def _switch_prev_branch(repo: Repository) -> Optional[str]:
+    """Resolve switch's '-' / '@{-1}': the branch left by the most recent
+    'checkout: moving from <X> to <Y>' HEAD reflog entry."""
+    from . import reflog as _reflog
+    for _old, _new, _ident, msg in reversed(_reflog.read(repo, "HEAD")):
+        if msg.startswith("checkout: moving from "):
+            rest = msg[len("checkout: moving from "):]
+            frm, _, _ = rest.partition(" to ")
+            return frm or None
+    return None
+
+
+def _switch_track_friendly(remote: Optional[str], merge_ref: str) -> str:
+    """The friendly name git prints in 'set up to track '<name>'.'."""
+    short = merge_ref
+    if short.startswith("refs/heads/"):
+        short = short[len("refs/heads/"):]
+    if remote and remote != ".":
+        return f"{remote}/{short}"
+    return short
+
+
+def _switch_resolve_tracking(repo: Repository, real_ref: str):
+    """Map a fully-resolved start ref to (remote, merge_ref) for direct
+    tracking. A remote-tracking ref under refs/remotes/<r>/<b> with the
+    standard fetch refspec maps back to (<r>, refs/heads/<b>); a local
+    branch maps to ('.', refs/heads/<b>)."""
+    from . import gitconfig
+    if real_ref.startswith("refs/remotes/"):
+        rest = real_ref[len("refs/remotes/"):]
+        # Find a remote whose fetch refspec maps real_ref back to a head.
+        for name, value in gitconfig.list_all(repo):
+            if not (name.startswith("remote.") and name.endswith(".fetch")):
+                continue
+            remote_name = name[len("remote."):-len(".fetch")]
+            spec = value[1:] if value.startswith("+") else value
+            src, _, dst = spec.partition(":")
+            if dst.endswith("/*") and src.endswith("/*"):
+                dpre, spre = dst[:-1], src[:-1]
+                if real_ref.startswith(dpre):
+                    tail = real_ref[len(dpre):]
+                    return remote_name, spre + tail
+        # No refspec matched; fall back to splitting on the remote name.
+        head, _, branch = rest.partition("/")
+        return head, f"refs/heads/{branch}"
+    if real_ref.startswith("refs/heads/"):
+        return ".", real_ref
+    return ".", real_ref
+
+
+def _switch_inherit_tracking(repo: Repository, real_ref: str):
+    """Resolve --track=inherit: copy the start branch's upstream config.
+    Returns (remote, merge_ref) on success, or a warning string to print
+    (before switching) when the source has no usable tracking config."""
+    from . import gitconfig
+    if not real_ref.startswith("refs/heads/"):
+        return f"warning: asked to inherit tracking from '{real_ref}', but no remote is set"
+    base = real_ref[len("refs/heads/"):]
+    remote = gitconfig.get(repo, f"branch.{base}.remote")
+    merge = gitconfig.get(repo, f"branch.{base}.merge")
+    if not remote:
+        return f"warning: asked to inherit tracking from '{base}', but no remote is set"
+    if not merge:
+        return f"warning: asked to inherit tracking from '{base}', but no merge configuration is set"
+    return (remote, merge)
+
+
+def _switch_write_tracking(repo: Repository, local: str,
+                           remote: str, merge_ref: str, quiet: bool) -> None:
+    """Write branch.<local>.{remote,merge} and print git's confirmation."""
+    from . import gitconfig
+    cfg = repo.gitdir / "config"
+    gitconfig.write_value(cfg, "branch", local, "remote", remote, mode="set")
+    gitconfig.write_value(cfg, "branch", local, "merge", merge_ref, mode="set")
+    if not quiet:
+        friendly = _switch_track_friendly(remote, merge_ref)
+        _print(f"branch '{local}' set up to track '{friendly}'.")
+
+
+_SWITCH_USAGE = (
+    "usage: git switch [<options>] [<branch>]\n"
+    "\n"
+    "    -c, --[no-]create <branch>\n"
+    "                          create and switch to a new branch\n"
+    "    -C, --[no-]force-create <branch>\n"
+    "                          create/reset and switch to a branch\n"
+    "    --[no-]guess          second guess 'git switch <no-such-branch>'\n"
+    "    --[no-]discard-changes\n"
+    "                          throw away local modifications\n"
+    "    -q, --[no-]quiet      suppress progress reporting\n"
+    "    --[no-]recurse-submodules[=<checkout>]\n"
+    "                          control recursive updating of submodules\n"
+    "    --[no-]progress       force progress reporting\n"
+    "    -m, --[no-]merge      perform a 3-way merge with the new branch\n"
+    "    --[no-]conflict <style>\n"
+    "                          conflict style (merge, diff3, or zdiff3)\n"
+    "    -d, --[no-]detach     detach HEAD at named commit\n"
+    "    -t, --[no-]track[=(direct|inherit)]\n"
+    "                          set branch tracking configuration\n"
+    "    -f, --[no-]force      force checkout (throw away local modifications)\n"
+    "    --[no-]orphan <new-branch>\n"
+    "                          new unborn branch\n"
+    "    --[no-]overwrite-ignore\n"
+    "                          update ignored files (default)\n"
+    "    --[no-]ignore-other-worktrees\n"
+    "                          do not check if another worktree is using this branch\n"
+    "\n"
+)
+
+
+class _SwitchParseError(Exception):
+    def __init__(self, message: str, rc: int = 129, show_usage: bool = False):
+        super().__init__(message)
+        self.message = message
+        self.rc = rc
+        self.show_usage = show_usage
+
+
+def _switch_parse(argv: list[str]) -> dict:
+    """Faithful subset of git switch's parse-options handling."""
+    opts = {"create": None, "force_create": None, "quiet": False,
+            "detach": False, "track": None, "args": []}
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    while i < n:
+        a = argv[i]
+        if saw_dd:
+            opts["args"].append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a == "-" or not a.startswith("-"):
+            opts["args"].append(a)
+            i += 1
+            continue
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            has_val = bool(eq)
+            if name in ("create", "force-create"):
+                key = "create" if name == "create" else "force_create"
+                if has_val:
+                    opts[key] = val
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _SwitchParseError(f"error: option `{name}' requires a value")
+                    opts[key] = argv[i]
+            elif name == "quiet":
+                if has_val:
+                    raise _SwitchParseError(f"error: option `{name}' takes no value")
+                opts["quiet"] = True
+            elif name == "detach":
+                if has_val:
+                    raise _SwitchParseError(f"error: option `{name}' takes no value")
+                opts["detach"] = True
+            elif name == "track":
+                if has_val:
+                    if val not in ("direct", "inherit"):
+                        raise _SwitchParseError('error: option `--track\' expects "direct" or "inherit"')
+                    opts["track"] = val
+                else:
+                    opts["track"] = "direct"
+            elif name == "no-track":
+                if has_val:
+                    raise _SwitchParseError(f"error: option `{name}' takes no value")
+                opts["track"] = "none"
+            else:
+                raise _SwitchParseError(f"error: unknown option `{name}'", show_usage=True)
+            i += 1
+            continue
+        # Short option cluster, possibly with an attached value.
+        j = 1
+        while j < len(a):
+            ch = a[j]
+            if ch in ("c", "C"):
+                key = "create" if ch == "c" else "force_create"
+                rest = a[j + 1:]
+                if rest:
+                    opts[key] = rest
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _SwitchParseError(f"error: switch `{ch}' requires a value")
+                    opts[key] = argv[i]
+                break
+            elif ch == "q":
+                opts["quiet"] = True
+            elif ch == "d":
+                opts["detach"] = True
+            elif ch == "t":
+                opts["track"] = "direct"
+            else:
+                raise _SwitchParseError(f"error: unknown switch `{ch}'", show_usage=True)
+            j += 1
+        i += 1
+    return opts
+
+
 def cmd_switch(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit switch")
-    ap.add_argument("-c", dest="create", default=None)
-    ap.add_argument("branch", nargs="?")
-    args = ap.parse_args(argv)
-    sub = []
-    if args.create:
-        sub = ["-b", args.create]
-        if args.branch:
-            sub.append(args.branch)
-    else:
-        if not args.branch:
+    try:
+        opts = _switch_parse(argv)
+    except _SwitchParseError as exc:
+        _err(exc.message)
+        if exc.show_usage:
+            sys.stderr.write(_SWITCH_USAGE)
+        return exc.rc
+
+    create = opts["create"]
+    force_create = opts["force_create"]
+    quiet = opts["quiet"]
+    detach = opts["detach"]
+    track = opts["track"]
+    args = opts["args"]
+    new_branch = create or force_create
+
+    if detach and new_branch is not None:
+        _err("fatal: '--detach' cannot be used with '-b/-B/--orphan'")
+        return 128
+    # --track/-t/--no-track without -c/-C makes git DWIM a branch name from the
+    # positional argument (strip refs/, remotes/, take the part after '/').
+    if track is not None and new_branch is None:
+        if not args or args[0] == "--":
+            _err("fatal: --track needs a branch name")
             return 128
-        sub = [args.branch]
-    return cmd_checkout(sub)
+        argv0 = args[0]
+        for pre in ("refs/", "remotes/"):
+            if argv0.startswith(pre):
+                argv0 = argv0[len(pre):]
+        slash = argv0.find("/")
+        if slash < 0 or slash == len(argv0) - 1:
+            _err("fatal: missing branch name; try -c")
+            return 128
+        new_branch = argv0[slash + 1:]
+        create = new_branch  # behaves like -c <dwimmed-name>
+        args = list(args)  # the original arg stays as the start point
+    if len(args) > 1:
+        _err("fatal: only one reference expected")
+        return 128
+
+    repo = _repo()
+    head_sym0, old_sha0 = refs_mod.read_head(repo)
+    on_branch0 = bool(head_sym0 and head_sym0.startswith("refs/heads/"))
+    old_name0 = (head_sym0[len("refs/heads/"):] if on_branch0
+                 else (old_sha0 if old_sha0 else None))
+
+    def _log_head(new_sha: Optional[str], new_name: str) -> None:
+        from . import reflog as _reflog
+        if old_sha0 and new_sha:
+            _reflog.append(repo, "HEAD", old_sha0, new_sha,
+                           f"checkout: moving from {old_name0} to {new_name}")
+
+    def _leaving_detached(new_sha: Optional[str]) -> None:
+        # When leaving a detached HEAD for a different commit, git reports the
+        # previous position (or warns about commits left behind if unreachable).
+        if quiet or on_branch0 or not old_sha0 or new_sha == old_sha0:
+            return
+        lost = _switch_orphans(repo, old_sha0)
+        if lost:
+            plural = "s" if len(lost) != 1 else ""
+            verb = "them" if len(lost) != 1 else "it"
+            _err(f"Warning: you are leaving {len(lost)} commit{plural} behind, not connected to")
+            _err("any of your branches:")
+            _err("")
+            for c_sha, c_subj in lost:
+                _err(f"  {c_sha[:7]} {c_subj}")
+            _err("")
+            _err(f"If you want to keep {verb} by creating a new branch, this may be a good time")
+            _err("to do so with:")
+            _err("")
+            _err(f" git branch <new-branch-name> {lost[0][0][:7]}")
+            _err("")
+        else:
+            _switch_describe_head(repo, "Previous HEAD position was", old_sha0)
+
+    raw_arg = args[0] if args else None
+    # git rewrites the `-` shorthand to `@{-1}` (the previously checked-out
+    # branch); the error message reflects the rewritten form.
+    if raw_arg == "-":
+        raw_arg = "@{-1}"
+    if raw_arg == "@{-1}":
+        prev = _switch_prev_branch(repo)
+        if prev is None:
+            _err("fatal: invalid reference: @{-1}")
+            return 128
+        raw_arg = prev
+
+    # Determine the start point for branch creation / the switch target.
+    if new_branch is not None:
+        start_arg = raw_arg
+        start_sha = (refs_mod.rev_parse(repo, start_arg) if start_arg
+                     else refs_mod.rev_parse(repo, "HEAD"))
+        if start_arg is not None and start_sha is None:
+            _err(f"fatal: invalid reference: {start_arg}")
+            return 128
+        # A branch is created at the peeled commit of its start point.
+        if start_sha is not None:
+            start_sha = refs_mod._peel_to_commit(repo, start_sha) or start_sha
+        exists = refs_mod.read_ref(repo, f"refs/heads/{new_branch}") is not None
+        if create is not None and exists:
+            _err(f"fatal: a branch named '{new_branch}' already exists")
+            return 128
+
+        # Resolve the real ref of the start point for tracking decisions.
+        real_ref = None
+        if start_arg is not None:
+            real_ref = _switch_dwim_ref(repo, start_arg)
+        # Resolve the effective tracking mode. track is None (unset → auto),
+        # "none" (--no-track suppresses auto), or "direct"/"inherit" (explicit).
+        explicit_track = track in ("direct", "inherit")
+        if track in (None, "none"):
+            do_track = None
+            if track is None and real_ref and real_ref.startswith("refs/remotes/"):
+                do_track = "direct"  # autoSetupMerge default for remote starts
+        else:
+            do_track = track
+        if explicit_track:
+            # Explicit -t/--track requires the start point to be a branch.
+            if real_ref is None or not (real_ref.startswith("refs/heads/")
+                                        or real_ref.startswith("refs/remotes/")):
+                disp = start_arg if start_arg is not None else "HEAD"
+                _err(f"fatal: cannot set up tracking information; starting point '{disp}' is not a branch")
+                return 128
+
+        if start_sha is None:
+            # Unborn HEAD: just repoint HEAD; ref is written on first commit.
+            refs_mod.set_head(repo, f"refs/heads/{new_branch}")
+            if not quiet:
+                _err(f"Switched to a new branch '{new_branch}'")
+            return 0
+
+        # Resolve tracking config up-front: inherit emits its failure
+        # warning before the switch happens; direct resolves the remote/merge.
+        track_pair = None
+        if do_track == "inherit":
+            res = _switch_inherit_tracking(repo, real_ref) if real_ref else \
+                f"warning: asked to inherit tracking from '{start_arg}', but no remote is set"
+            if isinstance(res, str):
+                _err(res)
+            else:
+                track_pair = res
+        elif do_track == "direct":
+            track_pair = _switch_resolve_tracking(repo, real_ref)
+
+        currently_on = on_branch0 and old_name0 == new_branch
+        reset_existing = exists  # only reachable via force_create
+        start_name = start_arg if start_arg is not None else "HEAD"
+        msg = (f"branch: Reset to {start_name}" if reset_existing
+               else f"branch: Created from {start_name}")
+        # git snapshots the "leaving detached HEAD" report before updating refs.
+        _leaving_detached(start_sha)
+        refs_mod.update_ref(repo, f"refs/heads/{new_branch}", start_sha, message=msg)
+        tree = _commit_tree(repo, start_sha) or start_sha
+        _log_head(start_sha, new_branch)
+        workdir.checkout_tree(repo, tree)
+        refs_mod.set_head(repo, f"refs/heads/{new_branch}")
+        if not quiet:
+            if currently_on:
+                _err(f"Reset branch '{new_branch}'")
+            elif reset_existing:
+                _err(f"Switched to and reset branch '{new_branch}'")
+            else:
+                _err(f"Switched to a new branch '{new_branch}'")
+        if track_pair is not None:
+            _switch_write_tracking(repo, new_branch, track_pair[0], track_pair[1], quiet)
+        return 0
+
+    # No -c/-C: a plain switch (optionally detaching).
+    if raw_arg is None:
+        if detach:
+            # `switch -d` with no argument detaches at the current HEAD.
+            if old_sha0 is None:
+                if on_branch0:
+                    # Unborn HEAD: symref to a branch with no commit yet.
+                    _err("fatal: You are on a branch yet to be born")
+                else:
+                    _err("fatal: missing branch or commit argument")
+                return 128
+            tree = _commit_tree(repo, old_sha0) or old_sha0
+            workdir.checkout_tree(repo, tree)
+            _log_head(old_sha0, old_sha0)
+            refs_mod.set_head(repo, old_sha0)
+            if not quiet:
+                _switch_describe_head(repo, "HEAD is now at", old_sha0)
+            return 0
+        _err("fatal: missing branch or commit argument")
+        return 128
+
+    sha = refs_mod.rev_parse(repo, raw_arg)
+    if sha is None:
+        _err(f"fatal: invalid reference: {raw_arg}")
+        return 128
+    real_ref = _switch_dwim_ref(repo, raw_arg)
+
+    if detach:
+        # Peel tags/objects to the underlying commit; detached HEAD stores it.
+        commit_sha = refs_mod._peel_to_commit(repo, sha) or sha
+        tree = _commit_tree(repo, commit_sha) or commit_sha
+        _leaving_detached(commit_sha)
+        workdir.checkout_tree(repo, tree)
+        _log_head(commit_sha, raw_arg)
+        refs_mod.set_head(repo, commit_sha)
+        if not quiet:
+            _switch_describe_head(repo, "HEAD is now at", commit_sha)
+        return 0
+
+    # Plain switch: the target must be a local branch.
+    is_branch = refs_mod.read_ref(repo, f"refs/heads/{raw_arg}") is not None
+    if not is_branch:
+        if real_ref and real_ref.startswith("refs/tags/"):
+            _err(f"fatal: a branch is expected, got tag '{real_ref[len('refs/tags/'):]}'")
+        elif real_ref and real_ref.startswith("refs/remotes/"):
+            _err(f"fatal: a branch is expected, got remote branch '{real_ref[len('refs/remotes/'):]}'")
+        elif real_ref:
+            _err(f"fatal: a branch is expected, got '{real_ref}'")
+        else:
+            _err(f"fatal: a branch is expected, got commit '{raw_arg}'")
+        _err("hint: If you want to detach HEAD at the commit, try again with the --detach option.")
+        return 128
+
+    if on_branch0 and old_name0 == raw_arg:
+        if not quiet:
+            _err(f"Already on '{raw_arg}'")
+        return 0
+    tree = _commit_tree(repo, sha) or sha
+    _leaving_detached(sha)
+    workdir.checkout_tree(repo, tree)
+    _log_head(sha, raw_arg)
+    refs_mod.set_head(repo, f"refs/heads/{raw_arg}")
+    if not quiet:
+        _err(f"Switched to branch '{raw_arg}'")
+    return 0
+
+
+def _switch_dwim_ref(repo: Repository, name: str) -> Optional[str]:
+    """Return the full ref that <name> resolves to (git's repo_dwim_ref),
+    trying the standard search order, or None if it is not a ref."""
+    if name.startswith("refs/") and refs_mod.read_ref(repo, name) is not None:
+        return name
+    for pat in (f"refs/heads/{name}", f"refs/tags/{name}",
+                f"refs/remotes/{name}", f"refs/remotes/{name}/HEAD"):
+        if refs_mod.read_ref(repo, pat) is not None:
+            return pat
+    if name == "HEAD" and refs_mod.read_ref(repo, "HEAD") is not None:
+        return "HEAD"
+    return None
+
+
+def _switch_orphans(repo: Repository, old_sha: str):
+    """Commits reachable from old_sha but from no ref, newest-first, as
+    (sha, subject) — git's 'commits left behind' list."""
+    from . import merge as merge_mod
+    # Collect ref tips (excluding HEAD itself).
+    tips = []
+    refs_dir = repo.gitdir / "refs"
+    for base in ("heads", "tags", "remotes"):
+        d = refs_dir / base
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file():
+                rel = "refs/" + str(p.relative_to(refs_dir)).replace(os.sep, "/")
+                t = refs_mod.read_ref(repo, rel)
+                if t:
+                    tips.append(t)
+    packed = repo.gitdir / "packed-refs"
+    if packed.exists():
+        for line in packed.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("^"):
+                continue
+            sha_part, _, ref_part = line.partition(" ")
+            if ref_part.startswith("refs/"):
+                tips.append(sha_part)
+
+    def reachable_from_tips(c: str) -> bool:
+        for t in tips:
+            if t == c or merge_mod.is_ancestor(repo, c, t):
+                return True
+        return False
+
+    # Walk commits from old_sha; stop descending once we hit a reachable one.
+    seen = set()
+    stack = [old_sha]
+    collected = []  # (sha, subject, commit_timestamp)
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if reachable_from_tips(cur):
+            continue
+        subj, cts = "", 0
+        try:
+            t, data = objs.read_object(repo, cur)
+            if t == "commit":
+                c = objs.parse_commit(data)
+                lines = c.message.splitlines()
+                subj = lines[0] if lines else ""
+                parts = c.committer.rsplit(" ", 2)
+                if len(parts) == 3 and parts[1].lstrip("-").isdigit():
+                    cts = int(parts[1])
+                for par in c.parents:
+                    if par not in seen:
+                        stack.append(par)
+        except Exception:
+            pass
+        collected.append((cur, subj, cts))
+    # rev-list default order: most recent commit date first.
+    collected.sort(key=lambda e: e[2], reverse=True)
+    return [(sha, subj) for sha, subj, _ts in collected]
 
 
 def cmd_restore(argv: list[str]) -> int:
@@ -7655,49 +8494,288 @@ def _rfc2822_to_raw(value: str) -> str:
     return f"{secs} {sign}{total // 3600:02d}{(total % 3600) // 60:02d}"
 
 
+_CLEAN_USAGE = (
+    "usage: git clean [-d] [-f] [-i] [-n] [-q] [-e <pattern>] "
+    "[-x | -X] [--] [<pathspec>...]\n"
+    "\n"
+    "    -q, --[no-]quiet      do not print names of files removed\n"
+    "    -n, --[no-]dry-run    dry run\n"
+    "    -f, --[no-]force      force\n"
+    "    -i, --[no-]interactive\n"
+    "                          interactive cleaning\n"
+    "    -d                    remove whole directories\n"
+    "    -e, --exclude <pattern>\n"
+    "                          add <pattern> to ignore rules\n"
+    "    -x                    remove ignored files, too\n"
+    "    -X                    remove only ignored files\n"
+    "\n"
+)
+
+
 def cmd_clean(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit clean")
-    ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("-d", action="store_true")
-    ap.add_argument("-n", "--dry-run", action="store_true")
-    ap.add_argument("-x", action="store_true")
-    args = ap.parse_args(argv)
+    from . import ignore as ignore_mod
+
+    force = 0
+    remove_dirs = False
+    dry_run = False
+    quiet = False
+    ignored = False        # -x: also clean ignored files
+    ignored_only = False   # -X: clean only ignored files
+    exclude_patterns: list[str] = []
+    pathspecs: list[str] = []
+
+    # Hand-rolled option parsing to reproduce C Git's parse-options error
+    # messages (rc 129 + usage block) and the -x/-X conflict (rc 128).
+    def _unknown_opt(msg: str) -> int:
+        sys.stderr.write(f"error: {msg}\n")
+        sys.stderr.write(_CLEAN_USAGE)
+        return 129
+
+    def _needs_value(msg: str) -> int:
+        # parse-options' "requires a value" diagnostics print no usage block.
+        sys.stderr.write(f"error: {msg}\n")
+        return 129
+
+    # Long-option table mirroring parse_options().  Positive options accept
+    # unique-prefix abbreviation; their "--no-" negations are accepted only in
+    # full form (the exotic abbreviated-negation ambiguity diagnostics that C
+    # Git's parse-options emits are intentionally not reproduced here).
+    _long_bools = ("quiet", "dry-run", "force", "interactive")
+    _long_value = ("exclude",)
+    _positives = list(_long_bools) + list(_long_value)
+
+    def _resolve_long(name: str):
+        """Return (canonical, negated) or None when unknown.  On ambiguity it
+        writes C Git's ``ambiguous option`` diagnostic and returns ('__ambig__',
+        False)."""
+        if name.startswith("no-") and name[3:] in _long_bools:
+            return (name[3:], True)
+        if name in _positives:
+            return (name, False)
+        matches = [c for c in _positives if c.startswith(name)]
+        if len(matches) == 1:
+            return (matches[0], False)
+        if len(matches) > 1:
+            joined = " or ".join("--" + m for m in matches)
+            sys.stderr.write(
+                f"error: ambiguous option: {name} (could be {joined})\n")
+            return ("__ambig__", False)
+        return None
+
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    while i < n:
+        a = argv[i]
+        if saw_dd:
+            pathspecs.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a.startswith("--"):
+            name, _, val = a[2:].partition("=")
+            has_val = "=" in a
+            res = _resolve_long(name)
+            if res is None:
+                return _unknown_opt(f"unknown option `{name}'")
+            canon, negated = res
+            if canon == "__ambig__":
+                return 129
+            if canon == "exclude":
+                if negated:    # cannot happen (NONEG), but guard anyway
+                    return _unknown_opt(f"unknown option `{name}'")
+                if not has_val:
+                    if i + 1 >= n:
+                        return _needs_value("option `exclude' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                exclude_patterns.append(val)
+            elif canon == "force":
+                force = 0 if negated else force + 1
+            elif canon == "dry-run":
+                dry_run = not negated
+            elif canon == "quiet":
+                quiet = not negated
+            elif canon == "interactive":
+                if negated:
+                    pass  # --no-interactive: interactive stays off (default)
+                else:
+                    # Interactive cleaning needs a TTY/editor loop; unsupported.
+                    _err("fatal: interactive clean (-i/--interactive) is not "
+                         "supported")
+                    return 128
+            i += 1
+            continue
+        if a.startswith("-") and a != "-":
+            j = 1
+            consumed_next = False
+            while j < len(a):
+                c = a[j]
+                if c == "f":
+                    force += 1
+                elif c == "d":
+                    remove_dirs = True
+                elif c == "n":
+                    dry_run = True
+                elif c == "q":
+                    quiet = True
+                elif c == "x":
+                    ignored = True
+                elif c == "X":
+                    ignored_only = True
+                elif c == "i":
+                    _err("fatal: interactive clean (-i/--interactive) is not "
+                         "supported")
+                    return 128
+                elif c == "e":
+                    rest = a[j + 1:]
+                    if rest:
+                        exclude_patterns.append(rest)
+                    else:
+                        if i + 1 >= n:
+                            return _needs_value("switch `e' requires a value")
+                        exclude_patterns.append(argv[i + 1])
+                        consumed_next = True
+                    break
+                else:
+                    return _unknown_opt(f"unknown switch `{c}'")
+                j += 1
+            i += 2 if consumed_next else 1
+            continue
+        pathspecs.append(a)
+        i += 1
+
     repo = _repo()
-    if not (args.force or args.dry_run):
-        _err("fatal: clean.requireForce; use -f or -n")
-        return 1
-    s = workdir.status(repo, include_ignored=args.x)
+
+    if ignored and ignored_only:
+        _err(_incompatible_opts(["-x", "-X"]))
+        return 128
+
+    if force == 0 and not dry_run:
+        # clean.requireForce defaults to true; refuse without -f/-n.
+        _err("fatal: clean.requireForce is true and -f not given: "
+             "refusing to clean")
+        return 128
+
+    if pathspecs:
+        # Pathspec-limited cleaning is not yet implemented byte-exact.
+        _err("fatal: pathspec-limited clean is not supported")
+        return 128
+
+    # Build the matcher.  Under -x the standard excludes (.gitignore, core
+    # excludesfile, info/exclude) are dropped; only the -e patterns remain.
+    # Otherwise the standard excludes apply, with -e patterns appended at the
+    # end so they take precedence (including negations).
+    iset = ignore_mod.IgnoreSet()
+    if not ignored:
+        iset.rules.extend(ignore_mod.load(repo.path).rules)
+    for pat in exclude_patterns:
+        iset.rules.append(ignore_mod.IgnoreRule(pat, "", "command-line", 0))
+
     tracked = workdir.tracked_paths(repo)
-
-    def dir_fully_untracked(d: str) -> bool:
-        prefix = d + "/"
-        return not any(t == d or t.startswith(prefix) for t in tracked)
-
-    targets: list[str] = []
-    seen: set[str] = set()
-    for u in sorted(s["untracked"]):
-        parts = u.split("/")
-        untracked_dir = None
+    tracked_dirs: set[str] = set()
+    for t in tracked:
+        parts = t.split("/")
         for k in range(1, len(parts)):
-            d = "/".join(parts[:k])
-            if dir_fully_untracked(d):
-                untracked_dir = d
-                break
-        if untracked_dir is not None:
-            if args.d:
-                target = untracked_dir + "/"
-                if target not in seen:
-                    seen.add(target)
-                    targets.append(target)
-            # Without -d, untracked directories are left untouched.
-        elif u not in seen:
-            seen.add(u)
-            targets.append(u)
+            tracked_dirs.add("/".join(parts[:k]))
+
+    def is_ignored(rel: str, is_dir: bool) -> bool:
+        return iset.is_ignored(rel, is_dir=is_dir)
+
+    def walk(rel_dir: str, dir_is_ignored: bool):
+        """Recurse one directory.  Returns (collapsible, has_tracked, my_targets):
+
+        * ``collapsible`` -- the whole directory could be removed as a single
+          ``rel_dir/`` entry (subject to ``-d``); the parent decides whether to
+          collapse it or keep the individual ``my_targets``.
+        * ``has_tracked`` -- the subtree contains a tracked path.
+        * ``my_targets`` -- removal targets to use if this directory is *not*
+          collapsed.
+
+        ``dir_is_ignored`` says whether ``rel_dir`` itself matched an ignore
+        rule; under that condition every descendant counts as ignored."""
+        base = repo.path / rel_dir if rel_dir else repo.path
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            return (False, False, [])
+
+        has_tracked = False
+        has_kept = False          # a path that must be preserved (blocks collapse)
+        has_file = False          # any regular file/symlink present
+        my_targets: list[str] = []
+
+        for name in entries:
+            if name == ".git":
+                continue
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            full = base / name
+            is_dir = workdir._is_dir_no_follow(full)
+
+            if rel in tracked:
+                has_tracked = True
+                continue
+
+            if is_dir:
+                sub_tracked_dir = rel in tracked_dirs
+                sub_ignored = dir_is_ignored or is_ignored(rel, True)
+                # Tracked directories are always descended (to clean their
+                # untracked contents).  Untracked directories are descended when
+                # -d is given, or (in -X mode) when not themselves ignored, so
+                # that ignored files inside an otherwise-untracked directory can
+                # be removed.  An ignored directory is an opaque unit: it is only
+                # touched with -d.
+                descend = (sub_tracked_dir or remove_dirs
+                           or (ignored_only and not sub_ignored))
+                if not descend:
+                    # Leave the directory untouched; it blocks the parent from
+                    # collapsing.
+                    has_kept = True
+                    continue
+                sub_collapsible, sub_has_tracked, sub_targets = walk(rel, sub_ignored)
+                if sub_has_tracked:
+                    has_tracked = True
+                if sub_collapsible and remove_dirs and not sub_tracked_dir:
+                    my_targets.append(rel + "/")
+                else:
+                    my_targets.extend(sub_targets)
+                    if not sub_collapsible:
+                        has_kept = True
+                continue
+
+            # Regular file (or symlink).
+            has_file = True
+            file_ignored = dir_is_ignored or is_ignored(rel, False)
+            removable = file_ignored if ignored_only else (not file_ignored)
+            if removable:
+                my_targets.append(rel)
+            else:
+                has_kept = True
+
+        # Can this directory be removed as a single unit?
+        if has_tracked or has_kept:
+            collapsible = False
+        elif ignored_only:
+            # Collapse only a directory whose entire content is ignored and that
+            # contains something (empty dirs never collapse under -X), unless the
+            # directory itself is an ignored dir.
+            collapsible = dir_is_ignored or has_file or bool(my_targets)
+        else:
+            # default / -x: any directory with no tracked and no kept content is
+            # removable (empty directories included).
+            collapsible = True
+        return (collapsible, has_tracked, my_targets)
+
+    _, _, targets = walk("", False)
 
     import shutil
     for target in sorted(targets):
-        if args.dry_run:
-            _print(f"Would remove {target}")
+        if dry_run:
+            if not quiet:
+                _print(f"Would remove {target}")
         else:
             full = repo.path / target.rstrip("/")
             try:
@@ -7705,7 +8783,8 @@ def cmd_clean(argv: list[str]) -> int:
                     shutil.rmtree(full)
                 else:
                     full.unlink()
-                _print(f"Removing {target}")
+                if not quiet:
+                    _print(f"Removing {target}")
             except OSError:
                 pass
     return 0
@@ -8652,11 +9731,19 @@ def cmd_shortlog(argv: list[str]) -> int:
     return 0
 
 
-def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], archive_time: int, prefix: str = "") -> bytes:
-    """Build a tar archive byte-for-byte identical to C Git's archive-tar.c."""
+def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], archive_time: int, prefix: str = "", verbose: bool = False) -> bytes:
+    """Build a tar archive byte-for-byte identical to C Git's archive-tar.c.
+
+    When ``verbose`` is set, each archived path is reported to stderr in the
+    same order C Git's ``archive --verbose`` does (archive.c:write_archive_entry).
+    """
     BLOCKSIZE = 512 * 20
     TAR_UMASK = 0o002
     out = bytearray()
+
+    def report(name: str) -> None:
+        if verbose:
+            _err(name)
 
     def emit_header(name: str, mode: int, size: int, typeflag: str, linkname: str = "") -> None:
         h = bytearray(512)
@@ -8700,22 +9787,37 @@ def _git_archive_tar(repo: Repository, tree: str, commit_sha: Optional[str], arc
             name = prefix + e.name
             mode = int(e.mode, 8)
             if e.is_dir():
+                report(name + "/")
                 emit_header(name + "/", (mode | 0o777) & ~TAR_UMASK, 0, "5")
                 walk(e.sha, name + "/")
             elif e.mode == "120000":
+                report(name)
                 _, target = objs.read_object(repo, e.sha)
-                emit_header(name, (mode | 0o777) & ~TAR_UMASK, 0, "2", target.decode("utf-8", "replace"))
+                # Symlinks are not umask'd: archive-tar.c does `mode |= 0777`.
+                emit_header(name, mode | 0o777, 0, "2", target.decode("utf-8", "replace"))
             elif e.is_gitlink():
-                continue
+                # C Git still reports gitlinks under --verbose (the verbose print
+                # in write_archive_entry precedes the type dispatch) with a
+                # trailing slash, and writes them as a directory entry before
+                # dropping the recursion.
+                report(name + "/")
+                emit_header(name + "/", (mode | 0o777) & ~TAR_UMASK, 0, "5")
             else:
+                report(name)
                 _, blob = objs.read_object(repo, e.sha)
                 base = 0o777 if (mode & 0o100) else 0o666
                 emit_header(name, (mode | base) & ~TAR_UMASK, len(blob), "0")
                 emit_content(blob)
 
     if prefix.endswith("/"):
-        # git emits a single directory entry for the whole prefix.
-        emit_header(prefix, (0o40000 | 0o777) & ~TAR_UMASK, 0, "5")
+        # git emits a single directory entry for the whole prefix; trailing
+        # slashes are collapsed to one for the entry name (archive.c).
+        plen = len(prefix)
+        while plen > 1 and prefix[plen - 2] == "/":
+            plen -= 1
+        pdir = prefix[:plen]
+        report(pdir)
+        emit_header(pdir, (0o40000 | 0o777) & ~TAR_UMASK, 0, "5")
     walk(tree, prefix)
     out.extend(b"\0" * 1024)  # end-of-archive trailer
     if len(out) % BLOCKSIZE:
@@ -8729,6 +9831,8 @@ def cmd_archive(argv: list[str]) -> int:
     ap.add_argument("-l", "--list", dest="list_formats", action="store_true")
     ap.add_argument("-o", "--output", default=None)
     ap.add_argument("--prefix", default="")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--mtime", default=None)
     ap.add_argument("rev", nargs="?")
     args = ap.parse_args(argv)
     if args.list_formats:
@@ -8755,8 +9859,24 @@ def cmd_archive(argv: list[str]) -> int:
     if archive_time is None:
         archive_time = 0
 
+    if args.mtime is not None:
+        # C Git: archive_time = approxidate(mtime_option). We implement the
+        # deterministic spellings byte-exact; relative / "now" forms resolve to
+        # the wall clock in C Git and are inherently non-reproducible, so we
+        # reject them rather than emit a value that cannot match the oracle.
+        parsed = objs._parse_date_env(args.mtime)
+        if parsed is not None:
+            archive_time = parsed[0]
+        else:
+            stripped = args.mtime.strip()
+            try:
+                archive_time = int(stripped)
+            except ValueError:
+                _err("fatal: unsupported --mtime value: %s" % args.mtime)
+                return 128
+
     if args.format == "tar":
-        blob = _git_archive_tar(repo, tree, commit_oid, archive_time, args.prefix)
+        blob = _git_archive_tar(repo, tree, commit_oid, archive_time, args.prefix, args.verbose)
         if args.output:
             Path(args.output).write_bytes(blob)
         else:
@@ -9161,6 +10281,7 @@ def cmd_update_index(argv: list[str]) -> int:
     ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("--index-info", dest="index_info", action="store_true")
     ap.add_argument("--show-index-version", dest="show_index_version", action="store_true")
+    ap.add_argument("-g", "--again", dest="again", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -9187,6 +10308,57 @@ def cmd_update_index(argv: list[str]) -> int:
                 e.set_stage(stage) if hasattr(e, "set_stage") else None
                 idx.upsert(e)
         write_index(repo, idx)
+        return 0
+    if args.again:
+        # -g/--again: re-run update on stage-0 entries whose index state already
+        # differs from HEAD (by mode or object id). Mirrors do_reupdate(): paths
+        # in conflict (stage != 0) and paths still identical to HEAD are skipped.
+        # A path whose worktree file has vanished is a fatal error and aborts the
+        # whole operation before the index is written (C git's update_one die()).
+        # The pathspec comes only from the command line — --again never reads
+        # stdin (its callback consumes the post-flag argv, not --stdin input).
+        _, head_sha = refs_mod.read_head(repo)
+        has_head = bool(head_sha)
+        head_map: dict[str, tuple[int, str]] = {}
+        if has_head:
+            try:
+                _t, _d = objs.read_object(repo, head_sha)
+                if _t == "commit":
+                    _tree = objs.parse_commit(_d).tree
+                    for hp, hm, hs in workdir.iter_tree_files(repo, _tree):
+                        head_map[hp] = (int(hm, 8), hs)
+            except KeyError:
+                has_head = False
+        prefixes = list(args.paths)
+
+        def _again_match(path: str) -> bool:
+            if not prefixes:
+                return True
+            for pre in prefixes:
+                if path == pre or path.startswith(pre.rstrip("/") + "/"):
+                    return True
+            return False
+
+        changed: list[str] = []
+        for entry in sorted(idx.entries, key=lambda e: (e.path, e.stage)):
+            if entry.stage != 0:
+                continue
+            if not _again_match(entry.path):
+                continue
+            old = head_map.get(entry.path) if has_head else None
+            if old is not None and old[0] == entry.mode and old[1] == entry.sha:
+                continue  # unchanged from HEAD
+            changed.append(entry.path)
+        # Validate all targets exist in the worktree before mutating the index,
+        # matching C git's behaviour of dying (no write) on the first missing one.
+        for path in changed:
+            full = repo.path / path
+            if not full.exists() and not full.is_symlink():
+                _err(f"error: {path}: does not exist and --remove not passed")
+                _err(f"fatal: Unable to process path {path}")
+                return 128
+        if changed:
+            workdir.add_paths(repo, changed, update_only=True)
         return 0
     # Gather target paths from the command line and/or stdin (-z → NUL).
     paths = list(args.paths)
@@ -11154,37 +12326,507 @@ def cmd_update_server_info(argv: list[str]) -> int:
     return 0
 
 
+_REPLACE_USAGE = (
+    "usage: git replace [-f] <object> <replacement>\n"
+    "   or: git replace [-f] --edit <object>\n"
+    "   or: git replace [-f] --graft <commit> [<parent>...]\n"
+    "   or: git replace [-f] --convert-graft-file\n"
+    "   or: git replace -d <object>...\n"
+    "   or: git replace [--format=<format>] [-l [<pattern>]]\n"
+    "\n"
+    "    -l, --list            list replace refs\n"
+    "    -d, --delete          delete replace refs\n"
+    "    -e, --edit            edit existing object\n"
+    "    -g, --graft           change a commit's parents\n"
+    "    --convert-graft-file  convert existing graft file\n"
+    "    -f, --[no-]force      replace the ref if it exists\n"
+    "    --[no-]raw            do not pretty-print contents for --edit\n"
+    "    --[no-]format <format>\n"
+    "                          use this format\n"
+)
+
+
+def _replace_usage_opt(msg: str) -> int:
+    sys.stderr.write(f"fatal: {msg}\n\n{_REPLACE_USAGE}\n")
+    return 129
+
+
 def cmd_replace(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit replace")
-    ap.add_argument("-d", "--delete", action="store_true")
-    ap.add_argument("-l", "--list", action="store_true")
-    ap.add_argument("orig", nargs="?")
-    ap.add_argument("replacement", nargs="?")
-    args = ap.parse_args(argv)
+    # Hand-rolled option parsing to match git's exact error formats. git's
+    # replace builtin always resolves the *real* objects (disable_replace_refs).
+    force = False
+    raw = False
+    fmt: Optional[str] = None
+    # cmdmode tracks the single selected mode; conflicting modes error like
+    # parse-options' OPT_CMDMODE: "options 'X' and 'Y' cannot be used together".
+    cmdmode: Optional[str] = None
+    mode_opt: dict[str, str] = {}  # mode -> option spelling that selected it
+    rest: list[str] = []
+
+    def set_mode(name: str, opt: str) -> Optional[int]:
+        nonlocal cmdmode
+        if cmdmode is not None and cmdmode != name:
+            sys.stderr.write(
+                f"error: options '{opt}' and '{mode_opt[cmdmode]}' "
+                "cannot be used together\n"
+            )
+            return 129
+        cmdmode = name
+        mode_opt[name] = opt
+        return None
+
+    i = 0
+    parsing = True
+    while i < len(argv):
+        a = argv[i]
+        if parsing and a == "--":
+            parsing = False
+            i += 1
+            continue
+        if parsing and a.startswith("-") and a != "-":
+            if a in ("-l", "--list"):
+                rc = set_mode("list", "-l" if a == "-l" else "--list")
+                if rc is not None:
+                    return rc
+            elif a in ("-d", "--delete"):
+                rc = set_mode("delete", "-d" if a == "-d" else "--delete")
+                if rc is not None:
+                    return rc
+            elif a in ("-e", "--edit"):
+                rc = set_mode("edit", "-e" if a == "-e" else "--edit")
+                if rc is not None:
+                    return rc
+            elif a in ("-g", "--graft"):
+                rc = set_mode("graft", "-g" if a == "-g" else "--graft")
+                if rc is not None:
+                    return rc
+            elif a == "--convert-graft-file":
+                rc = set_mode("convert", "--convert-graft-file")
+                if rc is not None:
+                    return rc
+            elif a in ("-f", "--force"):
+                force = True
+            elif a == "--no-force":
+                force = False
+            elif a == "--raw":
+                raw = True
+            elif a == "--no-raw":
+                raw = False
+            elif a == "--format":
+                if i + 1 >= len(argv):
+                    return _replace_usage_opt("option `format' requires a value")
+                fmt = argv[i + 1]
+                i += 1
+            elif a.startswith("--format="):
+                fmt = a[len("--format="):]
+            else:
+                sys.stderr.write(f"error: unknown switch `{a.lstrip('-')[0]}'\n"
+                                 if not a.startswith("--")
+                                 else f"error: unknown option `{a[2:]}'\n")
+                sys.stderr.write("\n" + _REPLACE_USAGE)
+                return 129
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+
+    if cmdmode is None:
+        cmdmode = "replace" if rest else "list"
+
+    if fmt is not None and cmdmode != "list":
+        return _replace_usage_opt("--format cannot be used when not listing")
+    if force and cmdmode not in ("replace", "edit", "graft", "convert"):
+        return _replace_usage_opt("-f only makes sense when writing a replacement")
+    if raw and cmdmode != "edit":
+        return _replace_usage_opt("--raw only makes sense with --edit")
+
     repo = _repo()
-    if args.list:
-        root = repo.gitdir / "refs" / "replace"
-        if root.exists():
-            for f in root.rglob("*"):
-                if f.is_file():
-                    _print(f.name)
-        return 0
-    if not args.orig:
-        return 1
-    orig = refs_mod.rev_parse(repo, args.orig)
-    if not orig:
+
+    if cmdmode == "edit":
+        # Requires an interactive editor; cannot be reproduced byte-exact.
+        sys.stderr.write("error: 'git replace --edit' is not supported\n")
         return 128
-    ref = f"refs/replace/{orig}"
-    if args.delete:
-        refs_mod.delete_ref(repo, ref)
-        return 0
-    if not args.replacement:
-        return 1
-    repl = refs_mod.rev_parse(repo, args.replacement)
-    if not repl:
-        return 128
-    refs_mod.update_ref(repo, ref, repl, message="replace")
+
+    if cmdmode == "list":
+        if len(rest) > 1:
+            return _replace_usage_opt("only one pattern can be given with -l")
+        return _replace_list(repo, rest[0] if rest else None, fmt)
+
+    if cmdmode == "delete":
+        if len(rest) < 1:
+            return _replace_usage_opt("-d needs at least one argument")
+        return _replace_delete(repo, rest)
+
+    if cmdmode == "replace":
+        if len(rest) != 2:
+            return _replace_usage_opt("bad number of arguments")
+        return _replace_object(repo, rest[0], rest[1], force)
+
+    if cmdmode == "graft":
+        if len(rest) < 1:
+            return _replace_usage_opt("-g needs at least one argument")
+        return _replace_create_graft(repo, rest, force, gentle=False, graft_state={})
+
+    if cmdmode == "convert":
+        if len(rest) != 0:
+            return _replace_usage_opt("--convert-graft-file takes no argument")
+        return 1 if _replace_convert_graft_file(repo, force) else 0
+
+    return 1
+
+
+def _replace_type(repo: Repository, sha: str) -> str:
+    return objs.read_object(repo, sha)[0]
+
+
+def _replace_list(repo: Repository, pattern: Optional[str], fmt: Optional[str]) -> int:
+    if fmt is None or fmt == "" or fmt == "short":
+        mode = "short"
+    elif fmt == "medium":
+        mode = "medium"
+    elif fmt == "long":
+        mode = "long"
+    else:
+        _err(f"error: invalid replace format '{fmt}'\n"
+             "valid formats are 'short', 'medium' and 'long'")
+        return 255
+    if pattern is None:
+        pattern = "*"
+    import fnmatch
+    # gather replace refs (loose + packed), keyed by the hex name suffix.
+    entries: dict[str, str] = {}
+    packed = refs_mod.read_packed_refs(repo)
+    for full, val in packed.items():
+        if full.startswith("refs/replace/"):
+            entries[full[len("refs/replace/"):]] = val
+    root = repo.gitdir / "refs" / "replace"
+    if root.exists():
+        for f in root.rglob("*"):
+            if f.is_file():
+                name = str(f.relative_to(root)).replace(os.sep, "/")
+                entries[name] = f.read_text(encoding="utf-8").strip()
+    for name in sorted(entries):
+        if not fnmatch.fnmatchcase(name, pattern):
+            continue
+        repl = entries[name]
+        if mode == "short":
+            _print(name)
+        elif mode == "medium":
+            _print(f"{name} -> {repl}")
+        else:
+            try:
+                obj_type = _replace_type(repo, name)
+            except (KeyError, ValueError):
+                _err(f"error: failed to resolve '{name}' as a valid ref")
+                return 255
+            repl_type = _replace_type(repo, repl)
+            _print(f"{name} ({obj_type}) -> {repl} ({repl_type})")
     return 0
+
+
+def _replace_delete_ref(repo: Repository, ref: str) -> None:
+    """Delete a ref that may live loose and/or in packed-refs."""
+    p = repo.gitdir / ref
+    if p.exists():
+        p.unlink()
+    ppath = repo.gitdir / "packed-refs"
+    if not ppath.exists():
+        return
+    lines = ppath.read_text(encoding="utf-8").splitlines()
+    if not any(line.partition(" ")[2] == ref for line in lines
+               if line and not line.startswith(("#", "^"))):
+        return
+    out: list[str] = []
+    skip_peel = False
+    for line in lines:
+        if line.startswith("^"):
+            if skip_peel:
+                skip_peel = False
+                continue
+            out.append(line)
+            continue
+        skip_peel = False
+        if line and not line.startswith("#") and line.partition(" ")[2] == ref:
+            skip_peel = True  # drop a following peel line, if any
+            continue
+        out.append(line)
+    ppath.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+
+
+def _replace_delete(repo: Repository, args: list[str]) -> int:
+    had_error = False
+    for spec in args:
+        oid = refs_mod.rev_parse(repo, spec)
+        if not oid:
+            _err(f"error: failed to resolve '{spec}' as a valid ref")
+            had_error = True
+            continue
+        ref = f"refs/replace/{oid}"
+        if refs_mod.read_ref(repo, ref) is None:
+            _err(f"error: replace ref '{oid}' not found")
+            had_error = True
+            continue
+        _replace_delete_ref(repo, ref)
+        _print(f"Deleted replace ref '{oid}'")
+    return 1 if had_error else 0
+
+
+def _replace_write_ref(repo: Repository, oid: str, repl: str, force: bool) -> int:
+    ref = f"refs/replace/{oid}"
+    if refs_mod.read_ref(repo, ref) is not None and not force:
+        _err(f"error: replace ref '{ref}' already exists")
+        return 255
+    refs_mod.update_ref(repo, ref, repl)
+    return 0
+
+
+def _replace_object(repo: Repository, object_ref: str, replace_ref: str, force: bool) -> int:
+    oid = refs_mod.rev_parse(repo, object_ref)
+    if not oid:
+        _err(f"error: failed to resolve '{object_ref}' as a valid ref")
+        return 255
+    repl = refs_mod.rev_parse(repo, replace_ref)
+    if not repl:
+        _err(f"error: failed to resolve '{replace_ref}' as a valid ref")
+        return 255
+    obj_type = _replace_type(repo, oid)
+    repl_type = _replace_type(repo, repl)
+    if not force and obj_type != repl_type:
+        _err("error: Objects must be of the same type.\n"
+             f"'{object_ref}' points to a replaced object of type '{obj_type}'\n"
+             f"while '{replace_ref}' points to a replacement object of "
+             f"type '{repl_type}'.")
+        return 255
+    return _replace_write_ref(repo, oid, repl, force)
+
+
+def _replace_could_not_read(repo: Repository, oid: str, wrote: Optional[list]) -> None:
+    """Once a replacement object has been written in this process, C git's object
+    lookup reports 'Could not read <oid>' for a syntactically valid but missing
+    full-length hex before the higher-level parse error. Mirror that ordering."""
+    if (wrote and wrote[0] and len(oid) == repo.hex_len
+            and all(c in "0123456789abcdef" for c in oid)
+            and not objs.object_exists(repo, oid)):
+        _err(f"error: Could not read {oid}")
+
+
+_GRAFT_DEPRECATED_HINT = (
+    "hint: Support for <GIT_DIR>/info/grafts is deprecated\n"
+    "hint: and will be removed in a future Git version.\n"
+    "hint:\n"
+    "hint: Please use \"git replace --convert-graft-file\"\n"
+    "hint: to convert the grafts into replace refs.\n"
+    "hint:\n"
+    "hint: Turn this message off by running\n"
+    "hint: \"git config set advice.graftFileDeprecated false\"\n"
+)
+
+
+def _replace_prepare_grafts(repo: Repository, state: Optional[dict]) -> None:
+    """Mirror C git's lazy prepare_commit_graft: the first time a commit is
+    parsed, the whole info/grafts file is read. If it exists, a deprecation
+    hint is shown (unless suppressed, e.g. by --convert-graft-file, or disabled
+    via advice.graftFileDeprecated), and every malformed line (a line whose
+    whitespace-separated tokens are not all full-length lowercase hex) emits
+    'error: bad graft data: <line>'. This happens exactly once."""
+    if state is None or state.get("prepared"):
+        return
+    state["prepared"] = True
+    graft_file = repo.gitdir / "info" / "grafts"
+    try:
+        text = graft_file.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return
+    if not state.get("suppress_hint"):
+        from . import gitconfig
+        advice = (gitconfig.get(repo, "advice.graftfiledeprecated") or "").lower()
+        if advice not in ("false", "0", "no", "off"):
+            sys.stderr.write(_GRAFT_DEPRECATED_HINT)
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip()
+        if not line or line[0] == "#":
+            continue
+        tokens = line.split()
+        ok = all(len(t) == repo.hex_len
+                 and all(c in "0123456789abcdef" for c in t) for t in tokens)
+        # parse_oid_hex also requires the separators between tokens to be a
+        # single space; any token failing full-hex parse triggers the error.
+        if not ok:
+            _err(f"error: bad graft data: {line}")
+
+
+def _replace_create_graft(repo: Repository, args: list[str], force: bool, gentle: bool,
+                          wrote: Optional[list] = None,
+                          graft_state: Optional[dict] = None) -> int:
+    old_ref = args[0]
+    old_oid = refs_mod.rev_parse(repo, old_ref)
+    if not old_oid:
+        _err(f"error: not a valid object name: '{old_ref}'")
+        return 255
+    # The commit parse below is what triggers C git's one-shot graft-table load.
+    _replace_prepare_grafts(repo, graft_state)
+    try:
+        obj_type, data = objs.read_object(repo, old_oid)
+    except (KeyError, ValueError):
+        _replace_could_not_read(repo, old_oid, wrote)
+        _err(f"error: could not parse {old_ref}")
+        return 255
+    if obj_type != "commit":
+        _err(f"error: object {old_oid} is a {obj_type}, not a commit")
+        _err(f"error: could not parse {old_ref}")
+        return 255
+
+    # Build new commit buffer: keep "tree" line, replace the parent block.
+    hexsz = repo.hex_len
+    # parents start after "tree <hex>\n" (5 + hexsz + 1)
+    parent_start = 5 + hexsz + 1
+    parent_end = parent_start
+    while data[parent_end:parent_end + 7] == b"parent ":
+        parent_end += 7 + hexsz + 1  # "parent " + hex + "\n"
+
+    new_parents = b""
+    for p in args[1:]:
+        poid = refs_mod.rev_parse(repo, p)
+        if not poid:
+            _err(f"error: not a valid object name: '{p}'")
+            return 255
+        try:
+            ptype = objs.read_object(repo, poid)[0]
+        except (KeyError, ValueError):
+            _replace_could_not_read(repo, poid, wrote)
+            _err(f"error: could not parse {p} as a commit")
+            return 255
+        if ptype != "commit":
+            _err(f"error: object {poid} is a {ptype}, not a commit")
+            _err(f"error: could not parse {p} as a commit")
+            return 255
+        new_parents += b"parent " + poid.encode() + b"\n"
+
+    buf = data[:parent_start] + new_parents + data[parent_end:]
+
+    # Drop any gpg signature (gpgsig header) -> warn.
+    buf, had_sig = _replace_remove_signature(buf, hexsz)
+    if had_sig:
+        _err(f"warning: the original commit '{old_ref}' has a gpg signature")
+        _err("warning: the signature will be removed in the replacement commit!")
+
+    # Mergetag check: a discarded mergetag whose tagged commit is not among the
+    # new parents is an error directing the user to --edit.
+    rc = _replace_check_mergetags(repo, data, args, hexsz)
+    if rc is not None:
+        return rc
+
+    new_oid = objs.write_object(repo, "commit", buf)
+    if wrote is not None:
+        wrote[0] = True
+
+    if new_oid == old_oid:
+        if gentle:
+            _err(f"warning: graft for '{old_oid}' unnecessary")
+            return 0
+        _err(f"error: new commit is the same as the old one: '{old_oid}'")
+        return 255
+
+    return _replace_write_ref(repo, old_oid, new_oid, force)
+
+
+def _replace_remove_signature(buf: bytes, hexsz: int) -> tuple[bytes, bool]:
+    """Strip a 'gpgsig' header (and continuation lines) from a commit buffer.
+    Returns (new_buf, had_signature)."""
+    # Header section ends at the first blank line.
+    sep = buf.find(b"\n\n")
+    header = buf if sep < 0 else buf[:sep]
+    body = b"" if sep < 0 else buf[sep:]
+    out_lines: list[bytes] = []
+    had = False
+    skipping = False
+    for line in header.split(b"\n"):
+        if skipping:
+            if line.startswith(b" "):
+                continue  # folded continuation of the signature
+            skipping = False
+        if line.startswith(b"gpgsig ") or line.startswith(b"gpgsig-sha256 "):
+            had = True
+            skipping = True
+            continue
+        out_lines.append(line)
+    return b"\n".join(out_lines) + body, had
+
+
+def _replace_check_mergetags(repo: Repository, data: bytes, args: list[str], hexsz: int) -> Optional[int]:
+    """Mirror builtin/replace.c check_mergetags: for each mergetag header in the
+    original commit, the tagged commit must be among the new parents."""
+    sep = data.find(b"\n\n")
+    header = data if sep < 0 else data[:sep]
+    lines = header.split(b"\n")
+    # Collect mergetag blocks (header line + folded continuation lines).
+    idx = 0
+    new_parent_oids: Optional[set[str]] = None
+    while idx < len(lines):
+        line = lines[idx]
+        if line.startswith(b"mergetag "):
+            block = [line[len(b"mergetag "):]]
+            idx += 1
+            while idx < len(lines) and lines[idx].startswith(b" "):
+                block.append(lines[idx][1:])
+                idx += 1
+            tag_payload = b"\n".join(block) + b"\n"
+            import hashlib
+            tag_oid = hashlib.sha1(
+                b"tag " + str(len(tag_payload)).encode() + b"\0" + tag_payload
+            ).hexdigest()
+            # Find the tagged object's oid from the tag payload.
+            tagged = None
+            for tl in tag_payload.split(b"\n"):
+                if tl.startswith(b"object "):
+                    tagged = tl[len(b"object "):].decode()
+                    break
+            if new_parent_oids is None:
+                new_parent_oids = set()
+                for p in args[1:]:
+                    poid = refs_mod.rev_parse(repo, p)
+                    if not poid:
+                        _err(f"error: not a valid object name: '{p}'")
+                        return 255
+                    new_parent_oids.add(poid)
+            if tagged not in new_parent_oids:
+                _err(f"error: original commit '{args[0]}' contains mergetag "
+                     f"'{tag_oid}' that is discarded; use --edit instead of --graft")
+                return 255
+        else:
+            idx += 1
+    return None
+
+
+def _replace_convert_graft_file(repo: Repository, force: bool) -> bool:
+    """Convert .git/info/grafts into replace refs. Returns True on error."""
+    graft_file = repo.gitdir / "info" / "grafts"
+    try:
+        text = graft_file.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return True
+    errs: list[str] = []
+    wrote = [False]
+    graft_state: dict = {"suppress_hint": True}
+    for raw_line in text.splitlines():
+        if raw_line.startswith("#"):
+            continue
+        parts = raw_line.split()
+        if not parts:
+            continue
+        rc = _replace_create_graft(repo, parts, force, gentle=True,
+                                   wrote=wrote, graft_state=graft_state)
+        if rc:
+            errs.append(raw_line)
+    if not errs:
+        try:
+            graft_file.unlink()
+        except FileNotFoundError:
+            pass
+        return False
+    _err("warning: could not convert the following graft(s):\n"
+         + "".join("\n\t" + e for e in errs))
+    return True
 
 
 def cmd_cherry(argv: list[str]) -> int:
@@ -11882,45 +13524,868 @@ def cmd_fast_import(argv: list[str]) -> int:
     return 0
 
 
-def cmd_interpret_trailers(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit interpret-trailers", add_help=False)
-    ap.add_argument("--trailer", action="append", default=[])
-    ap.add_argument("--only-trailers", dest="only_trailers", action="store_true")
-    ap.add_argument("--only-input", dest="only_input", action="store_true")
-    ap.add_argument("file", nargs="?")
-    args = ap.parse_args(argv)
-    text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
-    lines = text.splitlines()
-    # Find existing trailer block at end (consecutive lines matching "Key: value")
-    import re
-    trailer_re = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:\s")
-    start = len(lines)
-    while start > 0 and (lines[start - 1] == "" or trailer_re.match(lines[start - 1])):
-        if lines[start - 1] == "" and start - 1 > 0 and trailer_re.match(lines[start - 2]):
-            start -= 1
+_IT_USAGE = (
+    "usage: git interpret-trailers [--in-place] [--trim-empty]\n"
+    "                              [(--trailer (<key>|<key-alias>)[(=|:)<value>])...]\n"
+    "                              [--parse] [<file>...]\n"
+    "\n"
+    "    --[no-]in-place       edit files in place\n"
+    "    --[no-]trim-empty     trim empty trailers\n"
+    "    --[no-]where <placement>\n"
+    "                          where to place the new trailer\n"
+    "    --[no-]if-exists <action>\n"
+    "                          action if trailer already exists\n"
+    "    --[no-]if-missing <action>\n"
+    "                          action if trailer is missing\n"
+    "    --[no-]only-trailers  output only the trailers\n"
+    "    --[no-]only-input     do not apply trailer.<key-alias> configuration variables\n"
+    "    --[no-]unfold         reformat multiline trailer values as single-line values\n"
+    "    --parse               alias for --only-trailers --only-input --unfold\n"
+    "    --no-divider          do not treat \"---\" as the end of input\n"
+    "    --divider             opposite of --no-divider\n"
+    "    --[no-]trailer <trailer>\n"
+    "                          trailer(s) to add\n"
+    "\n"
+)
+
+# --- trailer placement / conflict-resolution enums (mirror trailer.h) -------
+_W_DEFAULT, _W_END, _W_AFTER, _W_BEFORE, _W_START = range(5)
+_E_DEFAULT, _E_ADD_IF_DIFF_NEIGHBOR, _E_ADD_IF_DIFF, _E_ADD, _E_REPLACE, _E_DO_NOTHING = range(6)
+_M_DEFAULT, _M_ADD, _M_DO_NOTHING = range(3)
+
+
+def _it_set_where(value):
+    table = {"after": _W_AFTER, "before": _W_BEFORE, "end": _W_END, "start": _W_START}
+    if value is None:
+        return _W_DEFAULT
+    return table.get(value.lower())
+
+
+def _it_set_if_exists(value):
+    table = {
+        "addifdifferent": _E_ADD_IF_DIFF,
+        "addifdifferentneighbor": _E_ADD_IF_DIFF_NEIGHBOR,
+        "add": _E_ADD,
+        "replace": _E_REPLACE,
+        "donothing": _E_DO_NOTHING,
+    }
+    if value is None:
+        return _E_DEFAULT
+    return table.get(value.lower())
+
+
+def _it_set_if_missing(value):
+    table = {"donothing": _M_DO_NOTHING, "add": _M_ADD}
+    if value is None:
+        return _M_DEFAULT
+    return table.get(value.lower())
+
+
+def _it_after_or_end(where):
+    return where == _W_AFTER or where == _W_END
+
+
+def _it_isspace(ch):
+    # C isspace under LC_ALL=C: space, \t, \n, \v, \f, \r
+    return ch in " \t\n\x0b\x0c\r"
+
+
+def _it_isalnum(ch):
+    return ("0" <= ch <= "9") or ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+
+
+def _it_token_len_without_separator(token):
+    n = len(token)
+    while n > 0 and not _it_isalnum(token[n - 1]):
+        n -= 1
+    return n
+
+
+def _it_last_non_space_char(s):
+    for i in range(len(s) - 1, -1, -1):
+        if not _it_isspace(s[i]):
+            return s[i]
+    return ""
+
+
+def _it_is_blank_line(s):
+    i = 0
+    while i < len(s) and s[i] != "\n" and _it_isspace(s[i]):
+        i += 1
+    return i >= len(s) or s[i] == "\n"
+
+
+def _it_rtrim(s):
+    n = len(s)
+    while n > 0 and _it_isspace(s[n - 1]):
+        n -= 1
+    return s[:n]
+
+
+def _it_trim(s):
+    n = len(s)
+    while n > 0 and _it_isspace(s[n - 1]):
+        n -= 1
+    s = s[:n]
+    i = 0
+    while i < len(s) and _it_isspace(s[i]):
+        i += 1
+    return s[i:]
+
+
+_IT_GENERATED_PREFIXES = ("Signed-off-by: ", "(cherry picked from commit ")
+
+
+class _ITConf:
+    __slots__ = ("name", "key", "command", "cmd", "where", "if_exists", "if_missing")
+
+    def __init__(self, name="", key=None, command=None, cmd=None,
+                 where=_W_END, if_exists=_E_ADD_IF_DIFF_NEIGHBOR, if_missing=_M_ADD):
+        self.name = name
+        self.key = key
+        self.command = command
+        self.cmd = cmd
+        self.where = where
+        self.if_exists = if_exists
+        self.if_missing = if_missing
+
+    def copy(self):
+        return _ITConf(self.name, self.key, self.command, self.cmd,
+                       self.where, self.if_exists, self.if_missing)
+
+
+class _ITTrailerItem:
+    __slots__ = ("token", "value")
+
+    def __init__(self, token, value):
+        self.token = token  # None if not a trailer line
+        self.value = value
+
+
+class _ITArgItem:
+    __slots__ = ("token", "value", "conf")
+
+    def __init__(self, token, value, conf):
+        self.token = token
+        self.value = value
+        self.conf = conf
+
+
+def _it_find_separator(line, separators):
+    whitespace_found = False
+    for idx, c in enumerate(line):
+        if c in separators:
+            return idx
+        if not whitespace_found and (_it_isalnum(c) or c == "-"):
             continue
-        if trailer_re.match(lines[start - 1]):
-            start -= 1
-        else:
-            break
-    head = lines[:start]
-    trailers = [l for l in lines[start:] if l.strip()]
-    # Add new trailers (skip duplicates exact match)
-    for t in args.trailer:
-        if t not in trailers:
-            trailers.append(t)
-    if args.only_trailers:
-        # --only-trailers prints just the trailer block.
-        for t in trailers:
-            _print(t)
+        if idx != 0 and (c == " " or c == "\t"):
+            whitespace_found = True
+            continue
+        break
+    return -1
+
+
+def _it_next_line_off(s, pos):
+    nl = s.find("\n", pos)
+    if nl == -1:
+        return len(s)
+    return nl + 1
+
+
+def _it_last_line(buf, length):
+    if length == 0:
+        return -1
+    if length == 1:
         return 0
-    out = "\n".join(head).rstrip("\n")
-    if out and trailers:
-        out += "\n\n"
-    if trailers:
-        out += "\n".join(trailers)
-    _print(out + ("\n" if not out.endswith("\n") else ""))
+    i = length - 2
+    while i >= 0:
+        if buf[i] == "\n":
+            return i + 1
+        i -= 1
     return 0
+
+
+def _it_wt_status_locate_end(s, length, comment):
+    pattern = "\n" + comment + " " + _IT_CUT_LINE
+    if s.startswith(pattern[1:]):
+        return 0
+    p = s.find(pattern)
+    if p != -1:
+        newlen = p + 1
+        if newlen < length:
+            return newlen
+    return length
+
+
+_IT_CUT_LINE = "------------------------ >8 ------------------------\n"
+
+
+def _it_ignored_log_message_bytes(buf, length, comment):
+    boc = 0
+    bol = 0
+    in_old_conflicts_block = False
+    cutoff = _it_wt_status_locate_end(buf, length, comment)
+    while bol < cutoff:
+        nl = buf.find("\n", bol)
+        if nl == -1 or nl >= length:
+            next_line = length
+        else:
+            next_line = nl + 1
+        if buf.startswith(comment, bol) or buf[bol] == "\n":
+            if not boc:
+                boc = bol
+        elif buf.startswith("Conflicts:\n", bol):
+            in_old_conflicts_block = True
+            if not boc:
+                boc = bol
+        elif in_old_conflicts_block and buf[bol] == "\t":
+            pass
+        elif boc:
+            boc = 0
+            in_old_conflicts_block = False
+        bol = next_line
+    return (length - boc) if boc else (length - cutoff)
+
+
+def _it_find_end_of_log_message(input_str, no_divider, comment):
+    end = len(input_str)
+    if not no_divider:
+        s = 0
+        while s < len(input_str):
+            if input_str.startswith("---", s):
+                v = s + 3
+                if v < len(input_str) and _it_isspace(input_str[v]):
+                    end = s
+                    break
+            s = _it_next_line_off(input_str, s)
+    return end - _it_ignored_log_message_bytes(input_str, end, comment)
+
+
+def _it_find_trailer_block_start(buf, length, conf_head, separators, comment):
+    only_spaces = True
+    recognized_prefix = False
+    trailer_lines = 0
+    non_trailer_lines = 0
+    possible_continuation_lines = 0
+
+    # The first paragraph is the title and cannot be trailers.
+    s = 0
+    while s < length:
+        if buf.startswith(comment, s) and s < length:
+            s = _it_next_line_off(buf, s)
+            continue
+        if _it_is_blank_line(buf[s:length]):
+            break
+        s = _it_next_line_off(buf, s)
+    end_of_title = s
+
+    l = _it_last_line(buf, length)
+    while l >= end_of_title:
+        bol = l
+        line = buf[bol:length]
+        if line.startswith(comment):
+            non_trailer_lines += possible_continuation_lines
+            possible_continuation_lines = 0
+            l = _it_last_line(buf, l)
+            continue
+        if _it_is_blank_line(line):
+            if only_spaces:
+                l = _it_last_line(buf, l)
+                continue
+            non_trailer_lines += possible_continuation_lines
+            if recognized_prefix and trailer_lines * 3 >= non_trailer_lines:
+                return _it_next_line_off(buf, bol)
+            elif trailer_lines and not non_trailer_lines:
+                return _it_next_line_off(buf, bol)
+            return length
+        only_spaces = False
+
+        matched_generated = False
+        for pfx in _IT_GENERATED_PREFIXES:
+            if line.startswith(pfx):
+                trailer_lines += 1
+                possible_continuation_lines = 0
+                recognized_prefix = True
+                matched_generated = True
+                break
+        if matched_generated:
+            l = _it_last_line(buf, l)
+            continue
+
+        separator_pos = _it_find_separator(line, separators)
+        if separator_pos >= 1 and not _it_isspace(line[0]):
+            trailer_lines += 1
+            possible_continuation_lines = 0
+            if not recognized_prefix:
+                for item in conf_head:
+                    if _it_token_matches_item(line, item, separator_pos):
+                        recognized_prefix = True
+                        break
+        elif _it_isspace(line[0]):
+            possible_continuation_lines += 1
+        else:
+            non_trailer_lines += 1
+            non_trailer_lines += possible_continuation_lines
+            possible_continuation_lines = 0
+        l = _it_last_line(buf, l)
+
+    return length
+
+
+def _it_token_matches_item(tok, item, tok_len):
+    if tok[:tok_len].lower() == item.conf.name[:tok_len].lower():
+        return True
+    if item.conf.key:
+        return tok[:tok_len].lower() == item.conf.key[:tok_len].lower()
+    return False
+
+
+def _it_token_from_item(item, tok):
+    if item.conf.key:
+        return item.conf.key
+    if tok is not None:
+        return tok
+    return item.conf.name
+
+
+def _it_parse_trailer(trailer, separator_pos, conf_head, separators, want_conf):
+    if separator_pos != -1:
+        tok = _it_trim(trailer[:separator_pos])
+        val = _it_trim(trailer[separator_pos + 1:])
+    else:
+        tok = _it_trim(trailer)
+        val = ""
+
+    conf = _IT_DEFAULT_CONF if want_conf else None
+    tok_len = _it_token_len_without_separator(tok)
+    for item in conf_head:
+        if _it_token_matches_item(tok, item, tok_len):
+            if want_conf:
+                conf = item.conf
+            tok = _it_token_from_item(item, tok)
+            break
+    return tok, val, conf
+
+
+def _it_unfold_value(val):
+    out = []
+    i = 0
+    n = len(val)
+    while i < n:
+        c = val[i]
+        i += 1
+        if c == "\n":
+            while i < n and _it_isspace(val[i]):
+                i += 1
+            out.append(" ")
+        else:
+            out.append(c)
+    return _it_trim("".join(out))
+
+
+# Default config + per-key config (populated from repo config when available).
+_IT_DEFAULT_CONF = _ITConf()
+_IT_CONF_HEAD = []
+_IT_SEPARATORS = ":"
+
+
+def _it_load_config():
+    """Read trailer.* / core.commentChar config (best-effort; no repo is fine)."""
+    global _IT_DEFAULT_CONF, _IT_CONF_HEAD, _IT_SEPARATORS
+    _IT_DEFAULT_CONF = _ITConf()
+    _IT_CONF_HEAD = []
+    _IT_SEPARATORS = ":"
+    comment = "#"
+    try:
+        repo = _repo()
+        cp = repo.config()
+    except Exception:
+        cp = None
+    if cp is None:
+        return comment
+    try:
+        if cp.has_section("core"):
+            cc = cp.get("core", "commentChar", fallback=None)
+            if cc is not None:
+                cc = _fmm_dequote_config(cc)
+            if cc and cc != "auto":
+                comment = cc
+    except Exception:
+        pass
+
+    def get_conf_item(name):
+        for it in _IT_CONF_HEAD:
+            if it.conf.name.lower() == name.lower():
+                return it
+        it = _ITArgItem(None, None, _IT_DEFAULT_CONF.copy())
+        it.conf.name = name
+        _IT_CONF_HEAD.append(it)
+        return it
+
+    types = {"key", "command", "cmd", "where", "ifexists", "ifmissing"}
+    try:
+        for sect, sub, key, val in _it_iter_config(cp):
+            if sect.lower() != "trailer":
+                continue
+            if val is not None:
+                val = _fmm_dequote_config(val)
+            if sub is None:
+                # trailer.<key> form
+                k = key.lower()
+                if k == "where":
+                    w = _it_set_where(val)
+                    if w is not None:
+                        _IT_DEFAULT_CONF.where = w
+                elif k == "ifexists":
+                    e = _it_set_if_exists(val)
+                    if e is not None:
+                        _IT_DEFAULT_CONF.if_exists = e
+                elif k == "ifmissing":
+                    m = _it_set_if_missing(val)
+                    if m is not None:
+                        _IT_DEFAULT_CONF.if_missing = m
+                elif k == "separators" and val is not None:
+                    _IT_SEPARATORS = val
+                continue
+            variable_name = key.lower()
+            if variable_name not in types:
+                continue
+            item = get_conf_item(sub)
+            conf = item.conf
+            if variable_name == "key" and val is not None:
+                conf.key = val
+            elif variable_name == "command" and val is not None:
+                conf.command = val
+            elif variable_name == "cmd" and val is not None:
+                conf.cmd = val
+            elif variable_name == "where":
+                w = _it_set_where(val)
+                if w is not None:
+                    conf.where = w
+            elif variable_name == "ifexists":
+                e = _it_set_if_exists(val)
+                if e is not None:
+                    conf.if_exists = e
+            elif variable_name == "ifmissing":
+                m = _it_set_if_missing(val)
+                if m is not None:
+                    conf.if_missing = m
+    except Exception:
+        pass
+    return comment
+
+
+def _it_iter_config(cp):
+    """Yield (section, subsection, key, value) for every config entry.
+
+    trailer.<x> -> ('trailer', None, 'x', v); trailer.<sub>.<x> ->
+    ('trailer', '<sub>', 'x', v). configparser flattens subsections into the
+    section name as 'trailer "sub"'.
+    """
+    for section in cp.sections():
+        if '"' in section:
+            base, rest = section.split('"', 1)
+            base = base.strip()
+            sub = rest.rsplit('"', 1)[0]
+        elif "." in section:
+            base, sub = section.split(".", 1)
+        else:
+            base, sub = section, None
+        for key, val in cp.items(section):
+            yield base, sub, key, val
+
+
+def _it_check_if_different(head, in_tok, arg, check_all):
+    where = arg.conf.where
+    idx = head.index(in_tok)
+    while True:
+        cur = head[idx]
+        if _it_same_trailer(cur, arg):
+            return False
+        nxt = idx - 1 if _it_after_or_end(where) else idx + 1
+        if nxt < 0 or nxt >= len(head):
+            break
+        idx = nxt
+        if not check_all:
+            break
+    return True
+
+
+def _it_same_token(a, b):
+    if a.token is None:
+        return False
+    a_len = _it_token_len_without_separator(a.token)
+    b_len = _it_token_len_without_separator(b.token)
+    min_len = b_len if a_len > b_len else a_len
+    return a.token[:min_len].lower() == b.token[:min_len].lower()
+
+
+def _it_same_trailer(a, b):
+    if not _it_same_token(a, b):
+        return False
+    return a.value.lower() == b.value.lower()
+
+
+def _it_format_trailers(opts, trailers, separators):
+    out = []
+    started = False
+    for item in trailers:
+        if item.token is not None:
+            if opts["trim_empty"] and len(item.value) == 0:
+                continue
+            out.append(item.token)
+            c = _it_last_non_space_char(item.token)
+            if c and c not in separators:
+                out.append(separators[0] + " ")
+            out.append(item.value)
+            out.append("\n")
+            started = True
+        elif not opts["only_trailers"]:
+            out.append(item.value)
+            out.append("\n")
+            started = True
+    return "".join(out), started
+
+
+def cmd_interpret_trailers(argv: list[str]) -> int:
+    # ---- parse_options-compatible argument scanning -----------------------
+    opts = {
+        "in_place": False, "trim_empty": False, "only_trailers": False,
+        "only_input": False, "unfold": False, "no_divider": False,
+    }
+    where = _W_DEFAULT
+    if_exists = _E_DEFAULT
+    if_missing = _M_DEFAULT
+    new_trailers = []  # list of (text, where, if_exists, if_missing)
+    files = []
+
+    def usage_err(msg=None):
+        if msg:
+            sys.stderr.write("error: %s\n" % msg)
+        sys.stderr.write(_IT_USAGE)
+
+    def fatal_usage(msg):
+        sys.stderr.write("fatal: %s\n\n" % msg)
+        sys.stderr.write(_IT_USAGE)
+
+    i = 0
+    n = len(argv)
+    saw_dashdash = False
+    while i < n:
+        a = argv[i]
+        if saw_dashdash:
+            files.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dashdash = True
+            i += 1
+            continue
+        if not a.startswith("-") or a == "-":
+            files.append(a)
+            i += 1
+            continue
+
+        # Split "--opt=value".
+        eq = None
+        name = a
+        if a.startswith("--") and "=" in a:
+            name, eq = a.split("=", 1)
+
+        def take_value():
+            nonlocal i, eq
+            if eq is not None:
+                v = eq
+                eq = None
+                return v
+            i += 1
+            if i >= n:
+                usage_err("option `%s' requires a value" % name[2:])
+                raise _ITExit(129)
+            return argv[i]
+
+        try:
+            if name in ("--in-place",):
+                opts["in_place"] = True
+            elif name in ("--no-in-place",):
+                opts["in_place"] = False
+            elif name == "--trim-empty":
+                opts["trim_empty"] = True
+            elif name == "--no-trim-empty":
+                opts["trim_empty"] = False
+            elif name == "--only-trailers":
+                opts["only_trailers"] = True
+            elif name == "--no-only-trailers":
+                opts["only_trailers"] = False
+            elif name == "--only-input":
+                opts["only_input"] = True
+            elif name == "--no-only-input":
+                opts["only_input"] = False
+            elif name == "--unfold":
+                opts["unfold"] = True
+            elif name == "--no-unfold":
+                opts["unfold"] = False
+            elif name == "--no-divider":
+                opts["no_divider"] = True
+            elif name == "--divider":
+                opts["no_divider"] = False
+            elif name == "--parse":
+                if eq is not None:
+                    usage_err("option `parse' takes no value")
+                    raise _ITExit(129)
+                opts["only_trailers"] = True
+                opts["only_input"] = True
+                opts["unfold"] = True
+            elif name == "--where":
+                w = _it_set_where(take_value())
+                if w is None:
+                    raise _ITExit(129)
+                where = w
+            elif name == "--no-where":
+                where = _W_DEFAULT
+            elif name == "--if-exists":
+                e = _it_set_if_exists(take_value())
+                if e is None:
+                    raise _ITExit(129)
+                if_exists = e
+            elif name == "--no-if-exists":
+                if_exists = _E_DEFAULT
+            elif name == "--if-missing":
+                m = _it_set_if_missing(take_value())
+                if m is None:
+                    raise _ITExit(129)
+                if_missing = m
+            elif name == "--no-if-missing":
+                if_missing = _M_DEFAULT
+            elif name == "--trailer":
+                new_trailers.append((take_value(), where, if_exists, if_missing))
+            elif name == "--no-trailer":
+                new_trailers = []
+            elif name in ("-h", "--help"):
+                sys.stdout.write(_IT_USAGE)
+                return 129
+            else:
+                opt_disp = name[2:] if name.startswith("--") else name[1:]
+                usage_err("unknown option `%s'" % opt_disp)
+                return 129
+        except _ITExit as ex:
+            return ex.code
+        i += 1
+
+    if opts["only_input"] and new_trailers:
+        fatal_usage("--trailer with --only-input does not make sense")
+        return 129
+
+    if not files and opts["in_place"]:
+        sys.stderr.write("fatal: no input file given for in-place editing\n")
+        return 128
+
+    comment = _it_load_config()
+    separators = _IT_SEPARATORS
+
+    # cl_separators = "=" + separators
+    cl_separators = "=" + separators
+
+    targets = files if files else [None]
+    for f in targets:
+        # ---- read + complete-line ----
+        if f is None:
+            data = sys.stdin.buffer.read()
+        else:
+            try:
+                with open(f, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                sys.stderr.write("fatal: could not read input file '%s'\n" % f)
+                return 128
+        text = data.decode("utf-8", "surrogateescape")
+        if text and not text.endswith("\n"):
+            text += "\n"
+
+        result = _it_process(opts, new_trailers, text, comment, separators,
+                             cl_separators)
+
+        if opts["in_place"]:
+            out_bytes = result.encode("utf-8", "surrogateescape")
+            with open(f, "wb") as fh:
+                fh.write(out_bytes)
+        else:
+            sys.stdout.buffer.write(result.encode("utf-8", "surrogateescape"))
+            sys.stdout.flush()
+    return 0
+
+
+class _ITExit(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def _it_process(opts, new_trailers, text, comment, separators, cl_separators):
+    # ---- parse trailer block ----
+    end_of_log = _it_find_end_of_log_message(text, opts["no_divider"], comment)
+    block_start = _it_find_trailer_block_start(
+        text, end_of_log, _IT_CONF_HEAD, separators, comment)
+
+    # strbuf_split_buf on text[block_start:end_of_log], keeping '\n'.
+    region = text[block_start:end_of_log]
+    raw_lines = []
+    pos = 0
+    rl = len(region)
+    while pos < rl:
+        nl = region.find("\n", pos)
+        if nl == -1:
+            raw_lines.append(region[pos:])
+            pos = rl
+        else:
+            raw_lines.append(region[pos:nl + 1])
+            pos = nl + 1
+
+    # join continuation lines (those starting with whitespace) onto previous
+    # line that itself looked like a trailer.
+    trailer_strings = []
+    last = None  # index into trailer_strings, or None
+    for ln in raw_lines:
+        if last is not None and ln and _it_isspace(ln[0]):
+            trailer_strings[last] = trailer_strings[last] + ln
+            continue
+        trailer_strings.append(ln)
+        idx = len(trailer_strings) - 1
+        last = idx if _it_find_separator(trailer_strings[idx], separators) >= 1 else None
+
+    # blank line before trailer block?
+    bl = _it_last_line(text, block_start)
+    blank_before = bl >= 0 and _it_is_blank_line(text[bl:block_start])
+
+    # ---- build trailer_objects (head) ----
+    head = []
+    for trailer in trailer_strings:
+        if trailer.startswith(comment):
+            continue
+        sep = _it_find_separator(trailer, separators)
+        if sep >= 1:
+            tok, val, _ = _it_parse_trailer(trailer, sep, _IT_CONF_HEAD,
+                                            separators, False)
+            if opts["unfold"]:
+                val = _it_unfold_value(val)
+            head.append(_ITTrailerItem(tok, val))
+        elif not opts["only_trailers"]:
+            val = trailer
+            if val.endswith("\n"):
+                val = val[:-1]
+            head.append(_ITTrailerItem(None, val))
+
+    out = []
+    # Print lines before the trailer block.
+    if not opts["only_trailers"]:
+        out.append(text[:block_start])
+    if not opts["only_trailers"] and not blank_before:
+        out.append("\n")
+
+    # ---- apply new trailers ----
+    if not opts["only_input"]:
+        arg_items = _it_build_arg_items(new_trailers, cl_separators, separators)
+        _it_process_lists(head, arg_items)
+
+    body, _ = _it_format_trailers(opts, head, separators)
+    out.append(body)
+
+    if not opts["only_trailers"]:
+        out.append(text[end_of_log:])
+
+    return "".join(out)
+
+
+def _it_build_arg_items(new_trailers, cl_separators, separators):
+    arg_items = []
+    for text, w, e, m in new_trailers:
+        sep = _it_find_separator(text, cl_separators)
+        if sep == 0:
+            sb = _it_trim(text)
+            sys.stderr.write("error: empty trailer token in trailer '%s'\n" % sb)
+            continue
+        tok, val, conf = _it_parse_trailer(text, sep, _IT_CONF_HEAD,
+                                           separators, True)
+        conf = conf.copy()
+        if w != _W_DEFAULT:
+            conf.where = w
+        if e != _E_DEFAULT:
+            conf.if_exists = e
+        if m != _M_DEFAULT:
+            conf.if_missing = m
+        arg_items.append(_ITArgItem(tok, val, conf))
+    return arg_items
+
+
+def _it_process_lists(head, arg_items):
+    for arg in arg_items:
+        applied = _it_find_same_and_apply(head, arg)
+        if not applied:
+            _it_apply_if_missing(head, arg)
+
+
+def _it_find_same_and_apply(head, arg):
+    where = arg.conf.where
+    middle = where == _W_AFTER or where == _W_BEFORE
+    backwards = _it_after_or_end(where)
+    if not head:
+        return False
+    start_tok = head[-1] if backwards else head[0]
+    order = range(len(head) - 1, -1, -1) if backwards else range(len(head))
+    for idx in order:
+        in_tok = head[idx]
+        if not _it_same_token(in_tok, arg):
+            continue
+        on_tok = in_tok if middle else start_tok
+        _it_apply_if_exists(head, in_tok, arg, on_tok)
+        return True
+    return False
+
+
+def _it_apply_if_exists(head, in_tok, arg, on_tok):
+    e = arg.conf.if_exists
+    if e == _E_DO_NOTHING:
+        return
+    if e == _E_REPLACE:
+        new_item = _ITTrailerItem(arg.token, arg.value)
+        _it_add_to_list(head, on_tok, arg, new_item)
+        if in_tok in head:
+            head.remove(in_tok)
+        return
+    if e == _E_ADD:
+        new_item = _ITTrailerItem(arg.token, arg.value)
+        _it_add_to_list(head, on_tok, arg, new_item)
+        return
+    if e == _E_ADD_IF_DIFF:
+        if _it_check_if_different(head, in_tok, arg, True):
+            new_item = _ITTrailerItem(arg.token, arg.value)
+            _it_add_to_list(head, on_tok, arg, new_item)
+        return
+    if e == _E_ADD_IF_DIFF_NEIGHBOR:
+        if _it_check_if_different(head, on_tok, arg, False):
+            new_item = _ITTrailerItem(arg.token, arg.value)
+            _it_add_to_list(head, on_tok, arg, new_item)
+        return
+
+
+def _it_add_to_list(head, on_tok, arg, new_item):
+    # list_add inserts AFTER on_tok; list_add_tail inserts BEFORE on_tok.
+    on_idx = head.index(on_tok)
+    if _it_after_or_end(arg.conf.where):
+        head.insert(on_idx + 1, new_item)
+    else:
+        head.insert(on_idx, new_item)
+
+
+def _it_apply_if_missing(head, arg):
+    m = arg.conf.if_missing
+    if m == _M_DO_NOTHING:
+        return
+    if m == _M_ADD:
+        new_item = _ITTrailerItem(arg.token, arg.value)
+        if _it_after_or_end(arg.conf.where):
+            head.append(new_item)
+        else:
+            head.insert(0, new_item)
 
 
 def cmd_verify_commit(argv: list[str]) -> int:
@@ -15276,20 +17741,259 @@ def cmd_upload_archive(argv: list[str]) -> int:
     return cmd_archive(["--format", "tar", "-o", "-", "HEAD"])
 
 
+_PACK_REDUNDANT_USAGE = (
+    "git pack-redundant [--verbose] [--alt-odb] (--all | <pack-filename>...)"
+)
+
+# 'git pack-redundant' is nominated for removal (Git 2.54). Without the
+# --i-still-use-this opt-in the command refuses to run. The message has no
+# replacement hint (hint == NULL), so only the generic block is printed.
+_PACK_REDUNDANT_DEPRECATION = (
+    "'git pack-redundant' is nominated for removal.\n"
+    "If you still use this command, here's what you can do:\n"
+    "\n"
+    "- read https://git-scm.com/docs/BreakingChanges.html\n"
+    "- check if anyone has discussed this on the mailing\n"
+    "  list and if they came up with something that can\n"
+    "  help you: https://lore.kernel.org/git/?q=git%20pack-redundant\n"
+    "- send an email to <git@vger.kernel.org> to let us\n"
+    "  know that you still use this command and were unable\n"
+    "  to determine a suitable replacement\n"
+    "\n"
+)
+
+
+def _pack_redundant_objdir(repo: Repository) -> str:
+    """Reproduce git's repo_get_object_directory() for path display.
+
+    git prints pack paths as ``<object-dir>/pack/pack-<hash>.<ext>``. The
+    object directory is ``$GIT_DIR/objects`` where ``$GIT_DIR`` is exactly what
+    setup discovered: the verbatim ``GIT_DIR`` env value when set, otherwise the
+    relative ``.git`` that discovery records after chdir-ing to the worktree
+    top-level.
+    """
+    env_git_dir = os.environ.get("GIT_DIR")
+    if env_git_dir:
+        return f"{env_git_dir}/objects"
+    cwd = Path(os.getcwd()).resolve()
+    if not repo.bare and cwd == repo.path:
+        return os.path.join(os.path.relpath(repo.gitdir, cwd), "objects")
+    return str(repo.gitdir / "objects")
+
+
 def cmd_pack_redundant(argv: list[str]) -> int:
-    """List redundant packs (subset of another). Trivial heuristic: same SHA set."""
-    ap = argparse.ArgumentParser(prog="pygit pack-redundant")
-    ap.add_argument("--all", action="store_true")
-    ap.parse_args(argv)
-    repo = _repo()
+    """List redundant packfiles (those whose objects are all covered by the
+    minimal byte-wise set of other packs). Plumbing; deprecated in Git 2.54."""
     from . import pack as _p
-    packs = list(_p._iter_packs(repo))
-    sets = [(pk.pack_path, set(pk.shas)) for pk in packs]
-    for i, (p, s) in enumerate(sets):
-        for j, (p2, s2) in enumerate(sets):
-            if i != j and s and s.issubset(s2) and s != s2:
-                _print(str(p))
+
+    # show_usage_if_asked: only when invoked as exactly `-h` or `--help-all`.
+    if argv == ["-h"] or argv == ["--help-all"]:
+        _print("usage: " + _PACK_REDUNDANT_USAGE)
+        return 129
+
+    load_all_packs = False
+    verbose = False
+    alt_odb = False
+    i_still_use_this = False
+    i = 0
+    n = len(argv)
+    positional: list[str] = []
+    while i < n:
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg == "--all":
+            load_all_packs = True
+        elif arg == "--verbose":
+            verbose = True
+        elif arg == "--alt-odb":
+            alt_odb = True
+        elif arg == "--i-still-use-this":
+            i_still_use_this = True
+        elif arg.startswith("-") and arg != "":
+            _err("usage: " + _PACK_REDUNDANT_USAGE)
+            return 129
+        else:
+            break
+        i += 1
+    # Everything from the first non-option onward is a pack-filename list.
+    positional = list(argv[i:])
+
+    repo = _repo()
+
+    if not i_still_use_this:
+        sys.stderr.write(_PACK_REDUNDANT_DEPRECATION)
+        _err("fatal: refusing to run without --i-still-use-this")
+        return 128
+
+    objdir = _pack_redundant_objdir(repo)
+
+    def _pack_display(pk, ext: str) -> str:
+        # pack_name / odb_pack_name are both <objdir>/pack/pack-<hash>.<ext>.
+        name = pk.pack_path.name  # pack-<hash>.pack
+        stem = name[:-len(".pack")] if name.endswith(".pack") else name
+        return f"{objdir}/pack/{stem}.{ext}"
+
+    # Build the local pack list in git's repo_for_each_pack order, reversed by
+    # pack_list_insert's prepend: that yields oldest-mtime-first.
+    all_local = list(_p._iter_packs(repo))
+    # repo_for_each_pack: local packs sorted by mtime descending (newest first);
+    # local_packs (after prepend) is the reverse => oldest first.
+    ordered = sorted(
+        all_local,
+        key=lambda pk: (pk.pack_path.stat().st_mtime_ns, pk.pack_path.name),
+    )
+
+    if load_all_packs:
+        local_packs = list(ordered)
+    else:
+        # Resolve each pack-filename to a known pack by substring match against
+        # the canonical pack path, in argument order (then prepend-reversed).
+        # add_pack_file: <40 chars => die; no substring match => die.
+        chosen: list = []
+        for fn in positional:
+            if len(fn) < 40:
+                _err(f"fatal: Bad pack filename: {fn}")
+                return 128
+            match = None
+            for pk in ordered:
+                if fn in str(pk.pack_path):
+                    match = pk
+                    break
+            if match is None:
+                _err(f"fatal: Filename {fn} not found in packed_git")
+                return 128
+            chosen.append(match)
+        # local_packs is built by prepending each add_pack result, reversing
+        # the add order.
+        local_packs = list(reversed(chosen))
+
+    if not local_packs:
+        _err("fatal: Zero packs found!")
+        return 128
+
+    # remaining_objects per pack (set of object ids in that pack).
+    remaining = {id(pk): set(pk.shas) for pk in local_packs}
+
+    # all_objects = union over local packs (alt-odb objects would be removed,
+    # but alternates are unsupported; see deferral note).
+    all_objects: set[str] = set()
+    for pk in local_packs:
+        all_objects |= remaining[id(pk)]
+
+    # Read object ids to ignore from stdin (one hex id per line). git always
+    # reads stdin unless it is a tty; tests/scripts pipe data or /dev/null.
+    ignore: set[str] = set()
+    if not sys.stdin.isatty():
+        hexsz = repo.hex_len
+        for line in sys.stdin:
+            # git's get_oid_hex reads exactly hexsz lowercase/uppercase hex
+            # chars from the start of the fgets buffer; anything trailing (the
+            # newline) is ignored. On failure it dies printing the raw buffer
+            # (which still contains the trailing newline), and die() then adds
+            # its own newline.
+            hexpart = line[:hexsz]
+            if len(hexpart) < hexsz or any(
+                c not in "0123456789abcdefABCDEF" for c in hexpart
+            ):
+                # die("Bad object ID on stdin: %s", buf): buf is the raw fgets
+                # line (with its own trailing newline, if any) and die() then
+                # appends exactly one newline of its own.
+                sys.stderr.write(f"fatal: Bad object ID on stdin: {line}\n")
+                return 128
+            ignore.add(hexpart.lower())
+    if ignore:
+        all_objects -= ignore
+        for pk in local_packs:
+            remaining[id(pk)] -= ignore
+
+    # cmp_local_packs: unique_objects per pack = objects in this pack not in any
+    # other local pack. With a single pack, unique_objects is empty.
+    unique: dict[int, set[str]] = {}
+    if len(local_packs) == 1:
+        unique[id(local_packs[0])] = set()
+    else:
+        for pk in local_packs:
+            others: set[str] = set()
+            for other in local_packs:
+                if other is pk:
+                    continue
+                others |= remaining[id(other)]
+            unique[id(pk)] = remaining[id(pk)] - others
+
+    # minimize(): unique packs (non-empty unique_objects) are mandatory; the
+    # rest are greedily covered by remaining_objects size.
+    unique_packs = [pk for pk in local_packs if unique[id(pk)]]
+    non_unique = [pk for pk in local_packs if not unique[id(pk)]]
+
+    # *min = unique (built via prepend => reversed relative to local_packs).
+    min_set = list(reversed(unique_packs))
+
+    missing = set(all_objects)
+    for pk in unique_packs:
+        missing -= remaining[id(pk)]
+
+    if missing:
+        unique_pack_objects = all_objects - missing
+        rem2 = {id(pk): remaining[id(pk)] - unique_pack_objects for pk in non_unique}
+        work = list(non_unique)
+        while work:
+            # sort: greatest remaining size first; git's stable sort keeps the
+            # existing relative order for ties.
+            work.sort(key=lambda pk: len(rem2[id(pk)]), reverse=True)
+            head = work[0]
+            if not rem2[id(head)]:
                 break
+            # prepend to min
+            min_set.insert(0, head)
+            for pk in work[1:]:
+                if rem2[id(pk)]:
+                    rem2[id(pk)] -= rem2[id(head)]
+            work = work[1:]
+
+    min_ids = {id(pk) for pk in min_set}
+    # red = pack_list_difference(local_packs, min): local_packs order, skipping
+    # packs already in min => oldest-mtime-first.
+    red = [pk for pk in local_packs if id(pk) not in min_ids]
+
+    if verbose:
+        # altodb_packs is empty (alternates unsupported); count is 0.
+        sys.stderr.write("There are 0 packs available in alt-odbs.\n")
+        sys.stderr.write("The smallest (bytewise) set of packs is:\n")
+        for pk in min_set:
+            sys.stderr.write(f"\t{_pack_display(pk, 'pack')}\n")
+        # duplicate objects within the min set (pairwise intersection sizes)
+        dup = 0
+        for a in range(len(min_set)):
+            for b in range(a + 1, len(min_set)):
+                dup += len(set(min_set[a].shas) & set(min_set[b].shas))
+        min_bytes = 0
+        for pk in min_set:
+            min_bytes += pk.pack_path.stat().st_size
+            min_bytes += pk.pack_path.with_suffix(".idx").stat().st_size
+        sys.stderr.write(
+            f"containing {dup} duplicate objects "
+            f"with a total size of {min_bytes // 1024}kb.\n"
+        )
+        sys.stderr.write(
+            f"A total of {len(all_objects)} unique objects were considered.\n"
+        )
+        sys.stderr.write("Redundant packs (with indexes):\n")
+
+    for pk in red:
+        _print(_pack_display(pk, "idx"))
+        _print(_pack_display(pk, "pack"))
+
+    if verbose:
+        red_bytes = 0
+        for pk in red:
+            red_bytes += pk.pack_path.stat().st_size
+            red_bytes += pk.pack_path.with_suffix(".idx").stat().st_size
+        sys.stderr.write(
+            f"{red_bytes // (1024 * 1024)}MB of redundant packs in total.\n"
+        )
+
     return 0
 
 

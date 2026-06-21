@@ -78,13 +78,24 @@ class Repository:
     # ---- init ----------------------------------------------------------
 
     @classmethod
-    def init(cls, path: os.PathLike | str, *, bare: bool = False, object_format: str = "sha1") -> "Repository":
+    def init(
+        cls,
+        path: os.PathLike | str,
+        *,
+        bare: bool = False,
+        object_format: str = "sha1",
+        gitdir_override: "os.PathLike | str | None" = None,
+        write_default_extras: bool = True,
+    ) -> "Repository":
         if object_format not in ("sha1", "sha256"):
             raise ValueError(f"unsupported object format {object_format}")
         path = Path(path).resolve()
         path.mkdir(parents=True, exist_ok=True)
-        gitdir = path if bare else (path / ".git")
-        gitdir.mkdir(exist_ok=True)
+        if gitdir_override is not None:
+            gitdir = Path(gitdir_override)
+        else:
+            gitdir = path if bare else (path / ".git")
+        gitdir.mkdir(parents=True, exist_ok=True)
         for sub in ("objects", "objects/info", "objects/pack", "refs", "refs/heads", "refs/tags"):
             (gitdir / sub).mkdir(parents=True, exist_ok=True)
         head = gitdir / "HEAD"
@@ -103,24 +114,31 @@ class Repository:
             if object_format != "sha1":
                 config += "[extensions]\n\tobjectformat = sha256\n"
             cfg.write_text(config, encoding="utf-8")
-        (gitdir / "description").write_text(
-            "Unnamed repository; edit this file 'description' to name the repository.\n",
-            encoding="utf-8",
-        )
-        (gitdir / "hooks").mkdir(exist_ok=True)
-        info = gitdir / "info"
-        info.mkdir(exist_ok=True)
-        exclude = info / "exclude"
-        if not exclude.exists():
-            exclude.write_text(
-                "# git ls-files --others --exclude-from=.git/info/exclude\n"
-                "# Lines that start with '#' are comments.\n"
-                "# For a project mostly in C, the following would be a good set of\n"
-                "# exclude patterns (uncomment them if you want to use them):\n"
-                "# *.[oa]\n"
-                "# *~\n",
-                encoding="utf-8",
-            )
+        if write_default_extras:
+            # C Git 2.54 produces description/hooks/info/exclude only from the
+            # template directory; pygit ships no compiled template, so it writes
+            # these stand-ins on a plain init. When a template is supplied the
+            # caller passes write_default_extras=False so the template's own
+            # files (or their absence) win, matching the oracle byte-for-byte.
+            if not (gitdir / "description").exists():
+                (gitdir / "description").write_text(
+                    "Unnamed repository; edit this file 'description' to name the repository.\n",
+                    encoding="utf-8",
+                )
+            (gitdir / "hooks").mkdir(exist_ok=True)
+            info = gitdir / "info"
+            info.mkdir(exist_ok=True)
+            exclude = info / "exclude"
+            if not exclude.exists():
+                exclude.write_text(
+                    "# git ls-files --others --exclude-from=.git/info/exclude\n"
+                    "# Lines that start with '#' are comments.\n"
+                    "# For a project mostly in C, the following would be a good set of\n"
+                    "# exclude patterns (uncomment them if you want to use them):\n"
+                    "# *.[oa]\n"
+                    "# *~\n",
+                    encoding="utf-8",
+                )
         return cls(path, gitdir=gitdir, bare=bare)
 
     # ---- config --------------------------------------------------------

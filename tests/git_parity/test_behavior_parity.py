@@ -2184,3 +2184,122 @@ def test_batch3_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch3_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# --- workflow batch 4: clean/interpret-trailers/replace/log+show/archive/init/switch/pack-redundant/update-index ---
+BATCH4_CASES = [
+    ('clean-q-suppresses-output', [('write','a.txt','a\n'),('write','b.log','b\n')], ['clean','-n','-q']),
+    ('clean-e-protects-pattern', [('write','a.txt','a\n'),('write','b.log','b\n')], ['clean','-n','-e','*.log']),
+    ('clean-exclude-eq', [('write','a.txt','a\n'),('write','b.log','b\n')], ['clean','-n','--exclude=*.log']),
+    ('clean-x-removes-ignored', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','a.txt','a\n'),('write','ignored.o','i\n')], ['clean','-n','-x']),
+    ('clean-x-with-e-still-protects', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','a.txt','a\n'),('write','b.log','b\n')], ['clean','-n','-x','-e','*.log']),
+    ('clean-X-only-ignored', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','a.txt','a\n'),('write','ignored.o','i\n')], ['clean','-n','-X']),
+    ('clean-X-e-adds-to-ignored', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','ignored.o','i\n'),('write','x.tmp','x\n')], ['clean','-n','-X','-e','*.tmp']),
+    ('clean-X-negation-unignores', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','keep.o','i\n')], ['clean','-n','-X','-e','!keep.o']),
+    ('clean-x-X-conflict', [('write','a.txt','a\n')], ['clean','-n','-x','-X']),
+    ('clean-require-force', [('write','a.txt','a\n')], ['clean']),
+    ('clean-unknown-option-usage', [('write','a.txt','a\n')], ['clean','-n','--bogus']),
+    ('clean-e-missing-value', [('write','a.txt','a\n')], ['clean','-n','-e']),
+    ('clean-dX-collapses-ignored-dir', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','build/o1.o','o\n'),('write','build/x.txt','t\n')], ['clean','-n','-d','-X']),
+    ('clean-d-mixed-dir-recurses', [('write','.gitignore','*.o\n'),['add','.gitignore'],['commit','-m','gi'],('write','sub/x.txt','x\n'),('write','sub/z.o','o\n')], ['clean','-n','-d']),
+    ('replace-list-empty', [('write','a.txt','hello\n'), ['add','a.txt'], ['commit','-m','first']], ['replace', '-l']),
+    ('replace-create-and-list-formats', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ['replace','HEAD~1','HEAD']], ['replace', '--format=long', '-l']),
+    ('replace-default-noargs-lists', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ['replace','HEAD~1','HEAD']], ['replace']),
+    ('replace-already-exists', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ['replace','HEAD~1','HEAD']], ['replace', 'HEAD~1', 'HEAD']),
+    ('replace-force-overwrite', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ('write','a.txt','3\n'), ['add','a.txt'], ['commit','-m','c3'], ['replace','HEAD~2','HEAD']], ['replace', '-f', 'HEAD~2', 'HEAD~1']),
+    ('replace-type-mismatch', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', 'HEAD', 'HEAD^{tree}']),
+    ('replace-delete', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ['replace','HEAD~1','HEAD']], ['replace', '-d', 'HEAD~1']),
+    ('replace-delete-not-found', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '-d', 'HEAD']),
+    ('replace-delete-no-args', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '-d']),
+    ('replace-graft-change-parent', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2'], ('write','a.txt','3\n'), ['add','a.txt'], ['commit','-m','c3']], ['replace', '--graft', 'HEAD~2', 'HEAD~1']),
+    ('replace-graft-unnecessary', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1'], ('write','a.txt','2\n'), ['add','a.txt'], ['commit','-m','c2']], ['replace', '--graft', 'HEAD', 'HEAD~1']),
+    ('replace-graft-bad-arg-count', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '--graft']),
+    ('replace-format-not-listing', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '--format=short', '-d', 'HEAD']),
+    ('replace-force-misuse', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '-f', '-l']),
+    ('replace-cmdmode-conflict', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '-d', '-l']),
+    ('replace-list-two-patterns', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '-l', 'a', 'b']),
+    ('replace-convert-graft-no-file', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '--convert-graft-file']),
+    ('replace-convert-graft-takes-no-arg', [('write','a.txt','1\n'), ['add','a.txt'], ['commit','-m','c1']], ['replace', '--convert-graft-file', 'foo']),
+    ('log-quiet-with-patch-shows-diff', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['log','-q','-p','-n1']),
+    ('log-quiet-patch-order-shows-diff', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['log','-p','-q','-n1']),
+    ('log-quiet-alone-noop', BASE + [('write','f.txt','x\n'), ['add','f.txt'], ['commit','-m','only']], ['log','-q','-n1']),
+    ('log-quiet-name-only-conflict', BASE + [('write','f.txt','x\n'), ['add','f.txt'], ['commit','-m','only']], ['log','-q','--name-only','-n1']),
+    ('log-quiet-stat-overrides-no-conflict', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['log','-q','--raw','--name-status','-n1']),
+    ('log-clear-decorations-noop', BASE + [('write','f.txt','x\n'), ['add','f.txt'], ['commit','-m','only'], ['tag','v1']], ['log','--clear-decorations','--decorate','--oneline','-n1']),
+    ('show-quiet-suppresses-diff', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['show','-q','HEAD']),
+    ('show-quiet-long-suppresses-diff', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['show','--quiet','HEAD']),
+    ('show-quiet-name-only-conflict', BASE + [('write','f.txt','x\n'), ['add','f.txt'], ['commit','-m','only']], ['show','-q','--name-only','HEAD']),
+    ('show-quiet-stat-overrides', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['show','-q','--stat','HEAD']),
+    ('show-clear-decorations-noop', BASE + [('write','f.txt','a\nb\nc\n'), ['add','f.txt'], ['commit','-m','first'], ('write','f.txt','a\nB\nc\n'), ['add','f.txt'], ['commit','-m','second']], ['show','--clear-decorations','-s','HEAD']),
+    ('archive-verbose-nested-stderr', [('write','a','x\n'),('write','d1/f1','x\n'),('write','d1/d2/f2','x\n'),('write','z/zz','x\n'),['add','-A'],['commit','-m','c']], ['archive','--format=tar','-v','HEAD']),
+    ('archive-verbose-prefix-dir-collapse', [('write','a','x\n'),('write','d1/f1','x\n'),['add','-A'],['commit','-m','c']], ['archive','--format=tar','-v','--prefix=p//','HEAD']),
+    ('archive-mtime-epoch', [('write','a','hello\n'),['add','-A'],['commit','-m','c']], ['archive','--format=tar','--mtime=@1234567890','HEAD']),
+    ('archive-mtime-iso-tz', [('write','a','hello\n'),['add','-A'],['commit','-m','c']], ['archive','--format=tar','--mtime=2005-04-07T22:13:13 +0200','HEAD']),
+    ('archive-symlink-mode-0777', [('write','a','hello\n'),['add','a'],['commit','-m','c'],['update-index','--add','--cacheinfo','120000,'+__import__('subprocess').run(['printf','a'],capture_output=True).stdout.decode(),'link']], ['archive','--format=tar','HEAD']),
+    ('init-shared-group', [], ['init', '-q', '--shared=group', 'r']),
+    ('init-shared-all', [], ['init', '-q', '--shared=all', 'r']),
+    ('init-shared-bare', [], ['init', '--shared', 'r']),
+    ('init-shared-octal', [], ['init', '-q', '--shared=0640', 'r']),
+    ('init-shared-umask-noop', [], ['init', '-q', '--shared=umask', 'r']),
+    ('init-shared-bad-filemode', [], ['init', '--shared=0400', 'r']),
+    ('init-shared-bad-bool', [], ['init', '--shared=bogus', 'r']),
+    ('init-separate-git-dir', [], ['init', '-q', '--separate-git-dir=realgit', 'wt']),
+    ('init-separate-git-dir-bare-conflict', [], ['init', '--bare', '--separate-git-dir=g', 'wt']),
+    ('init-template-missing', [], ['init', '-q', '--template=no_such_dir', 'r']),
+    ('init-template-custom', [('write', 'tmpl/description', 'CUSTOM DESC\n'), ('write', 'tmpl/info/exclude', 'custom\n'), ('write', 'tmpl/topfile', 'top\n')], ['init', '-q', '--template=tmpl', 'r']),
+    ('switch-detach-branch', BASE + [["branch", "other"]], ["switch", "-d", "other"]),
+    ('switch-detach-no-arg', BASE, ["switch", "-d"]),
+    ('switch-C-reset-existing', BASE + [["branch", "other"], ("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "second"]], ["switch", "-C", "other", "master"]),
+    ('switch-C-new', BASE, ["switch", "-C", "fresh"]),
+    ('switch-quiet-branch', BASE + [["branch", "other"]], ["switch", "-q", "other"]),
+    ('switch-two-refs-error', BASE + [["branch", "other"]], ["switch", "other", "master"]),
+    ('switch-no-arg-error', BASE, ["switch"]),
+    ('switch-invalid-ref-error', BASE, ["switch", "nope"]),
+    ('switch-nonbranch-needs-detach', BASE + [["branch", "other"], ["tag", "v1", "other"]], ["switch", "v1"]),
+    ('switch-detach-annotated-tag', BASE + [["branch", "other"], ["tag", "-a", "-m", "anno", "v1", "other"]], ["switch", "-d", "v1"]),
+    ('switch-c-already-exists', BASE + [["branch", "other"]], ["switch", "-c", "other"]),
+    ('switch-unknown-flag-usage', BASE, ["switch", "--bogus"]),
+    ('switch-c-requires-value', BASE, ["switch", "-c"]),
+    ('switch-detach-create-conflict', BASE, ["switch", "-c", "x", "-d"]),
+    ('switch-leave-detached-prev-head', BASE + [["branch", "other"], ("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "second"], ["switch", "-d", "other"]], ["switch", "master"]),
+    ('pack-redundant-h-stdout', [], ['pack-redundant', '-h']),
+    ('update-index-again-basic', [('write','a.txt','a\n'),('write','b.txt','b\n'),('write','c.txt','c\n'),['add','a.txt','b.txt','c.txt'],['commit','-qm','init'],['update-index','--cacheinfo','100644','0000000000000000000000000000000000000000','x'] and ['hash-object','-w','--stdin'],('write','a.txt','aworktree\n'),('write','b.txt','bmod\n')], ['update-index','--again']),
+    ('update-index-again-missing-aborts', [('write','a.txt','a\n'),('write','c.txt','c\n'),['add','a.txt','c.txt'],['commit','-qm','init'],('write','a.txt','aw\n'),('rm','c.txt')], ['update-index','--again']),
+    ('update-index-again-pathspec', [('write','a.txt','a\n'),('write','b.txt','b\n'),['add','a.txt','b.txt'],['commit','-qm','init'],('write','a.txt','aw\n'),('write','b.txt','bw\n')], ['update-index','--again','b.txt']),
+    ('update-index-again-noop-clean', [('write','a.txt','a\n'),['add','a.txt'],['commit','-qm','init']], ['update-index','--again']),
+    ('update-index-again-no-head', [('write','a.txt','a\n'),['add','a.txt'],('write','a.txt','aw\n')], ['update-index','--again']),
+]
+
+BATCH4_STDIN_CASES = [
+    ('interpret-trailers-add-after-signoff', [], ['interpret-trailers', '--trailer', 'Reviewed-by: B <b@x>'], 'subject\n\nbody line\n\nSigned-off-by: A <a@x>\n'),
+    ('interpret-trailers-parse-fold', [], ['interpret-trailers', '--parse'], 'subject\n\nReviewed-by: A\nFold: line1\n  cont\n'),
+    ('interpret-trailers-only-trailers-25pct', [], ['interpret-trailers', '--only-trailers'], 'subject\n\nSigned-off-by: A\nplain text\n'),
+    ('interpret-trailers-divider-default', [], ['interpret-trailers', '--trailer', 'Ack: me'], 'subject\n\nBody\n\nReviewed-by: A\n---\npatch\nFake: x\n'),
+    ('interpret-trailers-no-divider', [], ['interpret-trailers', '--no-divider', '--trailer', 'Ack: me'], 'subject\n\nBody\n\nReviewed-by: A\n---\npatch\nFake: x\n'),
+    ('interpret-trailers-if-exists-replace', [], ['interpret-trailers', '--if-exists', 'replace', '--trailer', 'Reviewed-by: B'], 'subject\n\nReviewed-by: A\n'),
+    ('interpret-trailers-if-exists-addifdifferent-dup', [], ['interpret-trailers', '--if-exists', 'addIfDifferent', '--trailer', 'Reviewed-by: A'], 'subject\n\nReviewed-by: A\nReviewed-by: B\n'),
+    ('interpret-trailers-where-start', [], ['interpret-trailers', '--where', 'start', '--trailer', 'Reviewed-by: C'], 'subject\n\nReviewed-by: A\nReviewed-by: B\n'),
+    ('interpret-trailers-trim-empty', [], ['interpret-trailers', '--trim-empty', '--trailer', 'Reviewed-by'], 'subject\n\nReviewed-by: A\n'),
+    ('interpret-trailers-only-input-trailer-error', [], ['interpret-trailers', '--only-input', '--trailer', 'C: d'], 'x\n\nA: b\n'),
+    ('interpret-trailers-empty-token', [], ['interpret-trailers', '--trailer', '=val'], 'x\n'),
+    ('interpret-trailers-in-place-no-file', [], ['interpret-trailers', '--in-place'], 'x\n'),
+    ('interpret-trailers-unknown-option', [], ['interpret-trailers', '--bogus'], 'x\n'),
+    ('interpret-trailers-no-trailing-newline', [], ['interpret-trailers', '--trailer', 'Ack: x'], 'subject\n\nReviewed-by: A'),
+    ('interpret-trailers-config-where-and-alias', [['init', '-q'], ['config', 'trailer.where', 'start'], ['config', 'trailer.sign.key', 'Signed-off-by']], ['interpret-trailers', '--trailer', 'sign: me'], 'subj\n\nReviewed-by: A\n'),
+    ('pack-redundant-gate-no-optin', [('write','a','a\n'), ['add','a'], ['commit','-m','a'], ['repack','-a','-d']], ['pack-redundant', '--all'], ''),
+    ('pack-redundant-unknown-flag', [('write','a','a\n'), ['add','a'], ['commit','-m','a'], ['repack','-a','-d']], ['pack-redundant', '--bogus', '--i-still-use-this'], ''),
+    ('pack-redundant-bad-filename-short', [('write','a','a\n'), ['add','a'], ['commit','-m','a'], ['repack','-a','-d']], ['pack-redundant', '--i-still-use-this', 'nope.pack'], ''),
+    ('pack-redundant-bad-oid-stdin', [('write','a','a\n'), ['add','a'], ['commit','-m','a'], ['repack','-a','-d'], ('write','b','b\n'), ['add','b'], ['commit','-m','b'], ['repack','-a']], ['pack-redundant', '--all', '--i-still-use-this'], 'notahexid\n'),
+]
+
+
+@pytest.mark.parametrize("case", BATCH4_CASES, ids=[c[0] for c in BATCH4_CASES])
+def test_batch4_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH4_STDIN_CASES, ids=[c[0] for c in BATCH4_STDIN_CASES])
+def test_batch4_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
