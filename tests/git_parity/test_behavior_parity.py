@@ -2048,3 +2048,90 @@ def test_fmt_merge_msg_parity(case, tmp_path: Path, git_254_oracle: str):
                               capture_output=True, text=True)
         results[tool] = (proc.returncode, proc.stdout, proc.stderr)
     assert results["pygit"] == results["oracle"]
+
+
+# --- workflow batch 2: column / describe / rev-list / checkout-index ---
+BATCH2_CASES = [
+    ('describe-dirty-clean', TAGGED, ["describe", "--dirty"]),
+    ('describe-dirty-modified', TAGGED + [("write", "a.txt", "alpha\nmore\nchanged\n")], ["describe", "--dirty"]),
+    ('describe-dirty-custom-mark', TAGGED + [("write", "a.txt", "alpha\nmore\nchanged\n")], ["describe", "--dirty=-mod"]),
+    ('describe-dirty-empty-mark', TAGGED + [("write", "a.txt", "alpha\nmore\nchanged\n")], ["describe", "--dirty="]),
+    ('describe-dirty-staged', TAGGED + [("write", "a.txt", "alpha\nmore\nstaged\n"), ["add", "-A"]], ["describe", "--dirty"]),
+    ('describe-dirty-untracked-only', TAGGED + [("write", "new.txt", "untracked\n")], ["describe", "--dirty"]),
+    ('describe-dirty-with-rev-error', TAGGED, ["describe", "--dirty", "HEAD"]),
+    ('describe-dirty-always-no-tags', BASE + [("write", "a.txt", "alpha-dirty\n")], ["describe", "--always", "--dirty"]),
+    ('rev-list-no-args-usage', BASE, ["rev-list"]),
+    ('rev-list-exclude-hidden-all', BASE + [("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "second"], ["checkout", "-b", "secret"], ("write", "s.txt", "sec\n"), ["add", "-A"], ["commit", "-m", "third"], ["checkout", "main"], ["config", "transfer.hideRefs", "refs/heads/secret"]], ["rev-list", "--exclude-hidden=fetch", "--all"]),
+    ('rev-list-exclude-hidden-negate', BASE + [("write", "a.txt", "alpha\nmore\n"), ["add", "-A"], ["commit", "-m", "second"], ["checkout", "-b", "secret"], ("write", "s.txt", "sec\n"), ["add", "-A"], ["commit", "-m", "third"], ["checkout", "main"], ["config", "transfer.hideRefs", "refs/heads"], ["config", "--add", "transfer.hideRefs", "!refs/heads/main"]], ["rev-list", "--exclude-hidden=fetch", "--all"]),
+    ('rev-list-exclude-hidden-bad-section', BASE, ["rev-list", "--exclude-hidden=bogus", "--all"]),
+    ('rev-list-exclude-hidden-twice', BASE, ["rev-list", "--exclude-hidden=fetch", "--exclude-hidden=receive", "--all"]),
+    ('rev-list-exclude-hidden-conflict-branches', REFSET, ["rev-list", "--exclude-hidden=fetch", "--branches"]),
+    ('rev-list-exclude-hidden-branches-first', REFSET, ["rev-list", "--branches", "--exclude-hidden=fetch"]),
+    ('rev-list-exclude-hidden-no-value', BASE, ["rev-list", "--exclude-hidden"]),
+    ('checkout-index-noop-explicit', BASE, ["checkout-index", "a.txt"]),
+    ('checkout-index-missing-creates', BASE + [("rm", "a.txt")], ["checkout-index", "a.txt"]),
+    ('checkout-index-no-create-skips-missing', BASE + [("rm", "a.txt")], ["checkout-index", "--no-create", "a.txt"]),
+    ('checkout-index-n-short-skips-missing', BASE + [("rm", "a.txt")], ["checkout-index", "-n", "-f", "a.txt"]),
+    ('checkout-index-create-overrides-no-create', BASE + [("rm", "a.txt")], ["checkout-index", "--no-create", "--create", "a.txt"]),
+    ('checkout-index-exists-modified-no-force', BASE + [("write", "a.txt", "modified\n")], ["checkout-index", "a.txt"]),
+    ('checkout-index-exists-modified-quiet', BASE + [("write", "a.txt", "modified\n")], ["checkout-index", "-q", "a.txt"]),
+    ('checkout-index-exists-modified-force', BASE + [("write", "a.txt", "modified\n")], ["checkout-index", "-f", "a.txt"]),
+    ('checkout-index-not-in-cache', BASE, ["checkout-index", "nope.txt"]),
+    ('checkout-index-not-in-cache-quiet', BASE, ["checkout-index", "-q", "nope.txt"]),
+    ('checkout-index-mix-all-explicit', BASE, ["checkout-index", "-a", "a.txt"]),
+    ('checkout-index-stage-out-of-range', BASE, ["checkout-index", "--stage=9", "a.txt"]),
+    ('checkout-index-stage-zero', BASE, ["checkout-index", "--stage=0", "a.txt"]),
+    ('checkout-index-stage-all-no-temp', BASE, ["checkout-index", "--stage=all", "--no-temp", "a.txt"]),
+    ('checkout-index-unknown-long', BASE, ["checkout-index", "--bogus", "a.txt"]),
+    ('checkout-index-unknown-short', BASE, ["checkout-index", "-Z", "a.txt"]),
+    ('checkout-index-stage-requires-value', BASE, ["checkout-index", "--stage"]),
+    ('checkout-index-ambiguous-abbrev', BASE, ["checkout-index", "--st", "a.txt"]),
+    ('checkout-index-help-short', BASE, ["checkout-index", "-h"]),
+    ('checkout-index-conflict-default-unmerged', [("write", "f", "base\n"), ["add", "f"], ["commit", "-m", "base"], ["checkout", "-b", "feat"], ("write", "f", "theirs\n"), ["add", "f"], ["commit", "-m", "t"], ["checkout", "main"], ("write", "f", "ours\n"), ["add", "f"], ["commit", "-m", "o"], ["merge", "feat"], ("rm", "f")], ["checkout-index", "f"]),
+    ('checkout-index-conflict-stage2', [("write", "f", "base\n"), ["add", "f"], ["commit", "-m", "base"], ["checkout", "-b", "feat"], ("write", "f", "theirs\n"), ["add", "f"], ["commit", "-m", "t"], ["checkout", "main"], ("write", "f", "ours\n"), ["add", "f"], ["commit", "-m", "o"], ["merge", "feat"], ("rm", "f")], ["checkout-index", "--stage=2", "f"]),
+    ('checkout-index-conflict-stage3-all', [("write", "f", "base\n"), ["add", "f"], ["commit", "-m", "base"], ["checkout", "-b", "feat"], ("write", "f", "theirs\n"), ["add", "f"], ["commit", "-m", "t"], ["checkout", "main"], ("write", "f", "ours\n"), ["add", "f"], ["commit", "-m", "o"], ["merge", "feat"], ("rm", "f")], ["checkout-index", "--stage=3", "-a"]),
+    ('checkout-index-conflict-stage-missing', [("write", "f", "base\n"), ["add", "f"], ["commit", "-m", "base"], ["checkout", "-b", "feat"], ("write", "f", "theirs\n"), ["add", "f"], ["commit", "-m", "t"], ["checkout", "main"], ("write", "f", "ours\n"), ["add", "f"], ["commit", "-m", "o"], ["merge", "feat"], ("rm", "f"), ("write", "g.txt", "x\n"), ["add", "g.txt"]], ["checkout-index", "--stage=2", "g.txt"]),
+]
+
+BATCH2_STDIN_CASES = [
+    ('column-rawmode-disabled', [], ["column", "--raw-mode=0"], 'alpha\nbeta\ngamma\n'),
+    ('column-rawmode-column', [], ["column", "--raw-mode=16", "--width=20"], 'alpha\nbeta\ngamma\ndelta\n'),
+    ('column-rawmode-row', [], ["column", "--raw-mode=17", "--width=20"], 'alpha\nbeta\ngamma\ndelta\n'),
+    ('column-rawmode-dense', [], ["column", "--raw-mode=144", "--width=20"], 'a\nbbbbbbbb\nc\nd\ne\nf\n'),
+    ('column-rawmode-1k-suffix', [], ["column", "--raw-mode=1k"], 'alpha\nbeta\n'),
+    ('column-rawmode-negative', [], ["column", "--raw-mode=-1"], 'alpha\n'),
+    ('column-rawmode-extra-arg', [], ["column", "--raw-mode=16", "zzz"], 'alpha\n'),
+    ('column-rawmode-indent-padding', [], ["column", "--raw-mode=16", "--indent=>>", "--padding=3"], 'a\nbb\nccc\n'),
+    ('rev-list-stdin-rev', TAGGED, ["rev-list", "--stdin"], 'HEAD\n'),
+    ('rev-list-stdin-exclude', MERGED, ["rev-list", "--stdin"], 'main\n^feat\n'),
+    ('rev-list-stdin-cmdline-mix', MERGED, ["rev-list", "--stdin", "main"], 'feat\n'),
+    ('rev-list-stdin-range', TAGGED, ["rev-list", "--stdin"], 'v1..HEAD\n'),
+    ('rev-list-stdin-pathspec', PATHHIST, ["rev-list", "--stdin"], 'HEAD\n--\na.txt\n'),
+    ('rev-list-stdin-not', MERGED, ["rev-list", "--stdin"], 'main\n--not\nfeat\n'),
+    ('rev-list-stdin-all', REFSET, ["rev-list", "--stdin"], '--all\n'),
+    ('rev-list-stdin-count', TAGGED, ["rev-list", "--stdin", "--count"], 'HEAD\n'),
+    ('rev-list-stdin-bad-option', BASE, ["rev-list", "--stdin"], '--bogus\n'),
+    ('rev-list-stdin-bad-rev', BASE, ["rev-list", "--stdin"], 'no-such-rev\n'),
+    ('rev-list-stdin-twice', BASE, ["rev-list", "--stdin", "--stdin"], 'HEAD\n'),
+    ('rev-list-stdin-self', BASE, ["rev-list", "--stdin"], '--stdin\n'),
+    ('rev-list-stdin-empty', BASE, ["rev-list", "--stdin"], ''),
+    ('rev-list-stdin-end-of-options', TAGGED, ["rev-list", "--stdin"], '--end-of-options\nHEAD\n'),
+    ('rev-list-stdin-blank-terminates', MERGED, ["rev-list", "--stdin"], 'main\n\nfeat\n'),
+    ('checkout-index-stdin-lf', BASE + [("rm", "a.txt")], ["checkout-index", "--stdin"], 'a.txt\n'),
+    ('checkout-index-stdin-z', BASE + [("rm", "a.txt"), ("rm", "b.txt")], ["checkout-index", "--stdin", "-z"], 'a.txt\x00b.txt\x00'),
+    ('checkout-index-stdin-quoted', [("write", "a b.txt", "hi\n"), ["add", "a b.txt"], ["commit", "-m", "x"], ("rm", "a b.txt")], ["checkout-index", "--stdin"], '"a b.txt"\n'),
+    ('checkout-index-stdin-z-no-unquote', [("write", "a b.txt", "hi\n"), ["add", "a b.txt"], ["commit", "-m", "x"], ("rm", "a b.txt")], ["checkout-index", "--stdin", "-z"], '"a b.txt"\x00'),
+    ('checkout-index-mix-stdin-explicit', BASE, ["checkout-index", "--stdin", "a.txt"], 'a.txt\n'),
+]
+
+
+@pytest.mark.parametrize("case", BATCH2_CASES, ids=[c[0] for c in BATCH2_CASES])
+def test_batch2_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH2_STDIN_CASES, ids=[c[0] for c in BATCH2_STDIN_CASES])
+def test_batch2_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)

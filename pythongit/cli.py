@@ -1184,6 +1184,85 @@ def _ls_files_format(repo: Repository, entry, fmt: str, abbrev: Optional[int]) -
     return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), fmt)
 
 
+_REV_LIST_USAGE = (
+    "usage: git rev-list [<options>] <commit>... [--] [<path>...]\n"
+    "\n"
+    "  limiting output:\n"
+    "    --max-count=<n>\n"
+    "    --max-age=<epoch>\n"
+    "    --min-age=<epoch>\n"
+    "    --sparse\n"
+    "    --no-merges\n"
+    "    --min-parents=<n>\n"
+    "    --no-min-parents\n"
+    "    --max-parents=<n>\n"
+    "    --no-max-parents\n"
+    "    --remove-empty\n"
+    "    --all\n"
+    "    --branches\n"
+    "    --tags\n"
+    "    --remotes\n"
+    "    --stdin\n"
+    "    --exclude-hidden=[fetch|receive|uploadpack]\n"
+    "    --quiet\n"
+    "  ordering output:\n"
+    "    --topo-order\n"
+    "    --date-order\n"
+    "    --reverse\n"
+    "  formatting output:\n"
+    "    --parents\n"
+    "    --children\n"
+    "    --objects | --objects-edge\n"
+    "    --disk-usage[=human]\n"
+    "    --unpacked\n"
+    "    --header | --pretty\n"
+    "    --[no-]object-names\n"
+    "    --abbrev=<n> | --no-abbrev\n"
+    "    --abbrev-commit\n"
+    "    --left-right\n"
+    "    --count\n"
+    "    -z\n"
+    "  special purpose:\n"
+    "    --bisect\n"
+    "    --bisect-vars\n"
+    "    --bisect-all\n"
+)
+
+
+def _hide_refs_patterns(repo, section: str) -> list[str]:
+    """Ordered ``transfer.hideRefs`` / ``<section>.hideRefs`` patterns.
+
+    Mirrors C Git's ``parse_hide_refs_config``: every matching config entry
+    (across files, in declared order) is appended; trailing ``/`` is stripped.
+    """
+    from . import gitconfig
+
+    keys = {"transfer.hiderefs", f"{section.lower()}.hiderefs"}
+    pats: list[str] = []
+    for full, value in gitconfig.list_all(repo):
+        if full in keys:
+            pats.append(value.rstrip("/"))
+    return pats
+
+
+def _ref_is_hidden(refname: str, patterns: list[str]) -> bool:
+    """C Git's ``ref_is_hidden``: last matching pattern wins; ``!`` un-hides.
+
+    Without ref namespaces, the stripped and full refname coincide, so a
+    leading ``^`` (match full refname) behaves the same as no prefix.
+    """
+    for match in reversed(patterns):
+        neg = False
+        if match.startswith("!"):
+            neg = True
+            match = match[1:]
+        if match.startswith("^"):
+            match = match[1:]
+        if refname == match or refname.startswith(match + "/"):
+            return not neg
+    return False
+
+
 def cmd_rev_list(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit rev-list", add_help=False)
     ap.add_argument("--count", action="store_true")
@@ -1233,6 +1312,8 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("--left-right", dest="left_right", action="store_true")
     ap.add_argument("--timestamp", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--exclude-hidden", dest="exclude_hidden", default=None)
     ap.add_argument("revs", nargs="*")
     # Split a trailing "-- <pathspec>..." off before argparse consumes the "--".
     rl_paths: list[str] = []
@@ -1241,6 +1322,55 @@ def cmd_rev_list(argv: list[str]) -> int:
         i = pre.index("--")
         rl_paths = pre[i + 1:]
         pre = pre[:i]
+    # `--exclude-hidden <section>` (separate token) is equivalent to the
+    # attached `--exclude-hidden=<section>` form; fold it so the value is not
+    # mistaken for a revision. A bare flag with no value is an error.
+    _norm: list[str] = []
+    _i = 0
+    while _i < len(pre):
+        t = pre[_i]
+        if t == "--exclude-hidden":
+            if _i + 1 >= len(pre):
+                _err("fatal: Option '--exclude-hidden' requires a value")
+                return 128
+            _norm.append(f"--exclude-hidden={pre[_i + 1]}")
+            _i += 2
+            continue
+        _norm.append(t)
+        _i += 1
+    pre = _norm
+    # `--exclude-hidden=<section>` excludes refs hidden by transfer/<section>
+    # hideRefs from the ref-namespace pseudo-opts. It is order-sensitive: C Git
+    # errors when it precedes --branches/--tags/--remotes, but each namespace op
+    # consumes (clears) the exclusion, so a preceding --all is fine. Walk the
+    # cleaned argv left-to-right to reproduce that exactly.
+    _apply_hidden_section: Optional[str] = None
+    _hidden_configured = False
+    _ns_clear = ("--all", "--branches", "--tags", "--remotes", "--glob")
+    for tok in pre:
+        head = tok.split("=", 1)[0]
+        if head == "--exclude-hidden":
+            section = tok.split("=", 1)[1] if "=" in tok else ""
+            if section not in ("fetch", "receive", "uploadpack"):
+                _err(f"fatal: unsupported section for hidden refs: {section}")
+                return 128
+            if _hidden_configured:
+                _err("fatal: --exclude-hidden= passed more than once")
+                return 128
+            _hidden_configured = True
+            _pending_section = section
+        elif _hidden_configured and head in ("--branches", "--tags", "--remotes"):
+            opt = head[2:]
+            sys.stderr.write(
+                f"error: options '--exclude-hidden' and '--{opt}' "
+                "cannot be used together\n")
+            sys.stderr.write(_REV_LIST_USAGE)
+            return 129
+        elif head in _ns_clear:
+            # This namespace op consumes (and clears) the pending exclusion.
+            if _hidden_configured:
+                _apply_hidden_section = _pending_section
+            _hidden_configured = False
     # argparse's nargs="?" greedily eats the following token, so a bare optional-
     # value flag like `--disk-usage HEAD` would swallow the revision. Rewrite the
     # bare forms to their attached "=<const>" so the next token stays a revision.
@@ -1273,12 +1403,16 @@ def cmd_rev_list(argv: list[str]) -> int:
     if args.all or args.remotes is not None:
         namespaces.append(("refs/remotes/", None if args.remotes in (None, "*") else args.remotes))
     have_ns = bool(namespaces)
+    hide_patterns = (_hide_refs_patterns(repo, _apply_hidden_section)
+                     if _apply_hidden_section is not None else [])
     if have_ns:
         import fnmatch
         for refname, _rsha in _enumerate_refs(repo):
             for pre_ns, pat in namespaces:
                 if refname.startswith(pre_ns):
                     if pat and not fnmatch.fnmatch(refname[len(pre_ns):], pat):
+                        continue
+                    if hide_patterns and _ref_is_hidden(refname, hide_patterns):
                         continue
                     csha = refs_mod.rev_parse(repo, refname + "^{commit}")
                     if csha:
@@ -1301,6 +1435,101 @@ def cmd_rev_list(argv: list[str]) -> int:
             if info:
                 st.extend(info[1])
         return seen_r
+
+    # --stdin: each input line is a revision argument (or, after a "--" line,
+    # a pathspec). Lines starting with "-" are pseudo-options; an unrecognized
+    # one is fatal, mirroring C Git's read_revisions_from_stdin. A revision that
+    # does not resolve is fatal here (unlike command-line args, which are lenient
+    # for back-compat). "--not" sticky-flips the include/exclude sense.
+    if pre.count("--stdin") > 1:
+        _err("fatal: --stdin given twice?")
+        return 128
+    if args.stdin:
+        not_flag = False
+        seen_eoo = False
+        seen_dd = False
+        _stdin_data = sys.stdin.read()
+        _stdin_lines = _stdin_data.split("\n")
+        # A trailing newline yields a final empty element that is not a record.
+        if _stdin_lines and _stdin_lines[-1] == "":
+            _stdin_lines.pop()
+        _li = 0
+        while _li < len(_stdin_lines):
+            raw = _stdin_lines[_li]
+            _li += 1
+            if raw == "":
+                break
+            line = raw
+            if line == "--":
+                seen_dd = True
+                break
+            if not seen_eoo and line.startswith("-"):
+                if line == "--end-of-options":
+                    seen_eoo = True
+                    continue
+                if line == "--not":
+                    not_flag = True
+                    continue
+                if line == "--all":
+                    for refname, _rs in _enumerate_refs(repo):
+                        if (refname.startswith("refs/heads/")
+                                or refname.startswith("refs/tags/")
+                                or refname.startswith("refs/remotes/")):
+                            csha = refs_mod.rev_parse(repo, refname + "^{commit}")
+                            if csha:
+                                (excludes if not_flag else starts).append(csha)
+                    _, hsha = refs_mod.read_head(repo)
+                    if hsha:
+                        (excludes if not_flag else starts).append(hsha)
+                    continue
+                if line in ("--branches", "--tags", "--remotes"):
+                    ns = {"--branches": "refs/heads/", "--tags": "refs/tags/",
+                          "--remotes": "refs/remotes/"}[line]
+                    for refname, _rs in _enumerate_refs(repo):
+                        if refname.startswith(ns):
+                            csha = refs_mod.rev_parse(repo, refname + "^{commit}")
+                            if csha:
+                                (excludes if not_flag else starts).append(csha)
+                    continue
+                _err(f"fatal: invalid option '{line}' in --stdin mode")
+                return 128
+            tok = line
+            neg = not_flag
+            if tok.startswith("^"):
+                tok = tok[1:]
+                neg = not neg
+            if "..." in tok:
+                a, _, b = tok.partition("...")
+                a_sha = refs_mod.rev_parse(repo, a or "HEAD")
+                b_sha = refs_mod.rev_parse(repo, b or "HEAD")
+                from . import merge as _m
+                if a_sha:
+                    starts.append(a_sha)
+                    lr_left |= _reach(a_sha)
+                if b_sha:
+                    starts.append(b_sha)
+                    lr_right |= _reach(b_sha)
+                if a_sha and b_sha:
+                    excludes.extend(_m.merge_bases(repo, a_sha, b_sha))
+                continue
+            if ".." in tok:
+                lo, _, hi = tok.partition("..")
+                hi_sha = refs_mod.rev_parse(repo, hi or "HEAD")
+                lo_sha = refs_mod.rev_parse(repo, lo) if lo else None
+                if hi_sha:
+                    starts.append(hi_sha)
+                if lo_sha:
+                    excludes.append(lo_sha)
+                continue
+            sha = refs_mod.rev_parse(repo, tok)
+            if not sha:
+                _err(f"fatal: bad revision '{line}'")
+                return 128
+            (excludes if neg else starts).append(sha)
+        if seen_dd:
+            while _li < len(_stdin_lines):
+                rl_paths.append(_stdin_lines[_li])
+                _li += 1
 
     for r in rev_args:
         if r.startswith("^"):
@@ -1335,7 +1564,13 @@ def cmd_rev_list(argv: list[str]) -> int:
         sha = refs_mod.rev_parse(repo, r)
         if sha:
             starts.append(sha)
-    if not starts and not have_ns:
+    if not starts and not have_ns and not args.stdin:
+        # No commits to walk and no rev input. C Git prints the full usage
+        # (rc 129) when no revision input was given at all; --stdin (even if it
+        # produced nothing) suppresses the error and yields empty output.
+        if not rev_args:
+            sys.stderr.write(_REV_LIST_USAGE)
+            return 129
         _err("usage: git rev-list [<options>] <commit>... [--] [<path>...]")
         return 128
 
@@ -6926,7 +7161,51 @@ def _describe_contains(repo: Repository, rev: str, sha: str) -> int:
     return 128
 
 
+def _describe_dirty(repo: Repository) -> bool:
+    """True when the working tree differs from HEAD, matching the semantics of
+    `git diff-index --quiet HEAD` (tracked content/mode changes, staged changes,
+    and deletions count; untracked files do not)."""
+    head = refs_mod.rev_parse(repo, "HEAD")
+    if not head:
+        return False
+    head_tree = _commit_tree(repo, head)
+    a_map = _tree_map_full(repo, head_tree)
+    from .index import read_index
+    idx = read_index(repo).by_path()
+    for p in set(a_map) | set(idx):
+        a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
+        b_present = p in idx
+        b_mode = idx[p].mode_str() if b_present else None
+        b_sha = idx[p].sha if b_present else None
+        b_dirty = False
+        if b_present:
+            wt = _side_from_worktree(repo, p)
+            if not wt.present:
+                b_present, b_mode, b_sha = False, None, None
+            else:
+                b_dirty = wt.sha != idx[p].sha or wt.mode != b_mode
+        if a.present and b_present and a.sha == b_sha and not b_dirty and a.mode == b_mode:
+            continue
+        if not a.present and not b_present:
+            continue
+        return True
+    return False
+
+
 def cmd_describe(argv: list[str]) -> int:
+    # --dirty takes an optional value only via "--dirty=<mark>" (a bare --dirty
+    # uses the default "-dirty"); unlike argparse's nargs="?", git never consumes
+    # the following token as the mark. Strip it out before argparse so a trailing
+    # commit-ish stays a positional.
+    dirty: Optional[str] = None
+    rest: list[str] = []
+    for tok in argv:
+        if tok == "--dirty":
+            dirty = "-dirty"
+        elif tok.startswith("--dirty="):
+            dirty = tok[len("--dirty="):]
+        else:
+            rest.append(tok)
     ap = argparse.ArgumentParser(prog="pygit describe", add_help=False)
     ap.add_argument("--tags", action="store_true")
     ap.add_argument("--all", action="store_true")
@@ -6935,9 +7214,18 @@ def cmd_describe(argv: list[str]) -> int:
     ap.add_argument("--long", action="store_true")
     ap.add_argument("--candidates", type=int, default=10)
     ap.add_argument("--abbrev", type=int, default=7)
-    ap.add_argument("rev", nargs="?", default="HEAD")
-    args = ap.parse_args(argv)
+    ap.add_argument("rev", nargs="?", default=None)
+    args = ap.parse_args(rest)
+    args.dirty = dirty
     repo = _repo()
+    if args.dirty is not None and args.rev is not None:
+        _err("fatal: option '--dirty' and commit-ishes cannot be used together")
+        return 128
+    suffix = ""
+    if args.dirty is not None and _describe_dirty(repo):
+        suffix = args.dirty
+    if args.rev is None:
+        args.rev = "HEAD"
     sha = refs_mod.rev_parse(repo, args.rev)
     if not sha:
         _err(f"fatal: Not a valid object name {args.rev}")
@@ -6991,12 +7279,12 @@ def cmd_describe(argv: list[str]) -> int:
             depth, tc, name = best
             ab = max(4, args.abbrev) if args.abbrev else 0
             if args.abbrev == 0 or (depth == 0 and not args.long):
-                _print(name)
+                _print(name + suffix)
             else:
-                _print(f"{name}-{depth}-g{sha[:ab]}")
+                _print(f"{name}-{depth}-g{sha[:ab]}{suffix}")
             return 0
         if args.always:
-            _print(sha[:max(4, args.abbrev)] if args.abbrev else sha[:7])
+            _print((sha[:max(4, args.abbrev)] if args.abbrev else sha[:7]) + suffix)
             return 0
         if any_tags:
             _err(f"fatal: No tags can describe '{sha}'.")
@@ -7054,14 +7342,14 @@ def cmd_describe(argv: list[str]) -> int:
         depth, tc, name = best
         ab = max(4, args.abbrev) if args.abbrev else 0
         if args.abbrev == 0:
-            _print(name)
+            _print(name + suffix)
         elif depth == 0 and not args.long:
-            _print(name)
+            _print(name + suffix)
         else:
-            _print(f"{name}-{depth}-g{sha[:ab]}")
+            _print(f"{name}-{depth}-g{sha[:ab]}{suffix}")
         return 0
     if args.always:
-        _print(sha[:max(4, args.abbrev)] if args.abbrev else sha[:7])
+        _print((sha[:max(4, args.abbrev)] if args.abbrev else sha[:7]) + suffix)
         return 0
     if not args.tags and (unann_commits & reach_sha):
         _err(f"fatal: No annotated tags can describe '{sha}'.")
@@ -11381,7 +11669,11 @@ def _rerere_auto_scan(repo: Repository) -> None:
 
 
 def _columnate(items: list[str], padding: int = 2) -> list[str]:
-    """Column-major layout (C Git's column.c default) into the terminal width."""
+    """Column-major layout (C Git's column.c default) into the terminal width.
+
+    Retained for ``git tag --column``; ``git column`` itself uses the faithful
+    port below.
+    """
     import shutil as _sh
     width = _sh.get_terminal_size((80, 24)).columns
     col_w = max(len(x) for x in items) + padding
@@ -11398,21 +11690,420 @@ def _columnate(items: list[str], padding: int = 2) -> list[str]:
     return out
 
 
-def cmd_column(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit column")
-    ap.add_argument("--mode", default="plain")
-    ap.add_argument("--padding", type=int, default=2)
-    args = ap.parse_args(argv)
-    items = [l for l in sys.stdin.read().splitlines() if l]
+# --- column layout: faithful port of C Git's column.c -----------------------
+
+_COL_LAYOUT_MASK = 0x000F
+_COL_ENABLE_MASK = 0x0030
+_COL_DENSE = 0x0080
+_COL_DISABLED = 0x0000
+_COL_ENABLED = 0x0010
+_COL_AUTO = 0x0020
+_COL_COLUMN = 0
+_COL_ROW = 1
+_COL_PLAIN = 15
+
+_COL_PARSE_OPTS = (
+    ("always", _COL_ENABLED, _COL_ENABLE_MASK),
+    ("never", _COL_DISABLED, _COL_ENABLE_MASK),
+    ("auto", _COL_AUTO, _COL_ENABLE_MASK),
+    ("plain", _COL_PLAIN, _COL_LAYOUT_MASK),
+    ("column", _COL_COLUMN, _COL_LAYOUT_MASK),
+    ("row", _COL_ROW, _COL_LAYOUT_MASK),
+    ("dense", _COL_DENSE, 0),
+)
+
+
+def _col_term_columns() -> int:
+    """Mirror C Git's term_columns(): $COLUMNS via atoi if >0, else ioctl on
+    fd 1, else 80."""
+    col_string = os.environ.get("COLUMNS")
+    if col_string is not None:
+        import re as _re
+        # atoi(): optional leading whitespace, optional sign, digits, stop at
+        # first non-digit.
+        m = _re.match(r"\s*([+-]?\d+)", col_string)
+        n_cols = int(m.group(1)) if m else 0
+        if n_cols > 0:
+            return n_cols
+    try:
+        ws = os.get_terminal_size(1)
+        if ws.columns:
+            return ws.columns
+    except Exception:
+        pass
+    return 80
+
+
+def _col_item_length(s: str) -> int:
+    """Display width of s (utf8_strnwidth equivalent)."""
+    import unicodedata
+    width = 0
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat in ("Mn", "Me", "Cf"):
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        width += 2 if eaw in ("W", "F") else 1
+    return width
+
+
+class _ColData:
+    __slots__ = ("items", "colopts", "indent", "nl", "padding", "width",
+                 "rows", "cols", "length", "widx")
+
+    def __init__(self, items, colopts, indent, nl, padding, width):
+        self.items = items
+        self.colopts = colopts
+        self.indent = indent
+        self.nl = nl
+        self.padding = padding
+        self.width = width
+        self.rows = 0
+        self.cols = 0
+        self.length = [_col_item_length(it) for it in items]
+        self.widx = []
+
+
+def _col_xy2linear(d: "_ColData", x: int, y: int) -> int:
+    if (d.colopts & _COL_LAYOUT_MASK) == _COL_COLUMN:
+        return x * d.rows + y
+    return y * d.cols + x
+
+
+def _col_layout(d: "_ColData") -> int:
+    initial_width = 0
+    for ln in d.length:
+        if initial_width < ln:
+            initial_width = ln
+    initial_width += d.padding
+    d.cols = (d.width - len(d.indent)) // initial_width
+    if d.cols == 0:
+        d.cols = 1
+    n = len(d.items)
+    d.rows = (n + d.cols - 1) // d.cols
+    return initial_width
+
+
+def _col_compute_column_width(d: "_ColData") -> None:
+    n = len(d.items)
+    for x in range(d.cols):
+        d.widx[x] = _col_xy2linear(d, x, 0)
+        for y in range(d.rows):
+            i = _col_xy2linear(d, x, y)
+            if i < n and d.length[d.widx[x]] < d.length[i]:
+                d.widx[x] = i
+
+
+def _col_shrink_columns(d: "_ColData") -> None:
+    n = len(d.items)
+    d.widx = [0] * d.cols
+    while d.rows > 1:
+        rows = d.rows
+        cols = d.cols
+        d.rows -= 1
+        d.cols = (n + d.rows - 1) // d.rows
+        if d.cols != cols:
+            d.widx = [0] * d.cols
+        _col_compute_column_width(d)
+        total_width = len(d.indent)
+        for x in range(d.cols):
+            total_width += d.length[d.widx[x]]
+            total_width += d.padding
+        if total_width > d.width:
+            d.rows = rows
+            d.cols = cols
+            break
+    _col_compute_column_width(d)
+
+
+def _col_display_cell(d: "_ColData", initial_width: int, empty_cell: str,
+                      x: int, y: int, out: list) -> bool:
+    n = len(d.items)
+    i = _col_xy2linear(d, x, y)
+    if i >= n:
+        return True
+    length = d.length[i]
+    if d.widx and d.length[d.widx[x]] < initial_width:
+        length += initial_width - d.length[d.widx[x]]
+        length -= d.padding
+    if (d.colopts & _COL_LAYOUT_MASK) == _COL_COLUMN:
+        newline = i + d.rows >= n
+    else:
+        newline = x == d.cols - 1 or i == n - 1
+    out.append((d.indent if x == 0 else "")
+               + d.items[i]
+               + (d.nl if newline else empty_cell[length:]))
+    return False
+
+
+def _col_display_table(d: "_ColData") -> None:
+    initial_width = _col_layout(d)
+    if d.colopts & _COL_DENSE:
+        _col_shrink_columns(d)
+    empty_cell = " " * initial_width
+    out: list = []
+    for y in range(d.rows):
+        for x in range(d.cols):
+            if _col_display_cell(d, initial_width, empty_cell, x, y, out):
+                break
+    sys.stdout.write("".join(out))
+
+
+def _col_display_plain(items, indent: str, nl: str) -> None:
+    sys.stdout.write("".join(indent + it + nl for it in items))
+
+
+def _col_print_columns(items, colopts: int, indent: str, nl: str,
+                       padding: int, width: int) -> None:
     if not items:
-        return 0
-    if args.mode == "plain":
-        # No columniation: emit the input lines unchanged.
-        for it in items:
-            _print(it)
-        return 0
-    for line in _columnate(items, args.padding):
-        _print(line)
+        return
+    nindent = indent if indent is not None else ""
+    nnl = nl if nl is not None else "\n"
+    npadding = padding
+    nwidth = width if width else (_col_term_columns() - 1)
+    if (colopts & _COL_ENABLE_MASK) != _COL_ENABLED:
+        _col_display_plain(items, "", "\n")
+        return
+    layout = colopts & _COL_LAYOUT_MASK
+    if layout == _COL_PLAIN:
+        _col_display_plain(items, nindent, nnl)
+    else:
+        d = _ColData(items, colopts, nindent, nnl, npadding, nwidth)
+        _col_display_table(d)
+
+
+def _col_parse_option(arg: str, colopts: int) -> tuple[int, bool, bool, bool]:
+    """Returns (colopts, ok, layout_set, enable_set)."""
+    for name, value, mask in _COL_PARSE_OPTS:
+        s = 1
+        arg_str = arg
+        if not mask:
+            if len(arg_str) > 2 and arg_str.startswith("no"):
+                arg_str = arg_str[2:]
+                s = 0
+        if arg_str != name:
+            continue
+        layout_set = enable_set = False
+        if mask == _COL_ENABLE_MASK:
+            enable_set = True
+        elif mask == _COL_LAYOUT_MASK:
+            layout_set = True
+        if mask:
+            colopts = (colopts & ~mask) | value
+        else:
+            if s:
+                colopts |= value
+            else:
+                colopts &= ~value
+        return colopts, True, layout_set, enable_set
+    return colopts, False, False, False
+
+
+def _col_parse_config(colopts: int, value: str) -> tuple[int, bool]:
+    """Returns (colopts, ok). Mirrors parse_config().
+
+    Raises _ColUsageError with git's "unsupported option" message on a bad
+    token.
+    """
+    sep = " ,"
+    group_set = 0
+    LAYOUT_SET, ENABLE_SET = 1, 2
+    i = 0
+    n = len(value)
+    while i < n:
+        # strcspn over separators
+        j = i
+        while j < n and value[j] not in sep:
+            j += 1
+        if j > i:
+            token = value[i:j]
+            colopts, ok, lset, eset = _col_parse_option(token, colopts)
+            if not ok:
+                raise _ColUsageError(
+                    129, "error: unsupported option '%s'" % token)
+            if lset:
+                group_set |= LAYOUT_SET
+            if eset:
+                group_set |= ENABLE_SET
+            i = j
+        # strspn over separators
+        while i < n and value[i] in sep:
+            i += 1
+    if (group_set & LAYOUT_SET) and not (group_set & ENABLE_SET):
+        colopts = (colopts & ~_COL_ENABLE_MASK) | _COL_ENABLED
+    return colopts, True
+
+
+def _col_parse_unsigned(name: str, raw: str) -> int:
+    """Mirror OPT_UNSIGNED: non-negative integer with optional k/m/g suffix."""
+    s = raw
+    mult = 1
+    if s and s[-1] in "kKmMgG":
+        suf = s[-1].lower()
+        mult = {"k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}[suf]
+        s = s[:-1]
+    if not s or not s.isdigit():
+        raise _ColUsageError(
+            129,
+            "error: option `%s' expects a non-negative integer value with an "
+            "optional k/m/g suffix" % name)
+    return int(s) * mult
+
+
+def _col_parse_int(name: str, raw: str) -> int:
+    """Mirror OPT_INTEGER: signed integer with optional k/m/g suffix."""
+    s = raw
+    mult = 1
+    if s and s[-1] in "kKmMgG":
+        suf = s[-1].lower()
+        mult = {"k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}[suf]
+        s = s[:-1]
+    neg = False
+    body = s
+    if body[:1] in ("+", "-"):
+        neg = body[0] == "-"
+        body = body[1:]
+    if not body or not body.isdigit():
+        raise _ColUsageError(
+            129,
+            "error: option `%s' expects an integer value with an optional "
+            "k/m/g suffix" % name)
+    v = int(body) * mult
+    return -v if neg else v
+
+
+_COL_USAGE = (
+    "usage: git column [<options>]\n"
+    "\n"
+    "    --[no-]command <name> lookup config vars\n"
+    "    --[no-]mode[=<style>] layout to use\n"
+    "    --raw-mode <n>        layout to use\n"
+    "    --[no-]width <n>      maximum width\n"
+    "    --[no-]indent <string>\n"
+    "                          padding space on left border\n"
+    "    --[no-]nl <string>    padding space on right border\n"
+    "    --[no-]padding <n>    padding space between columns\n"
+)
+
+
+class _ColUsageError(Exception):
+    def __init__(self, rc: int, msg: str | None = None, usage: bool = False,
+                 usage_stdout: bool = False):
+        self.rc = rc
+        self.msg = msg
+        self.usage = usage
+        self.usage_stdout = usage_stdout
+
+
+def cmd_column(argv: list[str]) -> int:
+    colopts = 0
+    width = 0
+    indent = None
+    nl = None
+    padding = 1
+    real_command = None
+    command = None
+
+    # --command must be the first argument (config lookup); we have no config
+    # to honor here, but enforce the placement rule like C Git.
+    if argv and argv[0].startswith("--command="):
+        command = argv[0][len("--command="):]
+
+    rest: list[str] = []
+    try:
+        i = 0
+        n = len(argv)
+
+        def take_value(tok: str, name: str) -> str:
+            nonlocal i
+            if "=" in tok:
+                return tok.split("=", 1)[1]
+            i += 1
+            if i >= n:
+                raise _ColUsageError(
+                    129, "error: option `%s' requires a value" % name)
+            return argv[i]
+
+        while i < n:
+            tok = argv[i]
+            if tok == "--":
+                i += 1
+                rest.extend(argv[i:])
+                break
+            if not tok.startswith("-") or tok == "-":
+                rest.append(tok)
+                i += 1
+                continue
+            name = tok[2:].split("=", 1)[0] if tok.startswith("--") else tok[1:]
+            if name == "command" or (tok.startswith("--command=")):
+                real_command = take_value(tok, "command")
+            elif name == "mode":
+                # OPT_COLUMN: optional argument (only via --mode=...).
+                if "=" in tok:
+                    val = tok.split("=", 1)[1]
+                    colopts, _ok = _col_parse_config(colopts, val)
+                else:
+                    # --mode == --column == always
+                    colopts &= ~_COL_ENABLE_MASK
+                    colopts |= _COL_ENABLED
+            elif name == "no-mode":
+                colopts &= ~_COL_ENABLE_MASK
+            elif name == "raw-mode":
+                colopts = _col_parse_unsigned("raw-mode", take_value(tok, "raw-mode"))
+            elif name == "width":
+                width = _col_parse_int("width", take_value(tok, "width"))
+            elif name == "indent":
+                indent = take_value(tok, "indent")
+            elif name == "nl":
+                nl = take_value(tok, "nl")
+            elif name == "padding":
+                padding = _col_parse_int("padding", take_value(tok, "padding"))
+            elif name == "h":
+                # -h prints usage to stdout (rc 129). --help would invoke the
+                # man page, which is out of scope here.
+                raise _ColUsageError(129, None, False, usage_stdout=True)
+            else:
+                raise _ColUsageError(
+                    129, "error: unknown option `%s'" % tok.lstrip("-").split("=", 1)[0],
+                    True)
+            i += 1
+    except _ColUsageError as exc:
+        if exc.msg is not None:
+            _err(exc.msg)
+        if exc.usage:
+            sys.stderr.write(_COL_USAGE + "\n")
+        if exc.usage_stdout:
+            sys.stdout.write(_COL_USAGE + "\n")
+        return exc.rc
+
+    if padding < 0:
+        _err("fatal: --padding must be non-negative")
+        return 128
+    if rest:
+        sys.stderr.write(_COL_USAGE + "\n")
+        return 129
+    if real_command or command:
+        if not real_command or not command or real_command != command:
+            _err("fatal: --command must be the first argument")
+            return 128
+
+    # finalize_colopts(&colopts, -1): AUTO -> resolve via isatty(1)/pager.
+    if (colopts & _COL_ENABLE_MASK) == _COL_AUTO:
+        colopts &= ~_COL_ENABLE_MASK
+        if sys.stdout.isatty():
+            colopts |= _COL_ENABLED
+
+    # strbuf_getline strips the trailing newline; trailing newline-less line
+    # is still kept. Read raw bytes to split on \n only (not \r etc).
+    data = sys.stdin.read()
+    if data == "":
+        items: list[str] = []
+    else:
+        items = data.split("\n")
+        if items and items[-1] == "":
+            items.pop()
+
+    _col_print_columns(items, colopts, indent, nl, padding, width)
     return 0
 
 
@@ -12292,28 +12983,511 @@ def _compute_patch_id(text: str) -> Optional[str]:
     return h.hexdigest() if patchlen else None
 
 
-def cmd_checkout_index(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit checkout-index")
-    ap.add_argument("-a", "--all", action="store_true")
-    ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("--prefix", default="")
-    ap.add_argument("paths", nargs="*")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    from .index import read_index
-    idx = read_index(repo)
-    targets = set(args.paths) if args.paths else None
-    if args.all:
-        targets = None
-    for e in idx.entries:
-        if targets is not None and e.path not in targets:
+_CHECKOUT_INDEX_USAGE = (
+    "usage: git checkout-index [<options>] [--] [<file>...]\n"
+    "\n"
+    "    -a, --[no-]all        check out all files in the index\n"
+    "    --[no-]ignore-skip-worktree-bits\n"
+    "                          do not skip files with skip-worktree set\n"
+    "    -f, --[no-]force      force overwrite of existing files\n"
+    "    -q, --[no-]quiet      no warning for existing files and files not in index\n"
+    "    -n, --no-create       don't checkout new files\n"
+    "    --create              opposite of --no-create\n"
+    "    -u, --[no-]index      update stat information in the index file\n"
+    "    -z                    paths are separated with NUL character\n"
+    "    --[no-]stdin          read list of paths from the standard input\n"
+    "    --[no-]temp           write the content to temporary files\n"
+    "    --[no-]prefix <string>\n"
+    "                          when creating files, prepend <string>\n"
+    "    --stage (1|2|3|all)   copy out the files from named stage\n"
+    "\n"
+)
+
+
+class _CheckoutIndexParseError(Exception):
+    """Signals a parse-options failure: print `message` (already complete),
+    then the usage block, and exit 129. If `message` is None, just usage."""
+
+    def __init__(self, message: Optional[str] = None, show_usage: bool = True,
+                 usage_stream: str = "stderr"):
+        super().__init__(message or "")
+        self.message = message
+        self.show_usage = show_usage
+        self.usage_stream = usage_stream
+
+
+class _CheckoutIndexDie(Exception):
+    """Signals a die(): print 'fatal: <message>' and exit 128."""
+
+
+# Long options: name -> (takes_value, allow_negation)
+_CI_LONG = {
+    "all": (False, True),
+    "ignore-skip-worktree-bits": (False, True),
+    "force": (False, True),
+    "quiet": (False, True),
+    "no-create": (False, False),
+    "create": (False, False),
+    "index": (False, True),
+    "stdin": (False, True),
+    "temp": (False, True),
+    "prefix": (True, True),
+    "stage": (True, False),
+}
+# Short options: letter -> (long-name-or-None, takes_value)
+_CI_SHORT = {
+    "a": ("all", False),
+    "f": ("force", False),
+    "q": ("quiet", False),
+    "n": ("no-create", False),
+    "u": ("index", False),
+    "z": (None, False),  # -z has no long form
+}
+
+
+def _ci_resolve_long(name: str):
+    """Resolve a (possibly abbreviated, possibly --no-) long option name to a
+    canonical (name, negated) pair, mirroring git's parse-options. Raises
+    _CheckoutIndexParseError on unknown/ambiguous names."""
+    negated = False
+    base = name
+    # Exact match wins before abbreviation/negation handling.
+    if base not in _CI_LONG and base.startswith("no-"):
+        stripped = base[3:]
+        if stripped in _CI_LONG and _CI_LONG[stripped][1]:
+            return stripped, True
+    if base in _CI_LONG:
+        return base, False
+    # Abbreviation: collect unique prefix matches over both the option names
+    # and their negated ("no-<name>") forms.
+    candidates: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for opt, (_, can_neg) in _CI_LONG.items():
+        if opt.startswith(base):
+            key = "--" + opt
+            if key not in seen:
+                seen.add(key)
+                candidates.append((opt, False))
+        if can_neg:
+            neg = "no-" + opt
+            if neg.startswith(base):
+                key = "--" + neg
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((opt, True))
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        disp = " or ".join(
+            "--" + ("no-" if neg else "") + opt for opt, neg in candidates
+        )
+        raise _CheckoutIndexParseError(
+            f"error: ambiguous option: {base} (could be {disp})",
+            usage_stream="stdout",
+        )
+    raise _CheckoutIndexParseError(f"error: unknown option `{name}'")
+
+
+def _ci_parse(argv: list[str]) -> dict:
+    """Faithful subset of parse_options for checkout-index. Returns a dict of
+    parsed values, or raises _CheckoutIndexParseError / _CheckoutIndexDie."""
+    opts = {
+        "all": False, "ignore-skip-worktree-bits": False, "force": False,
+        "quiet": False, "not_new": False, "index": False, "z": False,
+        "stdin": False, "temp": None, "prefix": None, "stage": 0,
+    }
+    paths: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            paths.extend(argv[i + 1:])
+            break
+        if a.startswith("--") and len(a) > 2:
+            body = a[2:]
+            eq = body.find("=")
+            inline = None
+            if eq >= 0:
+                name, inline = body[:eq], body[eq + 1:]
+            else:
+                name = body
+            canon, negated = _ci_resolve_long(name)
+            takes_value = _CI_LONG[canon][0]
+            if canon == "create":
+                opts["not_new"] = False
+                i += 1
+                continue
+            if canon == "no-create":
+                opts["not_new"] = not negated
+                i += 1
+                continue
+            if takes_value:
+                if inline is not None:
+                    val = inline
+                    i += 1
+                else:
+                    if i + 1 >= n:
+                        raise _CheckoutIndexParseError(
+                            f"error: option `{canon}' requires a value",
+                            show_usage=False,
+                        )
+                    val = argv[i + 1]
+                    i += 2
+                if canon == "prefix":
+                    opts["prefix"] = "" if negated else val
+                elif canon == "stage":
+                    if val == "all":
+                        opts["stage"] = 4
+                    elif len(val) == 1 and "1" <= val <= "3":
+                        opts["stage"] = int(val)
+                    else:
+                        raise _CheckoutIndexDie(
+                            "stage should be between 1 and 3 or all"
+                        )
+                continue
+            # boolean long option
+            if inline is not None:
+                raise _CheckoutIndexParseError(
+                    f"error: option `{canon}' takes no value"
+                )
+            value = not negated
+            if canon == "all":
+                opts["all"] = value
+            elif canon == "ignore-skip-worktree-bits":
+                opts["ignore-skip-worktree-bits"] = value
+            elif canon == "force":
+                opts["force"] = value
+            elif canon == "quiet":
+                opts["quiet"] = value
+            elif canon == "index":
+                opts["index"] = value
+            elif canon == "stdin":
+                opts["stdin"] = value
+            elif canon == "temp":
+                opts["temp"] = value
+            i += 1
             continue
-        out = repo.path / (args.prefix + e.path)
-        if out.exists() and not args.force:
+        # A bare "-" or any non-option token is a pathspec.
+        if a == "-" or not a.startswith("-"):
+            paths.append(a)
+            i += 1
             continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        _, data = objs.read_object(repo, e.sha)
+        if len(a) >= 2 and not a.startswith("--"):
+            # short option cluster, e.g. -afq
+            j = 1
+            while j < len(a):
+                ch = a[j]
+                if ch not in _CI_SHORT:
+                    raise _CheckoutIndexParseError(
+                        f"error: unknown switch `{ch}'"
+                    )
+                canon, takes_value = _CI_SHORT[ch]
+                if canon == "all":
+                    opts["all"] = True
+                elif canon == "force":
+                    opts["force"] = True
+                elif canon == "quiet":
+                    opts["quiet"] = True
+                elif canon == "no-create":
+                    opts["not_new"] = True
+                elif canon == "index":
+                    opts["index"] = True
+                elif canon is None:  # -z
+                    opts["z"] = True
+                j += 1
+            i += 1
+            continue
+        paths.append(a)
+        i += 1
+    return {"opts": opts, "paths": paths}
+
+
+def _ci_lstat_entry(full: Path):
+    """Build a stat snapshot comparable to a stored index entry, using the
+    same field derivation as index.stat_to_entry. Returns None if the path
+    does not exist (ENOENT-equivalent)."""
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return None
+    return st
+
+
+def _ci_changed(repo: Repository, e, st) -> bool:
+    """Replicate ie_match_stat(CE_MATCH_IGNORE_VALID|IGNORE_SKIP_WORKTREE):
+    is the worktree file `st` different from index entry `e`? Returns True if
+    the existing file must be overwritten (and thus needs --force)."""
+    import stat as _stat
+    from .index import stat_to_entry as _ste
+    # intent-to-add: always changed.
+    if e.intent_to_add:
+        return True
+    mode = e.mode
+    fmt = mode & 0o170000
+    # ce_match_stat_basic: type/mode comparison.
+    if fmt == 0o100000:  # regular file
+        if not _stat.S_ISREG(st.st_mode):
+            return True
+        # only owner-x bit considered (trust_executable_bit).
+        if (0o100 & (mode ^ st.st_mode)):
+            return True
+    elif fmt == 0o120000:  # symlink
+        if not _stat.S_ISLNK(st.st_mode) and not _stat.S_ISREG(st.st_mode):
+            return True
+    # match_stat_data: compare stored stat fields against a fresh snapshot
+    # derived identically (mtime s+ns, ctime s+ns, uid, gid, ino, dev, size).
+    fresh = _ste(e.path, st, e.sha, e.mode)
+    if (e.mtime_s & 0xFFFFFFFF) != (fresh.mtime_s & 0xFFFFFFFF):
+        return True
+    if (e.mtime_n & 0xFFFFFFFF) != (fresh.mtime_n & 0xFFFFFFFF):
+        return True
+    if (e.ctime_s & 0xFFFFFFFF) != (fresh.ctime_s & 0xFFFFFFFF):
+        return True
+    if (e.ctime_n & 0xFFFFFFFF) != (fresh.ctime_n & 0xFFFFFFFF):
+        return True
+    if (e.uid & 0xFFFFFFFF) != (fresh.uid & 0xFFFFFFFF):
+        return True
+    if (e.gid & 0xFFFFFFFF) != (fresh.gid & 0xFFFFFFFF):
+        return True
+    if (e.ino & 0xFFFFFFFF) != (fresh.ino & 0xFFFFFFFF):
+        return True
+    if (e.dev & 0xFFFFFFFF) != (fresh.dev & 0xFFFFFFFF):
+        return True
+    if (e.size & 0xFFFFFFFF) != (fresh.size & 0xFFFFFFFF):
+        return True
+    # racy-smudge: a zero-size cache entry whose blob is non-empty is dirty.
+    if (e.size & 0xFFFFFFFF) == 0:
+        empty_blob = objs.hash_bytes("blob", b"", repo)[0]
+        if e.sha != empty_blob:
+            return True
+    return False
+
+
+def _ci_write_entry(repo: Repository, e, out: Path, refresh: bool):
+    """Materialize one index entry to `out`. Returns the lstat result of the
+    written file (for --index refresh) or None on failure."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    typ, data = objs.read_object(repo, e.sha)
+    if (e.mode & 0o170000) == 0o120000:
+        # symlink
+        if out.exists() or out.is_symlink():
+            out.unlink()
+        os.symlink(data.decode("utf-8", "surrogateescape"), out)
+    else:
+        if out.exists() or out.is_symlink():
+            out.unlink()
         out.write_bytes(data)
+        if e.mode & 0o111:
+            os.chmod(out, out.stat().st_mode | 0o111)
+    if refresh:
+        try:
+            return os.lstat(out)
+        except OSError:
+            return None
+    return None
+
+
+def cmd_checkout_index(argv: list[str]) -> int:
+    # Show usage for -h before any other work (long --help runs the man page,
+    # which we cannot reproduce; it is handled by the dispatcher elsewhere).
+    if "-h" in argv:
+        sys.stdout.write(_CHECKOUT_INDEX_USAGE)
+        return 129
+    try:
+        parsed = _ci_parse(argv)
+    except _CheckoutIndexParseError as exc:
+        if exc.message:
+            sys.stderr.write(exc.message + "\n")
+        if exc.show_usage:
+            stream = sys.stdout if exc.usage_stream == "stdout" else sys.stderr
+            stream.write(_CHECKOUT_INDEX_USAGE)
+        return 129
+    except _CheckoutIndexDie as exc:
+        sys.stderr.write(f"fatal: {exc}\n")
+        return 128
+
+    opts = parsed["opts"]
+    paths = parsed["paths"]
+    repo = _repo()
+    idx = read_index(repo)
+
+    base_dir = opts["prefix"] or ""
+    # Resolve the to_tempfile tri-state (default: temp iff --stage=all).
+    to_tempfile = opts["temp"]
+    if to_tempfile is None:
+        to_tempfile = (opts["stage"] == 4)
+    if not to_tempfile and opts["stage"] == 4:
+        sys.stderr.write(
+            "fatal: options '--stage=all' and '--no-temp' cannot be used "
+            "together\n"
+        )
+        return 128
+    if to_tempfile:
+        # Writing to randomly-named temporary files yields non-deterministic
+        # output; not faithfully reproducible here.
+        sys.stderr.write(
+            "fatal: pygit checkout-index: --temp / --stage=all is not "
+            "supported\n"
+        )
+        return 128
+
+    quiet = opts["quiet"]
+    force = opts["force"]
+    not_new = opts["not_new"]
+    stage = opts["stage"]  # 0 default, 1..3 specific, 4 == all
+    ignore_skip = opts["ignore-skip-worktree-bits"]
+
+    # --index updates stat info in the index, but only when not writing
+    # to a prefix and not to tempfiles.
+    refresh_cache = bool(opts["index"]) and not base_dir and not to_tempfile
+
+    err = False
+    cache_changed = False
+
+    def checkout_file(name: str) -> bool:
+        """Return True on error (mirrors checkout_file returning <0)."""
+        nonlocal cache_changed
+        has_same_name = False
+        is_file = False
+        is_skipped = True
+        did_checkout = False
+        entries = [e for e in idx.entries if e.path == name]
+        for e in entries:
+            has_same_name = True
+            is_file = True
+            if not ignore_skip and e.skip_worktree:
+                break
+            is_skipped = False
+            est = e.stage
+            if est != stage and (stage != 4 or est == 0):
+                continue
+            did_checkout = True
+            out = repo.path / (base_dir + e.path)
+            if not _do_checkout_entry(e, out):
+                return True
+        if did_checkout:
+            return False
+        if has_same_name and stage == 4:
+            return False
+        if not quiet:
+            msg = f"git checkout-index: {name} "
+            if not has_same_name:
+                msg += "is not in the cache"
+            elif not is_file:
+                msg += "is a sparse directory"
+            elif is_skipped:
+                msg += ("has skip-worktree enabled; use "
+                        "'--ignore-skip-worktree-bits' to checkout")
+            elif stage:
+                msg += f"does not exist at stage {stage}"
+            else:
+                msg += "is unmerged"
+            sys.stderr.write(msg + "\n")
+        return True
+
+    def _do_checkout_entry(e, out: Path) -> bool:
+        """Mirror checkout_entry's worktree path. Return True on success,
+        False on error (an existing modified file without --force)."""
+        nonlocal cache_changed
+        st = _ci_lstat_entry(out)
+        if st is not None:
+            # path exists in the worktree
+            if not _ci_changed(repo, e, st):
+                return True  # up to date, nothing to do
+            if not force:
+                if not quiet:
+                    sys.stderr.write(
+                        f"{base_dir}{e.path} already exists, no checkout\n"
+                    )
+                return False
+            # force: fall through to (re)write
+        else:
+            if not_new:
+                return True
+        new_st = _ci_write_entry(repo, e, out, refresh_cache)
+        if refresh_cache and new_st is not None:
+            from .index import stat_to_entry as _ste
+            refreshed = _ste(e.path, new_st, e.sha, e.mode)
+            e.ctime_s, e.ctime_n = refreshed.ctime_s, refreshed.ctime_n
+            e.mtime_s, e.mtime_n = refreshed.mtime_s, refreshed.mtime_n
+            e.dev, e.ino = refreshed.dev, refreshed.ino
+            e.uid, e.gid = refreshed.uid, refreshed.gid
+            e.size = refreshed.size
+            cache_changed = True
+        return True
+
+    def checkout_all() -> bool:
+        nonlocal cache_changed
+        errs = False
+        for e in idx.entries:
+            if not ignore_skip and e.skip_worktree:
+                continue
+            est = e.stage
+            if est != stage and (stage != 4 or est == 0):
+                continue
+            if base_dir and (e.path == ""):
+                continue
+            out = repo.path / (base_dir + e.path)
+            if not _do_checkout_entry(e, out):
+                errs = True
+        return errs
+
+    # Mixing guards (die, rc 128), matching builtin ordering.
+    if paths:
+        if opts["all"]:
+            sys.stderr.write(
+                "fatal: git checkout-index: don't mix '--all' and explicit "
+                "filenames\n"
+            )
+            return 128
+        if opts["stdin"]:
+            sys.stderr.write(
+                "fatal: git checkout-index: don't mix '--stdin' and explicit "
+                "filenames\n"
+            )
+            return 128
+        for p in paths:
+            if checkout_file(p):
+                err = True
+
+    if opts["stdin"]:
+        if opts["all"]:
+            sys.stderr.write(
+                "fatal: git checkout-index: don't mix '--all' and '--stdin'\n"
+            )
+            return 128
+        raw = sys.stdin.buffer.read()
+        if opts["z"]:
+            items = raw.split(b"\0")
+            if items and items[-1] == b"":
+                items = items[:-1]
+            lines = [it.decode("utf-8", "surrogateescape") for it in items]
+        else:
+            text = raw.decode("utf-8", "surrogateescape")
+            lines = text.split("\n")
+            if lines and lines[-1] == "":
+                lines = lines[:-1]
+        for line in lines:
+            name = line
+            if not opts["z"] and name.startswith('"'):
+                try:
+                    name = _unquote_c_style(name)
+                except ValueError:
+                    sys.stderr.write("fatal: line is badly quoted\n")
+                    return 128
+            if checkout_file(name):
+                err = True
+
+    if opts["all"]:
+        if checkout_all():
+            err = True
+
+    if err:
+        return 1
+
+    if refresh_cache and cache_changed:
+        write_index(repo, idx)
     return 0
 
 
