@@ -2135,3 +2135,52 @@ def test_batch2_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch2_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# --- workflow batch 3: patch-id / cat-file / unpack-objects / merge-tree ---
+BATCH3_CASES = [
+    ('cat-file-p-use-mailmap-commit', [('write','.mailmap','Proper Name <proper@example.com> Parity <parity@example.com>\n')], ['cat-file', '-p', '--use-mailmap', 'HEAD']),
+    ('cat-file-s-use-mailmap-commit', [('write','.mailmap','Proper Name <proper@example.com> Parity <parity@example.com>\n')], ['cat-file', '-s', '--use-mailmap', 'HEAD']),
+    ('cat-file-batch-all-objects-unordered', [], ['cat-file', '--batch-check', '--batch-all-objects', '--unordered']),
+    ('unpack-objects-h-sole', BASE, ["unpack-objects", "-h"]),
+    ('unpack-objects-help-all-sole', BASE, ["unpack-objects", "--help-all"]),
+    ('unpack-objects-h-not-sole', BASE, ["unpack-objects", "-h", "foo"]),
+    ('unpack-objects-unknown-flag', BASE, ["unpack-objects", "--bogus"]),
+    ('unpack-objects-unknown-short', BASE, ["unpack-objects", "-x"]),
+    ('unpack-objects-positional', BASE, ["unpack-objects", "foo"]),
+    ('unpack-objects-double-dash', BASE, ["unpack-objects", "--"]),
+    ('merge-tree-conflict-default', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', 'feat', 'main']),
+    ('merge-tree-conflict-z', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '-z', 'feat', 'main']),
+    ('merge-tree-conflict-name-only', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '--name-only', 'feat', 'main']),
+    ('merge-tree-conflict-quiet', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '--quiet', 'feat', 'main']),
+    ('merge-tree-conflict-messages', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '--messages', 'feat', 'main']),
+    ('merge-tree-X-ours', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '-X', 'ours', 'feat', 'main']),
+    ('merge-tree-X-theirs', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '-X', 'theirs', 'feat', 'main']),
+    ('merge-tree-clean', BASE + [['checkout','-b','feat'], ('write','g.txt','feature\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','h.txt','mainline\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', 'feat', 'main']),
+    ('merge-tree-no-renames', BASE + [['checkout','-b','feat'], ['mv','a.txt','renamed.txt'], ('write','renamed.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '-X', 'no-renames', 'feat', 'main']),
+    ('merge-tree-usage-error', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main']], ['merge-tree', 'feat']),
+]
+
+BATCH3_STDIN_CASES = [
+    ('patch-id-stable', BASE, ["patch-id", "--stable"], 'diff --git a/a.txt b/a.txt\nindex 814f4a4..ddc897f 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n'),
+    ('patch-id-unstable', BASE, ["patch-id", "--unstable"], 'diff --git a/a.txt b/a.txt\nindex 814f4a4..ddc897f 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n'),
+    ('patch-id-verbatim', BASE, ["patch-id", "--verbatim"], 'diff --git a/a.txt b/a.txt\nindex 814f4a4..ddc897f 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n'),
+    ('patch-id-stable-unstable-conflict', BASE, ["patch-id", "--stable", "--unstable"], 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y\n'),
+    ('patch-id-h-usage', BASE, ["patch-id", "-h"], ''),
+    ('cat-file-batch-check-use-mailmap', [('write','.mailmap','Proper Name <proper@example.com> Parity <parity@example.com>\n')], ['cat-file', '--batch-check', '--use-mailmap'], 'HEAD\n'),
+    ('cat-file-batch-Z', [], ['cat-file', '--batch-check', '-Z'], 'HEAD\x00missingobj\x00'),
+    ('cat-file-batch-command-flush-requires-buffer', [], ['cat-file', '--batch-command'], 'info HEAD\nflush\n'),
+    ('merge-tree-stdin', BASE + [['checkout','-b','feat'], ('write','a.txt','alpha-feat\n'), ['add','-A'], ['commit','-m','feat-commit'], ['checkout','main'], ('write','a.txt','alpha-main\n'), ['add','-A'], ['commit','-m','main-commit']], ['merge-tree', '--stdin'], 'feat main\n'),
+]
+
+
+@pytest.mark.parametrize("case", BATCH3_CASES, ids=[c[0] for c in BATCH3_CASES])
+def test_batch3_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH3_STDIN_CASES, ids=[c[0] for c in BATCH3_STDIN_CASES])
+def test_batch3_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)

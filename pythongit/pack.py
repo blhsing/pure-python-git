@@ -1020,7 +1020,7 @@ def install_pack_file(repo: Repository, pack_path: Path, *, fix_thin: bool = Tru
     return pack_sha, dest_pack, len(entries)
 
 
-def unpack_pack_file(repo: Repository, pack_path: Path) -> int:
+def unpack_pack_file(repo: Repository, pack_path: Path, dry_run: bool = False) -> int:
     """Decompose a pack file into loose objects without reading the pack at once."""
     from . import objects as objs
 
@@ -1028,14 +1028,15 @@ def unpack_pack_file(repo: Repository, pack_path: Path) -> int:
 
     def write_loose(_sha: str, obj_type: str, payload: bytes) -> None:
         nonlocal count
-        objs.write_object(repo, obj_type, payload)
+        if not dry_run:
+            objs.write_object(repo, obj_type, payload)
         count += 1
 
     _pack_index_data_from_file(repo, Path(pack_path), on_object=write_loose)
     return count
 
 
-def unpack_pack_stream(repo: Repository, source) -> int:
+def unpack_pack_stream(repo: Repository, source, dry_run: bool = False) -> int:
     """Read a pack stream from a file-like object and unpack it as loose objects."""
     tmp_name = None
     try:
@@ -1046,7 +1047,7 @@ def unpack_pack_stream(repo: Repository, source) -> int:
                 if not chunk:
                     break
                 tmp.write(chunk)
-        return unpack_pack_file(repo, Path(tmp_name))
+        return unpack_pack_file(repo, Path(tmp_name), dry_run=dry_run)
     finally:
         if tmp_name:
             try:

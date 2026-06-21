@@ -375,9 +375,8 @@ def cmd_hash_object(argv: list[str]) -> int:
     return 0
 
 
-def _all_object_shas(repo: Repository) -> list[str]:
-    """Every object id in the repo (loose + packed), sorted ascending — the
-    order `cat-file --batch-all-objects` emits."""
+def _loose_object_shas(repo: Repository) -> set[str]:
+    """Every loose object id in the repo."""
     shas: set[str] = set()
     objdir = repo.gitdir / "objects"
     hex_len = repo.hex_len
@@ -387,6 +386,13 @@ def _all_object_shas(repo: Repository) -> list[str]:
                 for f in d.iterdir():
                     if f.is_file() and len(f.name) == hex_len - 2:
                         shas.add(d.name + f.name)
+    return shas
+
+
+def _all_object_shas(repo: Repository) -> list[str]:
+    """Every object id in the repo (loose + packed), sorted ascending — the
+    order `cat-file --batch-all-objects` emits."""
+    shas: set[str] = set(_loose_object_shas(repo))
     from . import pack as _p
     midx = _p.read_midx(repo)
     if midx is not None:
@@ -397,6 +403,124 @@ def _all_object_shas(repo: Repository) -> list[str]:
     return sorted(shas)
 
 
+def _all_object_shas_unordered(repo: Repository) -> list[str]:
+    """Object ids in `cat-file --batch-all-objects --unordered` order: loose
+    objects (sorted) first, then packed objects in pack-offset order, with
+    later duplicates suppressed (the first occurrence wins)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for sha in sorted(_loose_object_shas(repo)):
+        if sha not in seen:
+            seen.add(sha)
+            out.append(sha)
+    from . import pack as _p
+    midx = _p.read_midx(repo)
+    if midx is not None:
+        # MIDX exposes objects in oid-sorted order with their (pack, offset);
+        # emit pack-by-pack, each in offset order, matching git's pack walk.
+        packs: dict[int, list[tuple[int, str]]] = {}
+        for i, sha in enumerate(midx.shas):
+            packs.setdefault(midx.pack_ids[i], []).append((midx.offsets[i], sha))
+        for pid in sorted(packs):
+            for _off, sha in sorted(packs[pid]):
+                if sha not in seen:
+                    seen.add(sha)
+                    out.append(sha)
+    else:
+        # git's repo_for_each_pack walks packs most-recent-first (the packed_git
+        # list is sorted by descending mtime); replicate that ordering here.
+        packs = list(_p._iter_packs(repo))
+        def _mtime(pk):
+            try:
+                return pk.pack_path.stat().st_mtime_ns
+            except OSError:
+                return 0
+        packs.sort(key=lambda pk: (-_mtime(pk), pk.pack_path.name))
+        for pk in packs:
+            pairs = sorted((pk.offset_of(s), s) for s in pk.shas)
+            for _off, sha in pairs:
+                if sha not in seen:
+                    seen.add(sha)
+                    out.append(sha)
+    return out
+
+
+def _split_ident_line(person: bytes):
+    """Split a `Name <email> timestamp tz` ident into (name, email, rest).
+
+    Mirrors git's split_ident_line enough for mailmap rewriting: ``name`` is the
+    text before the last ``<`` (trailing space trimmed), ``email`` is between the
+    final ``<``/``>``, ``rest`` is everything from ``>`` onward (including the
+    space + date). Returns None when the line has no well-formed ``<email>``."""
+    lt = person.rfind(b"<")
+    if lt < 0:
+        return None
+    gt = person.find(b">", lt + 1)
+    if gt < 0:
+        return None
+    name_end = lt
+    # git trims a single run of trailing whitespace before '<'
+    while name_end > 0 and person[name_end - 1:name_end] in (b" ", b"\t"):
+        name_end -= 1
+    name = person[:name_end]
+    email = person[lt + 1:gt]
+    rest = person[gt + 1:]
+    return name, email, rest
+
+
+def _replace_idents_using_mailmap(buf: bytes, mm) -> bytes:
+    """Rewrite author/committer/tagger ``Name <email>`` idents in a commit/tag
+    object body through the mailmap, preserving the trailing timestamp. Only the
+    contiguous header block (up to the first blank line) is scanned, matching
+    git's apply_mailmap_to_header."""
+    headers = (b"author ", b"committer ", b"tagger ")
+    out: list[bytes] = []
+    i = 0
+    n = len(buf)
+    in_headers = True
+    while i < n:
+        nl = buf.find(b"\n", i)
+        if nl < 0:
+            line = buf[i:]
+            nxt = n
+            has_nl = False
+        else:
+            line = buf[i:nl]
+            nxt = nl + 1
+            has_nl = True
+        if in_headers:
+            if line == b"":
+                in_headers = False
+            else:
+                matched = None
+                for h in headers:
+                    if line.startswith(h):
+                        matched = h
+                        break
+                if matched is not None:
+                    person = line[len(matched):]
+                    split = _split_ident_line(person)
+                    if split is not None:
+                        name, email, rest = split
+                        try:
+                            nm = name.decode("utf-8")
+                            em = email.decode("utf-8")
+                        except UnicodeDecodeError:
+                            nm = name.decode("latin-1")
+                            em = email.decode("latin-1")
+                        new_name, new_email = mm.resolve(nm, em)
+                        new_person = (matched
+                                      + new_name.encode("utf-8")
+                                      + b" <" + new_email.encode("utf-8") + b">"
+                                      + rest)
+                        line = new_person
+        out.append(line)
+        if has_nl:
+            out.append(b"\n")
+        i = nxt
+    return b"".join(out)
+
+
 def _expand_batch_atoms(fmt: str, sha: str, t: str, size: int) -> str:
     """Expand the `cat-file --batch[-check]=<format>` %(atom) placeholders."""
     return (fmt.replace("%(objectname)", sha)
@@ -405,53 +529,150 @@ def _expand_batch_atoms(fmt: str, sha: str, t: str, size: int) -> str:
                .replace("%(objectsize)", str(size)))
 
 
-def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None) -> int:
+def _read_delimited_stdin(input_delim: str):
+    """Yield records from stdin split on ``input_delim`` ('\\n' or '\\0').
+
+    For newline-delimited input a trailing ``\\r`` is stripped (git's
+    strbuf_getdelim_strip_crlf). The final record is dropped when it is empty
+    (no trailing data after the last delimiter)."""
+    raw = sys.stdin.buffer.read()
+    delim = b"\0" if input_delim == "\0" else b"\n"
+    if not raw:
+        return
+    parts = raw.split(delim)
+    # split() leaves a trailing empty element when the stream ends with the
+    # delimiter; git stops at EOF so that trailing empty is not a record.
+    if parts and parts[-1] == b"":
+        parts.pop()
+    for p in parts:
+        if delim == b"\n" and p.endswith(b"\r"):
+            p = p[:-1]
+        yield p.decode("utf-8", "surrogateescape")
+
+
+def _batch_resolve(repo: Repository, name: str, mm=None):
+    """Resolve ``name`` for batch mode. Returns (sha, type, size, data) where
+    ``data`` is the (mailmap-rewritten) object contents, or None if missing.
+
+    With ``mm`` set, commit/tag idents are rewritten and ``size`` reflects the
+    rewritten content (matching git --use-mailmap)."""
+    sha = refs_mod.rev_parse(repo, name)
+    if sha is None or not objs.object_exists(repo, sha):
+        return None
+    t, data = objs.read_object(repo, sha)
+    if mm is not None and t in ("commit", "tag"):
+        data = _replace_idents_using_mailmap(data, mm)
+    return sha, t, len(data), data
+
+
+def _batch_write_record(info: str, data, check_only: bool, output_delim: str,
+                        buffer: bool) -> None:
+    """Write one batch record: the formatted info line + delimiter, then (for
+    --batch) the object contents + delimiter. Flushing is suppressed in buffer
+    mode."""
+    out = sys.stdout.buffer
+    out.write(info.encode("utf-8", "surrogateescape"))
+    out.write(output_delim.encode("latin-1"))
+    if not check_only:
+        if not buffer:
+            out.flush()
+        out.write(data)
+        out.write(output_delim.encode("latin-1"))
+    if not buffer:
+        out.flush()
+
+
+def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
+                    mm=None, input_delim="\n", output_delim="\n",
+                    buffer=False) -> int:
     if fmt is None:
         fmt = "%(objectname) %(objecttype) %(objectsize)"
-    source = names if names is not None else (line.strip() for line in sys.stdin)
+    source = names if names is not None else _read_delimited_stdin(input_delim)
+    out = sys.stdout.buffer
     for name in source:
-        if not name:
+        if names is None and not name:
             continue
-        sha = refs_mod.rev_parse(repo, name)
-        if sha is None or not objs.object_exists(repo, sha):
-            sys.stdout.write(f"{name} missing\n")
+        resolved = _batch_resolve(repo, name, mm)
+        if resolved is None:
+            out.write((f"{name} missing").encode("utf-8", "surrogateescape"))
+            out.write(output_delim.encode("latin-1"))
+            if not buffer:
+                out.flush()
             continue
-        t, data = objs.read_object(repo, sha)
-        info = _expand_batch_atoms(fmt, sha, t, len(data))
-        sys.stdout.write(info + "\n")
-        if not check_only:
-            sys.stdout.flush()
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.write(b"\n")
-            sys.stdout.buffer.flush()
+        sha, t, size, data = resolved
+        info = _expand_batch_atoms(fmt, sha, t, size)
+        _batch_write_record(info, data, check_only, output_delim, buffer)
+    if buffer:
+        out.flush()
     return 0
 
 
-def _cat_file_batch_command(repo: Repository) -> int:
-    """cat-file --batch-command: per-line `info`/`contents`/`flush` requests."""
-    for line in sys.stdin:
-        line = line.rstrip("\n")
+def _cat_file_batch_command(repo: Repository, fmt=None, mm=None,
+                            input_delim="\n", output_delim="\n",
+                            buffer=False) -> int:
+    """cat-file --batch-command: per-line `info`/`contents`/`flush` requests.
+
+    Without --buffer each command is run immediately; `flush` is rejected. With
+    --buffer, `contents`/`info` are queued and only dispatched by `flush` (or at
+    EOF)."""
+    if fmt is None:
+        fmt = "%(objectname) %(objecttype) %(objectsize)"
+    out = sys.stdout.buffer
+
+    def run(kind: str, arg: str) -> None:
+        resolved = _batch_resolve(repo, arg, mm)
+        if resolved is None:
+            out.write((f"{arg} missing").encode("utf-8", "surrogateescape"))
+            out.write(output_delim.encode("latin-1"))
+            out.flush()
+            return
+        sha, t, size, data = resolved
+        info = _expand_batch_atoms(fmt, sha, t, size)
+        _batch_write_record(info, data, kind == "info", output_delim, buffer)
+
+    queued: list[tuple[str, str]] = []
+
+    for line in _read_delimited_stdin(input_delim):
         if not line:
+            _err("fatal: empty command in input")
+            return 128
+        if line[0] in (" ", "\t"):
+            _err(f"fatal: whitespace before command: '{line}'")
+            return 128
+        if line.startswith("flush"):
+            if line != "flush":
+                _err("fatal: flush takes no arguments")
+                return 128
+            if not buffer:
+                _err("fatal: flush is only for --buffer mode")
+                return 128
+            for kind, arg in queued:
+                run(kind, arg)
+            out.flush()
+            queued.clear()
             continue
-        cmd, _, arg = line.partition(" ")
-        arg = arg.strip()
-        if cmd == "flush":
-            sys.stdout.flush()
-            sys.stdout.buffer.flush()
-            continue
-        sha = refs_mod.rev_parse(repo, arg)
-        if sha is None or not objs.object_exists(repo, sha):
-            sys.stdout.write(f"{arg} missing\n")
-            continue
-        t, data = objs.read_object(repo, sha)
-        if cmd == "info":
-            sys.stdout.write(f"{sha} {t} {len(data)}\n")
-        elif cmd == "contents":
-            sys.stdout.write(f"{sha} {t} {len(data)}\n")
-            sys.stdout.flush()
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.write(b"\n")
-            sys.stdout.buffer.flush()
+        matched = None
+        for name in ("contents", "info"):
+            if line.startswith(name):
+                matched = name
+                break
+        if matched is None:
+            _err(f"fatal: unknown command: '{line}'")
+            return 128
+        rest = line[len(matched):]
+        # `contents`/`info` need exactly a space then the argument.
+        if not rest.startswith(" "):
+            _err(f"fatal: {matched} requires arguments")
+            return 128
+        kind, arg = matched, rest[1:]
+        if buffer:
+            queued.append((kind, arg))
+        else:
+            run(kind, arg)
+    if buffer and queued:
+        for kind, arg in queued:
+            run(kind, arg)
+    out.flush()
     return 0
 
 
@@ -470,6 +691,19 @@ def cmd_cat_file(argv: list[str]) -> int:
     ap.add_argument("--batch-all-objects", dest="batch_all", action="store_true")
     ap.add_argument("--allow-unknown-type", dest="allow_unknown_type", action="store_true")
     ap.add_argument("--path", default=None)
+    ap.add_argument("--use-mailmap", "--mailmap", dest="use_mailmap",
+                    action="store_true", default=False)
+    ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="use_mailmap",
+                    action="store_false")
+    ap.add_argument("--buffer", dest="buffer", action="store_true", default=None)
+    ap.add_argument("--no-buffer", dest="buffer", action="store_false")
+    ap.add_argument("--unordered", dest="unordered", action="store_true", default=False)
+    ap.add_argument("--no-unordered", dest="unordered", action="store_false")
+    # --follow-symlinks (in-tree symlink resolution) is NOT implemented; it is
+    # left unrecognized so it is honestly reported as a gap rather than accepted
+    # and silently returning the symlink blob instead of the target.
+    ap.add_argument("-Z", dest="nul", action="store_true")
+    ap.add_argument("-z", dest="nul_in", action="store_true")
     ap.add_argument("pos", nargs="*")
     # `--batch[-check]=<format>` takes the format attached with '='; pull it out
     # so the store_true flags still parse, then thread it into the formatter.
@@ -479,6 +713,9 @@ def cmd_cat_file(argv: list[str]) -> int:
         if a.startswith("--batch-check="):
             batch_fmt = a.split("=", 1)[1]
             pre_argv.append("--batch-check")
+        elif a.startswith("--batch-command="):
+            batch_fmt = a.split("=", 1)[1]
+            pre_argv.append("--batch-command")
         elif a.startswith("--batch="):
             batch_fmt = a.split("=", 1)[1]
             pre_argv.append("--batch")
@@ -486,11 +723,47 @@ def cmd_cat_file(argv: list[str]) -> int:
             pre_argv.append(a)
     args = ap.parse_args(pre_argv)
     repo = _repo()
+
+    batch_enabled = args.batch or args.batch_check or args.batch_command
+    # --buffer/-Z/-z/--unordered/--batch-all-objects all require a batch mode.
+    for flag, val in (("--buffer", args.buffer is not None),
+                      ("--batch-all-objects", args.batch_all),
+                      ("-z", args.nul_in),
+                      ("-Z", args.nul)):
+        if val and not batch_enabled:
+            _err(f"fatal: '{flag}' requires a batch mode")
+            return 129
+
+    mm = None
+    if args.use_mailmap:
+        from . import mailmap as _mm
+        mm = _mm.load(repo)
+
+    # Delimiters: -Z makes both stdin and stdout NUL-terminated; -z only stdin.
+    input_delim = "\n"
+    output_delim = "\n"
+    if args.nul_in:
+        input_delim = "\0"
+    if args.nul:
+        input_delim = output_delim = "\0"
+    # --buffer defaults to on for --batch-all-objects, off otherwise.
+    buffer = args.buffer
+    if buffer is None:
+        buffer = bool(args.batch_all)
+
     if args.batch_command:
-        return _cat_file_batch_command(repo)
+        return _cat_file_batch_command(repo, fmt=batch_fmt, mm=mm,
+                                       input_delim=input_delim,
+                                       output_delim=output_delim, buffer=buffer)
     if args.batch or args.batch_check:
-        names = _all_object_shas(repo) if args.batch_all else None
-        return _cat_file_batch(repo, check_only=args.batch_check, names=names, fmt=batch_fmt)
+        if args.batch_all:
+            names = (_all_object_shas_unordered(repo) if args.unordered
+                     else _all_object_shas(repo))
+        else:
+            names = None
+        return _cat_file_batch(repo, check_only=args.batch_check, names=names,
+                               fmt=batch_fmt, mm=mm, input_delim=input_delim,
+                               output_delim=output_delim, buffer=buffer)
 
     # --textconv / --filters: with no configured drivers these are the identity
     # transform, so just stream the blob content (resolving <rev>:<path>).
@@ -517,6 +790,8 @@ def cmd_cat_file(argv: list[str]) -> int:
         if t != want_type:
             _err(f"fatal: cat-file {want_type}: bad file")
             return 128
+        if mm is not None and t in ("commit", "tag"):
+            data = _replace_idents_using_mailmap(data, mm)
         sys.stdout.buffer.write(data)
         return 0
 
@@ -535,6 +810,8 @@ def cmd_cat_file(argv: list[str]) -> int:
             _err(f"fatal: Not a valid object name {args.object}")
         return 128
     t, data = objs.read_object(repo, sha)
+    if mm is not None and t in ("commit", "tag"):
+        data = _replace_idents_using_mailmap(data, mm)
     if args.show_type:
         _print(t)
     elif args.show_size:
@@ -6665,13 +6942,350 @@ def cmd_push(argv: list[str]) -> int:
     return 0 if all(v == "ok" for v in res.values()) else 1
 
 
+_MERGE_TREE_USAGE = (
+    "usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>\n"
+    "   or: git merge-tree [--trivial-merge] <base-tree> <branch1> <branch2>\n"
+    "\n"
+    "    --write-tree          do a real merge instead of a trivial merge\n"
+    "    --trivial-merge       do a trivial merge only\n"
+    "    --[no-]messages       also show informational/conflict messages\n"
+    "    --quiet               suppress all output; only exit status wanted\n"
+    "    -z                    separate paths with the NUL character\n"
+    "    --name-only           list filenames without modes/oids/stages\n"
+    "    --allow-unrelated-histories\n"
+    "                          allow merging unrelated histories\n"
+    "    --stdin               perform multiple merges, one per line of input\n"
+    "    --[no-]merge-base <tree-ish>\n"
+    "                          specify a merge-base for the merge\n"
+    "    -X, --[no-]strategy-option <option=value>\n"
+    "                          option for selected merge strategy\n"
+    "\n"
+)
+
+
+def _mt_quote_c_style(path: str) -> bytes:
+    """Mirror git's quote_c_style(): emit a C-quoted, double-quoted string when
+    the name contains a control/high/special byte, else the raw bytes.  Used
+    for the merge-tree info section under the newline terminator."""
+    raw = path.encode("utf-8", "surrogateescape")
+    sq = {ord('"'): b'\\"', ord("\\"): b"\\\\", ord("\a"): b"\\a",
+          ord("\b"): b"\\b", ord("\f"): b"\\f", ord("\n"): b"\\n",
+          ord("\r"): b"\\r", ord("\t"): b"\\t", ord("\v"): b"\\v"}
+    needs = False
+    out = bytearray()
+    for byte in raw:
+        if byte in sq:
+            out += sq[byte]
+            needs = True
+        elif byte < 0x20 or byte >= 0x80:
+            out += b"\\%03o" % byte
+            needs = True
+        else:
+            out.append(byte)
+    if not needs:
+        return raw
+    return b'"' + bytes(out) + b'"'
+
+
+def _mt_real_merge(repo, merge_base, branch1, branch2, opts) -> int:
+    """Perform a real (ort) merge for ``merge-tree`` and emit git's output.
+
+    ``opts`` carries: name_only, quiet, show_messages (-1/0/1), z (NUL term),
+    use_stdin, allow_unrelated, favor, rename_detection.
+    Returns git's exit status (!clean), or 128/1 on errors."""
+    from . import ort as ort_mod
+    from . import merge as merge_mod
+
+    z = opts["z"]
+    term = b"\0" if z else b"\n"
+    out = opts.get("_out") or sys.stdout.buffer
+
+    def _resolve_commit(name):
+        sha = refs_mod.rev_parse(repo, name)
+        if sha is None:
+            return None
+        try:
+            t, _data = objs.read_object(repo, sha)
+        except KeyError:
+            return None
+        if t not in ("commit", "tag"):
+            return None
+        return sha
+
+    # _build_config only reads repo config/attributes; the tree arguments are
+    # unused, so empty placeholders are fine here.
+    cfg = ort_mod._build_config(repo, "", "", "")
+    cfg.variant = opts["favor"]
+    cfg.rename_detection = opts["rename_detection"]
+
+    if merge_base is not None:
+        # Explicit merge base: a non-recursive 3-way merge of the trees.
+        # git peels each of base/branch1/branch2 to a tree, dying with the
+        # offending name if any cannot be parsed.
+        for nm in (merge_base, branch1, branch2):
+            try:
+                ort_mod._peel_to_tree(repo, nm)
+            except (ValueError, KeyError):
+                _err(f"fatal: could not parse as tree '{nm}'")
+                return 128
+        res = ort_mod.merge_tree(repo, merge_base, branch1, branch2, cfg=cfg)
+    else:
+        one = _resolve_commit(branch1)
+        if one is None:
+            _err(f"merge-tree: {branch1} - not something we can merge")
+            return 1
+        two = _resolve_commit(branch2)
+        if two is None:
+            _err(f"merge-tree: {branch2} - not something we can merge")
+            return 1
+        bases = merge_mod.merge_bases(repo, one, two)
+        if not bases and not opts["allow_unrelated"]:
+            _err("fatal: refusing to merge unrelated histories")
+            return 128
+        # Pass the original ref names so conflict-marker labels match git
+        # (opt.branch1/branch2 become the "<<<<<<< name" markers).
+        res = ort_mod.merge_commits(repo, branch1, branch2, cfg=cfg,
+                                    allow_unrelated=True, favor=opts["favor"])
+
+    clean = res.clean
+    show_messages = opts["show_messages"]
+    if show_messages == -1:
+        show_messages = 0 if clean else 1
+
+    if opts["use_stdin"]:
+        out.write(b"%d" % (1 if clean else 0))
+        out.write(term)
+    out.write(res.tree.encode())
+    out.write(term)
+
+    if not clean:
+        # Info section: one record per (path, stage) in path/stage order.
+        entries = []
+        if res.conflict_index is not None:
+            for e in res.conflict_index.entries:
+                if getattr(e, "stage", 0):
+                    entries.append((e.path, e.stage, e.mode, e.sha))
+        entries.sort(key=lambda t: (t[0], t[1]))
+        last = None
+        for path, stage, mode, sha in entries:
+            if not opts["name_only"]:
+                out.write(b"%06o %s %d\t" % (mode, sha.encode(), stage))
+            elif last is not None and last == path:
+                continue
+            if z:
+                out.write(path.encode("utf-8", "surrogateescape"))
+            else:
+                out.write(_mt_quote_c_style(path))
+            out.write(term)
+            last = path
+
+    if show_messages:
+        out.write(term)
+        # Messages: sorted by path, then in recording order within each path.
+        for _primary, type_str, message, paths in res.messages:
+            if z:
+                out.write(b"%d" % len(paths))
+                out.write(b"\0")
+                for p in paths:
+                    out.write(p.encode("utf-8", "surrogateescape"))
+                    out.write(b"\0")
+                out.write(type_str.encode())
+                out.write(b"\0")
+            out.write(message.encode("utf-8", "surrogateescape"))
+            out.write(b"\n")
+            if z:
+                out.write(b"\0")
+
+    if opts["use_stdin"]:
+        out.write(term)
+    out.flush()
+    return 0 if clean else 1
+
+
 def cmd_merge_tree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge-tree", add_help=False)
-    ap.add_argument("--trivial-merge", action="store_true")
-    ap.add_argument("--write-tree", action="store_true")
-    ap.add_argument("pos", nargs="*")
-    args = ap.parse_args(argv)
     repo = _repo()
+
+    # Manual option parsing mirroring builtin/merge-tree.c's parse-options.
+    mode = None            # None / "real" / "trivial"
+    name_only = False
+    quiet = False
+    show_messages = -1     # -1 = auto (!clean), 0 = off, 1 = on
+    z = False
+    use_stdin = False
+    allow_unrelated = False
+    merge_base = None
+    favor = 0              # 0 / FAVOR_OURS / FAVOR_THEIRS
+    rename_detection = True
+    xopts: list[str] = []
+    pos: list[str] = []
+
+    from . import xdiff as _xd
+
+    def usage(code=129):
+        sys.stderr.write(_MERGE_TREE_USAGE)
+        return code
+
+    def unknown(opt):
+        # parse-options prints "error: unknown switch `x'" for short options and
+        # "error: unknown option `name'" for long options, then the usage.
+        if opt.startswith("--"):
+            sys.stderr.write(f"error: unknown option `{opt[2:]}'\n")
+        else:
+            sys.stderr.write(f"error: unknown switch `{opt[1:]}'\n")
+        sys.stderr.write(_MERGE_TREE_USAGE)
+        return 129
+
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            pos.extend(argv[i + 1:])
+            break
+        elif a == "--write-tree":
+            mode = "real"
+        elif a == "--trivial-merge":
+            mode = "trivial"
+        elif a == "--name-only":
+            name_only = True
+        elif a == "--quiet":
+            quiet = True
+        elif a == "--messages":
+            show_messages = 1
+        elif a == "--no-messages":
+            show_messages = 0
+        elif a == "-z":
+            z = True
+        elif a == "--stdin":
+            use_stdin = True
+        elif a == "--allow-unrelated-histories":
+            allow_unrelated = True
+        elif a == "--no-allow-unrelated-histories":
+            allow_unrelated = False
+        elif a == "--no-merge-base":
+            merge_base = None
+        elif a == "--merge-base":
+            i += 1
+            if i >= n:
+                return usage()
+            merge_base = argv[i]
+        elif a.startswith("--merge-base="):
+            merge_base = a.split("=", 1)[1]
+        elif a == "-X" or a == "--strategy-option":
+            i += 1
+            if i >= n:
+                return usage()
+            xopts.append(argv[i])
+        elif a.startswith("-X"):
+            xopts.append(a[2:])
+        elif a.startswith("--strategy-option="):
+            xopts.append(a.split("=", 1)[1])
+        elif a.startswith("-") and a != "-":
+            # Split a stacked short cluster's first switch for the error
+            # message (git reports the first unknown short switch).
+            if not a.startswith("--") and len(a) > 2:
+                return unknown("-" + a[1])
+            return unknown(a)
+        else:
+            pos.append(a)
+        i += 1
+
+    # Apply -X strategy options (subset; defer the rest).
+    for x in xopts:
+        if x == "ours":
+            favor = _xd.XDL_MERGE_FAVOR_OURS
+        elif x == "theirs":
+            favor = _xd.XDL_MERGE_FAVOR_THEIRS
+        elif x == "no-renames":
+            rename_detection = False
+        elif x in ("find-renames", "renames"):
+            rename_detection = True
+        elif x == "diff-algorithm=histogram":
+            pass  # histogram is the engine default
+        else:
+            _err(f"fatal: unknown strategy option: -X{x}")
+            return 128
+
+    # Incompatible-option checks (match git's die_for_incompatible_opt2 text).
+    if quiet:
+        if show_messages == 1:
+            _err("fatal: options '--quiet' and '--messages' cannot be used "
+                 "together")
+            return 128
+        if name_only:
+            _err("fatal: options '--quiet' and '--name-only' cannot be used "
+                 "together")
+            return 128
+        if use_stdin:
+            _err("fatal: options '--quiet' and '--stdin' cannot be used "
+                 "together")
+            return 128
+        if z:
+            _err("fatal: options '--quiet' and '-z' cannot be used together")
+            return 128
+        # --quiet implies messages off; output suppressed regardless below.
+        if show_messages == -1:
+            show_messages = 0
+
+    opts = dict(name_only=name_only, quiet=quiet, show_messages=show_messages,
+                z=z, use_stdin=use_stdin, allow_unrelated=allow_unrelated,
+                favor=favor, rename_detection=rename_detection)
+
+    # --stdin: one merge per input line, NUL-terminated records, always rc 0.
+    if use_stdin:
+        if mode == "trivial":
+            _err("fatal: --trivial-merge is incompatible with all other "
+                 "options")
+            return 128
+        if merge_base is not None:
+            _err("fatal: options '--merge-base' and '--stdin' cannot be used "
+                 "together")
+            return 128
+        sopts = dict(opts)
+        sopts["z"] = True
+        sopts["use_stdin"] = True
+        data = sys.stdin.buffer.read()
+        lines = data.split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()  # trailing newline does not yield an empty line
+        for line in lines:
+            text = line.decode("utf-8", "surrogateescape")
+            # git's string_list_split_in_place_f(" ", -1, TRIM): split on each
+            # single space, then strip whitespace from each resulting token.
+            parts = [p.strip() for p in text.split(" ")]
+            if len(parts) < 2:
+                _err(f"fatal: malformed input line: '{text}'.")
+                return 128
+            if len(parts) == 4 and parts[1] == "--":
+                _mt_real_merge(repo, parts[0], parts[2], parts[3], sopts)
+            elif len(parts) == 2:
+                _mt_real_merge(repo, None, parts[0], parts[1], sopts)
+            else:
+                _err(f"fatal: malformed input line: '{text}'.")
+                return 128
+        return 0
+
+    # Decide mode for the non-stdin case (matches git's MODE_UNKNOWN logic).
+    if mode is None:
+        if len(pos) == 2:
+            mode = "real"
+        elif len(pos) == 3:
+            mode = "trivial"
+        else:
+            return usage()
+    if mode == "real" and len(pos) != 2:
+        return usage()
+    if mode == "trivial" and len(pos) != 3:
+        return usage()
+
+    if mode == "real":
+        if quiet:
+            # Suppress stdout; only the exit status matters.
+            import io
+            opts["_out"] = io.BytesIO()
+        return _mt_real_merge(repo, merge_base, pos[0], pos[1], opts)
+
+    # Legacy trivial-merge form: deferred to the previous behavior.
     from . import sequencer
 
     def _tree_of(name):
@@ -6685,37 +7299,9 @@ def cmd_merge_tree(argv: list[str]) -> int:
             return s, refs_mod._peel_to_type(repo, s, "tree")
         return s, s
 
-    # Modern (git >= 2.38) form: `merge-tree <branch1> <branch2>` performs a real
-    # 3-way merge against the computed merge base and prints the result tree.
-    if len(args.pos) == 2 and not args.trivial_merge:
-        one, one_tree = _tree_of(args.pos[0])
-        two, two_tree = _tree_of(args.pos[1])
-        if not (one and two):
-            return 128
-        from . import merge as _m
-        bases = _m.merge_bases(repo, one, two)
-        base = bases[0] if bases else None
-        base_tree = (objs.parse_commit(objs.read_object(repo, base)[1]).tree
-                     if base else objs.hash_bytes("tree", b"", repo)[0])
-        tree, confs, _ci = sequencer._apply_patch(
-            repo, base_tree, two_tree, one_tree,
-            ort_base=base, ort_ours=one, ort_theirs=two)
-        _print(tree)
-        if confs:
-            _print("")
-            _print("Conflicting files:")
-            for p in confs:
-                _print(p)
-            return 1
-        return 0
-
-    # Legacy trivial-merge form: `merge-tree <base> <branch1> <branch2>`.
-    if len(args.pos) != 3:
-        _err("usage: pygit merge-tree <branch1> <branch2>")
-        return 128
-    b, b_tree = _tree_of(args.pos[0])
-    one, one_tree = _tree_of(args.pos[1])
-    two, two_tree = _tree_of(args.pos[2])
+    b, b_tree = _tree_of(pos[0])
+    one, one_tree = _tree_of(pos[1])
+    two, two_tree = _tree_of(pos[2])
     if not (b and one and two):
         return 128
     tree, confs, _conflict_idx = sequencer._apply_patch(
@@ -8920,13 +9506,48 @@ def cmd_pack_objects(argv: list[str]) -> int:
     return 0
 
 
+_UNPACK_OBJECTS_USAGE = "git unpack-objects [-n] [-q] [-r] [--strict]"
+
+
 def cmd_unpack_objects(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit unpack-objects")
-    ap.parse_args(argv)
+    # show_usage_if_asked: only when -h / --help-all is the sole argument; this
+    # runs before repository discovery (matches git's cmd_main ordering).
+    if len(argv) == 1 and argv[0] in ("-h", "--help-all"):
+        sys.stdout.write("usage: " + _UNPACK_OBJECTS_USAGE + "\n")
+        return 129
+
+    # git discovers the repository (repo_config) before parsing options, so a
+    # missing repo dies with rc 128 even for otherwise-invalid arguments.
     repo = _repo()
+
+    dry_run = False
+    # quiet/recover/strict are parsed for argument-acceptance parity; strict's
+    # fsck reachability enforcement is intentionally not implemented (DEFER).
+    for arg in argv:
+        if arg and arg[0] == "-":
+            if arg == "-n":
+                dry_run = True
+                continue
+            if arg == "-q":
+                continue
+            if arg == "-r":
+                continue
+            if arg == "--strict":
+                continue
+            if arg.startswith("--strict="):
+                continue
+            if arg.startswith("--pack_header="):
+                continue
+            if arg.startswith("--max-input-size="):
+                continue
+            sys.stderr.write("usage: " + _UNPACK_OBJECTS_USAGE + "\n")
+            return 129
+        # We don't take any non-flag arguments.
+        sys.stderr.write("usage: " + _UNPACK_OBJECTS_USAGE + "\n")
+        return 129
+
     from . import pack as _p
-    n = _p.unpack_pack_stream(repo, sys.stdin.buffer)
-    _print(f"Unpacked {n} objects")
+    _p.unpack_pack_stream(repo, sys.stdin.buffer, dry_run=dry_run)
     return 0
 
 
@@ -12891,96 +13512,300 @@ def cmd_annotate(argv: list[str]) -> int:
     return cmd_blame(argv)
 
 
-def _patch_id_for_commit(repo: Repository, sha: str) -> str:
+_PATCH_ID_USAGE = (
+    "usage: git patch-id [--stable | --unstable | --verbatim]\n"
+    "\n"
+    "    --unstable            use the unstable patch ID algorithm\n"
+    "    --stable              use the stable patch ID algorithm\n"
+    "    --verbatim            don't strip whitespace from the patch\n"
+    "\n"
+)
+
+
+# C ``isspace`` in the "C" locale: space, \t, \n, \v, \f, \r.
+_C_ISSPACE = frozenset(b" \t\n\x0b\x0c\r")
+
+
+def _patch_id_remove_space(line: bytes) -> bytes:
+    """Match C Git's remove_space(): drop every C-isspace byte."""
+    return bytes(b for b in line if b not in _C_ISSPACE)
+
+
+def _patch_id_is_hex_oid(buf: bytes) -> bool:
+    """Mirror get_oid_hex(): succeeds when buf starts with 40 hex digits."""
+    if len(buf) < 40:
+        return False
+    head = buf[:40]
+    return all(c in b"0123456789abcdefABCDEF" for c in head)
+
+
+def _patch_id_scan_hunk_header(line: bytes) -> tuple[bool, int, int]:
+    """Port of scan_hunk_header(): parse '@@ -<n>[,<m>] +<n>[,<m>] @@'.
+
+    Returns (ok, before, after). On failure before/after are left as C does
+    (only the fields it managed to set are meaningful); callers ignore them
+    when ok is False, matching the C path where scan_hunk_header's return is
+    discarded but the int outputs are used regardless.
+    """
+    digits = b"0123456789"
+    p = line
+    q = p[4:]
+    n = 0
+    while n < len(q) and q[n:n + 1] and q[n] in digits:
+        n += 1
+    if n < len(q) and q[n:n + 1] == b",":
+        q = q[n + 1:]
+        before = _atoi(q)
+        n = 0
+        while n < len(q) and q[n] in digits:
+            n += 1
+    else:
+        before = 1
+    if n == 0 or (q[n:n + 1] != b" ") or (q[n + 1:n + 2] != b"+"):
+        return False, before, 1
+    r = q[n + 2:]
+    n = 0
+    while n < len(r) and r[n] in digits:
+        n += 1
+    if n < len(r) and r[n:n + 1] == b",":
+        r = r[n + 1:]
+        after = _atoi(r)
+        n = 0
+        while n < len(r) and r[n] in digits:
+            n += 1
+    else:
+        after = 1
+    if n == 0:
+        return False, before, after
+    return True, before, after
+
+
+def _atoi(buf: bytes) -> int:
+    """C atoi() on a leading run of decimal digits (no sign handling needed)."""
+    n = 0
+    i = 0
+    while i < len(buf) and buf[i] in b"0123456789":
+        n = n * 10 + (buf[i] - 0x30)
+        i += 1
+    return n
+
+
+def _patch_id_getwholeline(data: bytes, pos: int) -> tuple[Optional[bytes], int]:
+    """Read one line including its trailing '\\n', like strbuf_getwholeline."""
+    if pos >= len(data):
+        return None, pos
+    nl = data.find(b"\n", pos)
+    if nl == -1:
+        return data[pos:], len(data)
+    return data[pos:nl + 1], nl + 1
+
+
+def _patch_id_flush_one_hunk(result: bytearray, ctx) -> "object":
+    """Port of flush_one_hunk(): fold ctx's digest into result (byte sum with
+    carry) and return a fresh SHA1 context."""
     import hashlib
-    c = objs.parse_commit(objs.read_object(repo, sha)[1])
-    parent_tree = ""
-    if c.parents:
-        parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
-    from . import diff as _d
-    h = hashlib.sha1()
-    for p, a_entry, b_entry in workdir.iter_tree_changes(repo, parent_tree or None, c.tree):
-        a_sha = a_entry.sha if a_entry else None
-        b_sha = b_entry.sha if b_entry else None
-        if a_sha == b_sha:
+    digest = ctx.digest()
+    carry = 0
+    for i in range(20):
+        carry += result[i] + digest[i]
+        result[i] = carry & 0xFF
+        carry >>= 8
+    return hashlib.sha1()
+
+
+def _get_one_patchid(data: bytes, pos: int, stable: bool, verbatim: bool):
+    """Faithful port of get_one_patchid().
+
+    Returns (patchlen, next_oid_hex, result_hex, new_pos).
+    next_oid_hex is the 40-char commit id of the *following* patch boundary,
+    or 40 zeros when no further boundary was seen.
+    """
+    import hashlib
+    ctx = hashlib.sha1()
+    result = bytearray(20)
+    patchlen = 0
+    found_next = False
+    before = after = -1
+    diff_is_binary = False
+    pre_oid_str = b""
+    post_oid_str = b""
+    next_oid_hex = "0" * 40
+
+    while True:
+        line, pos = _patch_id_getwholeline(data, pos)
+        if line is None:
+            break
+        p = line
+        matched_prefix = False
+        if line.startswith(b"commit "):
+            p = line[len(b"commit "):]
+            matched_prefix = True
+        elif line.startswith(b"From "):
+            p = line[len(b"From "):]
+            matched_prefix = True
+        if (not matched_prefix and line.startswith(b"\\ ")
+                and len(line) > 12):
+            if verbatim:
+                ctx.update(line)
             continue
-        at = bt = ""
-        if a_sha:
-            at = objs.read_object(repo, a_sha)[1].decode("utf-8", errors="replace")
-        if b_sha:
-            bt = objs.read_object(repo, b_sha)[1].decode("utf-8", errors="replace")
-        h.update(_d.unified_diff(at, bt, p, p).encode("utf-8", errors="replace"))
-    return h.hexdigest()
+
+        if _patch_id_is_hex_oid(p):
+            found_next = True
+            next_oid_hex = p[:40].decode("ascii").lower()
+            break
+
+        # Ignore commit comments.
+        if not patchlen and not line.startswith(b"diff "):
+            continue
+
+        # Parsing diff header?
+        if before == -1:
+            if line.startswith(b"GIT binary patch") or line.startswith(b"Binary files"):
+                diff_is_binary = True
+                before = 0
+                ctx.update(pre_oid_str)
+                ctx.update(post_oid_str)
+                if stable:
+                    ctx = _patch_id_flush_one_hunk(result, ctx)
+                continue
+            elif line.startswith(b"index "):
+                oid1_end = line.find(b"..")
+                oid2_end = -1
+                if oid1_end != -1:
+                    oid2_end = line.find(b" ", oid1_end)
+                if oid2_end == -1:
+                    oid2_end = len(line) - 1
+                if oid1_end != -1 and oid2_end != -1:
+                    pre_oid_str = line[len(b"index "):oid1_end]
+                    post_oid_str = line[oid1_end + 2:oid2_end]
+                continue
+            elif line.startswith(b"--- "):
+                before = after = 1
+            elif not (line[:1].isalpha()):
+                break
+
+        if diff_is_binary:
+            if line.startswith(b"diff "):
+                diff_is_binary = False
+                before = -1
+            continue
+
+        # Looking for a valid hunk header?
+        if before == 0 and after == 0:
+            if line.startswith(b"@@ -"):
+                _ok, before, after = _patch_id_scan_hunk_header(line)
+                continue
+            if not line.startswith(b"diff "):
+                break
+            if stable:
+                ctx = _patch_id_flush_one_hunk(result, ctx)
+            before = after = -1
+
+        # Inside a hunk.
+        c0 = line[0:1]
+        if c0 == b"-" or c0 == b" ":
+            before -= 1
+        if c0 == b"+" or c0 == b" ":
+            after -= 1
+
+        emit = line if verbatim else _patch_id_remove_space(line)
+        patchlen += len(emit)
+        ctx.update(emit)
+
+    if not found_next:
+        next_oid_hex = "0" * 40
+
+    ctx = _patch_id_flush_one_hunk(result, ctx)
+    result_hex = bytes(result).hex()
+    return patchlen, next_oid_hex, result_hex, pos
 
 
 def cmd_patch_id(argv: list[str]) -> int:
-    """Read a diff on stdin and emit its patch-id (hash of diff with line numbers stripped).
+    """Read one or more patches on stdin and emit their patch IDs.
 
-    Also accepts a commit id as positional arg.
+    Port of builtin/patch-id.c: emits "<patch-id> <commit-id>" per patch.
     """
-    ap = argparse.ArgumentParser(prog="pygit patch-id", add_help=False)
-    ap.add_argument("--stable", action="store_true")
-    ap.add_argument("rev", nargs="?")
-    args = ap.parse_args(argv)
-    if args.rev:
+    from . import gitconfig
+
+    repo = None
+    try:
         repo = _repo()
-        s = refs_mod.rev_parse(repo, args.rev)
-        if not s:
-            return 128
-        _print(_patch_id_for_commit(repo, s) + " " + s)
-        return 0
-    pid = _compute_patch_id(sys.stdin.read())
-    if pid is not None:
-        _print(f"{pid} {'0' * 40}")
+    except Exception:
+        repo = None
+
+    def _cfg_bool(name: str) -> bool:
+        val = gitconfig.get(repo, name)
+        if val is None:
+            return False
+        v = val.strip().lower()
+        if v in ("", "true", "yes", "on"):
+            return True
+        if v in ("false", "no", "off"):
+            return False
+        try:
+            return int(v) != 0
+        except ValueError:
+            return True
+
+    cfg_stable = _cfg_bool("patchid.stable")
+    cfg_verbatim = _cfg_bool("patchid.verbatim")
+
+    # CMDMODE: --unstable=1, --stable=2, --verbatim=3 (mutually exclusive).
+    opts = 0
+    mode_name = {1: "--unstable", 2: "--stable", 3: "--verbatim"}
+    for a in argv:
+        if a in ("-h", "--help"):
+            if a == "-h":
+                sys.stdout.write(_PATCH_ID_USAGE)
+                return 129
+            sys.stderr.write(
+                "fatal: 'patch-id --help' is not supported in this build\n")
+            return 129
+        new = None
+        if a == "--unstable":
+            new = 1
+        elif a == "--stable":
+            new = 2
+        elif a == "--verbatim":
+            new = 3
+        elif a == "--":
+            continue
+        elif a.startswith("-") and a != "-":
+            name = a[2:] if a.startswith("--") else a[1:]
+            sys.stderr.write(f"error: unknown option `{name}'\n")
+            sys.stderr.write(_PATCH_ID_USAGE)
+            return 129
+        else:
+            # Non-option args are silently ignored by git patch-id.
+            continue
+        if new is not None:
+            if opts and opts != new:
+                sys.stderr.write(
+                    f"error: options '{mode_name[new]}' and "
+                    f"'{mode_name[opts]}' cannot be used together\n")
+                return 129
+            opts = new
+
+    if opts:
+        stable = opts > 1
+        verbatim = opts == 3
+    else:
+        verbatim = cfg_verbatim
+        stable = cfg_stable or cfg_verbatim  # verbatim implies stable
+
+    data = sys.stdin.buffer.read()
+    pos = 0
+    cur_oid = "0" * 40
+    out = sys.stdout.buffer
+    n = len(data)
+    while pos < n:
+        patchlen, next_oid, result_hex, pos = _get_one_patchid(
+            data, pos, stable, verbatim)
+        if patchlen:
+            out.write(f"{result_hex} {cur_oid}\n".encode("ascii"))
+        cur_oid = next_oid
+    out.flush()
     return 0
-
-
-def _scan_hunk_header(line: str) -> tuple[int, int]:
-    import re
-    m = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
-    if not m:
-        return 0, 0
-    before = int(m.group(1)) if m.group(1) is not None else 1
-    after = int(m.group(2)) if m.group(2) is not None else 1
-    return before, after
-
-
-def _compute_patch_id(text: str) -> Optional[str]:
-    """Compute a patch-id exactly like C Git's get_one_patchid (default mode)."""
-    import hashlib
-    h = hashlib.sha1()
-    before = after = -1
-    patchlen = 0
-    for line in text.splitlines(keepends=True):
-        if line.startswith("\\ ") and len(line) > 12:
-            continue
-        if patchlen == 0 and not line.startswith("diff "):
-            continue
-        if before == -1:
-            if line.startswith("Binary files") or line.startswith("GIT binary patch"):
-                before = 0
-                continue
-            if line.startswith("index "):
-                continue
-            if line.startswith("--- "):
-                before = after = 1
-            elif not (line and line[0].isalpha()):
-                break
-        if before == 0 and after == 0:
-            if line.startswith("@@ -"):
-                before, after = _scan_hunk_header(line)
-                continue
-            if not line.startswith("diff "):
-                break
-            before = after = -1
-        if line and line[0] in "- ":
-            before -= 1
-        if line and line[0] in "+ ":
-            after -= 1
-        stripped = "".join(c for c in line if not c.isspace())
-        patchlen += len(stripped)
-        h.update(stripped.encode("utf-8", errors="replace"))
-    return h.hexdigest() if patchlen else None
 
 
 _CHECKOUT_INDEX_USAGE = (

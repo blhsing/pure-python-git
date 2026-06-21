@@ -157,6 +157,13 @@ class Opt:
         # Paths that underwent a top-level 3-way content merge (git's
         # "Auto-merging <path>" message), recorded in processing order.
         self.auto_merged: list[str] = []
+        # Conflict/info messages, mirroring merge-ort.c's path_msg() recording
+        # into opt->priv->conflicts.  Each entry is a logical conflict:
+        #   (primary_path, type_str, message_text, [paths...])
+        # where type_str is the merge-ort "short description" (e.g.
+        # "Auto-merging", "CONFLICT (contents)") that ``merge-tree -z`` emits.
+        # Recorded only for top-level (non-virtual) merges, exactly like git.
+        self.messages: list[tuple[str, str, str, list[str]]] = []
         self.null_oid = "0" * (repo.hash_len * 2)
         self._tree_cache: dict[str, dict] = {}
         self.rename_limit = rename_limit
@@ -212,6 +219,20 @@ class Opt:
         if self._attributes is None:
             return xdiff.DEFAULT_CONFLICT_MARKER_SIZE
         return self._attributes.marker_size(path)
+
+    def path_msg(self, type_str: str, primary_path: str, message: str,
+                 other_paths: "Optional[list[str]]" = None) -> None:
+        """Record a conflict/info message, mirroring merge-ort.c's path_msg().
+
+        Inner (virtual-ancestor) merges never record messages
+        (``opt->priv->call_depth && opt->verbosity < 5`` short-circuits in
+        git), so we skip them when ``call_depth`` is set."""
+        if self.call_depth:
+            return
+        paths = [primary_path]
+        if other_paths:
+            paths.extend(other_paths)
+        self.messages.append((primary_path, type_str, message, paths))
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +468,10 @@ def _ll_merge(opt: Opt, orig: bytes, src1: bytes, src2: bytes, *, path: str,
             return src2, 0
         if variant == xdiff.XDL_MERGE_FAVOR_OURS:
             return src1, 0
+        # LL_MERGE_BINARY_CONFLICT: git's ll_merge records the warning here.
+        opt.path_msg(
+            "CONFLICT (binary)", path,
+            f"warning: Cannot merge binary files: {path} ({name1} vs. {name2})")
         return src1, 2
     favor = xdiff.XDL_MERGE_FAVOR_UNION if drv == "union" else variant
     result, nconf = xdiff.xdl_merge(
@@ -581,6 +606,9 @@ def handle_content_merge(opt: Opt, path: str, o: VersionInfo, a: VersionInfo,
         merged, status = merge_3way(opt, path, o, a, b, pathnames, extra_marker_size)
         result.oid = objs.write_object(opt.repo, "blob", merged)
         clean = clean & (1 if status == 0 else 0)
+        # git records the "Auto-merging" info after the 3-way merge of a
+        # regular file (omittable hint; only top-level merges record it).
+        opt.path_msg("Auto-merging", path, f"Auto-merging {path}")
     elif s_isgitlink(a.mode):
         two_way = (S_IFMT & o.mode) != (S_IFMT & a.mode)
         clean, result.oid = merge_submodule(
@@ -1016,6 +1044,11 @@ def _apply_directory_rename_modifications(opt: Opt, pair: _Pair, new_path: str) 
 
 def detect_and_process_renames(opt: Opt, base: Optional[str], s1: Optional[str],
                                s2: Optional[str]) -> int:
+    # merge.renames=false / -Xno-renames: git's detect_and_process_renames
+    # skips rename (and directory-rename) detection entirely and reports the
+    # merge as clean at this stage.
+    if not opt.rename_detection:
+        return 1
     base_map = _leaf_map(opt, base)
     side_maps = {1: _leaf_map(opt, s1), 2: _leaf_map(opt, s2)}
 
@@ -1330,6 +1363,14 @@ def process_entry(opt: Opt, path: str, ci: CI, dm: "DirVersions") -> None:
         if clean_merge and ci.df_conflict:
             ci.filemask = 1 << df_file_index
             ci.stages[df_file_index] = VersionInfo(merged.mode, merged.oid)
+        if not clean_merge:
+            reason = "content"
+            if ci.filemask == 6:
+                reason = "add/add"
+            if s_isgitlink(merged.mode):
+                reason = "submodule"
+            opt.path_msg("CONFLICT (contents)", path,
+                         f"CONFLICT ({reason}): Merge conflict in {path}")
     elif ci.filemask in (3, 5):
         # modify/delete
         sidei = 2 if ci.filemask == 5 else 1
@@ -1337,6 +1378,17 @@ def process_entry(opt: Opt, path: str, ci: CI, dm: "DirVersions") -> None:
         ci.result_mode = ci.stages[index].mode
         ci.result_oid = ci.stages[index].oid
         ci.clean = False
+        modify_branch = opt.branch1 if sidei == 1 else opt.branch2
+        delete_branch = opt.branch2 if sidei == 1 else opt.branch1
+        # The rename/delete special-cases (ci.path_conflict with matching base
+        # oid) are handled elsewhere; this is the plain modify/delete notice.
+        if not (ci.path_conflict
+                and ci.stages[0].oid == ci.stages[sidei].oid):
+            opt.path_msg(
+                "CONFLICT (modify/delete)", path,
+                f"CONFLICT (modify/delete): {path} deleted in {delete_branch} "
+                f"and modified in {modify_branch}.  Version {modify_branch} "
+                f"of {path} left in tree.")
     elif ci.filemask in (2, 4):
         # added on one side
         sidei = 2 if ci.filemask == 4 else 1

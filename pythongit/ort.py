@@ -26,6 +26,12 @@ class OrtResult:
     conflicts: list[str]
     conflict_index: Optional[Index]
     auto_merged: list[str] = field(default_factory=list)
+    # Conflict/info messages for ``merge-tree`` display, each a tuple
+    # (primary_path, type_str, message_text, [paths...]).  Sorted by path then
+    # recording order, matching git's merge_display_update_messages().
+    messages: list = field(default_factory=list)
+    # True iff the merge had no conflicts (git's ``result.clean``).
+    clean: bool = True
 
 
 def _peel_to_tree(repo: Repository, rev: str) -> str:
@@ -156,7 +162,14 @@ def _ort_result(repo: Repository, tree: str, opt) -> OrtResult:
     stages = mergeort.conflicted_stages(opt)
     conflicts = sorted({path for path, _stage, _mode, _sha in stages})
     conflict_index = _result_index(repo, tree, stages) if stages else None
-    return OrtResult(tree, conflicts, conflict_index, list(opt.auto_merged))
+    # git's merge_display_update_messages sorts the per-path message lists by
+    # path (string_list_sort), then prints each path's messages in the order
+    # they were recorded.  Python's sort is stable, so a single sort by the
+    # primary path reproduces that ordering exactly.
+    messages = sorted(opt.messages, key=lambda m: m[0])
+    clean = not conflicts
+    return OrtResult(tree, conflicts, conflict_index, list(opt.auto_merged),
+                     messages, clean)
 
 
 def merge_tree(
