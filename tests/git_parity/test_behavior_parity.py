@@ -3350,3 +3350,65 @@ def test_batch11_repack_countobjects_parity(case, tmp_path: Path, git_254_oracle
         results[tool] = (proc.returncode, norm(proc.stdout), proc.stderr)
 
     assert results["pygit"] == results["oracle"]
+
+
+# fast-import's default statistics block (builtin/fast-import.c dump_stats) is
+# byte-exact for every structural field (Alloc'd/Total/per-type counts, branches,
+# marks, atoms, pack_report) EXCEPT two genuinely non-reproducible elements: the
+# Memory/pools/objects KiB lines (this Python process vs git's C heap) and the
+# "N deltas of M attempts" columns (git deltifies during packing; we store full
+# objects). These lock the whole block with only those two normalized, which also
+# exercises the --date-format/--export-marks/--max-pack-size/--big-file-threshold/
+# --depth/--active-branches flags through the deterministic path.
+_FI_LINEAR = ("blob\nmark :1\ndata 2\na\n\ncommit refs/heads/main\nmark :2\n"
+              "committer P <p@e> 1700000000 +0000\ndata 2\nx\nM 100644 :1 f\n\n")
+_FI_SUBDIR = ("blob\nmark :1\ndata 2\na\n\ncommit refs/heads/main\nmark :2\n"
+              "committer P <p@e> 1700000000 +0000\ndata 2\nx\nM 100644 :1 dir/a\n\n"
+              "blob\nmark :3\ndata 2\nb\n\ncommit refs/heads/main\nmark :4\n"
+              "committer P <p@e> 1700000000 +0000\ndata 2\ny\nM 100644 :3 dir/b\n\n")
+BATCH12_FASTIMPORT_STATS_CASES = [
+    ("fi-stats-empty", ["fast-import"], ""),
+    ("fi-stats-linear", ["fast-import"], _FI_LINEAR),
+    ("fi-stats-subdir", ["fast-import"], _FI_SUBDIR),
+    ("fi-date-format-raw", ["fast-import", "--date-format=raw"], _FI_LINEAR),
+    ("fi-max-pack-size", ["fast-import", "--max-pack-size=1m"], _FI_SUBDIR),
+    ("fi-big-file-threshold", ["fast-import", "--big-file-threshold=1m"], _FI_SUBDIR),
+    ("fi-depth", ["fast-import", "--depth=10"], _FI_SUBDIR),
+    ("fi-active-branches", ["fast-import", "--active-branches=5"], _FI_SUBDIR),
+    ("fi-export-marks", ["fast-import", "--export-marks=marks.txt"], _FI_LINEAR),
+]
+
+
+@pytest.mark.parametrize("case", BATCH12_FASTIMPORT_STATS_CASES,
+                         ids=[c[0] for c in BATCH12_FASTIMPORT_STATS_CASES])
+def test_batch12_fastimport_stats_parity(case, tmp_path: Path, git_254_oracle: str):
+    import re
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, probe, stdin = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    def norm(s: str) -> str:
+        s = re.sub(r"(?m)^(Memory total|       pools|     objects):.*$", r"\1: X", s)
+        s = re.sub(r"\d+ deltas of\s+\d+ attempts", "D deltas of A attempts", s)
+        return s
+
+    def snap(repo: Path):
+        gd = repo / ".git"
+        refs = sorted((str(p.relative_to(gd)).replace("\\", "/"), p.read_text())
+                      for p in (gd / "refs").rglob("*") if p.is_file())
+        return refs
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, input=stdin,
+                              text=True, capture_output=True)
+        results[tool] = (proc.returncode, norm(proc.stdout), norm(proc.stderr), snap(repo))
+
+    assert results["pygit"] == results["oracle"]

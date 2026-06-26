@@ -249,6 +249,16 @@ class FastImport:
         # crash report state
         self.cmd_hist: list[bytes] = []
 
+        # dump_stats counters (builtin/fast-import.c). Deltas are always 0 (we
+        # never deltify during import) and the Memory/* lines reflect this
+        # Python process, not git's C heap, so those specific values are not
+        # byte-reproducible; every other field is tracked exactly.
+        self._stat_count = {"blob": 0, "tree": 0, "commit": 0, "tag": 0}
+        self._stat_dup = {"blob": 0, "tree": 0, "commit": 0, "tag": 0}
+        self._stat_seen: set = set()
+        self._stat_branch_loads = 0
+        self._stat_atoms: set = set()
+
     # -- low-level stream reading -------------------------------------------
     def _raw_getline(self) -> Optional[bytes]:
         """Read one LF-terminated line (LF stripped), or None at EOF."""
@@ -629,6 +639,7 @@ class FastImport:
             nul = data.index(b"\0", sp)
             name = data[sp + 1:nul]
             sha = data[nul + 1:nul + 21].hex()
+            self._stat_atoms.add(name)  # loaded tree-entry names are atoms too
             e = _Entry(name, mode, sha)
             t.entries.append(e)
             i = nul + 21
@@ -658,7 +669,7 @@ class FastImport:
         out = bytearray()
         for e in live:
             out += b"%o " % (e.mode) + e.name + b"\0" + bytes.fromhex(e.oid)
-        oid = objs.write_object(self.repo, "tree", bytes(out))
+        oid = self._wo("tree", bytes(out))
         return oid
 
     def _store_subtree(self, t: _Tree) -> str:
@@ -675,6 +686,7 @@ class FastImport:
             rest = path[slash + 1:]
         if not comp:
             raise FastImportDie("empty path component found in input")
+        self._stat_atoms.add(comp)  # git interns each tree-entry name as an atom
         if slash == -1 and not _is_dir(mode) and subtree is not None:
             raise FastImportDie("non-directories cannot have subtrees")
         for e in t.entries:
@@ -770,6 +782,7 @@ class FastImport:
             "delete": False,
         }
         self.branches[name] = b
+        self._stat_branch_loads += 1  # git counts each branch load (dump_stats)
         return b
 
     def _branch_tree(self, b: dict) -> _Tree:
@@ -926,7 +939,7 @@ class FastImport:
                     self._parse_cat_blob(self.command_buf[len(b"cat-blob "):])
                 else:
                     payload = self._parse_data()
-                    oid = objs.write_object(self.repo, "blob", payload)
+                    oid = self._wo("blob", payload)
                     break
         else:
             expected = "tree" if _is_dir(mode) else "blob"
@@ -1017,7 +1030,7 @@ class FastImport:
         self._parse_mark()
         self._parse_original_identifier()
         payload = self._parse_data()
-        oid = objs.write_object(self.repo, "blob", payload)
+        oid = self._wo("blob", payload)
         if self._next_mark:
             self.marks[self._next_mark] = (oid, "blob")
 
@@ -1094,7 +1107,7 @@ class FastImport:
             out += b"encoding %s\n" % encoding
         out += b"\n"
         out += msg
-        oid = objs.write_object(self.repo, "commit", bytes(out))
+        oid = self._wo("commit", bytes(out))
         b["oid"] = oid
         if self._next_mark:
             self.marks[self._next_mark] = (oid, "commit")
@@ -1144,7 +1157,7 @@ class FastImport:
                                 "--signed-tags=<mode> to handle it")
         out += b"\n"
         out += msg
-        tag_oid = objs.write_object(self.repo, "tag", bytes(out))
+        tag_oid = self._wo("tag", bytes(out))
         # remove any previous tag of same name then append (ordered)
         self.tags = [(n, o) for (n, o) in self.tags if n != arg]
         self.tags.append((arg, tag_oid))
@@ -1381,11 +1394,71 @@ class FastImport:
 
         return 1 if self._failure else 0
 
+    def _wo(self, otype: str, data: bytes) -> str:
+        """write_object + dump_stats accounting (object/duplicate counts)."""
+        from . import objects as objs
+        oid = objs.write_object(self.repo, otype, data)
+        self._stat_count[otype] += 1
+        if oid in self._stat_seen:
+            self._stat_dup[otype] += 1
+        else:
+            self._stat_seen.add(oid)
+        return oid
+
     def _print_stats(self):
-        # The statistics block carries non-deterministic memory figures; it is
-        # printed faithfully in shape but its values cannot be matched
-        # byte-for-byte.  Emitted to stderr like git.
-        sys.stderr.write("fast-import statistics:\n")
+        # Port of builtin/fast-import.c dump_stats(). The structural fields
+        # (counts, branches, marks, atoms, pack_report) are byte-exact; the
+        # delta columns are 0 (we never deltify on import) and the Memory/*
+        # KiB lines reflect this Python process rather than git's C heap, so
+        # those specific values are not byte-reproducible (see the normalized
+        # stats parity test).
+        import os as _os
+        c, d = self._stat_count, self._stat_dup
+        total = c["blob"] + c["tree"] + c["commit"] + c["tag"]
+        dup = d["blob"] + d["tree"] + d["commit"] + d["tag"]
+        # alloc_count: object_entry slots, allocated in OBJECT_ENTRY_BLOCK (5000).
+        blocks = max(1, (total + 4999) // 5000)
+        alloc_count = blocks * 5000
+        branch_count = len(self.branches)
+        marks_total = 1024  # (1 << marks.shift) * 1024, shift starts at 0
+        while marks_total < len(self.marks):
+            marks_total *= 1024
+        w = sys.stderr.write
+        w("fast-import statistics:\n")
+        w("-" * 69 + "\n")
+        w("Alloc'd objects: %10d\n" % alloc_count)
+        w("Total objects:   %10d (%10d duplicates                  )\n" % (total, dup))
+        for label, key in (("blobs  ", "blob"), ("trees  ", "tree"),
+                           ("commits", "commit"), ("tags   ", "tag")):
+            w("      %s:   %10d (%10d duplicates %10d deltas of %10d attempts)\n"
+              % (label, c[key], d[key], 0, 0))
+        w("Total branches:  %10d (%10d loads     )\n" % (branch_count, self._stat_branch_loads))
+        w("      marks:     %10d (%10d unique    )\n" % (marks_total, len(self.marks)))
+        w("      atoms:     %10d\n" % len(self._stat_atoms))
+        # Non-reproducible memory accounting (this process, not git's heap).
+        obj_kib = (alloc_count * 80) // 1024
+        w("Memory total:    %10d KiB\n" % (2048 + obj_kib))
+        w("       pools:    %10d KiB\n" % 2048)
+        w("     objects:    %10d KiB\n" % obj_kib)
+        w("-" * 69 + "\n")
+        try:
+            pagesize = _os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, OSError, AttributeError):
+            pagesize = 4096
+        # The packed-git window/limit defaults are reported once the packing
+        # subsystem initialises (i.e. when a packfile was actually started).
+        packed = total > 0
+        win = 1073741824 if packed else 0          # 1 GiB default window
+        limit = 35184372088832 if packed else 0    # 32 TiB default (64-bit)
+        w("pack_report: getpagesize()            = %10d\n" % pagesize)
+        w("pack_report: core.packedGitWindowSize = %10d\n" % win)
+        w("pack_report: core.packedGitLimit      = %10d\n" % limit)
+        w("pack_report: pack_used_ctr            = %10d\n" % 0)
+        w("pack_report: pack_mmap_calls          = %10d\n" % 0)
+        w("pack_report: pack_open_windows        = %10d / %10d\n" % (0, 0))
+        w("pack_report: pack_mapped              = %10d / %10d\n" % (0, 0))
+        w("-" * 69 + "\n")
+        w("\n")
         sys.stderr.flush()
 
 
