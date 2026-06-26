@@ -3539,3 +3539,64 @@ def test_batch13_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch13_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+BATCH14_CASES = [
+    ('cat-file -e on an unresolvable name dies rc 128', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['cat-file', '-e', 'nonexistentref']),
+    ('ls-tree trailing-slash pathspec lists contents', [('write', 'sub/a.txt', 'apple\n'), ('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['ls-tree', 'HEAD', 'sub/']),
+    ('ls-tree -t with trailing-slash shows the dir too', [('write', 'sub/a.txt', 'apple\n'), ('write', 'sub/deep/d.txt', 'deep\n'), ('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['ls-tree', '-t', 'HEAD', 'sub/']),
+    ('ls-files -i without -o/-c is rejected', [('write', '.gitignore', '*.log\n'), ('write', 'junk.log', 'x\n'), ('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['ls-files', '-i', '--exclude-standard']),
+    ('rev-parse --revs-only suppresses on-disk path', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['rev-parse', '--revs-only', 'HEAD', 'file.txt']),
+    ('rev-parse --no-revs echoes only the path', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['rev-parse', '--no-revs', 'HEAD', 'file.txt']),
+    ('rev-parse echoes the -- separator', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['rev-parse', 'HEAD', '--', 'file.txt']),
+    ('rev-parse leading -- echoes separator then path', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['rev-parse', '--', 'file.txt']),
+    ('for-each-ref %(align:20) left pad', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['tag', 'v1.0'], ['branch', 'feature']], ['for-each-ref', '--format=%(align:20)%(refname)%(end)|']),
+    ('for-each-ref %(align:20,middle)', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['tag', 'v1.0'], ['branch', 'feature']], ['for-each-ref', '--format=%(align:20,middle)%(refname)%(end)|']),
+    ('for-each-ref %(align:width=15,position=right)', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['tag', 'v1.0'], ['branch', 'feature']], ['for-each-ref', '--format=%(align:width=15,position=right)%(refname)%(end)|']),
+    ('merge-base --independent prints both diverged tips', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B'], ['branch', 'topic'], ('write', 'f', 'a\nb\nc\n'), ['add', '-A'], ['commit', '-q', '-m', 'C'], ['checkout', '-q', 'topic'], ('write', 'g', 'd\n'), ['add', '-A'], ['commit', '-q', '-m', 'D'], ['checkout', '-q', 'main']], ['merge-base', '--independent', 'main', 'topic']),
+    ('merge-base --independent dedups an ancestor', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['merge-base', '--independent', 'main', 'main~1']),
+    ('show-branch --independent dedups identical tips', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['branch', 'feature']], ['show-branch', '--independent', 'main', 'feature']),
+    ('show-branch --independent three identical tips', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['branch', 'feature']], ['show-branch', '--independent', 'main', 'feature', 'main']),
+    ('count-objects -v -H humanises sizes', [('write', 'file.txt', 'line1\nline2\nline3\n'), ('write', 'sub/a.txt', 'apple\n'), ['add', '-A'], ['commit', '-q', '-m', 'first commit'], ('write', 'file.txt', 'line1\nline2 changed\nline3\nline4\n'), ['add', '-A'], ['commit', '-q', '-m', 'second commit']], ['count-objects', '-v', '-H']),
+    ('count-objects -v raw sizes unchanged', [('write', 'file.txt', 'line1\nline2\nline3\n'), ('write', 'sub/a.txt', 'apple\n'), ['add', '-A'], ['commit', '-q', '-m', 'first commit']], ['count-objects', '-v']),
+    ('rev-list --count --left-right two counts', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B'], ['branch', 'topic'], ('write', 'f', 'a\nb\nc\n'), ['add', '-A'], ['commit', '-q', '-m', 'C'], ['checkout', '-q', 'topic'], ('write', 'g', 'd\n'), ['add', '-A'], ['commit', '-q', '-m', 'D'], ['checkout', '-q', 'main']], ['rev-list', '--count', '--left-right', 'main...topic']),
+    ('rev-list --pretty bare defaults to medium', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty', 'HEAD']),
+    ('rev-list --pretty=medium single header + trailing blank', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty=medium', 'HEAD']),
+    ('rev-list --pretty=full', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty=full', 'HEAD']),
+    ('rev-list --pretty=fuller', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty=fuller', 'HEAD']),
+    ('rev-list --pretty=short omits Date line', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty=short', 'HEAD']),
+    ('rev-list --pretty=raw raw headers', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--pretty=raw', 'HEAD']),
+    ('rev-list --header -z rejected', [('write', 'f', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'A'], ('write', 'f', 'a\nb\n'), ['add', '-A'], ['commit', '-q', '-m', 'B']], ['rev-list', '--header', '-z', 'HEAD']),
+]
+
+BATCH14_STDIN_CASES = [
+    ('cat-file --batch-check %(rest) splits on whitespace', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['cat-file', '--batch-check=%(objectname) %(objecttype) %(rest)'], 'HEAD foo bar\n'),
+    ('cat-file --batch-check %(deltabase) for a loose object', [('write', 'file.txt', 'x\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['cat-file', '--batch-check=%(deltabase)'], 'HEAD\n'),
+    ('cat-file --batch-check %(objectsize:disk) loose disk size', [('write', 'file.txt', 'line1\nline2\nline3\n'), ['add', '-A'], ['commit', '-q', '-m', 'first commit'], ('write', 'file.txt', 'line1\nline2 changed\nline3\nline4\n'), ['add', '-A'], ['commit', '-q', '-m', 'second commit']], ['cat-file', '--batch-check=%(objectsize) %(objectsize:disk)'], 'HEAD\n'),
+    ('interpret-trailers runs trailer.<key>.command and substitutes output', [['config', 'trailer.sign.command', 'echo COMMITTER'], ('write', 'm.txt', 'subject\n\nbody\n')], ['interpret-trailers', '--trailer', 'sign:', 'm.txt'], ''),
+    ('interpret-trailers runs trailer.<key>.cmd with value as argv', [['config', 'trailer.fix.cmd', 'echo "saw:$1"'], ('write', 'm.txt', 'subject\n\nbody\n')], ['interpret-trailers', '--trailer', 'fix: B12', 'm.txt'], ''),
+    ('interpret-trailers auto-populates configured .command trailer with no --trailer', [['config', 'trailer.sign.command', 'echo COMMITTER'], ('write', 'm.txt', 'subject\n\nbody\n')], ['interpret-trailers', 'm.txt'], ''),
+    ('interpret-trailers command with $ARG substitution', [['config', 'trailer.see.command', 'echo "ref: $ARG"'], ('write', 'm.txt', 'subj\n\nbody\n')], ['interpret-trailers', '--trailer', 'see: X', 'm.txt'], ''),
+    ('mailinfo --quoted-cr=strip removes quoted CR from body', [], ['mailinfo', '--quoted-cr=strip', 'msg', 'patch'], 'From: A <a@b>\nSubject: s\nContent-Transfer-Encoding: quoted-printable\n\nline with cr=0D\nnext\n'),
+    ('mailinfo default quoted-cr warns on quoted CRLF', [], ['mailinfo', 'msg', 'patch'], 'From: A <a@b>\nSubject: s\nContent-Transfer-Encoding: quoted-printable\n\nline with cr=0D\nnext\n'),
+    ('mailinfo --quoted-cr=bogus rejected rc=129', [], ['mailinfo', '--quoted-cr=bogus', 'msg', 'patch'], 'From: A <a@b>\nSubject: s\nContent-Transfer-Encoding: quoted-printable\n\nline with cr=0D\nnext\n'),
+    ('format-patch invalid range left endpoint rejected', [('write', 'f.txt', 'line1\n'), ['add', 'f.txt'], ['commit', '-qm', 'commit 1'], ('write', 'f.txt', 'line1\nline2\n'), ['commit', '-qam', 'commit 2'], ('write', 'f.txt', 'line1\nline2\nline3\n'), ['commit', '-qam', 'commit 3']], ['format-patch', '--stdout', 'HEAD~3..HEAD~1'], ''),
+    ('apply --whitespace=bogus rejected rc=129', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-qm', 'base'], ('write', 'ap.patch', 'diff --git a/f.txt b/f.txt\nindex 3d2c7e8..0a0a0a0 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n')], ['apply', '--whitespace=bogus', 'ap.patch'], ''),
+    ('apply include then exclude same path applies it (first-match)', [('write', 'f1', 'a\n'), ('write', 'f2', 'x\n'), ['add', '.'], ['commit', '-qm', 'b'], ('write', 'mp.patch', 'diff --git a/f1 b/f1\n--- a/f1\n+++ b/f1\n@@ -1 +1 @@\n-a\n+A\n')], ['apply', '--include=f1', '--exclude=f1', 'mp.patch'], ''),
+    ('apply exclude then include same path skips it, empty result rc=0', [('write', 'f1', 'a\n'), ('write', 'f2', 'x\n'), ['add', '.'], ['commit', '-qm', 'b'], ('write', 'mp.patch', 'diff --git a/f1 b/f1\n--- a/f1\n+++ b/f1\n@@ -1 +1 @@\n-a\n+A\n')], ['apply', '--exclude=f1', '--include=f1', 'mp.patch'], ''),
+    ('apply nonexistent patch file error rc=128', [('write', 'f1', 'a\n'), ['add', '.'], ['commit', '-qm', 'b']], ['apply', 'nope.patch'], ''),
+    ('revert -n stages without committing (log unchanged)', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-qm', 'c1'], ('write', 'f.txt', 'a\nb\n'), ['commit', '-qam', 'c2']], ['log', '--oneline'], ''),
+    ('rebase upstream already up to date prints message to stdout', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-qm', 'base'], ['checkout', '-qb', 'topic'], ('write', 'f.txt', 'a\nb\n'), ['commit', '-qam', 't1']], ['rebase', 'main'], ''),
+    ('revert conflict writes short-sha+subject marker into worktree', [('write', 'f.txt', 'a\nb\nc\n'), ['add', 'f.txt'], ['commit', '-qm', 'c1'], ('write', 'f.txt', 'a\nB\nc\n'), ['commit', '-qam', 'c2'], ('write', 'f.txt', 'a\nB\nC\n'), ['commit', '-qam', 'c3'], ['revert', '--no-edit', 'HEAD~1']], ['cat-file', 'blob', '@:f.txt'], ''),
+]
+
+@pytest.mark.parametrize("case", BATCH14_CASES, ids=[c[0] for c in BATCH14_CASES])
+def test_batch14_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH14_STDIN_CASES, ids=[c[0] for c in BATCH14_STDIN_CASES])
+def test_batch14_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)

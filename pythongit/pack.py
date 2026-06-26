@@ -717,6 +717,24 @@ def find_in_packs(repo: Repository, sha: str):
     return None
 
 
+def packed_object_disk_size(repo: Repository, sha: str) -> Optional[int]:
+    """On-disk size of a packed object: the byte length of its entry in the
+    packfile (next object's offset, or the end of the objects region, minus this
+    object's offset). Matches git's %(objectsize:disk) / verify-pack column 4.
+    Returns None if the object is not in any pack."""
+    for pk in _iter_packs(repo):
+        off = pk.offset_of(sha)
+        if off is None:
+            continue
+        pk._load()
+        offsets = sorted(pk._offsets)  # type: ignore[arg-type]
+        pack_end = len(pk._mm) - pk.hash_len  # type: ignore[arg-type]
+        i = bisect.bisect_right(offsets, off)
+        next_off = offsets[i] if i < len(offsets) else pack_end
+        return next_off - off
+    return None
+
+
 def resolve_short(repo: Repository, prefix: str) -> Optional[str]:
     matches = []
     def collect_from_sorted(shas: list[str]) -> Optional[str]:

@@ -109,6 +109,21 @@ def _remove_redundant(repo: Repository, array: list[str]) -> list[str]:
     return [array[i] for i in range(cnt) if not redundant[i]]
 
 
+def reduce_heads(repo: Repository, heads: list[str]) -> list[str]:
+    """Port of commit-reach.c reduce_heads: uniquify the input commits
+    (preserving first-seen order) then drop any that are reachable from another
+    (remove_redundant). Used by `merge-base --independent`."""
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for h in heads:
+        if h not in seen:
+            seen.add(h)
+            uniq.append(h)
+    if len(uniq) <= 1:
+        return uniq
+    return _remove_redundant(repo, uniq)
+
+
 def merge_bases(repo: Repository, a: str, b: str) -> list[str]:
     """Return the merge bases of two commits, in git's order
     (repo_get_merge_bases): date-descending with FIFO tie-breaking, redundant

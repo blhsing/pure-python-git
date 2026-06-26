@@ -1324,12 +1324,52 @@ def _replace_idents_using_mailmap(buf: bytes, mm) -> bytes:
     return b"".join(out)
 
 
-def _expand_batch_atoms(fmt: str, sha: str, t: str, size: int) -> str:
-    """Expand the `cat-file --batch[-check]=<format>` %(atom) placeholders."""
+def _expand_batch_atoms(fmt: str, sha: str, t: str, size: int,
+                        repo: "Repository" = None, rest: str = "") -> str:
+    """Expand the `cat-file --batch[-check]=<format>` %(atom) placeholders.
+
+    %(objectsize:disk) is the on-disk representation size (the loose file's
+    bytes, or the packed entry's size); %(deltabase) is the delta base oid
+    (all-zeros for a non-delta object); %(rest) is the remainder of the input
+    record after the first run of whitespace (used with --batch-check)."""
+    if "%(objectsize:disk)" in fmt or "%(deltabase)" in fmt:
+        disk = _object_disk_size(repo, sha) if repo is not None else size
+        base = _batch_delta_base(repo, sha) if repo is not None else ("0" * len(sha))
+        fmt = (fmt.replace("%(objectsize:disk)", str(disk))
+                  .replace("%(deltabase)", base))
     return (fmt.replace("%(objectname)", sha)
                .replace("%(objecttype)", t)
-               .replace("%(objectsize:disk)", str(size))
-               .replace("%(objectsize)", str(size)))
+               .replace("%(objectsize)", str(size))
+               .replace("%(rest)", rest))
+
+
+def _batch_delta_base(repo: "Repository", sha: str) -> str:
+    """Return %(deltabase): the oid this object is a delta against, or an
+    all-zeros oid when it is stored whole (loose, or a non-delta pack entry).
+    Mirrors cat-file's data.delta_base_oid handling."""
+    zero = "0" * repo.hex_len
+    if objs._loose_path(repo, sha).exists():
+        return zero
+    try:
+        from . import pack as _pack
+        for pk in _pack._iter_packs(repo):
+            off = pk.offset_of(sha)
+            if off is None:
+                continue
+            pk._load()
+            data = pk._mm
+            obj_type, _size, pos = _pack._read_var_size(data, off)
+            if obj_type == _pack.OBJ_OFS_DELTA:
+                neg, _pos = _pack._read_offset(data, pos)
+                base_off = off - neg
+                off_to_oid = {pk.offset_of(s): s for s in pk.shas}
+                return off_to_oid.get(base_off, zero)
+            if obj_type == _pack.OBJ_REF_DELTA:
+                return data[pos:pos + pk.hash_len].hex()
+            return zero
+    except Exception:
+        pass
+    return zero
 
 
 def _read_delimited_stdin(input_delim: str):
@@ -1582,11 +1622,18 @@ def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
                     buffer=False, follow_symlinks=False) -> int:
     if fmt is None:
         fmt = "%(objectname) %(objecttype) %(objectsize)"
+    # %(rest) in the format means: split each input record at the first run of
+    # whitespace; the leading field is the object name and the remainder feeds
+    # %(rest) (cat-file.c split_on_whitespace).
+    split_on_whitespace = "%(rest)" in fmt
     source = names if names is not None else _read_delimited_stdin(input_delim)
     out = sys.stdout.buffer
     for name in source:
         if names is None and not name:
             continue
+        rest = ""
+        if split_on_whitespace:
+            name, rest = _batch_split_rest(name)
         resolved = (_batch_follow_resolve(repo, name, mm) if follow_symlinks
                     else _batch_resolve(repo, name, mm))
         if resolved is None:
@@ -1599,11 +1646,27 @@ def _cat_file_batch(repo: Repository, check_only: bool, names=None, fmt=None,
             _write_follow_special(resolved[0], resolved[1], output_delim, buffer)
             continue
         sha, t, size, data = resolved
-        info = _expand_batch_atoms(fmt, sha, t, size)
+        info = _expand_batch_atoms(fmt, sha, t, size, repo=repo, rest=rest)
         _batch_write_record(info, data, check_only, output_delim, buffer)
     if buffer:
         out.flush()
     return 0
+
+
+def _batch_split_rest(line: str) -> tuple[str, str]:
+    """Split a --batch-check record at the first run of whitespace (space/tab):
+    return (object-name, rest). When there is no whitespace, rest is empty.
+    Mirrors cat-file.c's split_on_whitespace handling."""
+    i = 0
+    n = len(line)
+    while i < n and line[i] not in " \t":
+        i += 1
+    if i == n:
+        return line, ""
+    name = line[:i]
+    while i < n and line[i] in " \t":
+        i += 1
+    return name, line[i:]
 
 
 def _cat_file_batch_command(repo: Repository, fmt=None, mm=None,
@@ -1632,7 +1695,7 @@ def _cat_file_batch_command(repo: Repository, fmt=None, mm=None,
                 out.flush()
             return
         sha, t, size, data = resolved
-        info = _expand_batch_atoms(fmt, sha, t, size)
+        info = _expand_batch_atoms(fmt, sha, t, size, repo=repo)
         _batch_write_record(info, data, kind == "info", output_delim, buffer)
 
     queued: list[tuple[str, str]] = []
@@ -1815,6 +1878,12 @@ def cmd_cat_file(argv: list[str]) -> int:
     sha = refs_mod.rev_parse(repo, args.object)
     exists = sha is not None and objs.object_exists(repo, sha)
     if args.exists:
+        # C: get_oid_with_context() runs first and die()s for a name that
+        # cannot be resolved at all (rc 128). A well-formed oid that simply
+        # is not present resolves fine, so -e reports !odb_has_object (rc 1).
+        if sha is None:
+            _err(f"fatal: Not a valid object name {args.object}")
+            return 128
         return 0 if exists else 1
     if sha is None or not exists:
         if (args.show_type or args.show_size) and sha is not None:
@@ -1890,38 +1959,61 @@ def cmd_ls_tree(argv: list[str]) -> int:
         else:
             sys.stdout.write(f"{e.mode.zfill(6)} {obj_t} {sha}\t{path}" + eol)
 
-    specs = [p.rstrip("/") for p in args.paths]
+    # `-d -r` implies `-t` (builtin/ls-tree.c): a recursive dirs-only walk shows
+    # the intermediate trees.
+    show_trees = args.show_trees or (args.dirs_only and args.r)
 
-    def matches(path: str) -> bool:
-        # The entry path is exactly a pathspec or lies under one.
+    # Each pathspec keeps a "trailing slash" flag: `sub/` means "match the
+    # contents of sub" (entries strictly under it), not the `sub` tree entry
+    # itself, while `sub` matches the `sub` entry exactly (and anything beneath
+    # it). This mirrors git's tree_entry_interesting/show_recursive behaviour.
+    # `s` is the normalised spec (trailing slash stripped); `trailing` records
+    # whether the original had one. `raw` keeps the trailing slash for the
+    # show_recursive "is there a deeper component" test.
+    specs = [(p.rstrip("/"), p.endswith("/") and p.rstrip("/") != "", p)
+             for p in args.paths]
+
+    def interesting(path: str) -> bool:
+        # Does any pathspec touch this entry? Either the entry lies inside a
+        # spec, exactly matches a no-slash spec, or is an ancestor of (the
+        # contents of) a spec (so we descend toward it). The raw spec keeps a
+        # trailing slash so `sub/` marks the `sub` directory as an ancestor.
         if not specs:
             return True
-        return any(path == s or path.startswith(s + "/") for s in specs)
+        for s, trailing, raw in specs:
+            if path.startswith(s + "/") or raw.startswith(path + "/"):
+                return True
+            if not trailing and path == s:
+                return True
+        return False
 
-    def should_descend(path: str) -> bool:
-        # Descend a directory if it is selected, or contains a pathspec.
-        if not specs:
+    def show_recursive(path: str) -> bool:
+        # Port of show_recursive: -r, or some pathspec has a path component
+        # strictly below this tree path. A trailing slash counts as a deeper
+        # component (so `sub/` makes the `sub` tree recursive), matching git.
+        if args.r:
             return True
-        return any(path == s or path.startswith(s + "/") or s.startswith(path + "/")
-                   for s in specs)
+        for _s, _trailing, raw in specs:
+            if raw.startswith(path + "/"):
+                return True
+        return False
 
     def walk(tsha: str, prefix: str = "") -> None:
         _t, td = objs.read_object(repo, tsha)
         for e in objs.parse_tree(td, repo.hash_len):
             path = prefix + e.name
+            if not interesting(path):
+                continue
             if e.is_dir():
-                if args.r:
-                    if matches(path) and args.show_trees:
-                        emit(e, path)
-                    if matches(path) or should_descend(path):
-                        walk(e.sha, path + "/")
-                else:
-                    if matches(path):
-                        emit(e, path)
-                    elif should_descend(path):
-                        walk(e.sha, path + "/")
+                recurse = show_recursive(path)
+                # A recursed tree is only printed with -t; a non-recursed
+                # (matched-leaf) tree is always printed. -d never hides trees.
+                if not recurse or show_trees:
+                    emit(e, path)
+                if recurse:
+                    walk(e.sha, path + "/")
             else:
-                if not args.dirs_only and matches(path):
+                if not args.dirs_only:
                     emit(e, path)
 
     walk(sha)
@@ -2089,6 +2181,21 @@ def _is_inside(child: Path, parent: Path) -> bool:
         return False
 
 
+def _looks_like_pathspec(arg: str) -> bool:
+    """Port of setup.c looks_like_pathspec: an unescaped glob special, or
+    long-form pathspec magic (`:(`), marks the argument as a pathspec even when
+    no such file exists on disk."""
+    escaped = False
+    for ch in arg:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch in "*?[":
+            return True
+    return arg.startswith(":(")
+
+
 def cmd_rev_parse(argv: list[str]) -> int:
     repo: Optional[Repository] = None
 
@@ -2112,19 +2219,55 @@ def cmd_rev_parse(argv: list[str]) -> int:
     sym_refs = False      # --symbolic: print ref names for --all/--branches/...
     verify = False
     quiet = False
-    no_revs = False
-    revs_only = False
     path_format: Optional[str] = None
     verified_count = 0
-    after_dashdash = False
     pending_git_path = False
+    # builtin/rev-parse.c output filter bits. DO_REVS/DO_FLAGS gate rev and flag
+    # output; DO_NONFLAGS|DO_NOREV together gate path output (show_file).
+    # --revs-only clears DO_NOREV (suppresses paths); --no-revs clears DO_REVS
+    # (suppresses revisions).
+    DO_REVS, DO_NOREV, DO_FLAGS, DO_NONFLAGS = 1, 2, 4, 8
+    filter_bits = DO_REVS | DO_NOREV | DO_FLAGS | DO_NONFLAGS
+    # as_is: 0 = normal; 1 = after a bare token failed to resolve (still verify
+    # the rest as filenames); 2 = after "--" (do not verify, just echo paths).
+    as_is = 0
+    has_dashdash = "--" in argv
+
+    def show_file(arg: str) -> bool:
+        # Port of show_file: emit a non-flag, non-rev token (a path or "--")
+        # only when both DO_NONFLAGS and DO_NOREV are set.
+        if (filter_bits & (DO_NONFLAGS | DO_NOREV)) == (DO_NONFLAGS | DO_NOREV):
+            _print(arg)
+            return True
+        return False
+
+    def verify_filename(arg: str) -> Optional[int]:
+        # Port of verify_filename: a path that looks like a pathspec or exists
+        # on disk is accepted; otherwise die with the ambiguous-argument error.
+        if arg and arg[0] == "-":
+            _err(f"fatal: option '{arg}' must come before non-option arguments")
+            return 128
+        if _looks_like_pathspec(arg) or (R().path / arg).exists() or os.path.lexists(arg):
+            return None
+        _err(f"fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.")
+        _err("Use '--' to separate paths from revisions, like this:")
+        _err("'git <command> [<revision>...] -- [<file>...]'")
+        return 128
 
     for arg in argv:
-        if after_dashdash:
-            _print(arg)
+        if as_is:
+            # After "--" (as_is==2) just echo; after a failed bare token
+            # (as_is==1) echo then verify each subsequent filename.
+            if show_file(arg) and as_is < 2:
+                rc = verify_filename(arg)
+                if rc is not None:
+                    return rc
             continue
         if arg == "--":
-            after_dashdash = True
+            # Pass on the "--" separator when we are showing flags or revs.
+            as_is = 2
+            if filter_bits & (DO_FLAGS | DO_REVS):
+                show_file(arg)
             continue
         if arg == "--git-dir":
             r = R()
@@ -2234,10 +2377,10 @@ def cmd_rev_parse(argv: list[str]) -> int:
                 abbrev = 7
             continue
         if arg == "--no-revs":
-            no_revs = True
+            filter_bits &= ~DO_REVS
             continue
         if arg == "--revs-only":
-            revs_only = True
+            filter_bits &= ~DO_NOREV
             continue
         if arg == "--symbolic":
             # Make subsequent --all/--branches/--tags/--remotes print ref names.
@@ -2259,17 +2402,20 @@ def cmd_rev_parse(argv: list[str]) -> int:
             r = R()
             sha = refs_mod.rev_parse(r, arg[1:])
             if sha is not None:
-                _print("^" + (sha[:abbrev] if abbrev else sha))
+                # A reversed revision: gated by DO_REVS (show_rev).
+                if filter_bits & DO_REVS:
+                    _print("^" + (sha[:abbrev] if abbrev else sha))
                 continue
         if arg.startswith("-") and arg != "-":
-            # Unrecognized dashed args are echoed verbatim, as C Git does
-            # (suppressed under --revs-only).
-            if not revs_only:
+            # An unrecognized dashed arg is a flag (show_flag): printed only if
+            # DO_FLAGS is set and the appropriate rev/no-rev bit is set. Generic
+            # flags are non-rev arguments, so they need DO_NOREV.
+            if (filter_bits & DO_FLAGS) and (filter_bits & DO_NOREV):
                 _print(arg)
             continue
-        # A revision argument (suppressed under --no-revs).
-        if no_revs:
-            continue
+        # A revision argument (show_rev): suppressed when DO_REVS is cleared
+        # (--no-revs). The token must still resolve; an unresolved one falls
+        # through to the filename path below.
         r = R()
         sha = refs_mod.rev_parse(r, arg)
         if sha is None:
@@ -2286,12 +2432,19 @@ def cmd_rev_parse(argv: list[str]) -> int:
                     return 1
                 _err("fatal: Needed a single revision")
                 return 128
-            _print(arg)
-            if not quiet:
-                _err(f"fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.")
-                _err("Use '--' to separate paths from revisions, like this:")
-                _err("'git <command> [<revision>...] -- [<file>...]'")
-            return 128
+            # An unresolved token with a preceding "--" is a hard error; without
+            # one it becomes a filename: as_is=1, echo it (subject to the
+            # filter), then verify it names a real path.
+            if has_dashdash:
+                _err(f"fatal: bad revision '{arg}'")
+                return 128
+            as_is = 1
+            if not show_file(arg):
+                continue
+            rc = verify_filename(arg)
+            if rc is not None:
+                return rc
+            continue
         if verify:
             verified_count += 1
             if verified_count > 1:
@@ -2299,6 +2452,9 @@ def cmd_rev_parse(argv: list[str]) -> int:
                     return 1
                 _err("fatal: Needed a single revision")
                 return 128
+        # show_rev: a resolved revision is printed only when DO_REVS is set.
+        if not (filter_bits & DO_REVS):
+            continue
         if symbolic is not None:
             full = refs_mod.dwim_full_name(r, arg) or arg
             _print(refs_mod.shorten_ref(full) if symbolic == "abbrev" else full)
@@ -2387,6 +2543,12 @@ def cmd_ls_files(argv: list[str]) -> int:
              "--resolve-undo, --deduplicate, --eol")
         sys.stderr.write("\n" + _LS_FILES_USAGE)
         return 129
+    # -i/--ignored only makes sense alongside -o or -c (explicitly): the others
+    # scan and the cached listing are the only sources it can filter
+    # (builtin/ls-files.c). The check runs before the no-flags->cached default.
+    if args.ignored and not args.others and not args.cached:
+        _err("fatal: ls-files -i must be used with either -o or -c")
+        return 128
     idx = read_index(repo)
     eol = "\0" if args.nul else "\n"
 
@@ -2588,6 +2750,48 @@ def _ref_is_hidden(refname: str, patterns: list[str]) -> bool:
     return False
 
 
+def _rev_list_emit_pretty(repo: Repository, sha: str, c, style: str, ab) -> None:
+    """Render one commit for `rev-list --pretty=<style>` (builtin multiline
+    styles). Mirrors `git log --pretty=<style>` for a single commit, but every
+    entry is terminated with a trailing blank line (the rev-list convention)."""
+    _print(f"commit {ab(sha)}")
+    if style == "raw":
+        _print(f"tree {c.tree}")
+        for p in c.parents:
+            _print(f"parent {p}")
+        _print(f"author {c.author}")
+        _print(f"committer {c.committer}")
+    elif style == "short":
+        if len(c.parents) > 1:
+            _print("Merge: " + " ".join(p[:7] for p in c.parents))
+        _print(f"Author: {_split_ident(c.author)[0]}")
+    elif style == "full":
+        if len(c.parents) > 1:
+            _print("Merge: " + " ".join(p[:7] for p in c.parents))
+        _print(f"Author: {_split_ident(c.author)[0]}")
+        _print(f"Commit: {_split_ident(c.committer)[0]}")
+    elif style == "fuller":
+        if len(c.parents) > 1:
+            _print("Merge: " + " ".join(p[:7] for p in c.parents))
+        _print(f"Author:     {_split_ident(c.author)[0]}")
+        _print(f"AuthorDate: {_format_date(c.author, 'default')}")
+        _print(f"Commit:     {_split_ident(c.committer)[0]}")
+        _print(f"CommitDate: {_format_date(c.committer, 'default')}")
+    else:  # medium (and bare --pretty)
+        if len(c.parents) > 1:
+            _print("Merge: " + " ".join(p[:7] for p in c.parents))
+        _print(f"Author: {_split_ident(c.author)[0]}")
+        _print(f"Date:   {_format_date(c.author, 'default')}")
+    _print("")
+    if style == "short":
+        first = c.message.splitlines()[0] if c.message.strip() else ""
+        _print(f"    {first}")
+    else:
+        for line in c.message.rstrip("\n").splitlines():
+            _print(f"    {line}")
+    _print("")
+
+
 def cmd_rev_list(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit rev-list", add_help=False)
     ap.add_argument("--count", action="store_true")
@@ -2709,9 +2913,19 @@ def cmd_rev_list(argv: list[str]) -> int:
     # value flag like `--disk-usage HEAD` would swallow the revision. Rewrite the
     # bare forms to their attached "=<const>" so the next token stays a revision.
     _opt_const = {"--disk-usage": "", "--branches": "*", "--tags": "*",
-                  "--remotes": "*", "--no-walk": "sorted"}
+                  "--remotes": "*", "--no-walk": "sorted", "--pretty": "medium"}
     pre = [f"{t}={_opt_const[t]}" if t in _opt_const else t for t in pre]
     args = ap.parse_args(pre)
+    # Reject -z combined with the options C Git refuses (builtin/rev-list.c:
+    # "-z option used with unsupported option"): --header, --timestamp,
+    # --pretty/--format, --objects-edge, --left-right, --disk-usage, --bisect*.
+    if args.z and (args.header or args.timestamp or args.pretty is not None
+                   or args.format is not None or args.oneline
+                   or args.objects_edge or args.left_right
+                   or args.disk_usage is not None or args.bisect
+                   or args.bisect_all or args.bisect_vars):
+        _err("fatal: -z option used with unsupported option")
+        return 128
     if args.parents and args.children:
         _err("fatal: options '--parents' and '--children' cannot be used together")
         return 128
@@ -3144,6 +3358,12 @@ def cmd_rev_list(argv: list[str]) -> int:
         elif fmt is None and args.pretty and "%" in args.pretty:
             fmt = args.pretty
         is_oneline = args.oneline or args.pretty == "oneline"
+        # The bare/builtin multiline styles (medium is the default with a bare
+        # --pretty). Each is rendered like `git log --pretty=<style>` for one
+        # commit but rev-list terminates every entry with a trailing blank line
+        # rather than separating entries with a leading blank.
+        style = args.pretty if args.pretty in (
+            "medium", "full", "fuller", "short", "raw") else "medium"
         if args.reverse:
             out = list(reversed(out))
         for s in out:
@@ -3156,26 +3376,36 @@ def cmd_rev_list(argv: list[str]) -> int:
                 _print(f"commit {_ab(s)}")
                 _print(_expand_commit_format(repo, s, c, fmt, {}))
             else:
-                _print(f"commit {_ab(s)}")
-                _emit_commit_header(s, c, style=args.pretty, date_mode="default")
-                _print("")
-                for line in c.message.rstrip("\n").splitlines():
-                    _print(f"    {line}")
+                _rev_list_emit_pretty(repo, s, c, style, _ab)
         return 0
     if args.count:
-        _print(str(len(out)))
+        # --count with --left-right prints the two sides tab-separated
+        # (builtin/rev-list.c): count_left = commits flagged SYMMETRIC_LEFT.
+        if args.left_right:
+            left = sum(1 for s in out if s in lr_left)
+            right = len(out) - left
+            _print(f"{left}\t{right}")
+        else:
+            _print(str(len(out)))
     elif args.objects or args.objects_edge:
-        wbuf = sys.stdout.write
+        out_buf = sys.stdout.buffer
+
+        def wz(line: str) -> None:
+            out_buf.write(line.encode("utf-8", "surrogateescape"))
+            out_buf.write(term.encode("latin-1"))
+
         # Boundary (uninteresting) commits, prefixed with '-', precede the rest.
         if args.objects_edge:
             for e in edges:
-                wbuf(f"-{_ab(e)}" + term)
+                wz(f"-{_ab(e)}")
         if args.reverse:
             out = list(reversed(out))
         for s in out:
-            wbuf(_ab(s) + term)
+            wz(_ab(s))
         # Objects reachable from the uninteresting (excluded) commits are
-        # already in the receiver, so C Git omits them from the listing.
+        # already in the receiver, so C Git omits them from the listing. With
+        # -z each named object is "<oid>\0path=<name>\0" (a separate record for
+        # the path); the bare non-z layout is "<oid> <name>" on one line.
         seen_obj = _reachable_tree_objects(repo, excluded, graph)
         for s in out:
             info = _commit_tree_parents(repo, s, graph)
@@ -3185,7 +3415,16 @@ def cmd_rev_list(argv: list[str]) -> int:
                 if osha in seen_obj:
                     continue
                 seen_obj.add(osha)
-                wbuf(f"{osha} {opath}" + term)
+                if args.z:
+                    out_buf.write(osha.encode("ascii"))
+                    out_buf.write(b"\0")
+                    if opath:
+                        out_buf.write(b"path=")
+                        out_buf.write(opath.encode("utf-8", "surrogateescape"))
+                        out_buf.write(b"\0")
+                else:
+                    wz(f"{osha} {opath}")
+        out_buf.flush()
     else:
         if args.reverse:
             out = list(reversed(out))
@@ -8569,6 +8808,37 @@ def cmd_checkout(argv: list[str]) -> int:
     paths: list[str] = []
     after_dd = False
     quiet = False
+    # Expand bundled short options ("-qb" -> "-q" "-b") the way parse_options
+    # does, so "git checkout -qb topic" treats topic as the new branch name.
+    # Stop expanding at the first option that consumes a value (-b/-B): the
+    # remainder of the cluster is that option's attached argument.
+    expanded: list[str] = []
+    _seen_dd = False
+    for a in argv:
+        if _seen_dd or a == "--" or not a.startswith("-") or a == "-" or a.startswith("--"):
+            expanded.append(a)
+            if a == "--":
+                _seen_dd = True
+            continue
+        # short cluster like -q, -qb, -bTOPIC
+        k = 1
+        n = len(a)
+        emitted_value_opt = False
+        while k < n:
+            ch = a[k]
+            if ch in ("b", "B"):
+                # value option: rest of cluster (if any) is the branch name
+                rest = a[k + 1:]
+                expanded.append("-" + ch)
+                if rest:
+                    expanded.append(rest)
+                emitted_value_opt = True
+                break
+            expanded.append("-" + ch)
+            k += 1
+        if not emitted_value_opt:
+            pass
+    argv = expanded
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -10464,6 +10734,19 @@ def cmd_merge_base(argv: list[str]) -> int:
         a, b = shas
         return 0 if a in _m.merge_bases(repo, a, b) else 1
 
+    # --independent: print the subset of the input commits not reachable from
+    # any other input commit (commit-reach.c reduce_heads), in input order.
+    if args.independent:
+        if args.all:
+            _err("fatal: options '--independent' and '--all' cannot be used together")
+            return 128
+        heads = _m.reduce_heads(repo, shas)
+        if not heads:
+            return 1
+        for s in heads:
+            _print(s)
+        return 0
+
     if len(shas) == 1:
         bases = [shas[0]]
     else:
@@ -10708,10 +10991,30 @@ def cmd_revert(argv: list[str]) -> int:
     if not target:
         _err(f"fatal: bad revision '{args.rev}'")
         return 128
-    sha, conflicts = sequencer.revert(repo, target, no_commit=args.no_commit)
+    # Need the reverted commit's abbrev + subject for the error line below.
+    _, tdata = objs.read_object(repo, target)
+    tc = objs.parse_commit(tdata)
+    t_subject = tc.message.splitlines()[0] if tc.message.strip() else ""
+    from .mergeort import _abbrev as _merge_abbrev
+    t_abbrev = _merge_abbrev(repo, target)
+
+    sha, conflicts, messages = sequencer.revert(repo, target, no_commit=args.no_commit)
     if conflicts:
-        for p in conflicts:
-            _print(f"CONFLICT (content): Merge conflict in {p}")
+        # The merge engine's "Auto-merging"/"CONFLICT" lines go to stdout in the
+        # order they were recorded (merge_display_update_messages); each tuple is
+        # (primary_path, type_str, message_text, [paths]).
+        for m in messages:
+            _print(m[2])
+        # sequencer.c do_pick_commit: error(_("could not revert %s... %s"),
+        # short_commit_name, msg.subject) then print_advice() -> hint block.
+        _err(f"error: could not revert {t_abbrev}... {t_subject}")
+        _err("hint: After resolving the conflicts, mark them with")
+        _err('hint: "git add/rm <pathspec>", then run')
+        _err('hint: "git revert --continue".')
+        _err('hint: You can instead skip this commit with "git revert --skip".')
+        _err('hint: To abort and get back to the state before "git revert",')
+        _err('hint: run "git revert --abort".')
+        _err("hint: Disable this message with \"git config set advice.mergeConflict false\"")
         return 1
     # --no-commit stages the revert without committing: no summary to print.
     if not args.no_commit:
@@ -13031,14 +13334,63 @@ def cmd_apply(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
 
+    # Capture include/exclude rules in their command-line order: apply.c keeps a
+    # single ordered limit_by_name list and uses the FIRST matching rule, so the
+    # separate argparse lists (which lose interleaving) cannot drive use_patch().
+    limit_by_name = []   # list of (pattern, is_include)
+    has_include = False
+    j = 0
+    while j < len(argv):
+        tok = argv[j]
+        for opt, inc in (("--include", True), ("--exclude", False)):
+            if tok == opt:
+                if j + 1 < len(argv):
+                    limit_by_name.append((argv[j + 1], inc))
+                    has_include = has_include or inc
+                j += 1
+                break
+            if tok.startswith(opt + "="):
+                limit_by_name.append((tok[len(opt) + 1:], inc))
+                has_include = has_include or inc
+                break
+        j += 1
+
     favor = args.favor or 0
     if favor and not args.threeway:
         _err("fatal: --ours, --theirs, and --union require --3way")
         return 128
 
-    text = (sys.stdin.buffer.read() if not args.file
-            else Path(args.file).read_bytes())
+    # parse_whitespace_option(): reject unknown actions before reading the patch.
+    if args.whitespace is not None and args.whitespace not in (
+            "warn", "nowarn", "error", "error-all", "strip", "fix"):
+        _err(f"error: unrecognized whitespace option '{args.whitespace}'")
+        return 129
+
     pif = args.file if args.file else "<stdin>"
+    if not args.file:
+        text = sys.stdin.buffer.read()
+    else:
+        # apply.c opens the file (error: can't open patch ...) then reads it
+        # (error: failed to read patch ...); a directory opens fine but fails to
+        # read with EISDIR, so the two failures use different messages.
+        try:
+            fd = os.open(args.file, os.O_RDONLY)
+        except OSError as exc:
+            _err(f"error: can't open patch '{args.file}': {exc.strerror}")
+            return 128
+        try:
+            chunks = []
+            while True:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                chunks.append(b)
+            text = b"".join(chunks)
+        except OSError as exc:
+            _err(f"error: failed to read patch: {exc.strerror}")
+            os.close(fd)
+            return 128
+        os.close(fd)
     try:
         patches = apply_mod.parse_patches(text, args.p_value, patch_input_file=pif,
                                           recount=args.recount)
@@ -13051,20 +13403,32 @@ def cmd_apply(argv: list[str]) -> int:
     if args.reverse:
         apply_mod.reverse_patches(patches)
 
-    # --include/--exclude filter the patched paths (fnmatch, like C Git).
-    if args.include or args.exclude:
+    # --include/--exclude: walk the ordered limit_by_name list; the first rule
+    # whose wildmatch() matches the pathname decides (include->use, exclude->skip).
+    # A path matching no rule is used unless any --include was given.  Mirror
+    # apply.c use_patch(); track skipped patches for the empty-result rule below.
+    skipped_patch = 0
+    if limit_by_name:
         import fnmatch as _fn
 
-        def _included(t: str) -> bool:
-            if args.include and not any(_fn.fnmatch(t, p) for p in args.include):
-                return False
-            if args.exclude and any(_fn.fnmatch(t, p) for p in args.exclude):
-                return False
-            return True
-        patches = [fp for fp in patches if _included(_apply_target(fp))]
+        def _use_patch(t: str) -> bool:
+            for pat, inc in limit_by_name:
+                if _fn.fnmatchcase(t, pat):
+                    return inc
+            return not has_include
+        kept = []
+        for fp in patches:
+            if _use_patch(_apply_target(fp)):
+                kept.append(fp)
+            else:
+                skipped_patch += 1
+        patches = kept
 
     if not patches:
-        if args.allow_empty:
+        # apply.c: the "No valid patches" error fires only when nothing was
+        # parsed AND nothing was skipped by include/exclude.  If patches were
+        # filtered out, applying zero patches succeeds silently.
+        if args.allow_empty or skipped_patch:
             return 0
         _err('error: No valid patches in input (allow with "--allow-empty")')
         return 128
@@ -13225,11 +13589,25 @@ def cmd_format_patch(argv: list[str]) -> int:
     rng = args.range
     starts: list[str] = []
     excludes: list[str] = []
+    def _ambiguous(name):
+        # setup_revisions() rejects an unresolvable endpoint, naming the whole
+        # argument as given on the command line.
+        _err(f"fatal: ambiguous argument '{name}': unknown revision or path not in the working tree.")
+        _err("Use '--' to separate paths from revisions, like this:")
+        _err("'git <command> [<revision>...] -- [<file>...]'")
+        return 128
+
     if ".." in rng:
         a, b = rng.split("..", 1)
         if a:
-            excludes.append(refs_mod.rev_parse(repo, a) or "")
-        starts.append(refs_mod.rev_parse(repo, b or "HEAD") or "")
+            ea = refs_mod.rev_parse(repo, a)
+            if ea is None:
+                return _ambiguous(rng)
+            excludes.append(ea)
+        sb = refs_mod.rev_parse(repo, b or "HEAD")
+        if sb is None:
+            return _ambiguous(rng)
+        starts.append(sb)
     elif rng.startswith("-"):
         n = int(rng[1:])
         head = refs_mod.rev_parse(repo, "HEAD") or ""
@@ -13323,8 +13701,13 @@ def cmd_format_patch(argv: list[str]) -> int:
             sys.stdout.write(out + ("\n" if i == len(commits) else "\n\n"))
         else:
             safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in subject)[:52].strip("-") or "patch"
-            fname = f"{i:04d}-{safe}.patch"
-            (out_dir / fname).write_text(out, encoding="utf-8")
+            # -v<n>/--reroll-count prefixes the filename with "v<n>-" (log.c
+            # get_patch_filename via rev->reroll_count).
+            prefix = f"v{args.reroll}-" if args.reroll is not None else ""
+            fname = f"{prefix}{i:04d}-{safe}.patch"
+            # In file-output mode git terminates each patch file with an extra
+            # blank line (the same trailing "\n\n" the --stdout form emits).
+            (out_dir / fname).write_text(out + "\n", encoding="utf-8")
             _print(str(out_dir / fname))
     return 0
 
@@ -13787,6 +14170,13 @@ def _am_parse_and_dispatch(repo: Repository, state: "_AmState", argv: list[str],
                         return _am_usage_err(f"option `{canon}' requires a value")
                     val = argv[i + 1]
                     i += 1
+                # --whitespace is OPT_PASSTHRU_ARGV to git-apply, whose
+                # parse_whitespace_option() rejects unknown actions (rc 129).
+                if canon == "whitespace" and val not in (
+                        "warn", "nowarn", "error", "error-all", "strip", "fix"):
+                    sys.stderr.write(
+                        f"error: unrecognized whitespace option '{val}'\n")
+                    return 129
                 state.git_apply_opts.append(f"--{canon}={val}")
             elif canon in ("ignore-space-change", "ignore-whitespace", "reject"):
                 state.git_apply_opts.append(f"--{canon}")
@@ -15739,6 +16129,53 @@ def _fer_quote(mode: str, v: str) -> str:
     return v
 
 
+def _parse_align_spec(arg: Optional[str]):
+    """Port of ref-filter.c align_atom_parser. Parse the %(align:<args>)
+    parameters into (position, width); return None if no valid width is given
+    (C errors, but here we fall back to no padding). ``position`` is one of
+    'left'/'right'/'middle' (default 'left'); args are comma-separated and may be
+    'position=<p>', 'width=<n>', a bare width, or a bare position word."""
+    if not arg:
+        return None
+    position = "left"
+    width = None
+    for s in arg.split(","):
+        if s.startswith("position="):
+            p = s[len("position="):]
+            if p in ("left", "right", "middle"):
+                position = p
+            else:
+                return None
+        elif s.startswith("width="):
+            try:
+                width = int(s[len("width="):])
+            except ValueError:
+                return None
+        elif s.isdigit():
+            width = int(s)
+        elif s in ("left", "right", "middle"):
+            position = s
+        else:
+            return None
+    if width is None or width <= 0:
+        return None
+    return position, width
+
+
+def _strbuf_utf8_align(s: str, position: str, width: int) -> str:
+    """Port of utf8.c strbuf_utf8_align (ASCII path: display width == length)."""
+    display_len = len(s)
+    if display_len >= width:
+        return s
+    if position == "left":
+        return s + " " * (width - display_len)
+    if position == "right":
+        return " " * (width - display_len) + s
+    # middle
+    left = (width - display_len) // 2
+    return " " * left + s + " " * (width - left - display_len)
+
+
 def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Optional[str],
                 quote: Optional[str] = None) -> str:
     """Expand a for-each-ref --format string's %(atom) placeholders. With
@@ -15824,16 +16261,36 @@ def _fer_expand(repo: Repository, ref: str, sha: str, fmt: str, head_ref: Option
             return re.sub(r"%\(([^)]*)\)", lambda m: _fer_quote(quote, atom(m.group(1))), s)
         return re.sub(r"%\(([^)]*)\)", lambda m: atom(m.group(1)), s)
 
-    # Resolve %(if)...%(then)...[%(else)...]%(end) conditionals innermost-first,
-    # before the plain atom substitution.
+    # Resolve %(if)...%(then)...[%(else)...]%(end) conditionals and
+    # %(align:...)...%(end) padding blocks innermost-first, before the plain
+    # atom substitution. Both atoms close with %(end), so look back from each
+    # %(end) to the nearest opening %(if or %(align.
     while True:
         end = fmt.find("%(end)")
         if end < 0:
             break
-        start = fmt.rfind("%(if", 0, end)
+        if_start = fmt.rfind("%(if", 0, end)
+        align_start = fmt.rfind("%(align", 0, end)
+        start = max(if_start, align_start)
         if start < 0:
             break
         seg = fmt[start:end + len("%(end)")]
+        if start == align_start:
+            # %(align:<args>)<content>%(end): expand the content, then pad it to
+            # the requested width/position (ref-filter.c end_align_handler ->
+            # strbuf_utf8_align). For ASCII, display width == byte length.
+            ma = re.match(r"%\(align(?::([^)]*))?\)(.*)%\(end\)$", seg, re.S)
+            if not ma:
+                break
+            spec = _parse_align_spec(ma.group(1))
+            content = subst(ma.group(2), do_quote=True)
+            if spec is None:
+                replacement = content
+            else:
+                position, width = spec
+                replacement = _strbuf_utf8_align(content, position, width)
+            fmt = fmt[:start] + replacement + fmt[end + len("%(end)"):]
+            continue
         m = re.match(r"%\(if(:[^)]*)?\)(.*?)%\(then\)(.*?)(?:%\(else\)(.*))?%\(end\)$", seg, re.S)
         if not m:
             break
@@ -18464,8 +18921,9 @@ def cmd_index_pack(argv: list[str]) -> int:
 
 
 def cmd_verify_pack(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit verify-pack")
-    ap.add_argument("-v", action="store_true")
+    ap = argparse.ArgumentParser(prog="pygit verify-pack", add_help=False)
+    ap.add_argument("-v", "--verbose", dest="v", action="store_true")
+    ap.add_argument("-s", "--stat-only", dest="stat_only", action="store_true")
     ap.add_argument("packs", nargs="+")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -18473,18 +18931,16 @@ def cmd_verify_pack(argv: list[str]) -> int:
     rc = 0
     for p in args.packs:
         path = Path(p)
+        # verify-pack normalises foo/foo.idx -> foo.pack (builtin/verify-pack.c).
         if path.suffix == ".idx":
             path = path.with_suffix(".pack")
+        elif path.suffix != ".pack":
+            path = path.with_name(path.name + ".pack")
         pk = _p.Pack(path, repo.object_format())
         try:
-            for sha in pk.shas:
-                t, data = pk.get(sha)  # type: ignore[misc]
-                actual, _ = objs.hash_bytes(t, data, repo)
-                if actual != sha:
-                    _err(f"error: bad object {sha}")
-                    rc = 1
-                if args.v:
-                    _print(f"{sha} {t} {len(data)}")
+            err = _verify_one_pack(repo, pk, args.v, args.stat_only)
+            if err:
+                rc = 1
         except Exception as e:
             _err(f"verify failed: {e}")
             rc = 1
@@ -18493,8 +18949,118 @@ def cmd_verify_pack(argv: list[str]) -> int:
     return rc
 
 
-def _loose_disk_kib(repo: Repository) -> int:
-    """Loose-object disk usage in KiB, matching C Git's du-style accounting."""
+def _verify_one_pack(repo: Repository, pk, verbose: bool, stat_only: bool) -> bool:
+    """Replicate index-pack --verify[-stat]'s per-object output for one pack.
+
+    Mirrors builtin/index-pack.c show_pack_info: objects are listed in pack
+    (offset) order as `<oid> <type-padded-6> <size> <size-in-pack> <offset>`
+    (with ` <chain-depth> <base-oid>` appended for delta objects), followed by
+    `non delta: N objects`, then a `chain length = N: M objects` histogram, and
+    finally (builtin/verify-pack.c) `<pack>.pack: ok`."""
+    from . import pack as _p
+
+    # Map oid -> offset, then order by offset (pack order).
+    shas = list(pk.shas)
+    off_of = {s: pk.offset_of(s) for s in shas}
+    ordered = sorted(shas, key=lambda s: off_of[s])
+    offsets_sorted = sorted(off_of[s] for s in shas)
+    # End of the object region = pack file size minus the trailing hash; this
+    # bounds the in-pack size of the last object.
+    pk._load()  # populate the mmap
+    pack_end = len(pk._mm) - pk.hash_len  # type: ignore[arg-type]
+    # next-offset boundary for each offset (for the in-pack byte count).
+    next_off: dict[int, int] = {}
+    for i, o in enumerate(offsets_sorted):
+        next_off[o] = offsets_sorted[i + 1] if i + 1 < len(offsets_sorted) else pack_end
+
+    err = False
+    base_objects = 0
+    chain_histogram: dict[int, int] = {}
+
+    def _header_size(sha: str) -> int:
+        """The size encoded in the pack object header (index-pack obj->size).
+
+        For a non-delta object this is the inflated size; for a delta it is the
+        uncompressed delta-instruction length, which is what verify-pack -v
+        prints in the size column for delta objects."""
+        obj_type, size, _pos = _p._read_var_size(pk._mm, off_of[sha])  # type: ignore[arg-type]
+        return size
+
+    def _chain_depth_and_base(sha: str):
+        """For a delta object return (depth, base_oid); for a base, (0, None)."""
+        off = off_of[sha]
+        depth = 0
+        cur_off = off
+        base_oid = None
+        seen_offs: set[int] = set()
+        while True:
+            data = pk._mm  # type: ignore[assignment]
+            obj_type, _size, pos = _p._read_var_size(data, cur_off)
+            if obj_type == _p.OBJ_OFS_DELTA:
+                neg, _pos = _p._read_offset(data, pos)
+                cur_off = cur_off - neg
+                depth += 1
+                if depth == 1:
+                    base_oid = _off_to_oid.get(cur_off)
+            elif obj_type == _p.OBJ_REF_DELTA:
+                b = data[pos:pos + pk.hash_len].hex()
+                depth += 1
+                if depth == 1:
+                    base_oid = b
+                # follow ref-delta base within this pack if present
+                nb_off = off_of.get(b)
+                if nb_off is None or nb_off in seen_offs:
+                    break
+                seen_offs.add(nb_off)
+                cur_off = nb_off
+                continue
+            else:
+                break
+            if cur_off in seen_offs:
+                break
+            seen_offs.add(cur_off)
+        return depth, base_oid
+
+    _off_to_oid = {off_of[s]: s for s in shas}
+
+    lines: list[str] = []
+    for sha in ordered:
+        t, data = pk.get(sha)  # type: ignore[misc]
+        actual, _ = objs.hash_bytes(t, data, repo)
+        if actual != sha:
+            _err(f"error: bad object {sha}")
+            err = True
+        off = off_of[sha]
+        in_pack = next_off[off] - off
+        depth, base_oid = _chain_depth_and_base(sha)
+        if depth:
+            chain_histogram[depth] = chain_histogram.get(depth, 0) + 1
+        else:
+            base_objects += 1
+        if verbose and not stat_only:
+            line = f"{sha} {t:<6} {_header_size(sha)} {in_pack} {off}"
+            if depth:
+                line += f" {depth} {base_oid}"
+            lines.append(line)
+    if verbose and not stat_only:
+        for line in lines:
+            _print(line)
+    if verbose or stat_only:
+        if base_objects:
+            noun = "object" if base_objects == 1 else "objects"
+            _print(f"non delta: {base_objects} {noun}")
+        for depth in sorted(chain_histogram):
+            cnt = chain_histogram[depth]
+            noun = "object" if cnt == 1 else "objects"
+            _print(f"chain length = {depth}: {cnt} {noun}")
+        if not stat_only:
+            _print(f"{pk.pack_path}: {'bad' if err else 'ok'}")
+    return err
+
+
+def _loose_disk_bytes(repo: Repository) -> int:
+    """Loose-object disk usage in bytes, matching C Git's on_disk_bytes (the
+    du-style ``st_blocks * 512`` accounting used by count-objects)."""
     total_blocks = 0
     objects = repo.gitdir / "objects"
     if objects.exists():
@@ -18505,7 +19071,12 @@ def _loose_disk_kib(repo: Repository) -> int:
                         total_blocks += obj.stat().st_blocks
                     except (OSError, AttributeError):
                         pass
-    return total_blocks * 512 // 1024
+    return total_blocks * 512
+
+
+def _loose_disk_kib(repo: Repository) -> int:
+    """Loose-object disk usage in KiB, matching C Git's du-style accounting."""
+    return _loose_disk_bytes(repo) // 1024
 
 
 def _humanise_bytes(n: int) -> str:
@@ -18529,9 +19100,9 @@ def cmd_count_objects(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     loose_count, _bytes = _loose_count_and_size(repo)
-    size = _loose_disk_kib(repo)
+    loose_size = _loose_disk_bytes(repo)
     if args.human and not args.v:
-        _print(f"{loose_count} objects, {_humanise_bytes(size * 1024)}")
+        _print(f"{loose_count} objects, {_humanise_bytes(loose_size)}")
         return 0
     if args.v:
         from . import pack as _p
@@ -18548,12 +19119,16 @@ def cmd_count_objects(argv: list[str]) -> int:
                 pack_count += 1
                 pack_objs += len(pk.shas)
                 packed_set.update(pk.shas)
+        # C count-objects (-v) sums p->pack_size + p->index_size for each local
+        # pack; the .rev/.bitmap files are not counted.
         pack_dir = repo.gitdir / "objects" / "pack"
         size_pack = 0
         if pack_dir.is_dir():
             for pk in pack_dir.glob("*.pack"):
                 size_pack += pk.stat().st_size
-        size_pack_kib = (size_pack + 1023) // 1024
+                idxp = pk.with_suffix(".idx")
+                if idxp.exists():
+                    size_pack += idxp.stat().st_size
         # prune-packable: loose objects that are ALSO present in a pack (what
         # `git prune-packed` would remove), per builtin/count-objects.c.
         prune_packable = 0
@@ -18565,16 +19140,26 @@ def cmd_count_objects(argv: list[str]) -> int:
                         oid = d.name + f.name
                         if len(oid) == repo.hex_len and f.is_file() and oid in packed_set:
                             prune_packable += 1
+        # In verbose mode the non-human size fields are raw bytes / 1024 (floor);
+        # -H humanises the raw byte counts instead (builtin/count-objects.c).
+        if args.human:
+            size_str = _humanise_bytes(loose_size)
+            size_pack_str = _humanise_bytes(size_pack)
+            size_garbage_str = _humanise_bytes(0)
+        else:
+            size_str = str(loose_size // 1024)
+            size_pack_str = str(size_pack // 1024)
+            size_garbage_str = "0"
         _print(f"count: {loose_count}")
-        _print(f"size: {size}")
+        _print(f"size: {size_str}")
         _print(f"in-pack: {pack_objs}")
         _print(f"packs: {pack_count}")
-        _print(f"size-pack: {size_pack_kib}")
+        _print(f"size-pack: {size_pack_str}")
         _print(f"prune-packable: {prune_packable}")
         _print("garbage: 0")
-        _print("size-garbage: 0")
+        _print(f"size-garbage: {size_garbage_str}")
     else:
-        _print(f"{loose_count} objects, {size} kilobytes")
+        _print(f"{loose_count} objects, {loose_size // 1024} kilobytes")
     return 0
 
 
@@ -18896,10 +19481,19 @@ def cmd_mailinfo(argv: list[str]) -> int:
     info block."""
     from . import am as _am
     mi = _am.Mailinfo()
+    # meta_charset.policy: 0=DEFAULT, 1=NO_REENCODE, 2=EXPLICIT (mirror mailinfo.c)
+    charset_policy = 0
+    charset_explicit = None
     msg_file = patch_file = None
     i = 0
     positional: list[str] = []
-    while i < len(argv):
+    n = len(argv)
+
+    def qcr_action(val):
+        return {"nowarn": _am.QCR_NOWARN, "warn": _am.QCR_WARN,
+                "strip": _am.QCR_STRIP}.get(val)
+
+    while i < n:
         arg = argv[i]
         if arg == "-k":
             mi.keep_subject = 1
@@ -18907,22 +19501,63 @@ def cmd_mailinfo(argv: list[str]) -> int:
             mi.keep_non_patch_brackets_in_subject = 1
         elif arg == "-m" or arg == "--message-id":
             mi.add_message_id = 1
+        elif arg == "--no-message-id":
+            mi.add_message_id = 0
         elif arg == "-u":
-            mi.metainfo_charset = "UTF-8"
+            charset_policy = 0
         elif arg == "-n":
-            mi.metainfo_charset = None
+            charset_policy = 1
         elif arg == "--scissors":
             mi.use_scissors = 1
         elif arg == "--no-scissors":
             mi.use_scissors = 0
-        elif arg.startswith("--encoding="):
-            mi.metainfo_charset = arg.split("=", 1)[1]
+        elif arg == "--encoding" or arg.startswith("--encoding="):
+            if "=" in arg:
+                val = arg.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= n:
+                    _err("error: option `encoding' requires a value")
+                    return 129
+                val = argv[i]
+            charset_policy = 2
+            charset_explicit = val
+        elif arg == "--quoted-cr" or arg.startswith("--quoted-cr="):
+            if "=" in arg:
+                val = arg.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= n:
+                    _err("error: option `quoted-cr' requires a value")
+                    return 129
+                val = argv[i]
+            act = qcr_action(val)
+            if act is None:
+                _err(f"error: bad action '{val}' for '--quoted-cr'")
+                return 129
+            mi.quoted_cr = act
         elif not arg.startswith("-"):
             positional.append(arg)
         i += 1
-    if len(positional) < 2:
+    if len(positional) != 2:
         _err("usage: git mailinfo [<options>] <msg> <patch> < mail >info")
         return 129
+    # Resolve meta_charset policy (mailinfo.c cmd_mailinfo switch).
+    #   CHARSET_DEFAULT    -> get_commit_output_encoding() == "UTF-8"
+    #   CHARSET_NO_REENCODE-> NULL
+    #   CHARSET_EXPLICIT   -> the switch's `break` leaves mi.metainfo_charset
+    #                         at its setup_mailinfo() memset value (NULL); the
+    #                         parsed charset is stored only in the local
+    #                         meta_charset struct and never copied into mi.  So
+    #                         an explicit --encoding=<X> disables re-coding (same
+    #                         observable effect as -n), regardless of <X>.
+    if charset_policy == 0:        # CHARSET_DEFAULT
+        mi.metainfo_charset = "UTF-8"
+    elif charset_policy == 1:      # CHARSET_NO_REENCODE
+        mi.metainfo_charset = None
+    else:                          # CHARSET_EXPLICIT
+        del charset_explicit
+        mi.metainfo_charset = None
     msg_file, patch_file = positional[0], positional[1]
     data = _stdin_bytes()
     msg_b, patch_b, info_b = _am.run_mailinfo(mi, data)
@@ -18934,6 +19569,11 @@ def cmd_mailinfo(argv: list[str]) -> int:
     sys.stdout.flush()
     sys.stdout.buffer.write(info_b)
     sys.stdout.buffer.flush()
+    if mi._warn_quoted_cr:
+        _err("warning: quoted CRLF detected")
+    if getattr(mi, "format_flowed", 0):
+        _err("warning: Patch sent with format=flowed; "
+             "space at the end of lines might be lost.")
     if mi.input_error:
         return 1
     return 0
@@ -20243,12 +20883,28 @@ def cmd_show_branch(argv: list[str]) -> int:
             _print(b)
         return 0
 
-    # --independent: print the tips that are not reachable from any other tip.
+    # --independent: print the tips not reachable from any other tip
+    # (builtin/show-branch.c show_independent). rev_mask[i] snapshots a tip's
+    # bits including every other tip that names the SAME commit, so duplicate
+    # tips collapse to one line: the first i prints and marks the commit
+    # UNINTERESTING, and later identical tips no longer compare equal.
     if args.independent:
+        # rev_mask[i] = OR of bits j whose tip is the same commit as rev[i].
+        rev_mask = []
         for i in range(num_rev):
-            if not any(j != i and revs[j] != revs[i] and revs[i] in reach[j]
-                       for j in range(num_rev)):
-                _print(revs[i])
+            m = 0
+            for j in range(num_rev):
+                if revs[j] == revs[i]:
+                    m |= (1 << j)
+            rev_mask.append(m)
+        uninteresting: set[str] = set()
+        for i in range(num_rev):
+            commit = revs[i]
+            if commit in uninteresting:
+                continue
+            if mask(commit) == rev_mask[i]:
+                _print(commit)
+            uninteresting.add(commit)
         return 0
 
     # Build the reachable union in rev-input order, then order it like git's
@@ -23544,8 +24200,10 @@ def _it_process(opts, new_trailers, text, comment, separators, cl_separators):
 
     # ---- apply new trailers ----
     if not opts["only_input"]:
+        config_items = _it_build_config_arg_items()
         arg_items = _it_build_arg_items(new_trailers, cl_separators, separators)
-        _it_process_lists(head, arg_items)
+        # list_splice(&config_head, &arg_head): config items first.
+        _it_process_lists(head, config_items + arg_items)
 
     body, _ = _it_format_trailers(opts, head, separators)
     out.append(body)
@@ -23554,6 +24212,17 @@ def _it_process(opts, new_trailers, text, comment, separators, cl_separators):
         out.append(text[end_of_log:])
 
     return "".join(out)
+
+
+def _it_build_config_arg_items():
+    """Mirror trailer.c parse_trailers_from_config: an arg item for each
+    configured trailer that has a .command (NOT .cmd), with empty value."""
+    items = []
+    for it in _IT_CONF_HEAD:
+        if it.conf.command:
+            tok = _it_token_from_item(it, None)
+            items.append(_ITArgItem(tok, "", it.conf.copy()))
+    return items
 
 
 def _it_build_arg_items(new_trailers, cl_separators, separators):
@@ -23602,26 +24271,89 @@ def _it_find_same_and_apply(head, arg):
     return False
 
 
+_IT_TRAILER_ARG_STRING = "$ARG"
+
+
+def _it_apply_command(conf, arg):
+    """Mirror trailer.c apply_command: run trailer.<key>.cmd/.command via shell,
+    capture stdout, trim, and return it.  cmd pushes the command as argv[0] and
+    the arg as a second argv; command substitutes $ARG into the command string."""
+    import subprocess
+    cmd_str = None
+    extra = None
+    if conf.cmd:
+        cmd_str = conf.cmd
+        if arg is not None:
+            extra = arg
+    elif conf.command:
+        cmd_str = conf.command
+        if arg is not None:
+            cmd_str = cmd_str.replace(_IT_TRAILER_ARG_STRING, arg)
+    else:
+        return ""
+    # Build the argv the way run-command.c prepare_shell_cmd does with use_shell.
+    if extra is not None:
+        argv = ["/bin/sh", "-c", cmd_str + ' "$@"', cmd_str, extra]
+    else:
+        argv = ["/bin/sh", "-c", cmd_str]
+    env = dict(os.environ)
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_PREFIX", "GIT_COMMON_DIR"):
+        env.pop(var, None)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, env=env)
+    except OSError:
+        sys.stderr.write("error: running trailer command '%s' failed\n" % cmd_str)
+        return ""
+    if proc.returncode != 0:
+        sys.stderr.write("error: running trailer command '%s' failed\n" % cmd_str)
+        return ""
+    out = proc.stdout.decode("utf-8", "surrogateescape")
+    return _it_trim(out)
+
+
+def _it_apply_item_command(in_tok, arg):
+    """Mirror trailer.c apply_item_command: if the arg's conf has a cmd/command,
+    compute the substituted value (falling back to in_tok's value when the arg
+    value is empty)."""
+    conf = arg.conf
+    if not (conf.command or conf.cmd):
+        return
+    if arg.value:
+        a = arg.value
+    elif in_tok is not None and in_tok.value:
+        a = in_tok.value
+    else:
+        a = ""
+    arg.value = _it_apply_command(conf, a)
+
+
 def _it_apply_if_exists(head, in_tok, arg, on_tok):
     e = arg.conf.if_exists
     if e == _E_DO_NOTHING:
         return
     if e == _E_REPLACE:
+        _it_apply_item_command(in_tok, arg)
         new_item = _ITTrailerItem(arg.token, arg.value)
         _it_add_to_list(head, on_tok, arg, new_item)
         if in_tok in head:
             head.remove(in_tok)
         return
     if e == _E_ADD:
+        _it_apply_item_command(in_tok, arg)
         new_item = _ITTrailerItem(arg.token, arg.value)
         _it_add_to_list(head, on_tok, arg, new_item)
         return
     if e == _E_ADD_IF_DIFF:
+        _it_apply_item_command(in_tok, arg)
         if _it_check_if_different(head, in_tok, arg, True):
             new_item = _ITTrailerItem(arg.token, arg.value)
             _it_add_to_list(head, on_tok, arg, new_item)
         return
     if e == _E_ADD_IF_DIFF_NEIGHBOR:
+        _it_apply_item_command(in_tok, arg)
         if _it_check_if_different(head, on_tok, arg, False):
             new_item = _ITTrailerItem(arg.token, arg.value)
             _it_add_to_list(head, on_tok, arg, new_item)
@@ -23642,6 +24374,7 @@ def _it_apply_if_missing(head, arg):
     if m == _M_DO_NOTHING:
         return
     if m == _M_ADD:
+        _it_apply_item_command(None, arg)
         new_item = _ITTrailerItem(arg.token, arg.value)
         if _it_after_or_end(arg.conf.where):
             head.append(new_item)

@@ -62,14 +62,18 @@ def _apply_patch(
     ort_base: Optional[str] = None,
     ort_ours: Optional[str] = None,
     ort_theirs: Optional[str] = None,
+    base_label: Optional[str] = None,
+    ours_label: Optional[str] = None,
+    theirs_label: Optional[str] = None,
 ):
     """Three-way merge head_tree with target_tree using base_tree as base.
 
     Runs the pure-Python ort engine (:mod:`pythongit.ort`) and returns
-    (new_tree_sha, conflicted_paths, conflict_index). When a path conflicts,
-    the conflict index records stages 1 (base), 2 (ours), 3 (theirs); the
-    merged-with-markers content is kept in the returned tree for checkout into
-    the worktree.
+    (new_tree_sha, conflicted_paths, conflict_index, messages). When a path
+    conflicts, the conflict index records stages 1 (base), 2 (ours), 3 (theirs);
+    the merged-with-markers content is kept in the returned tree for checkout
+    into the worktree.  ``messages`` is the ordered list of "Auto-merging"/
+    "CONFLICT" lines the merge produced (for display on stdout).
     """
     from . import ort as ort_mod
 
@@ -78,10 +82,14 @@ def _apply_patch(
         ort_base or base_tree,
         ort_ours or head_tree,
         ort_theirs or target_tree,
+        base_label=base_label,
+        ours_label=ours_label,
+        theirs_label=theirs_label,
     )
     if ort_result.conflicts:
         _note_rerere_conflicts(repo, ort_result.tree, ort_result.conflicts)
-    return ort_result.tree, ort_result.conflicts, ort_result.conflict_index
+    return (ort_result.tree, ort_result.conflicts, ort_result.conflict_index,
+            ort_result.messages)
 
 
 def cherry_pick(repo: Repository, target_sha: str,
@@ -94,7 +102,15 @@ def cherry_pick(repo: Repository, target_sha: str,
     if not head_sha:
         raise ValueError("no HEAD")
     head_tree = _commit_obj(repo, head_sha).tree
-    new_tree, conflicts, conflict_idx = _apply_patch(
+    # Conflict-marker labels (sequencer.c do_pick_commit / get_message).
+    # For cherry-pick: base = parent, next = the picked commit, so
+    #   o.ancestor = base_label = msg.parent_label = "parent of <abbrev> (<subject>)"
+    #   o.branch1  = "HEAD"     (ours)
+    #   o.branch2  = next_label = msg.label        = "<abbrev> (<subject>)"
+    from .mergeort import _abbrev as _merge_abbrev
+    subj = target.message.splitlines()[0] if target.message.strip() else ""
+    label = f"{_merge_abbrev(repo, target_sha)} ({subj})"
+    new_tree, conflicts, conflict_idx, messages = _apply_patch(
         repo,
         base_tree,
         target.tree,
@@ -102,6 +118,9 @@ def cherry_pick(repo: Repository, target_sha: str,
         ort_base=target.parents[0],
         ort_ours="HEAD",
         ort_theirs=target_sha,
+        base_label=f"parent of {label}",
+        ours_label="HEAD",
+        theirs_label=label,
     )
     if conflicts:
         # leave merged-with-markers in workdir, do not commit
@@ -145,7 +164,15 @@ def revert(repo: Repository, target_sha: str,
     if not head_sha:
         raise ValueError("no HEAD")
     head_tree = _commit_obj(repo, head_sha).tree
-    new_tree, conflicts, conflict_idx = _apply_patch(
+    # Conflict-marker labels (sequencer.c do_pick_commit / get_message).
+    # For revert: base = the reverted commit, next = its parent, so
+    #   o.ancestor = base_label = msg.label        = "<abbrev> (<subject>)"
+    #   o.branch1  = "HEAD"     (ours)
+    #   o.branch2  = next_label = msg.parent_label = "parent of <abbrev> (<subject>)"
+    from .mergeort import _abbrev as _merge_abbrev
+    subj = target.message.splitlines()[0] if target.message.strip() else ""
+    label = f"{_merge_abbrev(repo, target_sha)} ({subj})"
+    new_tree, conflicts, conflict_idx, messages = _apply_patch(
         repo,
         base_tree,
         new_target_tree,
@@ -153,13 +180,23 @@ def revert(repo: Repository, target_sha: str,
         ort_base=target_sha,
         ort_ours="HEAD",
         ort_theirs=target.parents[0],
+        base_label=label,
+        ours_label="HEAD",
+        theirs_label=f"parent of {label}",
     )
     if conflicts:
         workdir.checkout_tree(repo, new_tree)
         if conflict_idx is not None:
             from .index import write_index
             write_index(repo, conflict_idx)
-        return None, conflicts
+        # REVERT_HEAD + MERGE_MSG are written on conflict too (sequencer.c
+        # do_pick_commit -> write_message(git_path_merge_msg) with the conflict
+        # hint appended by append_conflicts_hint).
+        (repo.gitdir / "REVERT_HEAD").write_text(target_sha + "\n", encoding="utf-8")
+        rmsg = f'Revert "{target.message.splitlines()[0]}"\n\nThis reverts commit {target_sha}.\n'
+        hint = "\n# Conflicts:\n" + "".join(f"#\t{p}\n" for p in conflicts)
+        (repo.gitdir / "MERGE_MSG").write_text(rmsg + hint, encoding="utf-8")
+        return None, conflicts, messages
     workdir.checkout_tree(repo, new_tree)
     msg = f'Revert "{target.message.splitlines()[0]}"\n\nThis reverts commit {target_sha}.\n'
     if no_commit:
@@ -168,14 +205,14 @@ def revert(repo: Repository, target_sha: str,
         # REVERT_HEAD is written when no_commit && res == 0).
         (repo.gitdir / "REVERT_HEAD").write_text(target_sha + "\n", encoding="utf-8")
         _write_pseudo_msg(repo, msg)
-        return None, []
+        return None, [], []
     sha = _make_commit(repo, new_tree, [head_sha], msg)
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha,
                             message=f"revert: {msg.splitlines()[0]}")
     else:
         refs_mod.set_head(repo, sha)
-    return sha, []
+    return sha, [], []
 
 
 def rebase_onto(repo: Repository, upstream: str) -> tuple[int, list[str]]:
@@ -194,6 +231,15 @@ def rebase_onto(repo: Repository, upstream: str) -> tuple[int, list[str]]:
     if not base_list:
         raise RuntimeError("no common ancestor")
     base = base_list[0]
+
+    # builtin/rebase.c can_fast_forward(): when onto (== upstream here) is the
+    # single merge-base of upstream and HEAD and history is linear, the branch
+    # is already based on upstream.  Without --force-rebase git fast-forwards
+    # (a no-op when HEAD already contains upstream), prints "up to date", and
+    # never replays/rewrites the commits.  Signal that with picked == 0 and
+    # leave HEAD untouched.
+    if len(base_list) == 1 and base == up_sha:
+        return 0, []
     # collect commits from base..HEAD in order
     chain: list[str] = []
     cur = head_sha

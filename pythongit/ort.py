@@ -179,12 +179,18 @@ def merge_tree(
     theirs: str,
     *,
     cfg: "Optional[mergeort.MergeConfig]" = None,
+    base_label: "Optional[str]" = None,
+    ours_label: "Optional[str]" = None,
+    theirs_label: "Optional[str]" = None,
 ) -> OrtResult:
     """Run the ort merge for three tree-ish arguments with an explicit base.
 
     ``merge_base``, ``ours`` and ``theirs`` are used both to locate the trees
     to merge and (verbatim) as the conflict-marker labels, exactly mirroring
     ``git merge-tree --write-tree --merge-base <merge_base> <ours> <theirs>``.
+    ``*_label`` override the labels used in conflict markers without changing
+    which trees are merged (sequencer revert/cherry-pick pass human-readable
+    labels like "parent of 535b2da (c2)").
     """
     base_tree = _peel_to_tree(repo, merge_base)
     ours_tree = _peel_to_tree(repo, ours)
@@ -192,7 +198,10 @@ def merge_tree(
 
     if cfg is None:
         cfg = _build_config(repo, base_tree, ours_tree, theirs_tree)
-    opt = mergeort.Opt(repo, merge_base, ours, theirs,
+    opt = mergeort.Opt(repo,
+                       base_label if base_label is not None else merge_base,
+                       ours_label if ours_label is not None else ours,
+                       theirs_label if theirs_label is not None else theirs,
                        **_cfg_kwargs(cfg))
     tree, _clean = mergeort.merge_incore_nonrecursive(
         opt, base_tree, ours_tree, theirs_tree)
