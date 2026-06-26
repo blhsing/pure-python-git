@@ -199,7 +199,8 @@ def test_pack_bitmap_written_and_real_git_uses_it(tmprepo):
     for i in range(4):
         commit_one(repo, "a.txt", f"v{i}\n", f"c{i}")
 
-    assert cli.main(["pack-objects", "pack", "--all"]) == 0
+    # git only writes a .bitmap when --write-bitmap-index is given (no default).
+    assert cli.main(["pack-objects", "pack", "--all", "--write-bitmap-index"]) == 0
     pack_dir = repo.gitdir / "objects" / "pack"
     bitmaps = list(pack_dir.glob("pack-*.bitmap"))
     assert len(bitmaps) == 1

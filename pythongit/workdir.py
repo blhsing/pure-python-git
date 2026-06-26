@@ -122,7 +122,8 @@ def tree_path_entry(repo: Repository, tree_sha: str, path: str) -> Optional[objs
 # add / rm
 
 
-def _gather_add_candidates(repo: Repository, paths: Iterable[str], tracked: set[str]) -> list[str]:
+def _gather_add_candidates(repo: Repository, paths: Iterable[str], tracked: set[str],
+                           *, force: bool = False) -> list[str]:
     ignores = ignore_mod.load(repo.path)
     to_add: list[str] = []
     for p in paths:
@@ -132,11 +133,11 @@ def _gather_add_candidates(repo: Repository, paths: Iterable[str], tracked: set[
                 dirs[:] = [d for d in dirs if d != ".git"]
                 for f in files:
                     rel = _norm(os.path.relpath(os.path.join(root, f), repo.path))
-                    if not _ignored(rel) and (rel in tracked or not ignores.is_ignored(rel)):
+                    if not _ignored(rel) and (force or rel in tracked or not ignores.is_ignored(rel)):
                         to_add.append(rel)
         else:
             rel = _norm(os.path.relpath(ap, repo.path))
-            if rel in tracked or not ignores.is_ignored(rel, is_dir=_is_dir_no_follow(ap)):
+            if force or rel in tracked or not ignores.is_ignored(rel, is_dir=_is_dir_no_follow(ap)):
                 to_add.append(rel)
         # Include tracked paths under the pathspec so that deletions and
         # modifications of vanished files are staged, matching `git add`.
@@ -166,9 +167,69 @@ def would_add(repo: Repository, paths: Iterable[str]) -> list[str]:
     return out
 
 
+def explicit_ignored(repo: Repository, paths: Iterable[str]) -> list[str]:
+    """Explicitly-named pathspecs whose literal path is itself ignored.
+
+    Mirrors builtin/add.c: only paths the user names directly (not via a
+    recursive '.' or a containing directory) populate dir->ignored and trigger
+    the addIgnoredFile advice. Returns the sorted, normalized names."""
+    ignores = ignore_mod.load(repo.path)
+    tracked = set(read_index(repo).by_path())
+    out: list[str] = []
+    for p in paths:
+        ap = (repo.path / p).resolve()
+        rel = _norm(os.path.relpath(ap, repo.path))
+        if rel in (".", ""):
+            continue
+        if rel in tracked:
+            continue
+        is_dir = _is_dir_no_follow(ap)
+        if ignores.is_ignored(rel, is_dir=is_dir):
+            out.append(rel)
+    return sorted(set(out))
+
+
+def would_add_report(repo: Repository, paths: Iterable[str], *,
+                     ignore_removal: bool = False,
+                     update_only: bool = False,
+                     force: bool = False) -> list[tuple[str, str]]:
+    """Phased (label, path) report for `git add -n`/`-v`.
+
+    Phase 1 (tracked changes under the pathspec, path-sorted): deletions emit
+    ('remove', path) unless ignore_removal; content/mode changes emit
+    ('add', path). Phase 2 (untracked new files, path-sorted, only when not
+    update_only) emit ('add', path). Matches builtin/add.c's add_files_to_cache
+    (diff-queue order) followed by add_files (dir-scan order)."""
+    idx = read_index(repo).by_path()
+    tracked = set(idx)
+    candidates = set(_gather_add_candidates(repo, paths, tracked, force=force))
+    phase1: list[tuple[str, str]] = []
+    phase2: list[tuple[str, str]] = []
+    for rel in candidates:
+        full = repo.path / rel
+        present = full.exists() or full.is_symlink()
+        if rel in tracked:
+            if not present:
+                if not ignore_removal:
+                    phase1.append(("remove", rel))
+                continue
+            sha, _ = objs.hash_bytes("blob", _blob_data(full), repo)
+            if idx[rel].sha != sha or idx[rel].mode != _mode_for(full):
+                phase1.append(("add", rel))
+        else:
+            if not present:
+                continue
+            if update_only:
+                continue
+            phase2.append(("add", rel))
+    phase1.sort(key=lambda t: t[1])
+    phase2.sort(key=lambda t: t[1])
+    return phase1 + phase2
+
+
 def add_paths(repo: Repository, paths: Iterable[str], *,
               ignore_removal: bool = False, update_only: bool = False,
-              intent_to_add: bool = False) -> None:
+              intent_to_add: bool = False, force: bool = False) -> None:
     """Stage worktree paths into the index. ``update_only`` (git add -u) limits
     to already-tracked files; ``ignore_removal`` (git add --no-all) keeps the
     index entries of files removed from the worktree; ``intent_to_add``
@@ -176,7 +237,7 @@ def add_paths(repo: Repository, paths: Iterable[str], *,
     flag rather than their content."""
     idx = read_index(repo)
     tracked = set(idx.by_path())
-    to_add = _gather_add_candidates(repo, paths, tracked)
+    to_add = _gather_add_candidates(repo, paths, tracked, force=force)
     if update_only:
         to_add = [r for r in to_add if r in tracked]
     if intent_to_add:
@@ -418,13 +479,20 @@ def flatten_gitlinks(repo: Repository, tree_sha: str, prefix: str = "") -> dict[
 # tree <-> index
 
 
-def write_tree(repo: Repository, *, skip_intent_to_add: bool = False) -> str:
+class PrefixNotFound(Exception):
+    """Raised by write_tree(prefix=...) when the prefix is not a subdirectory."""
+
+
+def write_tree(repo: Repository, *, skip_intent_to_add: bool = False,
+               prefix: Optional[str] = None) -> str:
     """Build trees from the current index, returning the root tree sha.
 
     Refuses to run while conflict stages are present in the index — fail
     early instead of building a tree from a half-resolved state.
     ``skip_intent_to_add`` (used by commit) omits not-yet-staged intent-to-add
-    entries, which C Git excludes from the committed tree.
+    entries, which C Git excludes from the committed tree. ``prefix`` (git
+    write-tree --prefix=<p>/) returns the oid of the subtree at <p>, raising
+    PrefixNotFound if it is not a directory in the index.
     """
     idx = read_index(repo)
     if idx.has_conflicts():
@@ -447,6 +515,10 @@ def write_tree(repo: Repository, *, skip_intent_to_add: bool = False) -> str:
                 raise ValueError(f"path conflict at {part}")
         cur[parts[-1]] = e
 
+    # Map of directory-node id() -> written tree sha, so a prefix lookup can
+    # return the subtree oid (mirrors cache_tree_find).
+    node_sha: dict[int, str] = {}
+
     def emit(node: dict) -> str:
         entries: list[objs.TreeEntry] = []
         for name, val in node.items():
@@ -456,9 +528,21 @@ def write_tree(repo: Repository, *, skip_intent_to_add: bool = False) -> str:
             else:
                 entries.append(objs.TreeEntry(val.mode_str().lstrip("0") or "0", name, val.sha))
         data = objs.encode_tree(entries)
-        return objs.write_object(repo, "tree", data)
+        sha = objs.write_object(repo, "tree", data)
+        node_sha[id(node)] = sha
+        return sha
 
-    return emit(root)
+    root_sha = emit(root)
+    if prefix is None:
+        return root_sha
+    # cache_tree_find: strip leading/trailing slashes, descend by component.
+    node = root
+    for part in [p for p in prefix.strip("/").split("/") if p]:
+        nxt = node.get(part) if isinstance(node, dict) else None
+        if not isinstance(nxt, dict):
+            raise PrefixNotFound(prefix)
+        node = nxt
+    return node_sha[id(node)]
 
 
 def read_tree(repo: Repository, tree_sha: str) -> None:

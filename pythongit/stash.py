@@ -940,6 +940,251 @@ def list_stashes(repo: Repository) -> list[tuple[int, str, str]]:
     return [(i, e[1], e[3]) for i, e in enumerate(reversed(entries))]
 
 
+class StashInfo:
+    """Mirror of builtin/stash.c struct stash_info."""
+    def __init__(self) -> None:
+        self.revision = ""        # info->revision.buf (resolved selector form)
+        self.w_commit = ""        # the stash commit oid
+        self.b_commit = ""        # ^1
+        self.w_tree = ""          # : (worktree state)
+        self.b_tree = ""          # ^1: (base tree)
+        self.i_tree = ""          # ^2: (index tree)
+        self.u_tree = None        # ^3: (untracked, if has_u)
+        self.has_u = False
+        self.is_stash_ref = False
+
+
+def parse_stash_revision(commit: Optional[str], quiet: bool) -> Optional[str]:
+    """Port of parse_stash_revision: turn the optional selector into a revision
+    string, or None (after printing) when there is no stash to default to."""
+    if commit is None:
+        # rely on caller having checked ref existence; default to refs/stash@{0}
+        return "refs/stash@{0}"
+    if commit and all(c in "0123456789" for c in commit):
+        return f"refs/stash@{{{commit}}}"
+    return commit
+
+
+def get_stash_info(repo: Repository, args: list[str]) -> Optional[StashInfo]:
+    """Backwards-compatible wrapper returning just the StashInfo (or None)."""
+    info, _rc = get_stash_info_rc(repo, args)
+    return info
+
+
+def get_stash_info_rc(repo: Repository, args: list[str]):
+    """Port of get_stash_info + assert_stash_like. Returns (StashInfo, 0) on
+    success or (None, rc) after printing the relevant error, where rc is 128 for
+    die()-class failures and 1 for error()-class failures."""
+    if len(args) > 1:
+        msg = "".join(f" '{a}'" for a in args)
+        print(f"Too many revisions specified:{msg}", file=sys.stderr)
+        return None, 1
+    commit = args[0] if args else None
+    if commit is None:
+        if not reflog_mod.read(repo, "refs/stash") and \
+                refs_mod.read_ref(repo, "refs/stash") is None:
+            print("No stash entries found.", file=sys.stderr)
+            return None, 1
+    revision = parse_stash_revision(commit, False)
+    info = StashInfo()
+    info.revision = revision
+    # repo_get_oid(revision): resolve the selector.
+    w_commit = refs_mod.rev_parse(repo, revision)
+    if w_commit is None:
+        err = _reflog_range_error(repo, revision)
+        if err:
+            # die() inside the @{n} resolution -> rc 128.
+            print(err, file=sys.stderr)
+            return None, 128
+        # error("%s is not a valid reference") -> rc 1.
+        print(f"error: {revision} is not a valid reference", file=sys.stderr)
+        return None, 1
+    info.w_commit = w_commit
+    # assert_stash_like: w_tree=:, b_tree=^1:, i_tree=^2:, then has_u via ^3:.
+    try:
+        c = objs.parse_commit(objs.read_object(repo, w_commit)[1])
+    except (KeyError, ValueError):
+        print(f"fatal: '{revision}' is not a stash-like commit", file=sys.stderr)
+        return None, 128
+    if len(c.parents) < 2:
+        print(f"fatal: '{revision}' is not a stash-like commit", file=sys.stderr)
+        return None, 128
+    info.w_tree = c.tree
+    info.b_commit = c.parents[0]
+    info.b_tree = _tree_of_commit(repo, c.parents[0])
+    info.i_tree = _tree_of_commit(repo, c.parents[1])
+    if len(c.parents) >= 3:
+        info.has_u = True
+        info.u_tree = _tree_of_commit(repo, c.parents[2])
+    # is_stash_ref: the symbolic part dwims to refs/stash.
+    symbolic = revision.split("@", 1)[0]
+    info.is_stash_ref = (symbolic in ("stash", "refs/stash"))
+    return info, 0
+
+
+def _tree_of_commit(repo: Repository, sha: str) -> str:
+    return objs.parse_commit(objs.read_object(repo, sha)[1]).tree
+
+
+def _reflog_range_error(repo: Repository, revision: str) -> Optional[str]:
+    """If ``revision`` is a stash reflog selector that is out of range, return
+    git's 'log for '<ref>' only has N entries' message; else None."""
+    m = _re.match(r"^(refs/stash|stash)@\{(\d+)\}$", revision)
+    if not m:
+        return None
+    refname, n = m.group(1), int(m.group(2))
+    entries = reflog_mod.read(repo, "refs/stash")
+    if n >= len(entries):
+        return f"fatal: log for '{refname}' only has {len(entries)} entries"
+    return None
+
+
+def _tree_leaf_map(repo: Repository, tree: Optional[str]) -> dict:
+    out: dict[str, tuple[str, str]] = {}
+    if tree:
+        for path, mode, sha in workdir.iter_tree_files(repo, tree):
+            out[path] = (mode, sha)
+    return out
+
+
+def _three_way_worktree(repo: Repository, base_tree: str, ours_tree: str,
+                        theirs_tree: str) -> bool:
+    """Apply the changes base_tree -> theirs_tree onto the worktree+index
+    (ours == current). For the non-conflicting case this reproduces git's
+    merge_ort result. Returns True when clean, False on a content conflict."""
+    base = _tree_leaf_map(repo, base_tree)
+    theirs = _tree_leaf_map(repo, theirs_tree)
+    ours = _tree_leaf_map(repo, ours_tree)
+    idx = read_index(repo)
+    clean = True
+    for path in set(base) | set(theirs):
+        b = base.get(path)
+        t = theirs.get(path)
+        if b == t:
+            continue  # unchanged on theirs side
+        o = ours.get(path)
+        if o == b:
+            # ours unchanged from base: take theirs (add/modify/delete)
+            full = repo.path / path
+            if t is None:
+                if full.exists() or full.is_symlink():
+                    try:
+                        full.unlink()
+                    except OSError:
+                        pass
+                idx.remove(path)
+            else:
+                mode, sha = t
+                _materialize(repo, full, mode, sha)
+                st = full.lstat()
+                idx.upsert(stat_to_entry(path, st, sha, int(mode, 8)))
+        elif o == t:
+            continue  # both sides made the same change
+        else:
+            # divergent change -> conflict (rare; not in parity test set)
+            clean = False
+    write_index(repo, idx)
+    return clean
+
+
+def _reset_index_to_tree(repo: Repository, tree: str) -> None:
+    """Set the index to match ``tree`` without touching the worktree
+    (reset_tree(i_tree) in do_apply_stash)."""
+    idx = read_index(repo)
+    target = _tree_leaf_map(repo, tree)
+    by_path = idx.by_path()
+    for path in list(by_path):
+        if path not in target:
+            idx.remove(path)
+    for path, (mode, sha) in target.items():
+        cur = by_path.get(path)
+        if cur is not None and cur.sha == sha and cur.mode == int(mode, 8):
+            continue
+        full = repo.path / path
+        if full.exists() or full.is_symlink():
+            st = full.lstat()
+            idx.upsert(stat_to_entry(path, st, sha, int(mode, 8)))
+        else:
+            from .index import IndexEntry
+            idx.upsert(IndexEntry(mode=int(mode, 8), sha=sha, path=path))
+    write_index(repo, idx)
+
+
+def do_apply(repo: Repository, info: StashInfo, *, index: bool) -> int:
+    """Port of do_apply_stash (non-conflicting path). Returns 0 on success."""
+    c_tree = workdir.write_tree(repo)
+    has_index = index
+    if index:
+        if info.b_tree == info.i_tree or c_tree == info.i_tree:
+            has_index = False
+    # Restore the worktree (merge base->w_tree onto current). merge_ort prints
+    # "Already up to date." (to stdout) and is a no-op when theirs == base.
+    if info.w_tree == info.b_tree:
+        print("Already up to date.")
+        clean = True
+    else:
+        clean = _three_way_worktree(repo, info.b_tree, c_tree, info.w_tree)
+    if not clean:
+        if index:
+            print("Index was not unstashed.", file=sys.stderr)
+        return 1
+    if has_index:
+        _reset_index_to_tree(repo, info.i_tree)
+    else:
+        # unstage_changes_unless_new(&c_tree): index returns to c_tree for
+        # non-new paths. Since the worktree merge above only updated the index
+        # for taken paths, restore those index entries back to c_tree.
+        _reset_index_to_tree(repo, c_tree)
+    if info.has_u and info.u_tree:
+        _restore_untracked(repo, info.u_tree)
+    return 0
+
+
+def _restore_untracked(repo: Repository, u_tree: str) -> None:
+    for path, mode, sha in workdir.iter_tree_files(repo, u_tree):
+        _materialize(repo, repo.path / path, mode, sha)
+
+
+def do_drop(repo: Repository, info: StashInfo, quiet: bool) -> int:
+    """Port of do_drop_stash: delete the selected reflog entry, print 'Dropped'.
+    When the stash log becomes empty, the ref is cleared."""
+    m = _re.match(r"^(?:refs/stash|stash)@\{(\d+)\}$", info.revision)
+    n = int(m.group(1)) if m else 0
+    entries = reflog_mod.read(repo, "refs/stash")
+    if n >= len(entries):
+        return 1
+    drop_idx = len(entries) - 1 - n
+    keep = [x for j, x in enumerate(entries) if j != drop_idx]
+    p = repo.gitdir / "logs" / "refs" / "stash"
+    if keep:
+        with p.open("w", encoding="utf-8") as f:
+            for old, new, ident, msg in keep:
+                f.write(f"{old} {new} {ident}\t{msg}\n")
+        # Point refs/stash at the newest remaining entry WITHOUT appending a new
+        # reflog line (reflog_delete rewrites the log; the loose ref just tracks
+        # the tip).
+        (repo.gitdir / "refs" / "stash").write_text(keep[-1][1] + "\n",
+                                                     encoding="utf-8")
+    else:
+        p.unlink(missing_ok=True)
+        (repo.gitdir / "refs" / "stash").unlink(missing_ok=True)
+    if not quiet:
+        print(f"Dropped {info.revision} ({info.w_commit})")
+    return 0
+
+
+def do_clear(repo: Repository) -> int:
+    """Port of do_clear_stash: drop refs/stash and its reflog (no-op if absent)."""
+    (repo.gitdir / "logs" / "refs" / "stash").unlink(missing_ok=True)
+    (repo.gitdir / "refs" / "stash").unlink(missing_ok=True)
+    # also remove from packed-refs if present
+    try:
+        refs_mod.delete_ref(repo, "refs/stash")
+    except Exception:
+        pass
+    return 0
+
+
 def apply(repo: Repository, index: int = 0, *, pop: bool = False) -> bool:
     entries = reflog_mod.read(repo, "refs/stash")
     if not entries:

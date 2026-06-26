@@ -84,7 +84,8 @@ def _apply_patch(
     return ort_result.tree, ort_result.conflicts, ort_result.conflict_index
 
 
-def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]:
+def cherry_pick(repo: Repository, target_sha: str,
+                no_commit: bool = False) -> tuple[Optional[str], list[str]]:
     target = _commit_obj(repo, target_sha)
     if not target.parents:
         raise ValueError("cannot cherry-pick a root commit (no parent)")
@@ -111,6 +112,12 @@ def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[
         return None, conflicts
     workdir.checkout_tree(repo, new_tree)
     msg = target.message
+    if no_commit:
+        # --no-commit: stage the change (index+worktree already updated above),
+        # leave a MERGE_MSG with the picked commit's message, and do NOT write
+        # CHERRY_PICK_HEAD or create a commit (sequencer.c do_pick_commit).
+        _write_pseudo_msg(repo, msg)
+        return None, []
     sha = _make_commit(repo, new_tree, [head_sha], msg, author=target.author)
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha,
@@ -120,7 +127,14 @@ def cherry_pick(repo: Repository, target_sha: str) -> tuple[Optional[str], list[
     return sha, []
 
 
-def revert(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]:
+def _write_pseudo_msg(repo: Repository, msg: str) -> None:
+    """Write .git/MERGE_MSG (the message a later `commit` would default to)."""
+    text = msg if msg.endswith("\n") else msg + "\n"
+    (repo.gitdir / "MERGE_MSG").write_text(text, encoding="utf-8")
+
+
+def revert(repo: Repository, target_sha: str,
+           no_commit: bool = False) -> tuple[Optional[str], list[str]]:
     target = _commit_obj(repo, target_sha)
     if not target.parents:
         raise ValueError("cannot revert a root commit")
@@ -148,6 +162,13 @@ def revert(repo: Repository, target_sha: str) -> tuple[Optional[str], list[str]]
         return None, conflicts
     workdir.checkout_tree(repo, new_tree)
     msg = f'Revert "{target.message.splitlines()[0]}"\n\nThis reverts commit {target_sha}.\n'
+    if no_commit:
+        # --no-commit: stage the revert, write REVERT_HEAD (the reverted commit)
+        # and MERGE_MSG, but do NOT create a commit (sequencer.c do_pick_commit:
+        # REVERT_HEAD is written when no_commit && res == 0).
+        (repo.gitdir / "REVERT_HEAD").write_text(target_sha + "\n", encoding="utf-8")
+        _write_pseudo_msg(repo, msg)
+        return None, []
     sha = _make_commit(repo, new_tree, [head_sha], msg)
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha,

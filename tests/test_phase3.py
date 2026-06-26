@@ -31,7 +31,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="pygit-p3-"))
     try:
         os.chdir(tmp)
-        run("init", str(tmp))
+        run("init", "-b", "main", str(tmp))
         run("config", "user.name", "t")
         run("config", "user.email", "t@e.com")
 
@@ -132,8 +132,16 @@ def main() -> int:
                 mode = e.mode if len(e.mode) == 6 else e.mode.zfill(6)
                 ls_lines.append(f"{mode} {obj_t} {e.sha}\t{e.name}")
             import io
+            class _Stdin:
+                # mktree reads binary stdin (sys.stdin.buffer) for NUL/byte-safe
+                # paths, so the test double must expose .buffer like real stdin.
+                def __init__(self, text):
+                    self._text = text
+                    self.buffer = io.BytesIO(text.encode("utf-8"))
+                def read(self):
+                    return self._text
             old_stdin = sys.stdin
-            sys.stdin = io.StringIO("\n".join(ls_lines))
+            sys.stdin = _Stdin("\n".join(ls_lines) + "\n")
             try:
                 rc = run("mktree")
                 check(rc == 0, "mktree runs")

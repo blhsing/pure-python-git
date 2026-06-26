@@ -1029,5 +1029,44 @@ def _finish(repo: Repository, opts: Options, out: Callable[[str], None],
         except Exception:
             pass
         _p.clear_pack_cache(repo)
-    # update-server-info (-n suppresses): pygit has no server-info writer, so
-    # this is a structural no-op either way.
+
+    # update-server-info (-n suppresses), repack.c: run_update_server_info.
+    if opts.run_update_server_info:
+        write_server_info(repo)
+
+
+def write_server_info(repo: Repository) -> None:
+    """Port of server-info.c update_server_info(): write info/refs and
+    objects/info/packs.  Shared by ``git repack`` and ``git update-server-info``.
+    """
+    from . import objects as _objs
+    from . import refs as _refs
+
+    # info/refs: every ref (HEAD excluded, like for_each_ref), sorted by name,
+    # with a peeled "^{}" line for tag objects.
+    info_dir = repo.gitdir / "info"
+    info_dir.mkdir(parents=True, exist_ok=True)
+    all_refs = _refs.iter_all_refs(repo)
+    out: list[str] = []
+    for name in sorted(all_refs):
+        sha = all_refs[name]
+        out.append("%s\t%s\n" % (sha, name))
+        try:
+            t, _data = _objs.read_object(repo, sha)
+        except Exception:  # noqa: BLE001
+            t = None
+        if t == "tag":
+            peeled = _refs.peel_ref(repo, name)
+            if peeled:
+                out.append("%s\t%s^{}\n" % (peeled, name))
+    (info_dir / "refs").write_text("".join(out), encoding="utf-8")
+
+    # objects/info/packs: "P <name>\n" per local pack, then a trailing blank.
+    pack_dir = repo.gitdir / "objects" / "pack"
+    pack_info_dir = repo.gitdir / "objects" / "info"
+    pack_info_dir.mkdir(parents=True, exist_ok=True)
+    pack_lines: list[str] = []
+    if pack_dir.exists():
+        for f in sorted(pack_dir.glob("pack-*.pack")):
+            pack_lines.append("P %s\n" % f.name)
+    (pack_info_dir / "packs").write_text("".join(pack_lines) + "\n", encoding="utf-8")

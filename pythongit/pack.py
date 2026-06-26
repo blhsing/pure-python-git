@@ -658,9 +658,13 @@ def _pack_dir_signature(pack_dir: Path) -> tuple[tuple[str, int, int, int, int],
     if not pack_dir.is_dir():
         return tuple()
     sig = []
-    for p in sorted(pack_dir.glob("pack-*.pack")):
-        idx = p.with_suffix(".idx")
-        if not idx.exists():
+    # git's prepare_packed_git_one loads a pack for every "*.idx" in the dir
+    # (the pack name is the idx path with ".idx" stripped), not just the
+    # canonical "pack-<sha>" names.  An idx whose companion .pack is missing is
+    # treated as garbage and skipped.
+    for idx in sorted(pack_dir.glob("*.idx")):
+        p = idx.with_suffix(".pack")
+        if not p.exists():
             continue
         ps = p.stat()
         is_ = idx.stat()
@@ -1054,6 +1058,206 @@ def unpack_pack_stream(repo: Repository, source, dry_run: bool = False) -> int:
                 os.unlink(tmp_name)
             except OSError:
                 pass
+
+
+class UnpackDie(Exception):
+    """A fatal error during streaming unpack (mirrors git's die())."""
+
+
+class UnpackExit(Exception):
+    """git calls exit(1) directly (e.g. inflate error without --recover)."""
+
+    def __init__(self, code: int = 1):
+        super().__init__("unpack exit")
+        self.code = code
+
+
+# Map zlib status codes to git's zerr_to_string() table (git-zlib.c).
+_ZERR_STRING = {
+    -1: "stream error",       # Z_ERRNO
+    -2: "stream error",       # Z_STREAM_ERROR
+    -3: "data stream error",  # Z_DATA_ERROR
+    -4: "out of memory",      # Z_MEM_ERROR
+    -5: "buffer error",       # Z_BUF_ERROR
+    -6: "version error",      # Z_VERSION_ERROR
+}
+
+
+def unpack_objects_stream(
+    repo: Repository,
+    buf: bytes,
+    *,
+    dry_run: bool = False,
+    recover: bool = False,
+    write_err=None,
+) -> int:
+    """Port of builtin/unpack-objects.c semantics over an in-memory pack buffer.
+
+    Returns the process exit status (``has_errors``).  Raises ``UnpackDie`` to
+    signal git's ``die()`` cases (whose message the caller prints as
+    ``fatal: <msg>`` and exits 128).  ``write_err`` receives ``error:`` lines.
+    """
+    from . import objects as objs
+
+    if write_err is None:
+        def write_err(_msg):  # pragma: no cover - default no-op
+            pass
+
+    n = len(buf)
+    pos = 0
+    has_errors = 0
+
+    def fill(min_bytes: int) -> int:
+        # git's fill() dies with "early EOF" when stdin can't satisfy the read.
+        if pos + min_bytes > n:
+            raise UnpackDie("early EOF")
+        return pos
+
+    # ---- header (unpack_all) ----
+    fill(12)
+    if buf[0:4] != b"PACK":
+        raise UnpackDie("bad pack file")
+    version = int.from_bytes(buf[4:8], "big")
+    if version not in (2, 3):
+        raise UnpackDie("unknown pack file version %d" % version)
+    nr_objects = int.from_bytes(buf[8:12], "big")
+    pos = 12
+
+    # Held objects for in-pack delta bases (offset and ref resolution).
+    by_offset: dict[int, tuple[str, bytes]] = {}
+    by_sha: dict[str, tuple[str, bytes]] = {}
+    # Deltas whose base is not yet available, retried after the pass.
+    deferred: list = []
+
+    def read_varint_header() -> tuple[int, int]:
+        nonlocal pos
+        fill(1)
+        c = buf[pos]
+        pos += 1
+        obj_type = (c >> 4) & 7
+        size = c & 15
+        shift = 4
+        while c & 0x80:
+            fill(1)
+            c = buf[pos]
+            pos += 1
+            size += (c & 0x7F) << shift
+            shift += 7
+        return obj_type, size
+
+    def get_data(size: int) -> bytes:
+        """git's get_data(): inflate exactly one zlib stream producing `size`
+        bytes, advancing `pos` past the consumed compressed input."""
+        nonlocal pos, has_errors
+        d = zlib.decompressobj()
+        out = bytearray()
+        start = pos
+        try:
+            # Feed all remaining bytes; decompressobj stops at stream end and
+            # reports the unused tail so we can advance `pos` precisely.
+            chunk = buf[pos:]
+            out += d.decompress(chunk)
+            out += d.flush()
+        except zlib.error as exc:
+            # Mirror git_inflate -> error("inflate: %s (%s)") then
+            # error("inflate returned %d").
+            msg = str(exc)
+            zmsg = msg.rsplit(": ", 1)[-1] if ": " in msg else "no message"
+            ret = -3
+            for code in _ZERR_STRING:
+                if ("Error %d " % code) in msg:
+                    ret = code
+                    break
+            write_err("error: inflate: %s (%s)" % (_ZERR_STRING.get(ret, "stream error"), zmsg))
+            write_err("error: inflate returned %d" % ret)
+            has_errors = 1
+            if not recover:
+                raise UnpackExit(1)
+            return b""
+        if len(out) != size:
+            # Inflated to a different size than the header declared: git would
+            # keep looping fill()->inflate; an incomplete stream means EOF.
+            raise UnpackDie("early EOF")
+        consumed = len(chunk) - len(d.unused_data)
+        pos = start + consumed
+        return bytes(out)
+
+    def store(obj_type_name: str, payload: bytes, offset: int) -> None:
+        sha, _ = objs.hash_bytes(obj_type_name, payload, repo)
+        by_offset[offset] = (obj_type_name, payload)
+        by_sha[sha] = (obj_type_name, payload)
+        if not dry_run:
+            objs.write_object(repo, obj_type_name, payload)
+
+    for _i in range(nr_objects):
+        offset = pos
+        obj_type, size = read_varint_header()
+        if obj_type in (OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG):
+            data = get_data(size)
+            store(_TYPE_NAME[obj_type], data, offset)
+        elif obj_type == OBJ_OFS_DELTA:
+            neg, pos = _read_offset(buf, pos)
+            base_offset = offset - neg
+            delta = get_data(size)
+            base = by_offset.get(base_offset)
+            if base is None:
+                deferred.append(("ofs", offset, base_offset, delta))
+            else:
+                payload = apply_delta(base[1], delta)
+                store(base[0], payload, offset)
+        elif obj_type == OBJ_REF_DELTA:
+            fill(repo.hash_len)
+            base_sha = buf[pos:pos + repo.hash_len].hex()
+            pos += repo.hash_len
+            delta = get_data(size)
+            base = by_sha.get(base_sha)
+            if base is None:
+                try:
+                    base = objs.read_object(repo, base_sha)
+                except Exception:
+                    base = None
+            if base is None:
+                deferred.append(("ref", offset, base_sha, delta))
+            else:
+                payload = apply_delta(base[1], delta)
+                store(base[0], payload, offset)
+        else:
+            write_err("error: bad object type %d" % obj_type)
+            has_errors = 1
+            if not recover:
+                raise UnpackExit(1)
+
+    # Resolve any deferred deltas (git's write_rest / delta list handling).
+    progress = True
+    while deferred and progress:
+        progress = False
+        still: list = []
+        for item in deferred:
+            kind, offset, key, delta = item
+            base = by_offset.get(key) if kind == "ofs" else by_sha.get(key)
+            if base is None and kind == "ref":
+                try:
+                    base = objs.read_object(repo, key)
+                except Exception:
+                    base = None
+            if base is None:
+                still.append(item)
+                continue
+            payload = apply_delta(base[1], delta)
+            store(base[0], payload, offset)
+            progress = True
+        deferred = still
+    if deferred:
+        raise UnpackDie("unresolved deltas left after unpacking")
+
+    # ---- trailer check (final sha1 did not match) ----
+    fill(repo.hash_len)
+    computed = _hash_range(repo, buf, 0, pos)
+    trailer = buf[pos:pos + repo.hash_len]
+    if computed != trailer:
+        raise UnpackDie("final sha1 did not match")
+    pos += repo.hash_len
+    return has_errors
 
 
 def unpack_pack(repo: Repository, pack_bytes: bytes) -> int:
