@@ -369,25 +369,22 @@ def test_remote_verbose_option(tmprepo, capsys):
     assert "origin\thttps://example.com/repo.git (push)" in out
 
 
-def test_fetch_accepts_explicit_refspec(tmprepo, monkeypatch, capsys):
-    from pythongit import protocol
+def test_fetch_accepts_explicit_refspec(tmprepo, capsys):
+    # Behavioral test: fetch now goes through the local transport (localtransport)
+    # rather than the old protocol.fetch shim, so exercise a real local fetch with
+    # an explicit <remote> <refspec> and confirm FETCH_HEAD records the tip.
+    from tests.conftest import commit_one
 
-    repo, _ = tmprepo
-    captured = {}
-
-    def fake_fetch(fetch_repo, remote="origin", refspecs=None):
-        captured["repo"] = fetch_repo
-        captured["remote"] = remote
-        captured["refspecs"] = refspecs
-        return {"FETCH_HEAD": "a" * repo.hex_len}
-
-    monkeypatch.setattr(protocol, "fetch", fake_fetch)
-
-    assert cli_run("fetch", "origin", "main") == 0
-    assert captured["repo"].path == repo.path
-    assert captured["remote"] == "origin"
-    assert captured["refspecs"] == ["main"]
-    assert "FETCH_HEAD" in capsys.readouterr().out
+    repo, path = tmprepo
+    commit_one(repo, "f", "hi\n", "c1")
+    head = refs.rev_parse(repo, "HEAD")
+    remote = path.parent / "remote.git"
+    assert cli_run("init", "--bare", str(remote)) == 0
+    assert cli_run("push", str(remote), "HEAD:refs/heads/main") == 0
+    capsys.readouterr()
+    assert cli_run("fetch", str(remote), "main") == 0
+    fetch_head = (repo.gitdir / "FETCH_HEAD").read_text()
+    assert fetch_head.split()[0] == head
 
 
 def test_global_options_before_command(tmprepo, capsys):

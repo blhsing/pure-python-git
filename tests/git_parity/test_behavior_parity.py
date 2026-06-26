@@ -3042,3 +3042,140 @@ def test_batch9_difftool_tmpnorm_parity(case, tmp_path: Path, git_254_oracle: st
         results[tool] = (proc.returncode, norm(proc.stdout), norm(proc.stderr))
 
     assert results["pygit"] == results["oracle"]
+
+
+BATCH10_CASES = [
+    ('reset -U2 without --patch -> requires --patch rc128', [], ['reset', '-U2']),
+    ('reset --unified=2 without --patch -> requires --patch rc128', [], ['reset', '--unified=2']),
+    ('reset --unified with no value -> requires a value rc129', [], ['reset', '--unified']),
+    ('reset --unified= empty value -> expects a numerical value rc129', [], ['reset', '--unified=']),
+    ('reset --inter-hunk-context=2 without --patch -> requires --patch rc128', [], ['reset', '--inter-hunk-context=2']),
+    ('reset --inter-hunk-context no value -> requires a value rc129', [], ['reset', '--inter-hunk-context']),
+    ('reset -U-2 negative -> cannot be negative rc128', [], ['reset', '-U-2']),
+    ('reset --inter-hunk-context=-2 negative -> cannot be negative rc128', [], ['reset', '--inter-hunk-context=-2']),
+    ('reset -Uabc non-integer -> switch U expects integer rc129', [], ['reset', '-Uabc']),
+    ('reset -U with no value -> switch U requires a value rc129', [], ['reset', '-U']),
+    ('reset -U2x trailing junk -> switch U expects integer rc129', [], ['reset', '-U2x']),
+    ('reset --unified=abc -> option unified expects integer rc129', [], ['reset', '--unified=abc']),
+    ('reset --unified=2k suffix without --patch -> requires --patch rc128', [], ['reset', '--unified=2k']),
+    ('reset --unified=2147483648 out of range -> not in range rc129', [], ['reset', '--unified=2147483648']),
+    ('reset -U2g (2*1024^3 overflow) -> not in range rc129', [], ['reset', '-U2g']),
+    ('reset -U0x10 hex parsed then requires --patch rc128', [], ['reset', '-U0x10']),
+    ('reset --unified=010 octal parsed then requires --patch rc128', [], ['reset', '--unified=010']),
+    ('reset -U2 --inter-hunk-context=3 unified error reported first rc128', [], ['reset', '-U2', '--inter-hunk-context=3']),
+    ('stash --only-untracked unknown option -> usage block rc129', [], ['stash', '--only-untracked']),
+    ('stash --index unknown option -> usage block rc129', [], ['stash', '--index']),
+    ('stash --print unknown option -> usage block rc129', [], ['stash', '--print']),
+    ('stash --to-ref unknown option -> usage block rc129', [], ['stash', '--to-ref']),
+    ('stash -Z unknown short option -> unknown switch + usage rc129', [], ['stash', '-Z']),
+    ('fetch no remotes configured exits 0', [('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1']], ['fetch']),
+]
+
+BATCH10_STDIN_CASES = [
+    ('apply --add on empty input -> No valid patches rc128', [], ['apply', '--add'], ''),
+    ('apply --no-add on empty input -> identical to --add', [], ['apply', '--no-add'], ''),
+    ('apply bare on empty input -> identical baseline', [], ['apply'], ''),
+    ('apply --add --allow-empty on empty input -> rc0', [], ['apply', '--add', '--allow-empty'], ''),
+    ('reset --patch -U1 shows 1 context line each side, quit', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '--patch', '-U1'], 'q\n'),
+    ('reset --patch -U5 shows wide context, quit', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '--patch', '-U5'], 'q\n'),
+    ('reset --patch --unified=2 long form, quit', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '--patch', '--unified=2'], 'q\n'),
+    ('reset --patch -U2 accept hunk (y) unstages', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '--patch', '-U2'], 'y\n'),
+    ('reset --patch -U2 skip hunk (n)', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '--patch', '-U2'], 'n\n'),
+    ('reset -pU2 clustered short, quit', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n'), ['add', 'f.txt']], ['reset', '-pU2'], 'q\n'),
+]
+
+BATCH10_NETWORK_CASES = [
+    ('pull real merge divergent', [['init', '--bare', '../remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '../remote.git'], ['push', 'origin', 'main'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1'], ('write', 'g.txt', 'local\n'), ['add', 'g.txt'], ['commit', '-m', 'localwork']], ['pull', '--no-rebase', 'origin', 'main'], None),
+    ('push new branch to local bare', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', 'origin', 'main'], None),
+    ('push -v new branch (Pushing to + tracking ref)', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '-v', 'origin', 'main'], None),
+    ('push -u set-upstream', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '-u', 'origin', 'main'], None),
+    ('push HEAD displays HEAD -> main', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', 'origin', 'HEAD'], None),
+    ('push up-to-date second push', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main']], ['push', 'origin', 'main'], None),
+    ('push delete / colon-delete / delete-nonexistent', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main']], ['push', 'origin', '--delete', 'main'], None),
+    ('push non-ff rejection with advice', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ('write', 'a.txt', 'hello\ntwo\n'), ['commit', '-am', 'second'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1'], ('write', 'c.txt', 'div\n'), ['add', 'c.txt'], ['commit', '-m', 'divergent']], ['push', 'origin', 'main'], None),
+    ('push -f forced update', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ('write', 'a.txt', 'hello\ntwo\n'), ['commit', '-am', 'second'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1'], ('write', 'c.txt', 'div\n'), ['add', 'c.txt'], ['commit', '-m', 'divergent']], ['push', '-f', 'origin', 'main'], None),
+    ('push --force-with-lease (tracking match -> forced)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['fetch', 'origin'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2']], ['push', '--force-with-lease', 'origin', 'main'], None),
+    ('push --mirror', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['branch', 'dev'], ['tag', 'v1'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '--mirror', 'origin'], None),
+    ('push --all sorted branches', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['branch', 'dev'], ['branch', 'feature'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '--all', 'origin'], None),
+    ('push --tags', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['tag', 'v1'], ['tag', 'v2'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', 'origin', '--tags'], None),
+    ('push no upstream fatal', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push'], None),
+    ('push -o without receive.advertisePushOptions', [('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '-o', 'x=y', 'origin', 'main'], None),
+    ('push unknown option -> usage rc129', [('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['push', '--bogus', 'origin', 'main'], None),
+    ('push -d unmatched aborts all', [('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['branch', 'dev'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main', 'dev']], ['push', '-d', 'origin', 'dev', 'ghost'], None),
+    ('fetch origin new branches+tag', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['branch', 'dev'], ['tag', 'v1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main', 'dev'], ['push', 'origin', 'v1'], ['update-ref', '-d', 'refs/remotes/origin/main'], ['update-ref', '-d', 'refs/remotes/origin/dev']], ['fetch', 'origin'], None),
+    ('fetch origin main refspec (FETCH_HEAD + opportunistic)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['update-ref', '-d', 'refs/remotes/origin/main']], ['fetch', 'origin', 'main'], None),
+    ('fetch --no-tags', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['branch', 'dev'], ['tag', 'v1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main', 'dev'], ['push', 'origin', 'v1'], ['update-ref', '-d', 'refs/remotes/origin/main'], ['update-ref', '-d', 'refs/remotes/origin/dev']], ['fetch', '--no-tags', 'origin'], None),
+    ('fetch --prune deleted branch', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['branch', 'dev'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main', 'dev'], ['fetch', 'origin'], ['push', 'origin', '--delete', 'dev']], ['fetch', '--prune', 'origin'], None),
+    ('fetch ff update', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['fetch', 'origin'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1']], ['fetch', 'origin'], None),
+    ('fetch tag clobber reject (summary_width=0)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['tag', 'v1'], ['push', 'origin', 'v1'], ('write', 'x.txt', 'x\n'), ['add', 'x.txt'], ['commit', '-m', 'c2'], ['tag', '-f', 'v1'], ['push', 'origin', '-f', 'v1'], ['update-ref', 'refs/tags/v1', 'HEAD~1']], ['fetch', 'origin', 'refs/tags/v1:refs/tags/v1'], None),
+    ('fetch tag <name> shorthand', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['tag', 'v1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['push', 'origin', 'v1'], ['tag', '-d', 'v1']], ['fetch', 'origin', 'tag', 'v1'], None),
+    ('fetch --all multiple remotes (Fetching <name>)', [['init', '--bare', '@BASE@/r1.git'], ['init', '--bare', '@BASE@/r2.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'one', '@BASE@/r1.git'], ['remote', 'add', 'two', '@BASE@/r2.git'], ['push', 'one', 'main'], ['push', 'two', 'main'], ['update-ref', '-d', 'refs/remotes/one/main'], ['update-ref', '-d', 'refs/remotes/two/main']], ['fetch', '--all'], None),
+    ('fetch bare URL HEAD-only (FETCH_HEAD url-only note)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'HEAD:refs/heads/master'], ['remote', 'remove', 'origin']], ['fetch', '@BASE@/remote.git'], None),
+    ('fetch bare URL unresolvable HEAD fatal', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['remote', 'remove', 'origin']], ['fetch', '@BASE@/remote.git', 'main'], None),
+    ('fetch --dry-run (no FETCH_HEAD, no ref update)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ['update-ref', '-d', 'refs/remotes/origin/main']], ['fetch', '--dry-run', 'origin'], None),
+    ('fetch unknown option -> usage rc129', [('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['init', '--bare', '@BASE@/remote.git'], ['remote', 'add', 'origin', '@BASE@/remote.git']], ['fetch', '--bogus', 'origin'], None),
+    ('fetch file:// URL', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', 'file://@BASE@/remote.git'], ['push', 'origin', 'main'], ['update-ref', '-d', 'refs/remotes/origin/main']], ['fetch', 'origin'], None),
+    ('pull origin main fast-forward', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1']], ['pull', 'origin', 'main'], None),
+    ('pull origin main up to date', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main']], ['pull', 'origin', 'main'], None),
+    ('pull --ff-only divergent fail (diverging advice)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1'], ('write', 'g.txt', 'local\n'), ['add', 'g.txt'], ['commit', '-m', 'localwork']], ['pull', '--ff-only', 'origin', 'main'], None),
+    ('pull --rebase divergent', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1'], ('write', 'g.txt', 'local\n'), ['add', 'g.txt'], ['commit', '-m', 'localwork']], ['pull', '--rebase', 'origin', 'main'], None),
+    ('pull no tracking information', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', 'origin', 'main']], ['pull'], None),
+    ('pull configured upstream ff (no args)', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', '-u', 'origin', 'main'], ('write', 'f.txt', 'r1\nr2\n'), ['commit', '-am', 'r2'], ['push', 'origin', 'main'], ['reset', '--hard', 'HEAD~1']], ['pull'], None),
+    ('pull non-default remote, no branch', [['init', '--bare', '@BASE@/remote.git'], ('write', 'f.txt', 'r1\n'), ['add', 'f.txt'], ['commit', '-m', 'r1'], ['remote', 'add', 'origin', '@BASE@/remote.git'], ['push', '-u', 'origin', 'main'], ['remote', 'add', 'other', '@BASE@/remote.git']], ['pull', 'other'], None),
+]
+
+@pytest.mark.parametrize("case", BATCH10_CASES, ids=[c[0] for c in BATCH10_CASES])
+def test_batch10_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH10_STDIN_CASES, ids=[c[0] for c in BATCH10_STDIN_CASES])
+def test_batch10_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# Network cases (fetch/pull/push) need a SEPARATE remote per tool: the standard
+# harness runs oracle and pygit as siblings under one tmp_path, so a shared
+# relative remote collides. Here each tool gets an isolated root; @BASE@ in the
+# case is substituted with that root (so the remote lives at <root>/remote.git)
+# and normalized back to @BASE@ in the captured output so the path strings match.
+@pytest.mark.parametrize("case", BATCH10_NETWORK_CASES, ids=[c[0] for c in BATCH10_NETWORK_CASES])
+def test_batch10_network_parity(case, tmp_path: Path, git_254_oracle: str):
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+    _id, setup, probe, stdin = case
+    env = dict(__import__('os').environ); env.update(DETERMINISTIC_ENV); env['PYTHONPATH'] = str(ROOT)
+    def snap(work):
+        gd = work / '.git'
+        pf = gd / 'packed-refs'
+        packed = pf.read_text() if pf.exists() else '<none>'
+        refs = sorted((str(p.relative_to(gd)).replace(chr(92), '/'), p.read_text())
+                      for p in (gd / 'refs').rglob('*') if p.is_file())
+        return packed, refs
+    results = {}
+    for tool, base in (('oracle', [git_254_oracle]), ('pygit', pygit_cmd())):
+        root = tmp_path / tool
+        work = root / 'work'
+        work.mkdir(parents=True)
+        BASE = str(root)
+        def sub(x):
+            return x.replace('@BASE@', BASE) if isinstance(x, str) else x
+        def norm(s):
+            return s.replace(BASE, '@BASE@')
+        subprocess.run([*base, 'init', '-b', 'main', '.'], cwd=work, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == 'write':
+                (work / step[1]).parent.mkdir(parents=True, exist_ok=True)
+                (work / step[1]).write_text(step[2])
+            elif isinstance(step, tuple) and step and step[0] == 'rm':
+                (work / step[1]).unlink()
+            else:
+                subprocess.run([*base, *[sub(a) for a in step]], cwd=work, env=env, capture_output=True)
+        proc = subprocess.run([*base, *[sub(a) for a in probe]], cwd=work, env=env,
+                              input=stdin, text=True, capture_output=True)
+        packed, refs = snap(work)
+        results[tool] = (proc.returncode, norm(proc.stdout), norm(proc.stderr),
+                         norm(packed), [(k, norm(v)) for k, v in refs])
+    assert results['pygit'] == results['oracle']

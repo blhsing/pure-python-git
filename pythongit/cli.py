@@ -5942,6 +5942,9 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--exit-code", dest="exit_code", action="store_true")
     ap.add_argument("-R", dest="reverse", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
+    # Number of equal lines that still merge two adjacent hunks (diff.c
+    # OPT_DIFF_INTERHUNK_CONTEXT, default 0); honored by the unified patch path.
+    ap.add_argument("--inter-hunk-context", dest="interhunkcontext", type=int, default=0)
     # -M/-C (with optional attached values) are accepted but never consume a
     # following token; rename detection is on by default (diff.renames=true).
     ap.add_argument("--no-renames", dest="no_renames", action="store_true")
@@ -6041,7 +6044,8 @@ def cmd_diff(argv: list[str]) -> int:
         return 1 if changes else 0
     if args.exit_code:
         for path, a, b in changes:
-            _emit_file_diff(path, a, b, args.reverse, args.unified)
+            _emit_file_diff(path, a, b, args.reverse, args.unified,
+                            inter_hunk_context=args.interhunkcontext)
         return 1 if changes else 0
     if args.raw:
         zero7 = "0000000"
@@ -6081,14 +6085,17 @@ def cmd_diff(argv: list[str]) -> int:
             _print(line)
     elif args.word_diff in ("plain", "porcelain"):
         for path, a, b in changes:
-            _emit_file_diff(path, a, b, args.reverse, args.unified, word_diff=args.word_diff)
+            _emit_file_diff(path, a, b, args.reverse, args.unified, word_diff=args.word_diff,
+                            inter_hunk_context=args.interhunkcontext)
     else:
         renames = []
         if not args.no_renames:
             renames, changes = _detect_changes_renames(repo, changes)
         emit = [(dst, lambda s=src, d=dst, sm=sim, sa=sa, db=db: _emit_rename_patch(s, d, sm, sa, db))
                 for src, dst, sim, sa, db in renames]
-        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b, args.reverse, args.unified)) for path, a, b in changes]
+        emit += [(path, lambda p=path, a=a, b=b: _emit_file_diff(p, a, b, args.reverse, args.unified,
+                                                                 inter_hunk_context=args.interhunkcontext))
+                 for path, a, b in changes]
         for _key, fn in sorted(emit, key=lambda e: e[0]):
             fn()
     return 0
@@ -7569,7 +7576,139 @@ def _reset_merge_keep(repo: Repository, kind: str, target_sha: str, target_tree:
     return 0
 
 
+def _parse_options_int(name_disp: str, raw: str, precision: int = 4) -> int:
+    """Faithful port of parse-options.c OPTION_INTEGER value parsing
+    (git_parse_signed + get_unit_factor + the precision range check).
+
+    *name_disp* is the already-formatted ``optname()`` string ("switch `U'" or
+    "option `unified'") used in the diagnostics.  *raw* is the option argument
+    text (already separated from the option, never None).  *precision* is the
+    sizeof() of the target integer (4 = int).  Raises _SwitchParseError
+    (rc 129, no usage block) on a malformed or out-of-range value, mirroring
+    git's error() return from the option callback.
+    """
+    if raw == "":
+        # OPTION_INTEGER: "} else if (!*arg) { error("%s expects a numerical
+        # value") }" — checked before git_parse_signed is ever called.
+        raise _SwitchParseError(
+            f"error: {name_disp} expects a numerical value")
+    upper_bound = (1 << (precision * 8 - 1)) - 1
+    lower_bound = -upper_bound - 1
+    # git_parse_signed: strtoimax(value, &end, 0) then get_unit_factor(end).
+    s = raw
+    sign = 1
+    body = s
+    if body[:1] in ("+", "-"):
+        sign = -1 if body[0] == "-" else 1
+        body = body[1:]
+    # strtoimax base 0: 0x.. hex, 0.. octal, else decimal.  We require at least
+    # one digit to be consumed (end == value otherwise -> EINVAL).
+    digits = body
+    factor = 1
+    if digits and digits[-1] in "kKmMgG":
+        factor = {"k": 1024, "m": 1024 * 1024,
+                  "g": 1024 * 1024 * 1024}[digits[-1].lower()]
+        digits = digits[:-1]
+    base = 10
+    if digits[:2] in ("0x", "0X"):
+        base = 16
+        num = digits[2:]
+        valid = bool(num) and all(c in "0123456789abcdefABCDEF" for c in num)
+    elif digits[:1] == "0" and len(digits) > 1:
+        base = 8
+        num = digits
+        valid = all(c in "01234567" for c in num)
+    else:
+        num = digits
+        valid = bool(num) and all(c in "0123456789" for c in num)
+    if not valid:
+        raise _SwitchParseError(
+            f"error: {name_disp} expects an integer value with an "
+            "optional k/m/g suffix")
+    value = sign * int(num, base) * factor
+    # git_parse_signed's ERANGE branch and the trailing "value < lower_bound"
+    # check both report the same out-of-range diagnostic.
+    if not (lower_bound <= value <= upper_bound):
+        raise _SwitchParseError(
+            f"error: value {raw} for {name_disp} not in range "
+            f"[{lower_bound},{upper_bound}]")
+    return value
+
+
+def _reset_extract_context(argv: list[str]) -> tuple[int, int, list[str]]:
+    """Pull -U/--unified and --inter-hunk-context out of *argv* with git's
+    OPTION_INTEGER ('U'/'unified', NONEG) and (0/'inter-hunk-context', NONEG)
+    semantics, returning (context, interhunkcontext, remaining_argv).
+
+    Defaults are -1 (the OPT_DIFF_UNIFIED / OPT_DIFF_INTERHUNK_CONTEXT
+    sentinels meaning "not set").  Everything else is left in remaining_argv
+    for argparse.  Stops splitting at "--".
+    """
+    context = -1
+    interhunk = -1
+    rest: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            rest.extend(argv[i:])
+            break
+        if a == "--unified":
+            i += 1
+            if i >= n:
+                raise _SwitchParseError("error: option `unified' requires a value")
+            context = _parse_options_int("option `unified'", argv[i])
+        elif a.startswith("--unified="):
+            context = _parse_options_int("option `unified'", a[len("--unified="):])
+        elif a == "--inter-hunk-context":
+            i += 1
+            if i >= n:
+                raise _SwitchParseError(
+                    "error: option `inter-hunk-context' requires a value")
+            interhunk = _parse_options_int(
+                "option `inter-hunk-context'", argv[i])
+        elif a.startswith("--inter-hunk-context="):
+            interhunk = _parse_options_int(
+                "option `inter-hunk-context'", a[len("--inter-hunk-context="):])
+        elif a.startswith("-") and a != "-" and not a.startswith("--"):
+            # Short-option cluster (e.g. -pU2): scan char by char so that a 'U'
+            # appearing after value-less flags still consumes the rest of the
+            # token (or the next argv) as its integer value, matching how
+            # parse_options walks a packed short-option string.  Non-'U' chars
+            # are re-emitted as their own short token for argparse to handle.
+            cluster = a[1:]
+            j = 0
+            keep = ""
+            while j < len(cluster):
+                ch = cluster[j]
+                if ch == "U":
+                    attached = cluster[j + 1:]
+                    if attached:
+                        context = _parse_options_int("switch `U'", attached)
+                    else:
+                        i += 1
+                        if i >= n:
+                            raise _SwitchParseError(
+                                "error: switch `U' requires a value")
+                        context = _parse_options_int("switch `U'", argv[i])
+                    break
+                keep += ch
+                j += 1
+            if keep:
+                rest.append("-" + keep)
+        else:
+            rest.append(a)
+        i += 1
+    return context, interhunk, rest
+
+
 def cmd_reset(argv: list[str]) -> int:
+    try:
+        context, interhunk, argv = _reset_extract_context(argv)
+    except _SwitchParseError as exc:
+        sys.stderr.write(exc.message + "\n")
+        return exc.rc
     ap = argparse.ArgumentParser(prog="pygit reset", add_help=False)
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--soft", action="store_true")
@@ -7613,6 +7752,15 @@ def cmd_reset(argv: list[str]) -> int:
     mode = ("soft" if args.soft else "hard" if args.hard else "merge" if args.merge
             else "keep" if args.keep else "mixed")
 
+    # builtin/reset.c after parse_options: a value below the -1 "unset" sentinel
+    # is rejected outright (this runs for both patch and non-patch modes).
+    if context < -1:
+        _err("fatal: '--unified' cannot be negative")
+        return 128
+    if interhunk < -1:
+        _err("fatal: '--inter-hunk-context' cannot be negative")
+        return 128
+
     # reset --patch: hand the selected pathspec to the shared add-patch engine.
     if args.patch:
         if args.pathspec_from_file is not None:
@@ -7627,8 +7775,17 @@ def cmd_reset(argv: list[str]) -> int:
             _err(f"fatal: Failed to resolve '{treeish}' as a valid tree.")
             return 128
         from . import addpatch
-        rc = addpatch.run_add_p(repo, "reset", treeish, paths)
+        rc = addpatch.run_add_p(repo, "reset", treeish, paths,
+                                context=context, interhunkcontext=interhunk)
         return 1 if rc else 0
+
+    # Non-patch reset: the diff-context options only make sense with --patch.
+    if context != -1:
+        _err("fatal: the option '--unified' requires '--patch'")
+        return 128
+    if interhunk != -1:
+        _err("fatal: the option '--inter-hunk-context' requires '--patch'")
+        return 128
 
     if paths and mode != "mixed":
         _err(f"fatal: Cannot do {mode} reset with paths.")
@@ -8746,7 +8903,10 @@ def cmd_rebase(argv: list[str]) -> int:
     if picked == 0:
         _print(f"Current branch {branch} is up to date.")
     else:
-        _print(f"Successfully rebased and updated {head_sym or 'HEAD'}.")
+        # git's rebase prints progress + the result line to stderr: each step
+        # "Rebasing (k/n)\r" overwriting the previous, then the final message.
+        prog = "".join(f"Rebasing ({k}/{picked})\r" for k in range(1, picked + 1))
+        sys.stderr.write(prog + f"Successfully rebased and updated {head_sym or 'HEAD'}.\n")
     return 0
 
 
@@ -8794,6 +8954,62 @@ def cmd_reflog(argv: list[str]) -> int:
         _print(f"{disp} {ref}@{{{inner}}}: {msg}")
         shown += 1
     return 0
+
+
+# The full git_stash_usage[] block from builtin/stash.c (the BUILTIN_STASH_*
+# _USAGE macros joined by parse_options' "   or: " prefix), followed by the
+# blank line + option list that parse_options prints for the default (push)
+# option table on a parse error.  Emitted verbatim on an unknown stash option.
+_STASH_USAGE = (
+    "usage: git stash list [<log-options>]\n"
+    "   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]\n"
+    "   or: git stash drop [-q | --quiet] [<stash>]\n"
+    "   or: git stash pop [--index] [-q | --quiet] [<stash>]\n"
+    "   or: git stash apply [--index] [-q | --quiet] [<stash>]\n"
+    "   or: git stash branch <branchname> [<stash>]\n"
+    "   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]\n"
+    "                 [-u | --include-untracked] [-a | --all] [(-m | --message) <message>]\n"
+    "                 [--pathspec-from-file=<file> [--pathspec-file-nul]]\n"
+    "                 [--] [<pathspec>...]\n"
+    "   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]\n"
+    "                 [-u | --include-untracked] [-a | --all] [<message>]\n"
+    "   or: git stash clear\n"
+    "   or: git stash create [<message>]\n"
+    "   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>\n"
+    "   or: git stash export (--print | --to-ref <ref>) [<stash>...]\n"
+    "   or: git stash import <commit>\n"
+    "\n"
+    "    -k, --[no-]keep-index keep index\n"
+    "    -S, --[no-]staged     stash staged changes only\n"
+    "    -p, --[no-]patch      stash in patch mode\n"
+    "    --[no-]auto-advance   auto advance to the next file when selecting hunks interactively\n"
+    "    -U, --unified <n>     generate diffs with <n> lines context\n"
+    "    --inter-hunk-context <n>\n"
+    "                          show context between diff hunks up to the specified number of lines\n"
+    "    -q, --[no-]quiet      quiet mode\n"
+    "    -u, --[no-]include-untracked\n"
+    "                          include untracked files in stash\n"
+    "    -a, --[no-]all        include ignore files\n"
+    "    -m, --[no-]message <message>\n"
+    "                          stash message\n"
+    "    --[no-]pathspec-from-file <file>\n"
+    "                          read pathspec from file\n"
+    "    --[no-]pathspec-file-nul\n"
+    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n"
+    "\n"
+)
+
+
+def _stash_unknown_option(opt: str) -> int:
+    """Emit parse_options' diagnostic for an unknown stash option: the
+    "error: unknown {option,switch} `X'" line plus the full git_stash_usage
+    block, then return rc 129 (PARSE_OPT_HELP / parse error)."""
+    if opt.startswith("--"):
+        sys.stderr.write(f"error: unknown option `{opt[2:]}'\n")
+    else:
+        sys.stderr.write(f"error: unknown switch `{opt[1:]}'\n")
+    sys.stderr.write(_STASH_USAGE)
+    return 129
 
 
 def _stash_push(argv: list[str], save: bool) -> int:
@@ -8855,8 +9071,7 @@ def _stash_push(argv: list[str], save: bool) -> int:
         elif not a.startswith("-"):
             pathspecs.append(a)
         else:
-            _err(f"error: unknown option `{a[2:] if a.startswith('--') else a[1:]}'")
-            return 129
+            return _stash_unknown_option(a)
         i += 1
 
     # --patch interactive hunk selection (do_push_stash patch branch).
@@ -9121,32 +9336,1371 @@ def cmd_stash(argv: list[str]) -> int:
     return 128
 
 
-def cmd_fetch(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit fetch")
-    ap.add_argument("remote", nargs="?", default="origin")
-    ap.add_argument("refspecs", nargs="*")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    from . import protocol
-    updated = protocol.fetch(repo, args.remote, args.refspecs or None)
-    for ref, sha in updated.items():
-        _print(f" * {ref} -> {sha[:7]}")
-    if not updated:
-        _print("Already up to date.")
-    return 0
+# ===========================================================================
+# fetch / push / pull over local (file path / file://) remotes
+#
+# Mirrors builtin/fetch.c, builtin/push.c, builtin/pull.c, transport.c and the
+# local-transport object/ref negotiation.  Display output is byte-exact with
+# git 2.54.0 (the "From"/"To" headers, the columnated status records, the
+# rejection/advice messages, FETCH_HEAD, and tracking-ref updates).
+# ===========================================================================
+
+_DEFAULT_ABBREV = 7
+
+
+def _xport_anonymize_url(url: str) -> str:
+    """transport_anonymize_url(): for local paths this is the path unchanged."""
+    return url
+
+
+def _strip_url_for_display(url: str) -> str:
+    """display_state_init(): strip trailing slashes, then a trailing ``.git``."""
+    s = url
+    i = len(s) - 1
+    while i >= 0 and s[i] == "/":
+        i -= 1
+    # i is the index of the last non-slash char
+    if i > 3 and s[i - 3:i + 1] == ".git":
+        return s[:i - 3]
+    return s[:i + 1]
+
+
+def _summary_width(pairs: list[tuple[str, str]]) -> int:
+    """transport_summary_width(): 2*maxw+3 where maxw is the widest abbrev.
+
+    With DEFAULT_ABBREV=7 and small fresh repos this is always 7, giving 17.
+    """
+    maxw = -1
+    for old, new in pairs:
+        for oid in (old, new):
+            # find_unique_abbrev is >= DEFAULT_ABBREV; 7 in practice
+            w = _DEFAULT_ABBREV
+            if w > maxw:
+                maxw = w
+    if maxw < 0:
+        maxw = _DEFAULT_ABBREV
+    return 2 * maxw + 3
+
+
+def _abbrev(sha: str) -> str:
+    return sha[:_DEFAULT_ABBREV]
+
+
+def _resolve_remote(repo: Repository, name_or_url: str) -> "tuple[str, str, list[str], list[str]]":
+    """Return (remote_name, url, fetch_refspecs, push_refspecs).
+
+    ``name_or_url`` may be a configured remote name or a bare URL.  For a URL,
+    remote_name is the URL itself (git uses the URL as the "remote name").
+    """
+    from . import gitconfig
+    cp = repo.config()
+    sect = f'remote "{name_or_url}"'
+    if cp.has_section(sect):
+        url = gitconfig.get(repo, f"remote.{name_or_url}.url") or ""
+        pushurl = gitconfig.get(repo, f"remote.{name_or_url}.pushurl")
+        fetch_rs = gitconfig.get_all(repo, f"remote.{name_or_url}.fetch")
+        push_rs = gitconfig.get_all(repo, f"remote.{name_or_url}.push")
+        return name_or_url, url, fetch_rs, push_rs
+    # Bare URL.
+    return name_or_url, name_or_url, [], []
+
+
+def _push_url_for(repo: Repository, name_or_url: str) -> str:
+    from . import gitconfig
+    cp = repo.config()
+    sect = f'remote "{name_or_url}"'
+    if cp.has_section(sect):
+        pushurl = gitconfig.get(repo, f"remote.{name_or_url}.pushurl")
+        if pushurl:
+            return pushurl
+        return gitconfig.get(repo, f"remote.{name_or_url}.url") or ""
+    return name_or_url
+
+
+def _prettify_refname(name: str) -> str:
+    for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _err_no_repo(spec: str) -> int:
+    """connect.c die_no_repository(): the canonical no-remote error block."""
+    sys.stderr.write(
+        f"fatal: '{spec}' does not appear to be a git repository\n"
+        "fatal: Could not read from remote repository.\n\n"
+        "Please make sure you have the correct access rights\n"
+        "and the repository exists.\n")
+    return 128
+
+
+# ---------------------------------------------------------------------------
+# push
+# ---------------------------------------------------------------------------
+
+_PUSH_ADVICE = {
+    "non_ff_head": (
+        "Updates were rejected because the tip of your current branch is behind\n"
+        "its remote counterpart. If you want to integrate the remote changes,\n"
+        "use 'git pull' before pushing again.\n"
+        "See the 'Note about fast-forwards' in 'git push --help' for details."),
+    "non_ff_other": (
+        "Updates were rejected because a pushed branch tip is behind its remote\n"
+        "counterpart. If you want to integrate the remote changes, use 'git pull'\n"
+        "before pushing again.\n"
+        "See the 'Note about fast-forwards' in 'git push --help' for details."),
+    "already_exists": (
+        "Updates were rejected because the tag already exists in the remote."),
+    "fetch_first": (
+        "Updates were rejected because the remote contains work that you do not\n"
+        "have locally. This is usually caused by another repository pushing to\n"
+        "the same ref. If you want to integrate the remote changes, use\n"
+        "'git pull' before pushing again.\n"
+        "See the 'Note about fast-forwards' in 'git push --help' for details."),
+    "needs_force": (
+        "You cannot update a remote ref that points at a non-commit object,\n"
+        "or update a remote ref to make it point at a non-commit object,\n"
+        "without using the '--force' option.\n"),
+}
+
+
+def _print_push_status_line(code: str, summary: str, frm: Optional[str],
+                            to: str, msg: Optional[str], width: int) -> None:
+    """transport.c print_ref_status (non-porcelain)."""
+    line = " %c %-*s " % (code, width, summary)
+    if frm is not None:
+        line += "%s -> %s" % (_prettify_refname(frm), _prettify_refname(to))
+    else:
+        line += _prettify_refname(to)
+    if msg:
+        line += " (%s)" % msg
+    sys.stderr.write(line + "\n")
 
 
 def cmd_push(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit push")
-    ap.add_argument("remote", nargs="?", default="origin")
-    ap.add_argument("refspec", nargs="?", default=None)
-    args = ap.parse_args(argv)
     repo = _repo()
-    from . import protocol
-    res = protocol.push(repo, args.remote, [args.refspec] if args.refspec else None)
-    for ref, status in res.items():
-        _print(f" {status}\t{ref}")
-    return 0 if all(v == "ok" for v in res.values()) else 1
+    from . import localtransport as lt
+    from . import gitconfig
+
+    verbosity = 0          # -1 quiet, 0 normal, 1+ verbose
+    dry_run = False
+    force = False
+    delete = False
+    set_upstream = False
+    push_all = False        # --all / --branches
+    mirror = False
+    push_tags = False
+    no_verify = True        # local has no hooks; --verify/--no-verify accepted
+    porcelain = False
+    push_options: list[str] = []
+    positional: list[str] = []
+    family = None
+    cas = None              # force-with-lease: None | {} (tracking-for-all) | {ref: expect}
+    force_if_includes = False
+
+    i = 0
+    n = len(argv)
+    def need(arg):
+        nonlocal i
+        i += 1
+        if i >= n:
+            _err(f"error: option `{arg[2:] if arg.startswith('--') else arg}' requires a value")
+            sys.exit(129)
+        return argv[i]
+
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            positional.extend(argv[i + 1:])
+            break
+        elif a in ("-v", "--verbose"):
+            verbosity += 1
+        elif a in ("-q", "--quiet"):
+            verbosity = -1
+        elif a in ("-n", "--dry-run"):
+            dry_run = True
+        elif a in ("-f", "--force"):
+            force = True
+        elif a in ("-d", "--delete"):
+            delete = True
+        elif a in ("-u", "--set-upstream"):
+            set_upstream = True
+        elif a in ("--all", "--branches"):
+            push_all = True
+        elif a == "--mirror":
+            mirror = True
+        elif a in ("-t", "--tags"):
+            push_tags = True
+        elif a == "--no-verify":
+            no_verify = True
+        elif a == "--verify":
+            no_verify = False
+        elif a == "--porcelain":
+            porcelain = True
+        elif a in ("-o", "--push-option"):
+            push_options.append(need(a))
+        elif a.startswith("--push-option="):
+            push_options.append(a.split("=", 1)[1])
+        elif a == "--ipv4" or a == "-4":
+            family = "ipv4"
+        elif a == "--ipv6" or a == "-6":
+            family = "ipv6"
+        elif a == "--progress" or a == "--no-progress":
+            pass
+        elif a == "--repo":
+            positional.insert(0, need(a))
+        elif a == "--force-with-lease":
+            if cas is None:
+                cas = {}
+            cas["__all__"] = True
+        elif a.startswith("--force-with-lease="):
+            val = a.split("=", 1)[1]
+            if cas is None:
+                cas = {}
+            if ":" in val:
+                ref, expect = val.split(":", 1)
+                cas[ref] = expect
+            else:
+                cas[val] = None   # use tracking for this ref
+        elif a == "--no-force-with-lease":
+            cas = None
+        elif a == "--force-if-includes":
+            force_if_includes = True
+        elif a == "--no-force-if-includes":
+            force_if_includes = False
+        elif a == "--atomic" or a == "--no-atomic":
+            pass
+        elif a == "--thin" or a == "--no-thin":
+            pass
+        elif a == "--repo":
+            positional.insert(0, need(a))
+        elif a.startswith("-") and a != "-" and not (len(a) == 41 or len(a) == 65):
+            from ._transport_usage import PUSH_USAGE
+            if a.startswith("--"):
+                sys.stderr.write(f"error: unknown option `{a[2:]}'\n")
+            else:
+                sys.stderr.write(f"error: unknown switch `{a[1]}'\n")
+            sys.stderr.write(PUSH_USAGE)
+            return 129
+        else:
+            positional.append(a)
+        i += 1
+
+    # Determine remote and refspecs.
+    if positional:
+        remote_arg = positional[0]
+        spec_args = positional[1:]
+    else:
+        remote_arg = None
+        spec_args = []
+
+    if remote_arg is None:
+        # Default remote = branch's remote, else "origin".
+        head_sym, _ = refs_mod.read_head(repo)
+        branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+        remote_arg = (gitconfig.get(repo, f"branch.{branch}.remote") if branch else None) or "origin"
+
+    cp = repo.config()
+    if not cp.has_section(f'remote "{remote_arg}"') and not lt.is_local_url(remote_arg):
+        return _err_no_repo(remote_arg)
+
+    remote_name, _url, _frs, push_rs = _resolve_remote(repo, remote_arg)
+    url = _push_url_for(repo, remote_arg)
+    if not lt.is_local_url(url):
+        _err("fatal: pygit push supports local (file) remotes only")
+        return 128
+    if not os.path.exists(lt.local_path(url)):
+        return _err_no_repo(url)
+    remote = lt.open_remote(url)
+
+    # send-pack: push options require the receiver to advertise support
+    # (receive.advertisePushOptions); otherwise send_pack dies before any work.
+    if push_options:
+        adv = (gitconfig.get(remote, "receive.advertisePushOptions") or "").lower()
+        if adv not in ("true", "1", "yes", "on"):
+            sys.stderr.write("fatal: the receiving end does not support push options\n")
+            sys.stderr.write("fatal: the remote end hung up unexpectedly\n")
+            return 128
+
+    return _do_push(repo, remote, remote_name, url, spec_args, push_rs,
+                    verbosity=verbosity, dry_run=dry_run, force=force,
+                    delete=delete, set_upstream=set_upstream, push_all=push_all,
+                    mirror=mirror, push_tags=push_tags, porcelain=porcelain,
+                    cas=cas)
+
+
+def _do_push(repo, remote, remote_name, url, spec_args, configured_push_rs, *,
+             verbosity, dry_run, force, delete, set_upstream, push_all,
+             mirror, push_tags, porcelain, cas=None) -> int:
+    from . import localtransport as lt
+    from . import gitconfig
+
+    anon_url = _xport_anonymize_url(url)
+    remote_refs = lt.advertised_refs(remote)   # name -> oid on remote
+    local_refs = refs_mod.iter_all_refs(repo)  # name -> oid locally
+
+    # Build the list of (src_name, dst_name, src_oid, force) push commands.
+    # commands keep submission order for display.
+    commands: list[dict] = []
+
+    def add_command(src_name, dst_name, src_oid, forced, *, display_to=None,
+                    src_real=None):
+        commands.append(dict(src=src_name, dst=dst_name, new=src_oid,
+                             force=forced, src_real=src_real or src_name))
+
+    # match_push_refs errors (e.g. deleting a nonexistent ref) are reported
+    # before the transport runs and do not emit a "To" header.
+    match_errors: list[str] = []
+
+    def add_delete(spec_name):
+        if spec_name.startswith("refs/"):
+            if spec_name in remote_refs:
+                add_command(None, spec_name, repo.null_oid(), True)
+            else:
+                match_errors.append(spec_name)
+            return
+        for cand in (spec_name, f"refs/heads/{spec_name}", f"refs/tags/{spec_name}"):
+            if cand in remote_refs:
+                add_command(None, cand, repo.null_oid(), True)
+                return
+        match_errors.append(spec_name)
+
+    if mirror:
+        # Mirror: every local ref under refs/ -> same name; delete remote refs
+        # not present locally.
+        for name in sorted(local_refs):
+            add_command(name, name, local_refs[name], True)
+        for name in sorted(remote_refs):
+            if name not in local_refs:
+                add_command(None, name, repo.null_oid(), True)
+    elif push_all:
+        for name in sorted(local_refs):
+            if name.startswith("refs/heads/"):
+                add_command(name, name, local_refs[name], force)
+        if not commands:
+            pass
+    elif delete:
+        if not spec_args:
+            _err("fatal: --delete doesn't make sense without any refs")
+            return 128
+        for spec in spec_args:
+            add_delete(spec)
+    else:
+        specs = spec_args or configured_push_rs
+        # --tags is sugar for the refs/tags/* refspec; when present, no default
+        # push refspec is needed even with no positional refspecs.
+        if not specs and not push_tags:
+            rc = _default_push_refspec(repo, remote_name, set_upstream)
+            if isinstance(rc, int):
+                return rc
+            specs = [rc[0]]
+            if rc[1]:
+                set_upstream = True
+        for raw in specs:
+            rs = lt.Refspec(raw)
+            if rs.matching:
+                # ":" — push matching refs (those existing on both sides).
+                for name in sorted(local_refs):
+                    if name.startswith("refs/heads/") and name in remote_refs:
+                        add_command(name, name, local_refs[name], rs.force or force)
+                continue
+            src = rs.src
+            has_colon = rs.dst is not None
+            # Delete: empty source with a destination (":dst" or "src:" where
+            # src empty), i.e. nothing to push to the dst.
+            if has_colon and (src is None or src == ""):
+                add_delete(rs.dst)
+                continue
+            src_oid = refs_mod.rev_parse(repo, src) if src else None
+            src_full = refs_mod.dwim_full_name(repo, src) if src else None
+            if src_oid is None:
+                _err(f"error: src refspec {src} does not match any")
+                _err(f"error: failed to push some refs to '{anon_url}'")
+                return 1
+            dst = rs.dst if has_colon else (src_full or src)
+            dstfull = _expand_dst_ref(dst, src_full, remote_refs)
+            # The displayed source is the original refspec token (e.g. HEAD).
+            add_command(src, dstfull, src_oid, rs.force or force,
+                        src_real=src_full or src)
+
+    if push_tags:
+        for name in sorted(local_refs):
+            if name.startswith("refs/tags/"):
+                if not any(c["dst"] == name for c in commands):
+                    add_command(name, name, local_refs[name], force)
+
+    # match_push_refs errors abort the whole push before the transport runs:
+    # no "To" header, no other refs are pushed.
+    if match_errors:
+        if verbosity > 0:
+            sys.stderr.write(f"Pushing to {anon_url}\n")
+        for name in match_errors:
+            sys.stderr.write(f"error: unable to delete '{name}': remote ref does not exist\n")
+        sys.stderr.write(f"error: failed to push some refs to '{anon_url}'\n")
+        return 1
+
+    if verbosity > 0 and commands:
+        sys.stderr.write(f"Pushing to {anon_url}\n")
+
+    if not commands:
+        if verbosity >= 0:
+            sys.stderr.write("Everything up-to-date\n")
+        return 0
+
+    # Classify each command into a status.
+    results = []  # list of dict with status info
+    reject_reasons = set()
+    head_sym, _ = refs_mod.read_head(repo)
+
+    fetch_rs_cfg = gitconfig.get_all(repo, f"remote.{remote_name}.fetch")
+    for c in commands:
+        dst = c["dst"]
+        new = c["new"]
+        old = remote_refs.get(dst, repo.null_oid())
+        is_delete = (new == repo.null_oid())
+        status = None
+        force_update = c["force"]
+        cas_reject = None
+        # --force-with-lease: expected old value comes from the tracking ref.
+        if cas is not None and not is_delete:
+            entry_all = cas.get("__all__")
+            expect = None
+            has_cas = False
+            if dst in cas and cas[dst] is not None:
+                expect = cas[dst]; has_cas = True
+            elif dst in cas and cas[dst] is None:
+                expect = _tracking_oid(repo, fetch_rs_cfg, dst); has_cas = True
+            elif entry_all:
+                expect = _tracking_oid(repo, fetch_rs_cfg, dst); has_cas = True
+            if has_cas:
+                if expect is None or old != expect:
+                    cas_reject = "reject_stale"
+                else:
+                    force_update = True
+        if is_delete:
+            status = "deleted"
+        elif old == new:
+            status = "uptodate"
+        elif cas_reject:
+            status = cas_reject
+        elif old == repo.null_oid():
+            status = "new"
+        else:
+            # Existing ref update — classify the rejection reason like remote.c.
+            if not objs.object_exists(repo, old):
+                base = "reject_fetch_first"
+            elif not _both_commits(repo, old, new):
+                base = "reject_needs_force"
+            elif not _is_fast_forward(repo, remote, old, new):
+                base = "reject_nonff"
+            else:
+                base = None
+            if base is None:
+                status = "ff"
+            elif force_update:
+                status = "forced"
+            else:
+                status = base
+        results.append(dict(cmd=c, status=status, old=old, new=new,
+                            is_delete=is_delete))
+
+    # Determine if everything is uptodate / none pushed.
+    pushed_any = any(r["status"] in ("new", "ff", "forced", "deleted")
+                     for r in results)
+    _error_statuses = ("reject_nonff", "reject_fetch_first", "reject_needs_force",
+                       "reject_stale")
+    has_error = any(r["status"] in _error_statuses for r in results)
+
+    if not pushed_any and not has_error and verbosity <= 0:
+        # Nothing to do — but transport still may print uptodate at -v.
+        sys.stderr.write("Everything up-to-date\n")
+        return 0
+
+    # width across all involved oids
+    width = _summary_width([(r["old"], r["new"]) for r in results])
+
+    # Apply updates (unless dry-run) and collect display, mirroring
+    # transport_print_push_status ordering: uptodate (verbose) first, then OK,
+    # then errors.
+    def emit(r):
+        c = r["cmd"]; st = r["status"]
+        dst = c["dst"]; src = c["src"]; old = r["old"]; new = r["new"]
+        if st == "uptodate":
+            _print_push_status_line("=", "[up to date]", src, dst, None, width)
+        elif st == "new":
+            if dst.startswith("refs/tags/"):
+                summ = "[new tag]"
+            elif dst.startswith("refs/heads/"):
+                summ = "[new branch]"
+            else:
+                summ = "[new reference]"
+            _print_push_status_line("*", summ, src, dst, None, width)
+        elif st == "deleted":
+            _print_push_status_line("-", "[deleted]", None, dst, None, width)
+        elif st == "ff":
+            qr = "%s..%s" % (_abbrev(old), _abbrev(new))
+            _print_push_status_line(" ", qr, src, dst, None, width)
+        elif st == "forced":
+            qr = "%s...%s" % (_abbrev(old), _abbrev(new))
+            _print_push_status_line("+", qr, src, dst, "forced update", width)
+        elif st == "reject_nonff":
+            _print_push_status_line("!", "[rejected]", src, dst, "non-fast-forward", width)
+        elif st == "reject_fetch_first":
+            _print_push_status_line("!", "[rejected]", src, dst, "fetch first", width)
+        elif st == "reject_needs_force":
+            _print_push_status_line("!", "[rejected]", src, dst, "needs force", width)
+        elif st == "reject_stale":
+            _print_push_status_line("!", "[rejected]", src, dst, "stale info", width)
+
+    # Header "To <url>" before the first status record (stderr).
+    quiet = verbosity < 0
+    show_status = (not quiet) or has_error
+    printed_header = False
+
+    def header():
+        nonlocal printed_header
+        if not printed_header:
+            sys.stderr.write(f"To {anon_url}\n")
+            printed_header = True
+
+    if show_status:
+        header()
+        # verbose: uptodate first
+        if verbosity > 0:
+            for r in results:
+                if r["status"] == "uptodate":
+                    emit(r)
+        # OK statuses
+        for r in results:
+            if r["status"] in ("new", "ff", "forced", "deleted"):
+                emit(r)
+        # error statuses
+        for r in results:
+            st = r["status"]
+            if st in _error_statuses:
+                emit(r)
+                if st == "reject_nonff":
+                    if r["cmd"]["dst"] == head_sym:
+                        reject_reasons.add("non_ff_head")
+                    else:
+                        reject_reasons.add("non_ff_other")
+                elif st == "reject_fetch_first":
+                    reject_reasons.add("fetch_first")
+                elif st == "reject_needs_force":
+                    reject_reasons.add("needs_force")
+
+    # Apply ref updates on the remote (and local tracking).
+    if not dry_run:
+        for r in results:
+            st = r["status"]; c = r["cmd"]; dst = c["dst"]; new = r["new"]
+            if st in ("new", "ff", "forced"):
+                # copy objects then update remote ref
+                lt.copy_objects(repo, remote, [new], lt.destination_have(remote))
+                refs_mod.update_ref(remote, dst, new)
+            elif st == "deleted":
+                refs_mod.delete_ref(remote, dst)
+        # update local tracking refs for OK/uptodate
+        _update_tracking_refs(repo, remote_name, results, verbosity)
+
+    # set upstream
+    if set_upstream and not dry_run:
+        _set_push_upstreams(repo, remote_name, results)
+
+    # Failure summary + advice.
+    if has_error:
+        sys.stderr.write(f"error: failed to push some refs to '{anon_url}'\n")
+        _emit_push_advice(reject_reasons)
+        return 1
+
+    # transport.c: "Everything up-to-date" when nothing was actually pushed
+    # (reached only at verbosity > 0 here; the v<=0 case returned earlier).
+    if not pushed_any and verbosity >= 0:
+        sys.stderr.write("Everything up-to-date\n")
+    return 0
+
+
+def _emit_push_advice(reasons: set) -> None:
+    if "non_ff_head" in reasons:
+        _err(_advice_lines(_PUSH_ADVICE["non_ff_head"]))
+    elif "non_ff_other" in reasons:
+        _err(_advice_lines(_PUSH_ADVICE["non_ff_other"]))
+    elif "already_exists" in reasons:
+        _err(_advice_lines(_PUSH_ADVICE["already_exists"]))
+    elif "fetch_first" in reasons:
+        _err(_advice_lines(_PUSH_ADVICE["fetch_first"]))
+    elif "needs_force" in reasons:
+        _err(_advice_lines(_PUSH_ADVICE["needs_force"]))
+
+
+def _advice_lines(text: str) -> str:
+    """advise(): prefix each message line with 'hint: ' ('hint:' for blanks).
+
+    A single trailing newline in the message does not produce an extra blank
+    hint line (git's strbuf split treats it as the line terminator).
+    """
+    if text.endswith("\n"):
+        text = text[:-1]
+    out = []
+    for line in text.split("\n"):
+        out.append("hint: " + line if line else "hint:")
+    return "\n".join(out)
+
+
+def _is_fast_forward(repo, remote, old, new) -> bool:
+    """Whether ``old`` is an ancestor of ``new`` (need both objects).
+
+    The objects for ``old`` live on the remote, ``new`` locally; for the local
+    push case we have both via the local store once we have pushed, but for the
+    decision we read from whichever store has the object.
+    """
+    from . import merge as merge_mod
+    # old is on the remote; new is local. We need the commit graph of new in
+    # the local repo, and old as a candidate ancestor.  old may also be present
+    # locally (tracking ref).  Use the local repo if it has old, else copy is
+    # not needed — we can walk the remote for the ancestor check using local
+    # objects since 'new' descends from history that includes 'old' iff old is
+    # reachable from new.
+    try:
+        return merge_mod.is_ancestor(repo, old, new)
+    except Exception:
+        return False
+
+
+def _both_commits(repo, old, new) -> bool:
+    """True when both oids resolve to commit objects (remote.c ref_newer guard)."""
+    for oid in (old, new):
+        try:
+            t, _ = objs.read_object(repo, oid)
+        except KeyError:
+            return False
+        if t != "commit":
+            return False
+    return True
+
+
+def _tracking_oid(repo, fetch_rs, remote_ref):
+    """Local value of the remote-tracking ref for ``remote_ref`` (CAS expect)."""
+    track = _tracking_ref_for(fetch_rs, remote_ref)
+    if not track:
+        return None
+    return refs_mod.read_ref(repo, track)
+
+
+def _full_remote_ref_for_delete(remote_refs: dict, name: str) -> str:
+    if name.startswith("refs/"):
+        return name
+    for cand in (f"refs/heads/{name}", f"refs/tags/{name}"):
+        if cand in remote_refs:
+            return cand
+    if name in remote_refs:
+        return name
+    return f"refs/heads/{name}"
+
+
+def _expand_dst_ref(dst: str, src_full: Optional[str], remote_refs: dict) -> str:
+    if dst.startswith("refs/"):
+        return dst
+    # If a remote ref already matches under heads/tags, prefer it.
+    if src_full and src_full.startswith("refs/tags/"):
+        return f"refs/tags/{dst}"
+    for cand in (f"refs/heads/{dst}",):
+        return cand
+    return f"refs/heads/{dst}"
+
+
+def _default_push_refspec(repo, remote_name, set_upstream):
+    """setup_default_push_refspecs() for push.default=simple.
+
+    Returns (refspec_str, auto_set_upstream) or an int return code on error.
+    """
+    from . import gitconfig
+    head_sym, head_sha = refs_mod.read_head(repo)
+    if not head_sym or not head_sym.startswith("refs/heads/"):
+        sys.stderr.write(
+            "fatal: You are not currently on a branch.\n"
+            "To push the history leading to the current (detached HEAD)\n"
+            "state now, use\n\n"
+            f"    git push {remote_name} HEAD:<name-of-remote-branch>\n\n")
+        return 128
+    branch = head_sym[len("refs/heads/"):]
+    merge = gitconfig.get(repo, f"branch.{branch}.merge")
+    bremote = gitconfig.get(repo, f"branch.{branch}.remote")
+    auto = (gitconfig.get(repo, "push.autoSetupRemote") or "").lower() in ("true", "1", "yes", "on")
+    if not merge or not bremote:
+        if auto:
+            return (f"{head_sym}:{head_sym}", True)
+        advice = ("\nTo have this happen automatically for branches without a tracking\n"
+                  "upstream, see 'push.autoSetupRemote' in 'git help config'.\n")
+        sys.stderr.write(
+            f"fatal: The current branch {branch} has no upstream branch.\n"
+            "To push the current branch and set the remote as upstream, use\n\n"
+            f"    git push --set-upstream {remote_name} {branch}\n"
+            f"{advice}\n")
+        return 128
+    # simple: upstream branch name must match local branch name
+    upstream = merge  # refs/heads/<name>
+    up_short = upstream[len("refs/heads/"):] if upstream.startswith("refs/heads/") else upstream
+    if up_short != branch:
+        _err("fatal: The upstream branch of your current branch does not match\n"
+             "the name of your current branch.  To push to the upstream branch\n"
+             "on the remote, use\n\n"
+             f"    git push {remote_name} HEAD:{up_short}\n\n"
+             "To push to the branch of the same name on the remote, use\n\n"
+             f"    git push {remote_name} HEAD\n")
+        return 128
+    return (f"{head_sym}:{upstream}", False)
+
+
+def _update_tracking_refs(repo, remote_name, results, verbosity) -> None:
+    """transport_update_tracking_ref: map pushed remote refs to local tracking."""
+    from . import gitconfig
+    fetch_rs = gitconfig.get_all(repo, f"remote.{remote_name}.fetch")
+    for r in results:
+        if r["status"] not in ("new", "ff", "forced", "deleted", "uptodate"):
+            continue
+        c = r["cmd"]; dst = c["dst"]
+        track = _tracking_ref_for(fetch_rs, dst)
+        if not track:
+            continue
+        if verbosity > 0:
+            sys.stderr.write(f"updating local tracking ref '{track}'\n")
+        if r["status"] == "deleted":
+            try:
+                refs_mod.delete_ref(repo, track)
+            except Exception:
+                pass
+        else:
+            refs_mod.update_ref(repo, track, r["new"])
+
+
+def _tracking_ref_for(fetch_rs: list[str], remote_ref: str) -> Optional[str]:
+    """Map a remote ref through fetch refspecs to a local tracking ref."""
+    for raw in fetch_rs:
+        spec = raw[1:] if raw.startswith("+") else raw
+        if ":" not in spec:
+            continue
+        src, dst = spec.split(":", 1)
+        if src.endswith("*") and dst.endswith("*"):
+            prefix = src[:-1]
+            if remote_ref.startswith(prefix):
+                return dst[:-1] + remote_ref[len(prefix):]
+        elif src == remote_ref:
+            return dst
+    return None
+
+
+def _set_push_upstreams(repo, remote_name, results) -> None:
+    from . import gitconfig
+    cfg_path = repo.gitdir / "config"
+    for r in results:
+        if r["status"] not in ("new", "ff", "forced", "uptodate"):
+            continue
+        c = r["cmd"]; src = c.get("src_real") or c["src"]; dst = c["dst"]
+        if not src or not src.startswith("refs/heads/"):
+            continue
+        if not dst.startswith("refs/heads/"):
+            continue
+        local_branch = src[len("refs/heads/"):]
+        gitconfig.write_value(cfg_path, "branch", local_branch, "remote", remote_name)
+        gitconfig.write_value(cfg_path, "branch", local_branch, "merge", dst)
+        dst_short = dst[len("refs/heads/"):]
+        _print(f"branch '{local_branch}' set up to track '{remote_name}/{dst_short}'.")
+
+
+def cmd_fetch(argv: list[str]) -> int:
+    return _cmd_fetch_impl(argv)
+
+
+# ---------------------------------------------------------------------------
+# fetch
+# ---------------------------------------------------------------------------
+
+def _refcol_width(updates: list[dict], verbosity: int) -> int:
+    """builtin/fetch.c refcol_width(): widest remote refname among shown rows.
+
+    ``updates`` is the list of display rows (each with 'remote' and 'local'
+    full ref names and an 'uptodate' flag).  Min width 10; uptodate rows count
+    only at verbosity>0.
+    """
+    width = 10
+    for u in updates:
+        if u.get("hidden"):
+            continue
+        if verbosity <= 0 and u.get("uptodate"):
+            continue
+        rlen = len(_prettify_refname(u["remote"]))
+        if width < rlen:
+            width = rlen
+    return width
+
+
+def _fetch_head_note(remote_ref: str, url_disp: str) -> str:
+    # builtin/fetch.c: note is "<kind> '<what>' of <url>"; for HEAD the kind and
+    # what are both empty so only the url is written.
+    if remote_ref == "HEAD":
+        return url_disp
+    if remote_ref.startswith("refs/heads/"):
+        return f"branch '{remote_ref[len('refs/heads/'):]}' of {url_disp}"
+    if remote_ref.startswith("refs/tags/"):
+        return f"tag '{remote_ref[len('refs/tags/'):]}' of {url_disp}"
+    if remote_ref.startswith("refs/remotes/"):
+        return f"remote-tracking branch '{remote_ref[len('refs/remotes/'):]}' of {url_disp}"
+    return f"'{remote_ref}' of {url_disp}"
+
+
+def _cmd_fetch_impl(argv: list[str]) -> int:
+    repo = _repo()
+    from . import localtransport as lt
+    from . import gitconfig
+
+    verbosity = 0
+    dry_run = False
+    fetch_all = False
+    multiple = False
+    append = False
+    force = False
+    prune = False
+    prune_tags = False
+    keep = False
+    update_head_ok = False
+    no_tags = False
+    tags = False        # -t / --tags : fetch all tags too
+    write_fetch_head = True
+    refmap: list[str] = []
+    fetch_options: list[str] = []
+    positional: list[str] = []
+    family = None
+    unshallow = False
+    refetch = False
+
+    i = 0
+    n = len(argv)
+
+    def need(arg):
+        nonlocal i
+        i += 1
+        if i >= n:
+            _err(f"error: option requires a value")
+            sys.exit(129)
+        return argv[i]
+
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            positional.extend(argv[i + 1:]); break
+        elif a in ("-v", "--verbose"):
+            verbosity += 1
+        elif a in ("-q", "--quiet"):
+            verbosity = -1
+        elif a in ("--all",):
+            fetch_all = True
+        elif a == "--multiple":
+            multiple = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif a == "--no-dry-run":
+            dry_run = False
+        elif a in ("-a", "--append"):
+            append = True
+        elif a in ("-f", "--force"):
+            force = True
+        elif a in ("-p", "--prune"):
+            prune = True
+        elif a in ("-P", "--prune-tags"):
+            prune_tags = True
+        elif a in ("-k", "--keep"):
+            keep = True
+        elif a in ("-u", "--update-head-ok"):
+            update_head_ok = True
+        elif a in ("-n", "--no-tags"):
+            no_tags = True
+        elif a in ("-t", "--tags"):
+            tags = True
+        elif a == "--no-write-fetch-head":
+            write_fetch_head = False
+        elif a == "--write-fetch-head":
+            write_fetch_head = True
+        elif a == "-m" or a == "--refmap":
+            refmap.append(need(a))
+        elif a.startswith("--refmap="):
+            refmap.append(a.split("=", 1)[1])
+        elif a in ("-o", "--server-option"):
+            fetch_options.append(need(a))
+        elif a.startswith("--server-option="):
+            fetch_options.append(a.split("=", 1)[1])
+        elif a in ("-j", "--jobs"):
+            need(a)
+        elif a.startswith("--jobs="):
+            pass
+        elif a == "--ipv4" or a == "-4":
+            family = "ipv4"
+        elif a == "--ipv6" or a == "-6":
+            family = "ipv6"
+        elif a == "--unshallow":
+            unshallow = True
+        elif a == "--refetch":
+            refetch = True
+        elif a in ("--auto-maintenance", "--auto-gc", "--no-auto-maintenance",
+                   "--no-auto-gc"):
+            pass
+        elif a == "--progress" or a == "--no-progress":
+            pass
+        elif a == "--set-upstream":
+            pass
+        elif a.startswith("--depth=") or a == "--depth":
+            if a == "--depth":
+                need(a)
+        elif a.startswith("-") and a != "-":
+            from ._transport_usage import FETCH_USAGE
+            if a.startswith("--"):
+                sys.stderr.write(f"error: unknown option `{a[2:]}'\n")
+            else:
+                sys.stderr.write(f"error: unknown switch `{a[1]}'\n")
+            sys.stderr.write(FETCH_USAGE)
+            return 129
+        else:
+            positional.append(a)
+        i += 1
+
+    # builtin/fetch.c: --dry-run disables FETCH_HEAD writing entirely.
+    if dry_run:
+        write_fetch_head = False
+
+    # Resolve the list of remotes to fetch from.
+    if fetch_all:
+        remotes = _all_remote_names(repo)
+        spec_args = []
+    elif multiple:
+        remotes = positional or _all_remote_names(repo)
+        spec_args = []
+    else:
+        if positional:
+            remote_arg = positional[0]
+            spec_args = positional[1:]
+        else:
+            head_sym, _ = refs_mod.read_head(repo)
+            branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+            configured = gitconfig.get(repo, f"branch.{branch}.remote") if branch else None
+            # remote_get(NULL): no args and no remotes configured -> nothing to
+            # do (git runs fetch_multiple on an empty list and exits 0, having
+            # truncated FETCH_HEAD).
+            if not configured and not _all_remote_names(repo):
+                if write_fetch_head and not append:
+                    (repo.gitdir / "FETCH_HEAD").write_text("", encoding="utf-8")
+                return 0
+            remote_arg = configured or "origin"
+            spec_args = []
+        remotes = [remote_arg]
+
+    # builtin/fetch.c: truncate FETCH_HEAD up front unless --append; this
+    # happens before the transport connects, so a failing fetch still leaves an
+    # empty FETCH_HEAD behind.
+    if write_fetch_head and not append:
+        (repo.gitdir / "FETCH_HEAD").write_text("", encoding="utf-8")
+
+    multi = fetch_all or multiple
+    rc = 0
+    for ridx, remote_arg in enumerate(remotes):
+        # fetch_multiple(): print "Fetching <name>" before each remote.
+        if multi and verbosity >= 0:
+            sys.stdout.write(f"Fetching {remote_arg}\n")
+            sys.stdout.flush()
+        r = _fetch_one_remote(repo, remote_arg, [] if multi else spec_args,
+                              verbosity=verbosity, dry_run=dry_run, force=force,
+                              prune=prune, prune_tags=prune_tags, no_tags=no_tags,
+                              tags=tags, append=True, write_fetch_head=write_fetch_head,
+                              refmap=refmap, update_head_ok=update_head_ok)
+        if r != 0:
+            if multi:
+                sys.stderr.write(f"error: could not fetch {remote_arg}\n")
+            rc = 1 if multi else r
+    return rc
+
+
+def _all_remote_names(repo: Repository) -> list[str]:
+    from . import gitconfig
+    seen = []
+    for full, _v in gitconfig.list_all(repo):
+        if full.startswith("remote.") and full.endswith(".url"):
+            name = full[len("remote."):-len(".url")]
+            if name not in seen:
+                seen.append(name)
+    return seen
+
+
+def _fetch_one_remote(repo, remote_arg, spec_args, *, verbosity, dry_run, force,
+                      prune, prune_tags, no_tags, tags, append, write_fetch_head,
+                      refmap, update_head_ok) -> int:
+    from . import localtransport as lt
+    from . import gitconfig
+
+    cp = repo.config()
+    is_named = cp.has_section(f'remote "{remote_arg}"')
+    if not is_named and not lt.is_local_url(remote_arg):
+        return _err_no_repo(remote_arg)
+    remote_name, url, fetch_rs, _push_rs = _resolve_remote(repo, remote_arg)
+    if not url:
+        url = remote_arg
+    if not lt.is_local_url(url):
+        _err("fatal: pygit fetch supports local (file) remotes only")
+        return 128
+    if not os.path.exists(lt.local_path(url)):
+        return _err_no_repo(url)
+    remote = lt.open_remote(url)
+    remote_refs = lt.advertised_refs(remote)
+    url_disp = _strip_url_for_display(url)
+
+    # Determine whether tags should be auto-followed.  Default: when fetching
+    # via configured refspecs, tags pointing at fetched objects are followed.
+    tag_opt = "follow"
+    if no_tags:
+        tag_opt = "none"
+    elif tags:
+        tag_opt = "all"
+
+    # Expand the "tag <name>" shorthand into refs/tags/<name>:refs/tags/<name>.
+    expanded_specs = []
+    j = 0
+    while j < len(spec_args):
+        if spec_args[j] == "tag" and j + 1 < len(spec_args):
+            nm = spec_args[j + 1]
+            expanded_specs.append(f"refs/tags/{nm}:refs/tags/{nm}")
+            j += 2
+        else:
+            expanded_specs.append(spec_args[j])
+            j += 1
+    spec_args = expanded_specs
+
+    # Build the ref_map (builtin/fetch.c get_ref_map).  Each entry:
+    #   remote: full remote refname
+    #   local:  full local destination ref, or None (FETCH_HEAD display only)
+    #   oid:    remote oid
+    #   force:  forced update
+    #   fhs:    fetch-head status "merge" / "not-for-merge" / "ignore"
+    ref_map = []
+    opp_entries = []   # opportunistic orefs, appended after tags (get_ref_map)
+    if spec_args:
+        # Command-line refspecs -> FETCH_HEAD_MERGE.
+        for raw in spec_args:
+            rs = lt.Refspec(raw)
+            src = rs.src
+            if src is None:
+                continue
+            matched = _match_remote_src(remote_refs, src)
+            for mref, moid in matched:
+                dst = _expand_fetch_dst(rs.dst, mref) if rs.dst else None
+                ref_map.append(dict(remote=mref, local=dst, oid=moid,
+                                    force=rs.force or force, fhs="merge"))
+        # Opportunistic remote-tracking updates from the configured fetch
+        # refspec (or --refmap); FETCH_HEAD_IGNORE, appended after tags.
+        opp_specs = refmap if refmap else fetch_rs
+        for raw in opp_specs:
+            rs = lt.Refspec(raw)
+            if not (rs.pattern and rs.src and rs.dst):
+                continue
+            prefix = rs.src[:-1]; dprefix = rs.dst[:-1]
+            for u in list(ref_map):
+                mref = u["remote"]
+                if u["local"] is not None:
+                    continue
+                if mref.startswith(prefix):
+                    local = dprefix + mref[len(prefix):]
+                    if any(o["remote"] == mref and o["local"] == local for o in ref_map):
+                        continue
+                    opp_entries.append(dict(remote=mref, local=local,
+                                            oid=remote_refs[mref],
+                                            force=rs.force or force, fhs="ignore"))
+    elif not fetch_rs:
+        # No refspecs at all (bare URL with no configured fetch): fetch HEAD.
+        # get_remote_ref(remote_refs, "HEAD") — die if HEAD is unresolvable.
+        head_target = lt.remote_head_target(remote)
+        head_oid = None
+        if head_target and head_target in remote_refs:
+            head_oid = remote_refs[head_target]
+        elif "HEAD" in remote_refs:
+            head_oid = remote_refs["HEAD"]
+        if head_oid is None:
+            _err("fatal: couldn't find remote ref HEAD")
+            return 128
+        ref_map.append(dict(remote="HEAD", local=None, oid=head_oid,
+                            force=force, fhs="merge"))
+    else:
+        for raw in fetch_rs:
+            rs = lt.Refspec(raw)
+            if rs.pattern and rs.src and rs.dst:
+                prefix = rs.src[:-1]; dprefix = rs.dst[:-1]
+                for mref in sorted(remote_refs):
+                    if mref.startswith(prefix):
+                        local = dprefix + mref[len(prefix):]
+                        ref_map.append(dict(remote=mref, local=local,
+                                            oid=remote_refs[mref],
+                                            force=rs.force or force,
+                                            fhs="not-for-merge"))
+            elif rs.src:
+                matched = _match_remote_src(remote_refs, rs.src)
+                for mref, moid in matched:
+                    dst = _expand_fetch_dst(rs.dst, mref) if rs.dst else None
+                    ref_map.append(dict(remote=mref, local=dst, oid=moid,
+                                        force=rs.force or force,
+                                        fhs="not-for-merge"))
+        # branch.<current>.merge tip is FETCH_HEAD_MERGE.
+        head_sym, _ = refs_mod.read_head(repo)
+        cur_branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+        merge_ref = gitconfig.get(repo, f"branch.{cur_branch}.merge") if cur_branch else None
+        bremote = gitconfig.get(repo, f"branch.{cur_branch}.remote") if cur_branch else None
+        if merge_ref and bremote == remote_name:
+            for u in ref_map:
+                if u["remote"] == merge_ref:
+                    u["fhs"] = "merge"
+
+    # Tag following.
+    if tag_opt == "all":
+        for mref in sorted(remote_refs):
+            if mref.startswith("refs/tags/") and not any(u["remote"] == mref for u in ref_map):
+                ref_map.append(dict(remote=mref, local=mref, oid=remote_refs[mref],
+                                    force=force, fhs="not-for-merge"))
+    elif tag_opt == "follow":
+        # find_non_local_tags(): auto-follow tags that point at objects we are
+        # fetching and that are NOT already present locally (same oid).
+        wanted = {u["oid"] for u in ref_map}
+        local_all = refs_mod.iter_all_refs(repo)
+        for mref in sorted(remote_refs):
+            if not mref.startswith("refs/tags/"):
+                continue
+            if any(u["remote"] == mref for u in ref_map):
+                continue
+            toid = remote_refs[mref]
+            if local_all.get(mref) == toid:
+                continue  # already have this tag at this oid
+            if toid in wanted or _peel_remote(remote, toid) in wanted:
+                ref_map.append(dict(remote=mref, local=mref, oid=toid,
+                                    force=force, fhs="not-for-merge"))
+
+    # Opportunistic ref updates are appended last (get_ref_map orders these
+    # after the tags so duplicate-removal keeps the not-for-merge tag entry).
+    ref_map.extend(opp_entries)
+
+    # Transfer objects for all wanted oids.
+    have = lt.destination_have(repo)
+    wanted_tips = [u["oid"] for u in ref_map]
+    if wanted_tips and not dry_run:
+        lt.copy_objects(remote, repo, wanted_tips, have)
+
+    # Compute display rows + apply ref updates.
+    rows = []
+    fetch_head_entries = []
+    failed = False
+    for u in ref_map:
+        remote_ref = u["remote"]; local = u["local"]; new = u["oid"]
+        # FETCH_HEAD entry (skip ignore/ duplicates).
+        if u["fhs"] in ("merge", "not-for-merge"):
+            fetch_head_entries.append((remote_ref, new, u["fhs"] == "merge"))
+        if local is None:
+            # FETCH_HEAD-only display row.
+            if remote_ref.startswith("refs/heads/"):
+                summ = "branch"
+            elif remote_ref.startswith("refs/tags/"):
+                summ = "tag"
+            elif remote_ref.startswith("refs/remotes/"):
+                summ = "remote-tracking branch"
+            else:
+                summ = "branch"
+            rows.append(dict(remote=remote_ref, local="FETCH_HEAD",
+                             old=repo.null_oid(), new=new, uptodate=False,
+                             code="*", summary=summ, msg=None, peer=False))
+            continue
+        old = refs_mod.read_ref(repo, local)
+        row = dict(remote=remote_ref, local=local,
+                   old=old or repo.null_oid(), new=new, uptodate=False,
+                   code=None, summary=None, msg=None, peer=True)
+        if old == new:
+            row["uptodate"] = True
+            row["code"] = "="; row["summary"] = "[up to date]"
+        elif old is None:
+            if remote_ref.startswith("refs/tags/") or local.startswith("refs/tags/"):
+                row["code"] = "*"; row["summary"] = "[new tag]"
+            elif remote_ref.startswith("refs/heads/"):
+                row["code"] = "*"; row["summary"] = "[new branch]"
+            else:
+                row["code"] = "*"; row["summary"] = "[new ref]"
+            if not dry_run:
+                refs_mod.update_ref(repo, local, new)
+        else:
+            if local.startswith("refs/tags/"):
+                if u["force"]:
+                    row["code"] = "t"; row["summary"] = "[tag update]"
+                    if not dry_run:
+                        refs_mod.update_ref(repo, local, new)
+                else:
+                    row["code"] = "!"; row["summary"] = "[rejected]"
+                    row["msg"] = "would clobber existing tag"
+                    failed = True
+            else:
+                ff = _is_fast_forward(repo, remote, old, new)
+                if ff:
+                    row["code"] = " "
+                    row["summary"] = "%s..%s" % (_abbrev(old), _abbrev(new))
+                    if not dry_run:
+                        refs_mod.update_ref(repo, local, new)
+                elif u["force"]:
+                    row["code"] = "+"
+                    row["summary"] = "%s...%s" % (_abbrev(old), _abbrev(new))
+                    row["msg"] = "forced update"
+                    if not dry_run:
+                        refs_mod.update_ref(repo, local, new)
+                else:
+                    row["code"] = "!"
+                    row["summary"] = "%s...%s" % (_abbrev(old), _abbrev(new))
+                    row["msg"] = "(non-fast-forward)"
+                    failed = True
+        rows.append(row)
+
+    # Prune.
+    prune_rows = []
+    if prune:
+        prune_rows = _compute_prune(repo, remote_name, fetch_rs, remote_refs,
+                                    spec_args, dry_run)
+
+    # Write FETCH_HEAD (append=add).
+    if write_fetch_head and not dry_run:
+        _write_fetch_head_file(repo, fetch_head_entries, url_disp, append)
+
+    # Display.
+    _display_fetch(url_disp, rows, prune_rows, verbosity, failed)
+
+    return 1 if failed else 0
+
+
+def _match_remote_src(remote_refs: dict, src: str) -> list[tuple[str, str]]:
+    if src in remote_refs:
+        return [(src, remote_refs[src])]
+    if src == "HEAD":
+        return []
+    out = []
+    for cand in (f"refs/heads/{src}", f"refs/tags/{src}"):
+        if cand in remote_refs:
+            out.append((cand, remote_refs[cand]))
+    if out:
+        return out
+    # last resort: any ref ending with /src
+    for name, oid in remote_refs.items():
+        if name == src:
+            out.append((name, oid))
+    return out
+
+
+def _expand_fetch_dst(dst: str, remote_ref: str) -> str:
+    if dst.startswith("refs/"):
+        return dst
+    if remote_ref.startswith("refs/tags/"):
+        return f"refs/tags/{dst}"
+    return f"refs/heads/{dst}"
+
+
+def _peel_remote(remote, oid) -> str:
+    from . import objects as o
+    cur = oid
+    for _ in range(10):
+        try:
+            t, data = o.read_object(remote, cur)
+        except KeyError:
+            return cur
+        if t == "tag":
+            tgt = refs_mod._tag_target(data)
+            if not tgt:
+                return cur
+            cur = tgt
+        else:
+            return cur
+    return cur
+
+
+def _tag_points_into(remote, oid, wanted: set) -> bool:
+    return _peel_remote(remote, oid) in wanted
+
+
+def _compute_prune(repo, remote_name, fetch_rs, remote_refs, spec_args, dry_run):
+    """Delete local tracking refs that no longer exist on the remote."""
+    rows = []
+    for raw in fetch_rs:
+        rs_force = raw.startswith("+")
+        spec = raw[1:] if rs_force else raw
+        if ":" not in spec:
+            continue
+        src, dst = spec.split(":", 1)
+        if not (src.endswith("*") and dst.endswith("*")):
+            continue
+        sprefix = src[:-1]; dprefix = dst[:-1]
+        # current local tracking refs under dprefix
+        for name, oid in sorted(refs_mod.iter_all_refs(repo).items()):
+            if not name.startswith(dprefix):
+                continue
+            remote_equiv = sprefix + name[len(dprefix):]
+            if remote_equiv not in remote_refs:
+                rows.append(dict(local=name, old=oid))
+                if not dry_run:
+                    refs_mod.delete_ref(repo, name)
+    return rows
+
+
+def _write_fetch_head_file(repo, entries, url_disp, append) -> None:
+    lines = []
+    for remote_ref, oid, merge in entries:
+        marker = "" if merge else "not-for-merge"
+        note = _fetch_head_note(remote_ref, url_disp)
+        lines.append(f"{oid}\t{marker}\t{note}\n")
+    path = repo.gitdir / "FETCH_HEAD"
+    if append and path.exists():
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("".join(lines))
+    else:
+        path.write_text("".join(lines), encoding="utf-8")
+
+
+def _display_fetch(url_disp, rows, prune_rows, verbosity, failed=False) -> None:
+    if verbosity < 0:
+        return
+    # Prune rows are displayed first (builtin/fetch.c prunes before stores).
+    shown = []
+    for r in prune_rows:
+        shown.append(dict(remote="(none)", local=r["local"], code="-",
+                          summary="[deleted]", msg=None, uptodate=False,
+                          old=r["old"], new="", peer=True, prune=True))
+    for r in rows:
+        if r["uptodate"] and verbosity <= 0:
+            continue
+        shown.append(r)
+    if not shown:
+        return
+    # builtin/fetch.c: summary_width = transport_summary_width(ref_map) only when
+    # the ref transaction succeeded; if any update failed, the computation is
+    # skipped and summary_width stays 0 (no padding for any row).
+    if failed:
+        width = 0
+    else:
+        width = _summary_width([(r.get("old", "0"), r.get("new", "0")) for r in rows])
+    # refcol_width: skip non-peer rows (FETCH_HEAD-only) and uptodate at v<=0.
+    refcol = 10
+    for r in shown:
+        if not r.get("peer", True):
+            continue
+        if verbosity <= 0 and r.get("uptodate"):
+            continue
+        rlen = len(_prettify_refname(r["remote"]) if r["remote"] != "(none)" else "(none)")
+        if refcol < rlen:
+            refcol = rlen
+    out = [f"From {url_disp}"]
+    for r in shown:
+        code = r["code"]; summary = r["summary"]
+        remote = _prettify_refname(r["remote"]) if r["remote"] != "(none)" else "(none)"
+        local = _prettify_refname(r["local"])
+        line = " %c %-*s " % (code, width, summary)
+        line += "%-*s -> %s" % (refcol, remote, local)
+        if r.get("msg"):
+            msg = r["msg"]
+            line += ("  " + msg) if msg.startswith("(") else ("  (%s)" % msg)
+        out.append(line)
+    sys.stderr.write("\n".join(out) + "\n")
 
 
 _MERGE_TREE_USAGE = (
@@ -9564,7 +11118,10 @@ def cmd_apply(argv: list[str]) -> int:
     # path strip / context / merge family
     ap.add_argument("-p", dest="p_value", type=int, default=None)
     ap.add_argument("-C", dest="p_context", type=int, default=None)
-    ap.add_argument("--no-add", dest="no_add", action="store_true")
+    # OPT_BOOL(0, "no-add", &state->no_add) in apply.c: --add is the positive
+    # form (the default — keep added lines), --no-add ignores additions.
+    ap.add_argument("--no-add", dest="no_add", action="store_true", default=False)
+    ap.add_argument("--add", dest="no_add", action="store_false")
     ap.add_argument("--unidiff-zero", dest="unidiff_zero", action="store_true")
     ap.add_argument("--allow-overlap", dest="allow_overlap", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
@@ -13430,22 +14987,358 @@ _register_phase4()
 
 
 def cmd_pull(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit pull")
-    ap.add_argument("remote", nargs="?", default="origin")
-    ap.add_argument("branch", nargs="?", default=None)
-    args = ap.parse_args(argv)
-    rc = cmd_fetch([args.remote])
-    if rc != 0:
-        return rc
     repo = _repo()
+    from . import gitconfig
+
+    # Split pull options into fetch-side and merge/rebase-side, mirroring
+    # builtin/pull.c run_merge()/run_rebase() option forwarding.
+    verbosity = 0
+    opt_rebase = None        # None=unspecified, False, True
+    opt_ff = None            # None, "--ff", "--no-ff", "--ff-only"
+    no_commit = False
+    strategies: list[str] = []
+    strategy_opts: list[str] = []
+    fetch_opts: list[str] = []   # forwarded to the fetch step
+    positional: list[str] = []
+
+    i = 0
+    n = len(argv)
+
+    def need(arg):
+        nonlocal i
+        i += 1
+        if i >= n:
+            _err("error: option requires a value")
+            sys.exit(129)
+        return argv[i]
+
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            positional.extend(argv[i + 1:]); break
+        elif a in ("-v", "--verbose"):
+            verbosity += 1; fetch_opts.append("-v")
+        elif a in ("-q", "--quiet"):
+            verbosity = -1; fetch_opts.append("-q")
+        elif a in ("-r", "--rebase"):
+            opt_rebase = True
+        elif a == "--no-rebase":
+            opt_rebase = False
+        elif a == "--ff":
+            opt_ff = "--ff"
+        elif a == "--no-ff":
+            opt_ff = "--no-ff"
+        elif a == "--ff-only":
+            opt_ff = "--ff-only"
+        elif a in ("-n", "--no-stat"):
+            pass
+        elif a == "--stat":
+            pass
+        elif a == "--no-commit":
+            no_commit = True
+        elif a == "--commit":
+            pass
+        elif a in ("-e", "--edit", "--no-edit"):
+            pass
+        elif a in ("--squash", "--no-squash", "--autostash", "--no-autostash",
+                   "--allow-unrelated-histories", "--signoff", "--no-signoff",
+                   "--progress", "--no-progress", "--no-verify", "--verify"):
+            pass
+        elif a in ("-s", "--strategy"):
+            strategies.append(need(a))
+        elif a.startswith("--strategy="):
+            strategies.append(a.split("=", 1)[1])
+        elif a in ("-X", "--strategy-option"):
+            strategy_opts.append(need(a))
+        elif a.startswith("--strategy-option="):
+            strategy_opts.append(a.split("=", 1)[1])
+        elif a.startswith("-X"):
+            strategy_opts.append(a[2:])
+        elif a in ("-a", "--append", "-f", "--force", "-t", "--tags",
+                   "-p", "--prune", "-k", "--keep", "--unshallow", "--refetch",
+                   "--no-tags"):
+            fetch_opts.append(a)
+        elif a in ("-j", "--jobs"):
+            fetch_opts.append(a); fetch_opts.append(need(a))
+        elif a in ("-o", "--server-option"):
+            fetch_opts.append(a); fetch_opts.append(need(a))
+        elif a == "--refmap":
+            fetch_opts.append(a); fetch_opts.append(need(a))
+        elif a.startswith("--refmap="):
+            fetch_opts.append(a)
+        elif a in ("--ipv4", "-4", "--ipv6", "-6"):
+            fetch_opts.append(a)
+        elif a.startswith("-") and a != "-":
+            _err(f"error: unknown option `{a.lstrip('-')}'")
+            return 129
+        else:
+            positional.append(a)
+        i += 1
+
+    repo_arg = positional[0] if positional else None
+    refspecs = positional[1:] if len(positional) > 1 else []
+
+    # 1. Fetch.
+    fetch_argv = list(fetch_opts)
+    if repo_arg is not None:
+        fetch_argv.append(repo_arg)
+        fetch_argv.extend(refspecs)
+    fetch_rc = _cmd_fetch_impl(fetch_argv)
+    if fetch_rc != 0:
+        return fetch_rc
+
+    # 2. Gather merge heads from FETCH_HEAD (entries not marked not-for-merge).
+    merge_heads = _read_merge_heads(repo)
+    if not merge_heads:
+        return _pull_no_merge_candidates(repo, repo_arg, refspecs, opt_rebase)
+
+    head_sym, orig_head = refs_mod.read_head(repo)
+
+    # Empty head: behave like a checkout of the single merge head.
+    if orig_head is None:
+        target = merge_heads[0]
+        if head_sym:
+            refs_mod.update_ref(repo, head_sym, target, message="initial pull")
+        else:
+            refs_mod.set_head(repo, target)
+        commit = objs.parse_commit(objs.read_object(repo, target)[1])
+        workdir.checkout_tree(repo, commit.tree)
+        return 0
+
+    if len(merge_heads) > 1:
+        if opt_rebase:
+            _err("fatal: Cannot rebase onto multiple branches.")
+            return 128
+        if opt_ff == "--ff-only":
+            _err("fatal: Cannot fast-forward to multiple branches.")
+            return 128
+
+    # Determine divergence (builtin/pull.c get_can_ff / already_up_to_date).
+    can_ff = all(orig_head == mh or _is_fast_forward(repo, repo, orig_head, mh)
+                 for mh in merge_heads)
+    up_to_date = all(mh == orig_head or _is_fast_forward(repo, repo, mh, orig_head)
+                     for mh in merge_heads)
+    divergent = (not can_ff) and (not up_to_date)
+
+    # ff-only takes precedence over rebase.
+    if opt_ff == "--ff-only":
+        if divergent:
+            return _pull_die_ff_impossible()
+        opt_rebase = False
+    # No action specified and we can't fast-forward -> require a choice.
+    if opt_ff is None and opt_rebase is None and divergent:
+        _err(_advice_lines(_PULL_NONFF_ADVICE))
+        _err("fatal: Need to specify how to reconcile divergent branches.")
+        return 128
+
+    # 3. Merge or rebase.
+    merge_argv = []
+    if verbosity < 0:
+        merge_argv.append("-q")
+    elif verbosity > 0:
+        merge_argv.append("-v")
+    for s in strategies:
+        merge_argv.extend(["-s", s])
+    for x in strategy_opts:
+        merge_argv.extend(["-X", x])
+    if no_commit:
+        merge_argv.append("--no-commit")
+
+    if opt_rebase:
+        if can_ff:
+            return cmd_merge(merge_argv + ["--ff-only"] + merge_heads)
+        return cmd_rebase([merge_heads[0]])
+
+    if opt_ff:
+        merge_argv.append(opt_ff)
+    # A non-ff merge needs git's fmt-merge-msg title ("Merge branch 'x' of url").
+    msg = _pull_merge_title(repo)
+    if msg and not can_ff:
+        merge_argv.extend(["-m", msg])
+    merge_argv.extend(merge_heads)
+    return cmd_merge(merge_argv)
+
+
+def _pull_merge_title(repo) -> Optional[str]:
+    """builtin/merge.c + fmt-merge-msg.c default merge title from FETCH_HEAD.
+
+    Groups the for-merge FETCH_HEAD entries by source URL and kind, producing
+    e.g. "Merge branch 'main' of <url>".  The "into <branch>" suffix is omitted
+    for the default branches main/master (the built-in suppress-dest patterns).
+    """
+    path = repo.gitdir / "FETCH_HEAD"
+    if not path.exists():
+        return None
+    # Per source: lists of branch/tag/remote/generic names.
+    from collections import OrderedDict
+    srcs = OrderedDict()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        if parts[1].strip() == "not-for-merge":
+            continue
+        note = parts[2]
+        kind, name, url = _parse_fetch_head_note(note)
+        entry = srcs.setdefault(url, dict(branch=[], tag=[], r_branch=[], generic=[]))
+        entry[kind].append(name)
+    if not srcs:
+        return None
+
+    def join(sing, plur, names):
+        if len(names) == 1:
+            return sing + "'" + names[0] + "'"
+        quoted = ", ".join("'" + n + "'" for n in names[:-1])
+        return plur + quoted + " and '" + names[-1] + "'"
+
+    pieces = []
+    for url, e in srcs.items():
+        sub = []
+        if e["branch"]:
+            sub.append(join("branch ", "branches ", e["branch"]))
+        if e["r_branch"]:
+            sub.append(join("remote-tracking branch ", "remote-tracking branches ", e["r_branch"]))
+        if e["tag"]:
+            sub.append(join("tag ", "tags ", e["tag"]))
+        if e["generic"]:
+            sub.append(join("commit ", "commits ", e["generic"]))
+        piece = ", ".join(sub)
+        if url and url != ".":
+            piece += f" of {url}"
+        pieces.append(piece)
+    title = "Merge " + "; ".join(pieces)
+
     head_sym, _ = refs_mod.read_head(repo)
-    branch = args.branch
-    if not branch and head_sym and head_sym.startswith("refs/heads/"):
-        branch = head_sym[len("refs/heads/"):]
-    if not branch:
-        _err("fatal: no branch to merge")
+    if head_sym and head_sym.startswith("refs/heads/"):
+        dest = head_sym[len("refs/heads/"):]
+        if dest not in ("main", "master"):
+            title += f" into {dest}"
+    return title
+
+
+def _parse_fetch_head_note(note: str) -> "tuple[str, str, str]":
+    """Parse a FETCH_HEAD note into (kind, name, url).
+
+    Notes look like "branch 'main' of <url>", "tag 'v1' of <url>",
+    "'HEAD' of <url>", or "remote-tracking branch 'x' of <url>".
+    """
+    url = ""
+    body = note
+    # split " of <url>" off the end (url may contain spaces only rarely).
+    idx = note.rfind("' of ")
+    if idx != -1:
+        body = note[:idx + 1]
+        url = note[idx + 5:]
+    kind = "generic"
+    if body.startswith("branch "):
+        kind = "branch"; rest = body[len("branch "):]
+    elif body.startswith("tag "):
+        kind = "tag"; rest = body[len("tag "):]
+    elif body.startswith("remote-tracking branch "):
+        kind = "r_branch"; rest = body[len("remote-tracking branch "):]
+    else:
+        rest = body
+    name = rest.strip()
+    if name.startswith("'") and name.endswith("'"):
+        name = name[1:-1]
+    return kind, name, url
+
+
+_PULL_NONFF_ADVICE = (
+    "You have divergent branches and need to specify how to reconcile them.\n"
+    "You can do so by running one of the following commands sometime before\n"
+    "your next pull:\n"
+    "\n"
+    "  git config pull.rebase false  # merge\n"
+    "  git config pull.rebase true   # rebase\n"
+    "  git config pull.ff only       # fast-forward only\n"
+    "\n"
+    "You can replace \"git config\" with \"git config --global\" to set a default\n"
+    "preference for all repositories. You can also pass --rebase, --no-rebase,\n"
+    "or --ff-only on the command line to override the configured default per\n"
+    "invocation.\n")
+
+
+def _pull_die_ff_impossible() -> int:
+    # advise_if_enabled(ADVICE_DIVERGING, ...) appends the standard "Disable
+    # this message" hint keyed by the advice name.
+    _err(_advice_lines(
+        "Diverging branches can't be fast-forwarded, you need to either:\n"
+        "\n"
+        "\tgit merge --no-ff\n"
+        "\n"
+        "or:\n"
+        "\n"
+        "\tgit rebase\n"
+        "\n"
+        'Disable this message with "git config set advice.diverging false"'))
+    _err("fatal: Not possible to fast-forward, aborting.")
+    return 128
+
+
+def _read_merge_heads(repo: Repository) -> list[str]:
+    """builtin/pull.c get_merge_heads(): FETCH_HEAD entries not 'not-for-merge'."""
+    path = repo.gitdir / "FETCH_HEAD"
+    if not path.exists():
+        return []
+    heads = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        oid = parts[0].strip()
+        marker = parts[1].strip()
+        if marker == "not-for-merge":
+            continue
+        heads.append(oid)
+    return heads
+
+
+def _pull_no_merge_candidates(repo, repo_arg, refspecs, opt_rebase) -> int:
+    from . import gitconfig
+    head_sym, _ = refs_mod.read_head(repo)
+    curr_branch = head_sym[len("refs/heads/"):] if head_sym and head_sym.startswith("refs/heads/") else None
+    remote = gitconfig.get(repo, f"branch.{curr_branch}.remote") if curr_branch else None
+    rebase_word = "rebase against" if opt_rebase else "merge with"
+
+    if refspecs:
+        if opt_rebase:
+            sys.stderr.write("There is no candidate for rebasing against among the refs that you just fetched.\n")
+        else:
+            sys.stderr.write("There are no candidates for merging among the refs that you just fetched.\n")
+        sys.stderr.write("Generally this means that you provided a wildcard refspec which had no\n"
+                         "matches on the remote end.\n")
         return 1
-    return cmd_merge([f"refs/remotes/{args.remote}/{branch}"])
+    if repo_arg and curr_branch and (not remote or repo_arg != remote):
+        sys.stderr.write(
+            f"You asked to pull from the remote '{repo_arg}', but did not specify\n"
+            "a branch. Because this is not the default configured remote\n"
+            "for your current branch, you must specify a branch on the command line.\n")
+        return 1
+    if not curr_branch:
+        sys.stderr.write("You are not currently on a branch.\n")
+        sys.stderr.write(f"Please specify which branch you want to {rebase_word}.\n")
+        sys.stderr.write("See git-pull(1) for details.\n\n")
+        sys.stderr.write("    git pull <remote> <branch>\n\n")
+        return 1
+    # No tracking information for the branch.
+    only_remote = _only_remote_name(repo) or "<remote>"
+    sys.stderr.write("There is no tracking information for the current branch.\n")
+    sys.stderr.write(f"Please specify which branch you want to {rebase_word}.\n")
+    sys.stderr.write("See git-pull(1) for details.\n\n")
+    sys.stderr.write("    git pull <remote> <branch>\n\n")
+    sys.stderr.write("If you wish to set tracking information for this branch you can do so with:\n\n")
+    sys.stderr.write(f"    git branch --set-upstream-to={only_remote}/<branch> {curr_branch}\n\n")
+    return 1
+
+
+def _only_remote_name(repo: Repository):
+    names = _all_remote_names(repo)
+    return names[0] if len(names) == 1 else None
 
 
 def cmd_grep(argv: list[str]) -> int:
