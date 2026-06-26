@@ -136,7 +136,10 @@ def main() -> int:
         run("format-patch", "-o", str(tmp / "patches"), "-1")
         patches = list((tmp / "patches").glob("*.patch"))
         if patches:
-            rc = run("mailsplit", "-o", str(tmp / "split"), str(patches[0]))
+            # git mailsplit takes -o<dir> attached (it rejects "-o <dir>" with
+            # "fatal: unknown option: -o") and does not create the output dir.
+            (tmp / "split").mkdir(exist_ok=True)
+            rc = run("mailsplit", "-o" + str(tmp / "split"), str(patches[0]))
             check(rc == 0, "mailsplit")
             class FakeStdin2:
                 buffer = None

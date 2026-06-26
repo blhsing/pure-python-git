@@ -48,6 +48,13 @@ class Fragment:
     # marker and a trailing '\n' if present in the patch), as bytes.
     body: list[bytes] = field(default_factory=list)
     rejected: bool = False
+    # 1-based patch-file line number of the first body line (the line right
+    # after the "@@" header).  Used for whitespace-error diagnostics, which
+    # report ``<patch>:<linenr>: ...``.
+    body_linenr: int = 0
+    # verbatim "@@ -A,B +C,D @@[ section]" header line (no trailing newline),
+    # used to reproduce the .rej hunk text byte-for-byte.
+    header_line: str = ""
 
 
 @dataclass
@@ -67,6 +74,10 @@ class Patch:
     lines_added: int = 0
     lines_deleted: int = 0
     fragments: list[Fragment] = field(default_factory=list)
+    # binary patch payload: (method, inflated_bytes) for the forward hunk and,
+    # optionally, the reverse hunk.  method is "literal" or "delta".
+    binary_forward: Optional[tuple] = None
+    binary_reverse: Optional[tuple] = None
     # results filled in during application
     result: Optional[bytes] = None
     conflicted_threeway: bool = False
@@ -142,6 +153,91 @@ def _skip_tree_prefix(p_value: int, line: str) -> Optional[str]:
             if nslash <= 0:
                 return None if i == 0 else line[i + 1 :]
     return None
+
+
+# base85 (git's variant, base85.c) decoder for "GIT binary patch" payloads.
+_B85_ALPHABET = (b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                 b"abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~")
+_B85_DEC = {c: i for i, c in enumerate(_B85_ALPHABET)}
+
+
+def _decode_85(data: bytes, want: int) -> Optional[bytes]:
+    """Port of decode_85(): decode ``want`` bytes from base85 text ``data``."""
+    out = bytearray()
+    p = 0
+    n = len(data)
+    while want > 0:
+        acc = 0
+        cnt = 0
+        while cnt < 5:
+            if p >= n:
+                return None
+            de = _B85_DEC.get(data[p])
+            if de is None:
+                return None
+            acc = acc * 85 + de
+            p += 1
+            cnt += 1
+        # emit up to 4 bytes
+        for shift in (24, 16, 8, 0):
+            if want == 0:
+                break
+            out.append((acc >> shift) & 0xFF)
+            want -= 1
+    return bytes(out)
+
+
+def _parse_binary_hunk(lines: list[str], i: int) -> tuple[Optional[tuple], int]:
+    """Port of parse_binary_hunk(): read one "literal/delta <size>" block of
+    base85 lines.  Returns ((method, inflated_bytes), next_index) or (None, i)
+    when the current line is not a binary hunk header."""
+    import zlib
+    header = _strip_eol(lines[i])
+    if header.startswith("delta "):
+        method = "delta"
+        try:
+            origlen = int(header[6:].strip())
+        except ValueError:
+            return None, i
+    elif header.startswith("literal "):
+        method = "literal"
+        try:
+            origlen = int(header[8:].strip())
+        except ValueError:
+            return None, i
+    else:
+        return None, i
+    i += 1
+    data = bytearray()
+    n = len(lines)
+    while i < n:
+        ln = _strip_eol(lines[i])
+        if ln == "":
+            i += 1
+            break
+        raw = ln.encode("latin-1", "replace")
+        llen = len(raw) + 1  # account for the newline
+        if llen < 7 or (llen - 2) % 5:
+            return None, i
+        byte_length = raw[0]
+        if ord("A") <= byte_length <= ord("Z"):
+            byte_length = byte_length - ord("A") + 1
+        elif ord("a") <= byte_length <= ord("z"):
+            byte_length = byte_length - ord("a") + 27
+        else:
+            return None, i
+        chunk = _decode_85(raw[1:], byte_length)
+        if chunk is None:
+            return None, i
+        data += chunk
+        i += 1
+    try:
+        inflated = zlib.decompress(bytes(data))
+    except zlib.error:
+        return None, i
+    if len(inflated) != origlen:
+        return None, i
+    return (method, inflated), i
 
 
 def _squash_slash(name: Optional[str]) -> Optional[str]:
@@ -288,7 +384,11 @@ def _find_name_common(line: str, default: Optional[str], p_value: int,
     pv = p_value
     while i < (len(line) if end is None else end):
         c = line[i]
-        if end is None and c.isspace() and c in " \t\n":
+        # Mirror C's `if (!end && isspace(c))`: ANY whitespace (incl. '\r',
+        # '\v', '\f') is a candidate terminator.  '\n' always ends the name;
+        # space/tab end it per the terminate mask; every other whitespace
+        # (e.g. a '\r' from a --keep-cr CRLF patch) ends it unconditionally.
+        if end is None and c in " \t\n\r\x0b\x0c":
             if c == "\n":
                 break
             if _name_terminate(c, terminate):
@@ -536,7 +636,20 @@ def _parse_git_patch(lines: list[str], i: int, p_value_opt: Optional[int],
         elif body.startswith("+++ "):
             if patch.new_name is None and not patch.is_delete and not _is_dev_null(body[4:]):
                 patch.new_name = _find_name(body[4:], None, p_value, TERM_TAB)
-        elif body.startswith("Binary files") or body.startswith("GIT binary patch"):
+        elif body.startswith("GIT binary patch"):
+            patch.is_binary = True
+            # Parse the forward (and optional reverse) binary hunks that follow.
+            fwd, j = _parse_binary_hunk(lines, i + 1)
+            if fwd is not None:
+                patch.binary_forward = fwd
+                rev, k = _parse_binary_hunk(lines, j)
+                if rev is not None:
+                    patch.binary_reverse = rev
+                    j = k
+                i = j
+                linenr = i + 1
+                break  # binary patch ends the header; no text hunks follow
+        elif body.startswith("Binary files"):
             patch.is_binary = True
         i += 1
         linenr += 1
@@ -645,7 +758,10 @@ def _parse_one_hunk(lines: list[str], i: int) -> tuple[Optional[Fragment], int]:
         )
     except (ValueError, IndexError):
         return None, i + 1
+    frag.header_line = header
     i += 1
+    # body begins at the next line; record its 1-based patch-file line number
+    frag.body_linenr = i + 1
     n = len(lines)
     if _RECOUNT:
         # Port of recount_diff(): recompute counts from the hunk body, stopping
@@ -734,6 +850,140 @@ class ApplyOpts:
     ita_only: bool = False
     check: bool = False
     verbosity: int = 0  # 0 normal, -1 silent, 1 verbose
+    # whitespace-error action (mirror enum ws_error_action): "nowarn",
+    # "warn" (default when applying), "fix"/correct, "error"/die.
+    ws_action: str = "warn"
+    # filled in by check_and_apply: the path reported in ws diagnostics
+    patch_input_file: str = ""
+    # --reject: apply hunk-by-hunk, write .rej for failures (forces verbose).
+    apply_with_reject: bool = False
+
+
+# --- whitespace-error checking (ws.c) --------------------------------------
+WS_BLANK_AT_EOL = 1 << 6
+WS_SPACE_BEFORE_TAB = 1 << 7
+WS_INDENT_WITH_NON_TAB = 1 << 8
+WS_CR_AT_EOL = 1 << 9
+WS_BLANK_AT_EOF = 1 << 10
+WS_TAB_IN_INDENT = 1 << 11
+WS_DEFAULT_RULE = WS_BLANK_AT_EOL | WS_BLANK_AT_EOF | WS_SPACE_BEFORE_TAB | 8
+WS_TAB_WIDTH_MASK = (1 << 6) - 1
+
+
+def _ws_check(line: bytes, ws_rule: int) -> int:
+    """Port of ws_check() (ws.c, no highlight stream): return the bitmask of
+    whitespace violations on a single line (without the leading +/- marker)."""
+    result = 0
+    n = len(line)
+    if n > 0 and line[n - 1:n] == b"\n":
+        n -= 1
+    # A trailing CR that came in as part of a CRLF line ending is not treated
+    # as a whitespace error by git apply (observed: --keep-cr patches do not
+    # warn on the bare '\r').  Strip it before the trailing-whitespace scan.
+    if n > 0 and line[n - 1:n] == b"\r":
+        n -= 1
+    trailing_ws = -1
+    if ws_rule & WS_BLANK_AT_EOL:
+        i = n - 1
+        while i >= 0:
+            c = line[i]
+            if c in (0x20, 0x09, 0x0b, 0x0c, 0x0d):  # isspace minus \n handled
+                trailing_ws = i
+                result |= WS_BLANK_AT_EOL
+                i -= 1
+            else:
+                break
+    if trailing_ws == -1:
+        trailing_ws = n
+    # indentation checks
+    written = 0
+    i = 0
+    while i < trailing_ws:
+        c = line[i]
+        if c == 0x20:
+            i += 1
+            continue
+        if c != 0x09:
+            break
+        if (ws_rule & WS_SPACE_BEFORE_TAB) and written < i:
+            result |= WS_SPACE_BEFORE_TAB
+        elif ws_rule & WS_TAB_IN_INDENT:
+            result |= WS_TAB_IN_INDENT
+        written = i + 1
+        i += 1
+    if (ws_rule & WS_INDENT_WITH_NON_TAB) and (i - written) >= (ws_rule & WS_TAB_WIDTH_MASK or 8):
+        result |= WS_INDENT_WITH_NON_TAB
+    return result
+
+
+def _ws_error_string(result: int) -> str:
+    """Port of whitespace_error_string()."""
+    parts: list[str] = []
+    if (result & WS_TRAILING_MASK) == WS_TRAILING_MASK:
+        parts.append("trailing whitespace")
+    else:
+        if result & WS_BLANK_AT_EOL:
+            parts.append("trailing whitespace")
+        if result & WS_BLANK_AT_EOF:
+            parts.append("new blank line at EOF")
+    if result & WS_SPACE_BEFORE_TAB:
+        parts.append("space before tab in indent")
+    if result & WS_INDENT_WITH_NON_TAB:
+        parts.append("indent with spaces")
+    if result & WS_TAB_IN_INDENT:
+        parts.append("tab in indent")
+    return ", ".join(parts)
+
+
+WS_TRAILING_MASK = WS_BLANK_AT_EOL | WS_BLANK_AT_EOF
+
+# whitespace-error accounting for one apply run (mirror struct apply_state's
+# whitespace_error / squelch_whitespace_errors).
+_WS_ERROR_COUNT = 0
+_WS_FIXED_COUNT = 0
+_WS_SQUELCH = 5
+
+
+def _record_ws_error(opts: ApplyOpts, content: bytes, linenr: int) -> None:
+    """Port of check_whitespace()+record_ws_error(): detect violations on an
+    added line and, unless squelched/silent, print the
+    ``<patch>:<linenr>: <reason>.`` diagnostic followed by the offending line."""
+    global _WS_ERROR_COUNT
+    result = _ws_check(content, WS_DEFAULT_RULE)
+    if not result:
+        return
+    _WS_ERROR_COUNT += 1
+    if _WS_SQUELCH and _WS_SQUELCH < _WS_ERROR_COUNT:
+        return
+    err = _ws_error_string(result)
+    disp = content
+    if disp.endswith(b"\n"):
+        disp = disp[:-1]
+    if not _MUTED:
+        import sys
+        sys.stderr.write(
+            "%s:%d: %s.\n" % (opts.patch_input_file, linenr, err))
+        sys.stderr.buffer.write(disp)
+        sys.stderr.buffer.write(b"\n")
+        sys.stderr.buffer.flush()
+
+
+def _ws_fix_line(content: bytes, ws_rule: int) -> bytes:
+    """Port of ws_fix_copy() for the common case: strip trailing whitespace
+    (blank-at-eol) on an added line, preserving the trailing newline.
+    Increments the fixed-line counter when the line actually changes."""
+    global _WS_FIXED_COUNT
+    nl = b""
+    body = content
+    if body.endswith(b"\n"):
+        nl = b"\n"
+        body = body[:-1]
+    fixed = body
+    if ws_rule & WS_BLANK_AT_EOL:
+        fixed = fixed.rstrip(b" \t\r\x0b\x0c")
+    if fixed != body:
+        _WS_FIXED_COUNT += 1
+    return fixed + nl
 
 
 def _build_pre_post(frag: Fragment, opts: ApplyOpts) -> tuple[Image, Image, bool, bool]:
@@ -783,6 +1033,15 @@ def _build_pre_post(frag: Fragment, opts: ApplyOpts) -> tuple[Image, Image, bool
             if opts.no_add:
                 k += 1
                 continue
+            # Whitespace-error check on added lines (mirror check_whitespace in
+            # apply_one_fragment, gated by ws_error_action != nowarn and not in
+            # reverse).  The reported line number is the patch-file line of this
+            # body entry.
+            if not opts.reverse and opts.ws_action != "nowarn":
+                linenr = frag.body_linenr + k
+                _record_ws_error(opts, content, linenr)
+            if opts.ws_action == "fix":
+                content = _ws_fix_line(content, WS_DEFAULT_RULE)
             post.lines.append(content)
             post.flags.append(0)
         # '@' '\\' ignored
@@ -917,24 +1176,73 @@ def _apply_one_fragment(img: Image, frag: Fragment, opts: ApplyOpts,
                     % (leading, trailing, applied_pos + 1))
         _update_image(img, applied_pos, pre, post, opts)
         return True
+    # No position found.  In verbose mode, dump the searched-for preimage text
+    # (apply.c: error("while searching for:\n%.*s")).
+    if opts.verbosity > 0 and not quiet:
+        old_text = _fragment_oldlines(frag, opts)
+        _stderr("error: while searching for:\n%s"
+                % old_text.decode("utf-8", "surrogateescape"))
     return False
+
+
+def _fragment_oldlines(frag: Fragment, opts: ApplyOpts) -> bytes:
+    """Reconstruct the preimage (context + removed) text of a hunk for the
+    'while searching for' diagnostic."""
+    out = bytearray()
+    body = frag.body
+    k = 0
+    nb = len(body)
+    while k < nb:
+        ln = body[k]
+        if ln:
+            tag = chr(ln[0])
+            content = ln[1:]
+            nxt_noeol = (k + 1 < nb and body[k + 1][:1] == b"\\")
+            if nxt_noeol and content.endswith(b"\n"):
+                content = content[:-1]
+            t = tag
+            if opts.reverse:
+                t = "+" if tag == "-" else "-" if tag == "+" else tag
+            if t in (" ", "-"):
+                out += content
+            elif t == "\n":
+                out += b"\n"
+        k += 1
+    return bytes(out)
+
+
+# When git-apply runs at verbosity_silent (apply_verbosity <= -1), C Git swaps
+# its error()/warning() routines for a mute routine, so *all* diagnostics are
+# suppressed (check_apply_state: set_error_routine(mute_routine)).  ``git am``
+# relies on this for its initial 3-way attempt.  We reproduce it with a module
+# flag toggled around check_and_apply().
+_MUTED = False
 
 
 def _stderr(msg: str) -> None:
     import sys
+    if _MUTED:
+        return
     sys.stderr.write(msg + "\n")
 
 
 def _apply_fragments_to_image(img: Image, patch: Patch, opts: ApplyOpts,
                               report_name: str, *, quiet: bool = False) -> bool:
     """Apply all hunks; returns True on full success.  On failure emits the
-    git 'patch failed: name:oldpos' error (unless quiet)."""
+    git 'patch failed: name:oldpos' error (unless quiet).
+
+    With --reject, every hunk is attempted; failures are recorded on the
+    fragment (frag.rejected) and the function still returns True so the partial
+    result is written out (the caller then writes the .rej file)."""
     nth = 0
     for frag in patch.fragments:
         nth += 1
         if not _apply_one_fragment(img, frag, opts, nth=nth, quiet=quiet):
             if not quiet:
                 _stderr("error: patch failed: %s:%d" % (report_name, frag.oldpos))
+            if opts.apply_with_reject:
+                frag.rejected = True
+                continue
             return False
     return True
 
@@ -1026,6 +1334,56 @@ def check_and_apply(repo, patches: list[Patch], opts: ApplyOpts,
     3-way fallback happen), then write_out_results() commits them."""
     from .index import read_index, write_index
 
+    global _MUTED, _WS_ERROR_COUNT, _WS_FIXED_COUNT
+    _saved_muted = _MUTED
+    if opts.verbosity <= -1:
+        _MUTED = True
+    _WS_ERROR_COUNT = 0
+    _WS_FIXED_COUNT = 0
+    if not opts.patch_input_file:
+        opts.patch_input_file = patch_input_file
+    try:
+        rc = _check_and_apply_inner(repo, patches, opts, patch_input_file)
+        rc = _emit_ws_summary(opts, rc)
+        return rc
+    finally:
+        _MUTED = _saved_muted
+
+
+def _emit_ws_summary(opts: ApplyOpts, rc: int) -> int:
+    """Port of the whitespace-error summary block at the tail of apply_patch().
+    Returns the (possibly updated) rc."""
+    if not _WS_ERROR_COUNT:
+        return rc
+    import sys
+    if _WS_SQUELCH and _WS_SQUELCH < _WS_ERROR_COUNT:
+        squelched = _WS_ERROR_COUNT - _WS_SQUELCH
+        unit = "error" if squelched == 1 else "errors"
+        if not _MUTED:
+            sys.stderr.write(f"warning: squelched {squelched} whitespace {unit}\n")
+    if opts.ws_action == "error":
+        n = _WS_ERROR_COUNT
+        verb = "line adds" if n == 1 else "lines add"
+        if not _MUTED:
+            sys.stderr.write(f"error: {n} {verb} whitespace errors.\n")
+        return 128
+    if opts.ws_action == "fix" and _WS_FIXED_COUNT and not opts.check:
+        n = _WS_FIXED_COUNT
+        unit = "line applied" if n == 1 else "lines applied"
+        if not _MUTED:
+            sys.stderr.write(f"warning: {n} {unit} after fixing whitespace errors.\n")
+    else:
+        n = _WS_ERROR_COUNT
+        verb = "line adds" if n == 1 else "lines add"
+        if not _MUTED:
+            sys.stderr.write(f"warning: {n} {verb} whitespace errors.\n")
+    return rc
+
+
+def _check_and_apply_inner(repo, patches: list[Patch], opts: ApplyOpts,
+                           patch_input_file: str) -> int:
+    from .index import read_index, write_index
+
     update_index = (opts.check_index or opts.ita_only) and (not opts.check)
     idx = read_index(repo) if (opts.check_index or update_index) else None
 
@@ -1047,6 +1405,10 @@ def check_and_apply(repo, patches: list[Patch], opts: ApplyOpts,
     if opts.check:
         return 0
 
+    # die_on_ws_error (--whitespace=error): abort before writing anything out.
+    if opts.ws_action == "error" and _WS_ERROR_COUNT:
+        return 128
+
     # ---- write_out_results: phase 0 remove, phase 1 create -------------------
     conflicted: list[str] = []
     errs = False
@@ -1061,6 +1423,12 @@ def check_and_apply(repo, patches: list[Patch], opts: ApplyOpts,
             for p in conflicted:
                 _stderr("U %s" % p)
         errs = True
+
+    # A patch with any rejected hunk (--reject) makes apply fail overall.
+    if opts.apply_with_reject:
+        for patch in patches:
+            if any(f.rejected for f in patch.fragments):
+                errs = True
 
     if update_index and idx is not None:
         write_index(repo, idx)
@@ -1193,6 +1561,9 @@ def _apply_data(repo, idx, patch: Patch, opts: ApplyOpts) -> int:
     img = Image(pre_bytes)
     report = patch.old_name if patch.old_name else patch.new_name
 
+    if patch.is_binary:
+        return _apply_binary(repo, patch, img, pre_bytes, opts)
+
     if not opts.threeway or _try_threeway(repo, idx, patch, opts, img) < 0:
         if opts.threeway and not patch.direct_to_threeway and opts.verbosity > -1:
             _stderr("Falling back to direct application...")
@@ -1201,6 +1572,78 @@ def _apply_data(repo, idx, patch: Patch, opts: ApplyOpts) -> int:
         if patch.direct_to_threeway or not _apply_fragments_to_image(img, patch, opts, report):
             return -1
     patch.result = img.buf
+    return 0
+
+
+def _apply_binary(repo, patch: Patch, img: Image, pre_bytes: bytes,
+                  opts: ApplyOpts) -> int:
+    """Port of apply_binary(): apply a GIT binary patch.  Returns 0 on success,
+    -1 on failure (the caller prints 'patch does not apply')."""
+    name = patch.old_name if patch.old_name else patch.new_name
+    hexsz = repo.hex_len
+    # Require full index line (full hex old/new oids).
+    if (len(patch.old_oid_prefix) != hexsz or len(patch.new_oid_prefix) != hexsz):
+        if not _MUTED:
+            _stderr("error: cannot apply binary patch to '%s' "
+                    "without full index line" % name)
+        return -1
+    # Verify the preimage matches.
+    if patch.old_name:
+        pre_oid = objs.hash_bytes("blob", pre_bytes, repo)[0]
+        if pre_oid != patch.old_oid_prefix:
+            if not _MUTED:
+                _stderr("error: the patch applies to '%s' (%s), which does not "
+                        "match the current contents." % (name, pre_oid))
+            return -1
+    else:
+        if pre_bytes:
+            if not _MUTED:
+                _stderr("error: the patch applies to an empty '%s' but it is "
+                        "not empty" % name)
+            return -1
+
+    new_oid = patch.new_oid_prefix
+    if set(new_oid) == {"0"}:
+        patch.result = b""  # deletion
+        return 0
+
+    if objs.object_exists(repo, new_oid):
+        t, data = objs.read_object(repo, new_oid)
+        patch.result = data
+        return 0
+
+    # Apply the forward binary fragment to the preimage.
+    frag = patch.binary_forward
+    if opts.reverse:
+        if patch.binary_reverse is None:
+            if not _MUTED:
+                _stderr("error: cannot reverse-apply a binary patch without "
+                        "the reverse hunk to '%s'" % name)
+            return -1
+        frag = patch.binary_reverse
+    if frag is None:
+        if not _MUTED:
+            _stderr("error: missing binary patch data for '%s'" % name)
+        return -1
+    method, payload = frag
+    if method == "literal":
+        result = payload
+    else:  # delta
+        from . import pack
+        try:
+            result = pack.apply_delta(pre_bytes, payload)
+        except Exception:
+            if not _MUTED:
+                _stderr("error: binary patch does not apply to '%s'" % name)
+            return -1
+    # Verify the result hash.
+    res_oid = objs.hash_bytes("blob", result, repo)[0]
+    if res_oid != new_oid:
+        if not _MUTED:
+            _stderr("error: binary patch to '%s' creates incorrect result "
+                    "(expecting %s, got %s)" % (name, new_oid, res_oid))
+        return -1
+    patch.result = result
     return 0
 
 
@@ -1271,14 +1714,14 @@ def _write_out_one(repo, idx, patch: Patch, opts: ApplyOpts, phase: int,
         if phase == 0:
             return _remove_file(repo, idx, patch, opts)
         if phase == 1:
-            _write_out_one_reject(opts, patch)
+            _write_out_one_reject(opts, patch, repo)
         return 0
     if patch.is_new > 0 or patch.is_copy:
         if phase == 1:
             r = _create_file(repo, idx, patch, opts)
             if r < 0:
                 return r
-            _write_out_one_reject(opts, patch)
+            _write_out_one_reject(opts, patch, repo)
             if patch.conflicted_threeway:
                 conflicted.append(patch.new_name)
         return 0
@@ -1289,17 +1732,42 @@ def _write_out_one(repo, idx, patch: Patch, opts: ApplyOpts, phase: int,
         r = _create_file(repo, idx, patch, opts)
         if r < 0:
             return r
-        _write_out_one_reject(opts, patch)
+        _write_out_one_reject(opts, patch, repo)
         if patch.conflicted_threeway:
             conflicted.append(patch.new_name)
     return 0
 
 
-def _write_out_one_reject(opts: ApplyOpts, patch: Patch) -> None:
-    """Without --reject (we never produce .rej here), write_out_one_reject only
-    prints the verbose 'Applied patch %s cleanly.' notice."""
-    if opts.verbosity > 0:
-        _say_patch_name("Applied patch %s cleanly.", patch)
+def _write_out_one_reject(opts: ApplyOpts, patch: Patch, repo=None) -> None:
+    """Port of write_out_one_reject(): when --reject produced rejected hunks,
+    write <new>.rej and announce; otherwise print the verbose 'Applied patch %s
+    cleanly.' notice."""
+    cnt = sum(1 for f in patch.fragments if f.rejected)
+    if not cnt:
+        if opts.verbosity > 0:
+            _say_patch_name("Applied patch %s cleanly.", patch)
+        return
+    plural = "reject" if cnt == 1 else "rejects"
+    if opts.verbosity > -1:
+        _say_patch_name("Applying patch %%s with %d %s..." % (cnt, plural), patch)
+    rej = bytearray()
+    rej += ("diff a/%s b/%s\t(rejected hunks)\n"
+            % (patch.new_name, patch.new_name)).encode("utf-8", "surrogateescape")
+    n = 0
+    for frag in patch.fragments:
+        n += 1
+        if not frag.rejected:
+            if opts.verbosity > -1:
+                _stderr("Hunk #%d applied cleanly." % n)
+            continue
+        if opts.verbosity > -1:
+            _stderr("Rejected hunk #%d." % n)
+        rej += frag.header_line.encode("utf-8", "surrogateescape") + b"\n"
+        rej += b"".join(frag.body)
+        if rej[-1:] != b"\n":
+            rej += b"\n"
+    if repo is not None:
+        (repo.path / (patch.new_name + ".rej")).write_bytes(bytes(rej))
 
 
 def _remove_file(repo, idx, patch: Patch, opts: ApplyOpts, rmdir: bool = True) -> int:

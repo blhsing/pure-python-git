@@ -38,6 +38,16 @@ def _err(s: str) -> None:
     sys.stderr.write(s + ("\n" if not s.endswith("\n") else ""))
 
 
+def _stdin_bytes() -> bytes:
+    """Read all of stdin as bytes, tolerating a text-only stdin shim (e.g. test
+    harnesses that replace sys.stdin with an object exposing only read())."""
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is not None:
+        return buf.read()
+    data = sys.stdin.read()
+    return data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+
+
 def _graph_for_repo(repo: Repository):
     try:
         from . import commitgraph
@@ -11534,6 +11544,8 @@ def cmd_apply(argv: list[str]) -> int:
     ap.add_argument("--union", dest="favor", action="store_const", const=3)
     ap.add_argument("--apply", dest="force_apply", action="store_true")
     ap.add_argument("--allow-empty", dest="allow_empty", action="store_true")
+    ap.add_argument("--whitespace", dest="whitespace", default=None)
+    ap.add_argument("--reject", dest="reject", action="store_true")
     ap.add_argument("file", nargs="?")
     args = ap.parse_args(argv)
     repo = _repo()
@@ -11586,6 +11598,9 @@ def cmd_apply(argv: list[str]) -> int:
     ita_only = bool(args.ita) and not check_index
 
     verbosity = 1 if args.verbose else (-1 if args.quiet else 0)
+    # --reject forces verbose (apply.c check_apply_state).
+    if args.reject and verbosity == 0:
+        verbosity = 1
 
     # check_apply_state: stat/numstat/summary/check (and --build-fake-ancestor)
     # turn off the actual apply unless --apply forces it.  --check never writes.
@@ -11606,6 +11621,8 @@ def cmd_apply(argv: list[str]) -> int:
         ita_only=ita_only,
         check=not do_apply,
         verbosity=verbosity,
+        ws_action=_apply_ws_action(args.whitespace, do_apply),
+        apply_with_reject=args.reject,
     )
     # When applying (or --check), run the matching/apply pass first; its rc and
     # any errors take precedence.  The diffstat/numstat/summary are emitted at
@@ -11621,6 +11638,19 @@ def cmd_apply(argv: list[str]) -> int:
     if args.summary:
         _apply_emit_summary(patches)
     return 0
+
+
+def _apply_ws_action(whitespace: Optional[str], do_apply: bool) -> str:
+    """Map git-apply's --whitespace=<action> to the ApplyOpts ws_action.  The
+    default is 'warn' when applying and 'nowarn' otherwise (apply.c:196)."""
+    if whitespace is None:
+        return "warn" if do_apply else "nowarn"
+    mapping = {
+        "warn": "warn", "nowarn": "nowarn",
+        "fix": "fix", "strip": "fix",
+        "error": "error", "error-all": "error",
+    }
+    return mapping.get(whitespace, "warn" if do_apply else "nowarn")
 
 
 def _apply_emit_summary(patches) -> None:
@@ -11834,80 +11864,272 @@ def _format_rfc2822_date(sig: str) -> str:
     return _format_date(sig, "rfc")
 
 
-def cmd_am(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit am", add_help=False)
-    ap.add_argument("-3", "--3way", dest="threeway", action="store_true")
-    ap.add_argument("file", nargs="?")
-    args = ap.parse_args(argv)
-    repo = _repo()
-    from . import patch
-    text = (Path(args.file).read_text(encoding="utf-8", errors="replace")
-            if args.file else sys.stdin.read())
-    msgs: list[list[str]] = []
-    cur: list[str] = []
-    for line in text.splitlines():
-        if line.startswith("From ") and cur:
-            msgs.append(cur)
-            cur = [line]
+class _AmAbort(Exception):
+    """Raised by the am machinery to stop the session (like die_user_resolve /
+    die): carries the process exit code."""
+
+    def __init__(self, rc: int):
+        self.rc = rc
+
+
+# Resume modes (mirror enum resume_type in builtin/am.c)
+_RESUME_FALSE = 0
+_RESUME_APPLY = 1
+_RESUME_RESOLVED = 2
+_RESUME_SKIP = 3
+_RESUME_ABORT = 4
+_RESUME_QUIT = 5
+_RESUME_SHOW_PATCH_RAW = 6
+_RESUME_SHOW_PATCH_DIFF = 7
+_RESUME_ALLOW_EMPTY = 8
+
+# empty_action
+_STOP_ON_EMPTY = 0
+_DROP_EMPTY = 1
+_KEEP_EMPTY = 2
+
+# keep_type
+_KEEP_FALSE = 0
+_KEEP_TRUE = 1
+_KEEP_NON_PATCH = 2
+
+# scissors_type
+_SCISSORS_UNSET = -1
+_SCISSORS_FALSE = 0
+_SCISSORS_TRUE = 1
+
+# signoff_type
+_SIGNOFF_FALSE = 0
+_SIGNOFF_TRUE = 1
+_SIGNOFF_EXPLICIT = 2
+
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+class _AmState:
+    """Port of struct am_state plus the am_run state machine."""
+
+    def __init__(self, repo: Repository):
+        self.repo = repo
+        self.dir = repo.gitdir / "rebase-apply"
+        self.cur = 0
+        self.last = 0
+        self.prec = 4
+        self.author_name: Optional[str] = None
+        self.author_email: Optional[str] = None
+        self.author_date: Optional[str] = None
+        self.msg: Optional[str] = None
+        # options
+        self.interactive = 0
+        self.no_verify = 0
+        self.threeway = 0
+        self.quiet = 0
+        self.signoff = _SIGNOFF_FALSE
+        self.utf8 = 1
+        self.keep = _KEEP_FALSE
+        self.message_id = 0
+        self.scissors = _SCISSORS_UNSET
+        self.quoted_cr = -1  # quoted_cr_unset
+        self.empty_type = _STOP_ON_EMPTY
+        self.git_apply_opts: list[str] = []
+        self.resolvemsg: Optional[str] = None
+        self.committer_date_is_author_date = 0
+        self.ignore_date = 0
+        self.sign_commit: Optional[str] = None
+        self.rebasing = 0
+
+    # -- path / state-file helpers ------------------------------------------
+    def path(self, name: str) -> Path:
+        return self.dir / name
+
+    def _write_text(self, name: str, s: str) -> None:
+        self.path(name).write_text(s, encoding="utf-8")
+
+    def _write_count(self, name: str, val: int) -> None:
+        self.path(name).write_text(str(val), encoding="utf-8")
+
+    def _write_bool(self, name: str, val) -> None:
+        self._write_text(name, "t" if val else "f")
+
+    def _read_state(self, name: str, trim: bool) -> Optional[str]:
+        p = self.path(name)
+        if not p.exists():
+            return None
+        data = p.read_bytes().decode("utf-8", "surrogateescape")
+        return data.strip() if trim else data
+
+    def say(self, stream, text: str) -> None:
+        if not self.quiet:
+            stream.write(text + "\n")
+
+    # -- am_in_progress -----------------------------------------------------
+    def in_progress(self) -> bool:
+        if not self.dir.is_dir():
+            return False
+        if not self.path("last").is_file():
+            return False
+        if not self.path("next").is_file():
+            return False
+        return True
+
+    # -- load ---------------------------------------------------------------
+    def load(self) -> None:
+        from . import am as _am
+        self.cur = int((self._read_state("next", True) or "0").split()[0] or 0)
+        self.last = int((self._read_state("last", True) or "0").split()[0] or 0)
+        script = self.path("author-script")
+        if script.exists():
+            for line in script.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
+                key, _, val = line.partition("=")
+                dq = _am.sq_dequote(val)
+                if key == "GIT_AUTHOR_NAME":
+                    self.author_name = dq
+                elif key == "GIT_AUTHOR_EMAIL":
+                    self.author_email = dq
+                elif key == "GIT_AUTHOR_DATE":
+                    self.author_date = dq
+        fc = self.path("final-commit")
+        if fc.exists():
+            self.msg = fc.read_text(encoding="utf-8", errors="surrogateescape")
+        self.threeway = 1 if self._read_state("threeway", True) == "t" else 0
+        self.quiet = 1 if self._read_state("quiet", True) == "t" else 0
+        self.signoff = 1 if self._read_state("sign", True) == "t" else 0
+        self.utf8 = 1 if self._read_state("utf8", True) == "t" else 0
+        keep = self._read_state("keep", True)
+        self.keep = (_KEEP_TRUE if keep == "t" else
+                     _KEEP_NON_PATCH if keep == "b" else _KEEP_FALSE)
+        self.message_id = 1 if self._read_state("messageid", True) == "t" else 0
+        sc = self._read_state("scissors", True)
+        self.scissors = (_SCISSORS_TRUE if sc == "t" else
+                         _SCISSORS_FALSE if sc == "f" else _SCISSORS_UNSET)
+        qcr = self._read_state("quoted-cr", True)
+        if not qcr:
+            self.quoted_cr = -1
         else:
-            cur.append(line)
-    if cur:
-        msgs.append(cur)
-    for msg in msgs:
-        try:
-            blank = msg.index("")
-        except ValueError:
+            from . import am as _am2
+            act = {"nowarn": _am2.QCR_NOWARN, "warn": _am2.QCR_WARN,
+                   "strip": _am2.QCR_STRIP}.get(qcr)
+            self.quoted_cr = act if act is not None else -1
+        applyopt = self._read_state("apply-opt", True) or ""
+        self.git_apply_opts = _sq_dequote_to_list(applyopt)
+        self.rebasing = 1 if self.path("rebasing").exists() else 0
+
+    # -- destroy ------------------------------------------------------------
+    def destroy(self) -> None:
+        import shutil
+        if self.dir.exists():
+            shutil.rmtree(self.dir, ignore_errors=True)
+
+    def msgnum(self) -> str:
+        return "%0*d" % (self.prec, self.cur)
+
+
+def _sq_dequote_to_list(s: str) -> list[str]:
+    """Port of sq_dequote_to_strvec(): split a sq_quoted line into argv."""
+    from . import am as _am
+    out: list[str] = []
+    s = s.strip()
+    i = 0
+    n = len(s)
+    while i < n:
+        while i < n and s[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        # find the extent of this quoted token (it may contain '\'' escapes)
+        if s[i] != "'":
+            # unquoted token (apply opts are always quoted, but be lenient)
+            j = i
+            while j < n and s[j] != " ":
+                j += 1
+            out.append(s[i:j])
+            i = j
             continue
-        headers = msg[:blank]
-        body = msg[blank + 1 :]
-        subject = ""
-        author_name = author_email = author_date = None
-        for h in headers:
-            if h.startswith("Subject: "):
-                subject = h[len("Subject: "):]
-                if subject.startswith("["):
-                    end = subject.find("]")
-                    if end != -1:
-                        subject = subject[end + 1 :].strip()
-            elif h.startswith("From: "):
-                who = h[len("From: "):]
-                author_name, author_email = _parse_who(who)
-            elif h.startswith("Date: "):
-                author_date = _rfc2822_to_raw(h[len("Date: "):])
-        if "---" in body:
-            sep = body.index("---")
-            msg_lines = body[:sep]
-            patch_text = "\n".join(body[sep + 1 :])
-        else:
-            msg_lines = body
-            patch_text = ""
-        applied, failed = patch.apply_patch_text(patch_text, repo_path=repo.path)
-        if failed:
-            _err(f"error: patch failed: {failed[0]}" if failed else "error: patch does not apply")
-            _err(f"Patch failed at 0001 {subject}")
-            return 128
-        if applied:
-            workdir.add_paths(repo, applied)
-        body_msg = "\n".join(msg_lines).strip()
-        full_msg = subject + (("\n\n" + body_msg) if body_msg else "")
-        _print(f"Applying: {subject}")
-        old_env: dict[str, Optional[str]] = {}
-        for key, val in (("GIT_AUTHOR_NAME", author_name), ("GIT_AUTHOR_EMAIL", author_email),
-                         ("GIT_AUTHOR_DATE", author_date)):
-            if val is not None:
-                old_env[key] = os.environ.get(key)
-                os.environ[key] = val
-        try:
-            rc = cmd_commit(["-q", "-m", full_msg])
-        finally:
-            for key, prev in old_env.items():
-                if prev is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = prev
-        if rc != 0:
-            return rc
-    return 0
+        # accumulate up to the matching closing quote, honoring '\'' escapes
+        j = i + 1
+        token_src = ["'"]
+        while j < n:
+            if s[j] == "'":
+                token_src.append("'")
+                if j + 1 < n and s[j + 1] == "\\":
+                    # '\X' escape: copy '\X'
+                    token_src.append(s[j + 1:j + 4])
+                    j += 4
+                    continue
+                j += 1
+                break
+            token_src.append(s[j])
+            j += 1
+        dq = _am.sq_dequote("".join(token_src))
+        out.append(dq if dq is not None else "")
+        i = j
+    return out
+
+
+def _am_index_has_changes(repo: Repository) -> tuple[bool, list[str]]:
+    """Port of repo_index_has_changes(): does the index differ from HEAD's
+    tree?  Returns (changed, sorted_changed_paths)."""
+    head_sym, head = refs_mod.read_head(repo)
+    if head:
+        head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
+        tree_files = {p: s for p, _m, s in workdir.iter_tree_files(repo, head_tree)}
+    else:
+        tree_files = {}
+    from .index import read_index
+    idx = read_index(repo)
+    idx_files = {e.path: e.sha for e in idx.entries if e.stage == 0}
+    changed: list[str] = []
+    for p in set(tree_files) | set(idx_files):
+        if tree_files.get(p) != idx_files.get(p):
+            changed.append(p)
+    # unmerged entries also count as changes
+    for e in idx.entries:
+        if e.stage != 0 and e.path not in changed:
+            changed.append(e.path)
+    changed.sort()
+    return (bool(changed), changed)
+
+
+def _am_unmerged(repo: Repository) -> bool:
+    from .index import read_index
+    idx = read_index(repo)
+    return any(e.stage != 0 for e in idx.entries)
+
+
+def cmd_am(argv: list[str]) -> int:
+    repo = _repo()
+    state = _AmState(repo)
+    # am.threeway / am.messageid / commit.gpgsign config defaults
+    cp = repo.config()
+
+    def _cfg_bool(section: str, key: str) -> Optional[bool]:
+        if cp.has_option(section, key):
+            try:
+                return cp.getboolean(section, key)
+            except ValueError:
+                v = cp.get(section, key).strip().lower()
+                return v in ("true", "yes", "on", "1", "")
+        return None
+
+    tw = _cfg_bool("am", "threeway")
+    if tw is not None:
+        state.threeway = 1 if tw else 0
+    mid = _cfg_bool("am", "messageid")
+    if mid is not None:
+        state.message_id = 1 if mid else 0
+    gs = _cfg_bool("commit", "gpgsign")
+    if gs is not None:
+        state.sign_commit = "" if gs else None
+
+    in_progress = state.in_progress()
+    if in_progress:
+        state.load()
+
+    try:
+        rc = _am_parse_and_dispatch(repo, state, argv, in_progress)
+    except _AmAbort as ab:
+        return ab.rc
+    return rc
 
 
 def _rfc2822_to_raw(value: str) -> str:
@@ -11923,6 +12145,1280 @@ def _rfc2822_to_raw(value: str) -> str:
     sign = "+" if total >= 0 else "-"
     total = abs(total)
     return f"{secs} {sign}{total // 3600:02d}{(total % 3600) // 60:02d}"
+
+
+_AM_USAGE = (
+    "usage: git am [<options>] [(<mbox> | <Maildir>)...]\n"
+    "   or: git am [<options>] (--continue | --skip | --abort)\n"
+    "\n"
+    "    -i, --[no-]interactive\n"
+    "                          run interactively\n"
+    "    -n, --no-verify       bypass pre-applypatch and applypatch-msg hooks\n"
+    "    --verify              opposite of --no-verify\n"
+    "    -3, --[no-]3way       allow fall back on 3way merging if needed\n"
+    "    -q, --[no-]quiet      be quiet\n"
+    "    -s, --[no-]signoff    add a Signed-off-by trailer to the commit message\n"
+    "    -u, --[no-]utf8       recode into utf8 (default)\n"
+    "    -k, --[no-]keep       pass -k flag to git-mailinfo\n"
+    "    --[no-]keep-non-patch pass -b flag to git-mailinfo\n"
+    "    -m, --[no-]message-id pass -m flag to git-mailinfo\n"
+    "    --[no-]keep-cr        pass --keep-cr flag to git-mailsplit for mbox format\n"
+    "    -c, --[no-]scissors   strip everything before a scissors line\n"
+    "    --quoted-cr <action>  pass it through git-mailinfo\n"
+    "    --[no-]whitespace <action>\n"
+    "                          pass it through git-apply\n"
+    "    --[no-]ignore-space-change\n"
+    "                          pass it through git-apply\n"
+    "    --[no-]ignore-whitespace\n"
+    "                          pass it through git-apply\n"
+    "    --[no-]directory <root>\n"
+    "                          pass it through git-apply\n"
+    "    --[no-]exclude <path> pass it through git-apply\n"
+    "    --[no-]include <path> pass it through git-apply\n"
+    "    -C <n>                pass it through git-apply\n"
+    "    -p <num>              pass it through git-apply\n"
+    "    --[no-]patch-format <format>\n"
+    "                          format the patch(es) are in\n"
+    "    --[no-]reject         pass it through git-apply\n"
+    "    --[no-]resolvemsg ... override error message when patch failure occurs\n"
+    "    --continue            continue applying patches after resolving a conflict\n"
+    "    -r, --resolved        synonyms for --continue\n"
+    "    --skip                skip the current patch\n"
+    "    --abort               restore the original branch and abort the patching operation\n"
+    "    --quit                abort the patching operation but keep HEAD where it is\n"
+    "    --show-current-patch[=(diff|raw)]\n"
+    "                          show the patch being applied\n"
+    "    --retry               try to apply current patch again\n"
+    "    --allow-empty         record the empty patch as an empty commit\n"
+    "    --[no-]committer-date-is-author-date\n"
+    "                          lie about committer date\n"
+    "    --[no-]ignore-date    use current timestamp for author date\n"
+    "    --[no-]rerere-autoupdate\n"
+    "                          update the index with reused conflict resolution if possible\n"
+    "    -S, --[no-]gpg-sign[=<key-id>]\n"
+    "                          GPG-sign commits\n"
+    "    --empty (stop|drop|keep)\n"
+    "                          how to handle empty patches\n"
+    "\n"
+)
+
+
+def _am_usage_err(msg: str) -> int:
+    sys.stderr.write(f"error: {msg}\n")
+    sys.stderr.write(_AM_USAGE)
+    return 129
+
+
+def _am_parse_and_dispatch(repo: Repository, state: "_AmState", argv: list[str],
+                           in_progress: bool) -> int:
+    """Mirror the parse_options + dispatch tail of cmd_am()."""
+    from . import am as _am
+
+    resume_mode = _RESUME_FALSE
+    keep_cr = -1
+    patch_format = _am.PATCH_FORMAT_UNKNOWN
+    binary = -1
+    paths: list[str] = []
+
+    # -h handling
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(_AM_USAGE)
+        return 129
+
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    seen_resume_opt: Optional[str] = None
+
+    def _cmdmode(mode: int, opt: str) -> Optional[int]:
+        nonlocal resume_mode, seen_resume_opt
+        if resume_mode != _RESUME_FALSE and resume_mode != mode:
+            a, b = sorted([seen_resume_opt, opt])
+            sys.stderr.write(f"error: options '{a}' and '{b}' cannot be used together\n")
+            return 129
+        resume_mode = mode
+        seen_resume_opt = opt
+        return None
+
+    while i < n:
+        a = argv[i]
+        if saw_dd:
+            paths.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a == "-" or not a.startswith("-"):
+            paths.append(a)
+            i += 1
+            continue
+        # ---- long options ----
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            has_val = bool(eq)
+            neg = False
+            canon = name
+            if name.startswith("no-"):
+                neg = True
+                canon = name[3:]
+            # boolean toggles
+            if canon == "interactive":
+                state.interactive = 0 if neg else 1
+            elif name == "no-verify":
+                state.no_verify = 1
+            elif name == "verify":
+                state.no_verify = 0
+            elif canon == "3way":
+                state.threeway = 0 if neg else 1
+            elif canon == "quiet":
+                state.quiet = 0 if neg else 1
+            elif canon == "signoff":
+                state.signoff = _SIGNOFF_FALSE if neg else _SIGNOFF_EXPLICIT
+            elif canon == "utf8":
+                state.utf8 = 0 if neg else 1
+            elif canon == "keep":
+                state.keep = _KEEP_FALSE if neg else _KEEP_TRUE
+            elif canon == "keep-non-patch":
+                state.keep = _KEEP_FALSE if neg else _KEEP_NON_PATCH
+            elif canon == "message-id":
+                state.message_id = 0 if neg else 1
+            elif canon == "keep-cr":
+                keep_cr = 0 if neg else 1
+            elif canon == "scissors":
+                state.scissors = _SCISSORS_FALSE if neg else _SCISSORS_TRUE
+            elif name == "quoted-cr":
+                if not has_val:
+                    if i + 1 >= n:
+                        return _am_usage_err("option `quoted-cr' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                act = {"nowarn": _am.QCR_NOWARN, "warn": _am.QCR_WARN,
+                       "strip": _am.QCR_STRIP}.get(val)
+                if act is None:
+                    sys.stderr.write(f"error: bad action '{val}' for '--quoted-cr'\n")
+                    return 129
+                state.quoted_cr = act
+            elif canon in ("whitespace", "directory", "exclude", "include"):
+                if not has_val:
+                    if i + 1 >= n:
+                        return _am_usage_err(f"option `{canon}' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                state.git_apply_opts.append(f"--{canon}={val}")
+            elif canon in ("ignore-space-change", "ignore-whitespace", "reject"):
+                state.git_apply_opts.append(f"--{canon}")
+            elif name == "patch-format":
+                if not has_val:
+                    if i + 1 >= n:
+                        return _am_usage_err("option `patch-format' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                fmt = {"mbox": _am.PATCH_FORMAT_MBOX, "stgit": _am.PATCH_FORMAT_STGIT,
+                       "stgit-series": _am.PATCH_FORMAT_STGIT_SERIES,
+                       "hg": _am.PATCH_FORMAT_HG, "mboxrd": _am.PATCH_FORMAT_MBOXRD}.get(val)
+                if fmt is None:
+                    sys.stderr.write(f"error: invalid value for '--patch-format': '{val}'\n")
+                    return 129
+                patch_format = fmt
+            elif name == "resolvemsg":
+                if not has_val:
+                    if i + 1 >= n:
+                        return _am_usage_err("option `resolvemsg' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                state.resolvemsg = val
+            elif name == "continue":
+                r = _cmdmode(_RESUME_RESOLVED, "--continue")
+                if r is not None:
+                    return r
+            elif name == "resolved":
+                r = _cmdmode(_RESUME_RESOLVED, "--resolved")
+                if r is not None:
+                    return r
+            elif name == "skip":
+                r = _cmdmode(_RESUME_SKIP, "--skip")
+                if r is not None:
+                    return r
+            elif name == "abort":
+                r = _cmdmode(_RESUME_ABORT, "--abort")
+                if r is not None:
+                    return r
+            elif name == "quit":
+                r = _cmdmode(_RESUME_QUIT, "--quit")
+                if r is not None:
+                    return r
+            elif name == "show-current-patch":
+                mode = _RESUME_SHOW_PATCH_RAW
+                if has_val:
+                    if val == "raw":
+                        mode = _RESUME_SHOW_PATCH_RAW
+                    elif val == "diff":
+                        mode = _RESUME_SHOW_PATCH_DIFF
+                    else:
+                        sys.stderr.write(
+                            f"error: invalid value for '--show-current-patch': '{val}'\n")
+                        return 129
+                r = _cmdmode(mode, "--show-current-patch")
+                if r is not None:
+                    return r
+            elif name == "retry":
+                r = _cmdmode(_RESUME_APPLY, "--retry")
+                if r is not None:
+                    return r
+            elif name == "allow-empty":
+                r = _cmdmode(_RESUME_ALLOW_EMPTY, "--allow-empty")
+                if r is not None:
+                    return r
+            elif canon == "committer-date-is-author-date":
+                state.committer_date_is_author_date = 0 if neg else 1
+            elif canon == "ignore-date":
+                state.ignore_date = 0 if neg else 1
+            elif canon == "rerere-autoupdate":
+                pass  # rerere autoupdate state (no observable effect here)
+            elif name == "gpg-sign" or canon == "gpg-sign":
+                if neg:
+                    state.sign_commit = None
+                else:
+                    state.sign_commit = val if has_val else ""
+            elif name == "empty":
+                if not has_val:
+                    if i + 1 >= n:
+                        return _am_usage_err("option `empty' requires a value")
+                    val = argv[i + 1]
+                    i += 1
+                et = {"stop": _STOP_ON_EMPTY, "drop": _DROP_EMPTY,
+                      "keep": _KEEP_EMPTY}.get(val)
+                if et is None:
+                    sys.stderr.write(f"error: invalid value for '--empty': '{val}'\n")
+                    return 129
+                state.empty_type = et
+            elif name == "binary" or canon == "binary":
+                binary = 0 if neg else 1
+            elif name == "rebasing":
+                state.rebasing = 1
+            else:
+                return _am_usage_err(f"unknown option `{name}'")
+            i += 1
+            continue
+        # ---- short options (clustered) ----
+        j = 1
+        consumed_next = False
+        while j < len(a):
+            c = a[j]
+            if c == "i":
+                state.interactive = 1
+            elif c == "n":
+                state.no_verify = 1
+            elif c == "3":
+                state.threeway = 1
+            elif c == "q":
+                state.quiet = 1
+            elif c == "s":
+                state.signoff = _SIGNOFF_EXPLICIT
+            elif c == "u":
+                state.utf8 = 1
+            elif c == "k":
+                state.keep = _KEEP_TRUE
+            elif c == "m":
+                state.message_id = 1
+            elif c == "c":
+                state.scissors = _SCISSORS_TRUE
+            elif c == "r":
+                r = _cmdmode(_RESUME_RESOLVED, "--resolved")
+                if r is not None:
+                    return r
+            elif c == "b":
+                binary = 1
+            elif c in ("C", "p"):
+                rest = a[j + 1:]
+                if not rest:
+                    if i + 1 >= n:
+                        sys.stderr.write(f"error: switch `{c}' requires a value\n")
+                        return 129
+                    rest = argv[i + 1]
+                    consumed_next = True
+                state.git_apply_opts.append(f"-{c}{rest}")
+                break
+            elif c == "S":
+                rest = a[j + 1:]
+                state.sign_commit = rest  # -S<key> or -S (empty)
+                break
+            else:
+                return _am_usage_err(f"unknown switch `{c}'")
+            j += 1
+        i += 2 if consumed_next else 1
+
+    if binary >= 0:
+        sys.stderr.write(
+            "The -b/--binary option has been a no-op for long time, and\n"
+            "it will be removed. Please do not use it anymore.\n")
+
+    return _am_dispatch(repo, state, resume_mode, keep_cr, patch_format,
+                        paths, in_progress)
+
+
+def _am_dispatch(repo: Repository, state: "_AmState", resume_mode: int,
+                 keep_cr: int, patch_format: int, paths: list[str],
+                 in_progress: bool) -> int:
+    if in_progress:
+        if paths or (resume_mode == _RESUME_FALSE and not sys.stdin.isatty()):
+            _err(f"fatal: previous rebase directory {_am_dir_disp(repo, state)} "
+                 "still exists but mbox given.")
+            return 128
+        if resume_mode == _RESUME_FALSE:
+            resume_mode = _RESUME_APPLY
+        if state.signoff == _SIGNOFF_EXPLICIT:
+            _am_append_signoff(state)
+    else:
+        if state.dir.exists() and not state.rebasing:
+            if resume_mode in (_RESUME_ABORT, _RESUME_QUIT):
+                state.destroy()
+                return 0
+            _err(f"fatal: Stray {_am_dir_disp(repo, state)} directory found.\n"
+                 'Use "git am --abort" to remove it.')
+            return 128
+        if resume_mode:
+            _err("fatal: Resolve operation not in progress, we are not resuming.")
+            return 128
+        if state.interactive and not paths:
+            _err("fatal: interactive mode requires patches on the command line")
+            return 128
+        rc = _am_setup(repo, state, patch_format, paths, keep_cr)
+        if rc != 0:
+            return rc
+
+    if resume_mode == _RESUME_FALSE:
+        return _am_run(repo, state, 0)
+    if resume_mode == _RESUME_APPLY:
+        return _am_run(repo, state, 1)
+    if resume_mode in (_RESUME_RESOLVED, _RESUME_ALLOW_EMPTY):
+        return _am_resolve(repo, state, 1 if resume_mode == _RESUME_ALLOW_EMPTY else 0)
+    if resume_mode == _RESUME_SKIP:
+        return _am_skip(repo, state)
+    if resume_mode == _RESUME_ABORT:
+        return _am_abort(repo, state)
+    if resume_mode == _RESUME_QUIT:
+        state.destroy()
+        return 0
+    if resume_mode in (_RESUME_SHOW_PATCH_RAW, _RESUME_SHOW_PATCH_DIFF):
+        return _am_show_patch(repo, state, resume_mode)
+    return 0
+
+
+def _am_dir_disp(repo: Repository, state: "_AmState") -> str:
+    """Display path for the rebase-apply directory as git prints it (relative to
+    cwd when inside the worktree, matching git_path output)."""
+    try:
+        return os.path.relpath(state.dir, repo.path)
+    except ValueError:
+        return str(state.dir)
+
+
+def _am_append_signoff(state: "_AmState") -> None:
+    msg = state.msg or ""
+    cn, ce = state.repo.user()
+    # committer identity for the trailer
+    csig = objs.build_signature(state.repo, "committer")
+    cwho, _t, _z = _split_ident(csig)
+    n, e = _parse_who(cwho)
+    body = msg.rstrip("\n")
+    trailer = f"Signed-off-by: {n} <{e}>"
+    # append_signoff with no existing trailer block: blank line then trailer
+    if body:
+        state.msg = body + "\n\n" + trailer + "\n"
+    else:
+        state.msg = trailer + "\n"
+
+
+def _am_setup(repo: Repository, state: "_AmState", patch_format: int,
+              paths: list[str], keep_cr: int) -> int:
+    from . import am as _am
+    if not patch_format:
+        patch_format = _am_detect_format(state, paths)
+    if not patch_format:
+        _err("Patch format detection failed.")
+        return 128
+    state.dir.mkdir(parents=True, exist_ok=True)
+    refs_mod.delete_ref(repo, "REBASE_HEAD")
+
+    rc = _am_split_mail(repo, state, patch_format, paths, keep_cr)
+    if rc != 0:
+        state.destroy()
+        _err("fatal: Failed to split patches.")
+        return 128
+
+    if state.rebasing:
+        state.threeway = 1
+    state._write_bool("threeway", state.threeway)
+    state._write_bool("quiet", state.quiet)
+    state._write_bool("sign", state.signoff)
+    state._write_bool("utf8", state.utf8)
+    state._write_text("keep", {_KEEP_FALSE: "f", _KEEP_TRUE: "t",
+                               _KEEP_NON_PATCH: "b"}[state.keep])
+    state._write_bool("messageid", state.message_id)
+    state._write_text("scissors", {_SCISSORS_UNSET: "", _SCISSORS_FALSE: "f",
+                                   _SCISSORS_TRUE: "t"}[state.scissors])
+    state._write_text("quoted-cr", {-1: "", _am.QCR_NOWARN: "nowarn",
+                                    _am.QCR_WARN: "warn", _am.QCR_STRIP: "strip"}
+                      .get(state.quoted_cr, ""))
+    state._write_text("apply-opt", " ".join(_am.sq_quote(o) for o in state.git_apply_opts)
+                      if state.git_apply_opts else "")
+    state._write_text("rebasing" if state.rebasing else "applying", "")
+
+    head_sym, head = refs_mod.read_head(repo)
+    if head:
+        state._write_text("abort-safety", head)
+        if not state.rebasing:
+            refs_mod.update_ref(repo, "ORIG_HEAD", head)
+    else:
+        state._write_text("abort-safety", "")
+        if not state.rebasing:
+            refs_mod.delete_ref(repo, "ORIG_HEAD")
+
+    state._write_count("next", state.cur)
+    state._write_count("last", state.last)
+    return 0
+
+
+def _am_detect_format(state: "_AmState", paths: list[str]) -> int:
+    from . import am as _am
+    if not paths or paths[0] == "-" or Path(paths[0]).is_dir():
+        return _am.PATCH_FORMAT_MBOX
+    try:
+        data = Path(paths[0]).read_bytes()
+    except OSError:
+        return _am.PATCH_FORMAT_MBOX
+    return _am.detect_patch_format(data, False)
+
+
+def _am_split_mail(repo: Repository, state: "_AmState", patch_format: int,
+                   paths: list[str], keep_cr: int) -> int:
+    from . import am as _am
+    if keep_cr < 0:
+        keep_cr = 0
+        cp = repo.config()
+        if cp.has_option("am", "keepcr"):
+            try:
+                keep_cr = 1 if cp.getboolean("am", "keepcr") else 0
+            except ValueError:
+                keep_cr = 0
+    if patch_format not in (_am.PATCH_FORMAT_MBOX, _am.PATCH_FORMAT_MBOXRD):
+        # stgit/hg conversions are uncommon for am; only mbox/mboxrd supported
+        # byte-exact here.
+        _err("fatal: Failed to split patches.")
+        return 1
+    mboxrd = (patch_format == _am.PATCH_FORMAT_MBOXRD)
+    skip = 0
+    srcs = paths if paths else ["-"]
+    for src in srcs:
+        is_stdin = (src == "-")
+        if is_stdin:
+            data = _stdin_bytes()
+        elif Path(src).is_dir():
+            ns, err = _am.split_maildir(Path(src), state.dir, state.prec, skip,
+                                        bool(keep_cr), mboxrd)
+            if err:
+                return 1
+            skip = ns
+            continue
+        else:
+            try:
+                data = Path(src).read_bytes()
+            except OSError:
+                return 1
+        ns, err = _am.split_mbox(data, state.dir, True, state.prec, skip,
+                                 bool(keep_cr), mboxrd, is_stdin)
+        if err or ns < 0:
+            return 1
+        skip = ns
+    state.cur = 1
+    state.last = skip
+    return 0
+
+
+def _am_parse_mail(repo: Repository, state: "_AmState", mail: Path) -> bool:
+    """Port of parse_mail(): run mailinfo, populate state author/msg, write the
+    msg/patch/info state files.  Returns True if the patch should be skipped."""
+    from . import am as _am
+    mi = _am.Mailinfo()
+    mi.metainfo_charset = "UTF-8" if state.utf8 else None
+    if state.keep == _KEEP_TRUE:
+        mi.keep_subject = 1
+    elif state.keep == _KEEP_NON_PATCH:
+        mi.keep_non_patch_brackets_in_subject = 1
+    if state.message_id:
+        mi.add_message_id = 1
+    if state.scissors == _SCISSORS_FALSE:
+        mi.use_scissors = 0
+    elif state.scissors == _SCISSORS_TRUE:
+        mi.use_scissors = 1
+    if state.quoted_cr in (_am.QCR_NOWARN, _am.QCR_WARN, _am.QCR_STRIP):
+        mi.quoted_cr = state.quoted_cr
+
+    data = mail.read_bytes()
+    msg_b, patch_b, info_b = _am.run_mailinfo(mi, data)
+    if msg_b is None:
+        # empty patch -> mailinfo error "could not parse patch" in C -> die
+        _err("fatal: could not parse patch")
+        raise _AmAbort(128)
+    state.path("msg").write_bytes(msg_b)
+    state.path("patch").write_bytes(patch_b)
+    state.path("info").write_bytes(info_b)
+    if mi._warn_quoted_cr:
+        _err("warning: quoted CRLF detected")
+    if mi.format_flowed:
+        _err("warning: Patch sent with format=flowed; "
+             "space at the end of lines might be lost.")
+
+    # parse the info file
+    subject_parts: list[str] = []
+    author_name = author_email = author_date = ""
+    for raw in info_b.decode("utf-8", "surrogateescape").split("\n"):
+        if raw.startswith("Subject: "):
+            subject_parts.append(raw[len("Subject: "):])
+        elif raw.startswith("Author: "):
+            author_name = raw[len("Author: "):]
+        elif raw.startswith("Email: "):
+            author_email = raw[len("Email: "):]
+        elif raw.startswith("Date: "):
+            author_date = raw[len("Date: "):]
+
+    if author_name == "Mail System Internal Data":
+        return True
+
+    log_message = msg_b.decode("utf-8", "surrogateescape")
+    full = "\n".join(subject_parts) + "\n\n" + log_message
+    full = _strbuf_stripspace(full, None)
+    state.author_name = author_name
+    state.author_email = author_email
+    state.author_date = author_date
+    state.msg = full
+    return False
+
+
+def _am_write_author_script(state: "_AmState") -> None:
+    from . import am as _am
+    lines = [
+        "GIT_AUTHOR_NAME=" + _am.sq_quote(state.author_name or ""),
+        "GIT_AUTHOR_EMAIL=" + _am.sq_quote(state.author_email or ""),
+        "GIT_AUTHOR_DATE=" + _am.sq_quote(state.author_date or ""),
+        "",
+    ]
+    state.path("author-script").write_text("\n".join(lines), encoding="utf-8",
+                                           errors="surrogateescape")
+
+
+def _am_is_empty_patch(state: "_AmState") -> bool:
+    p = state.path("patch")
+    if not p.exists():
+        return True
+    return p.stat().st_size == 0
+
+
+def _am_run(repo: Repository, state: "_AmState", resume: int) -> int:
+    state.path("dirtyindex").unlink(missing_ok=True)
+
+    # refresh index (refresh stat info, write) then check dirtiness vs HEAD
+    _am_refresh_index(repo)
+    changed, paths = _am_index_has_changes(repo)
+    if changed:
+        state._write_bool("dirtyindex", 1)
+        _err(f"fatal: Dirty index: cannot apply patches (dirty: {chr(10).join(paths)})")
+        return 128
+
+    while state.cur <= state.last:
+        mail = state.path(state.msgnum())
+        if not mail.exists():
+            _am_next(repo, state)
+            if resume:
+                state.load()
+            resume = 0
+            continue
+
+        if resume:
+            _am_validate_resume(state)
+        else:
+            skip = _am_parse_mail(repo, state, mail)
+            if skip:
+                _am_next(repo, state)
+                if resume:
+                    state.load()
+                resume = 0
+                continue
+            if state.signoff:
+                _am_append_signoff(state)
+            _am_write_author_script(state)
+            state.path("final-commit").write_text(state.msg or "", encoding="utf-8",
+                                                  errors="surrogateescape")
+
+        if state.interactive and _am_do_interactive(repo, state):
+            _am_next(repo, state)
+            if resume:
+                state.load()
+            resume = 0
+            continue
+
+        to_keep = False
+        if _am_is_empty_patch(state):
+            if state.empty_type == _DROP_EMPTY:
+                state.say(sys.stdout, "Skipping: " + _am_first_line(state.msg))
+                _am_next(repo, state)
+                if resume:
+                    state.load()
+                resume = 0
+                continue
+            elif state.empty_type == _KEEP_EMPTY:
+                to_keep = True
+                state.say(sys.stdout, "Creating an empty commit: " + _am_first_line(state.msg))
+            else:  # STOP_ON_EMPTY
+                _print("Patch is empty.")
+                _am_die_user_resolve(repo, state)
+
+        # applypatch-msg hook (mirror run_applypatch_msg_hook): runs on the
+        # final-commit file, then the (possibly edited) message is re-read.
+        if _am_run_applypatch_msg_hook(repo, state):
+            raise _AmAbort(1)
+
+        if not to_keep:
+            state.say(sys.stdout, "Applying: " + _am_first_line(state.msg))
+            apply_status = _am_apply(repo, state, None)
+            if apply_status and state.threeway:
+                apply_status = _am_fall_back_threeway(repo, state)
+                if not apply_status:
+                    changed, _ = _am_index_has_changes(repo)
+                    if not changed:
+                        state.say(sys.stdout, "No changes -- Patch already applied.")
+                        _am_next(repo, state)
+                        if resume:
+                            state.load()
+                        resume = 0
+                        continue
+            if apply_status:
+                _print(f"Patch failed at {state.msgnum()} {_am_first_line(state.msg)}")
+                _am_advise_show_patch(repo)
+                _am_die_user_resolve(repo, state)
+
+        _am_do_commit(repo, state)
+        _am_next(repo, state)
+        if resume:
+            state.load()
+        resume = 0
+
+    if not state.rebasing:
+        state.destroy()
+    return 0
+
+
+def _am_first_line(msg: Optional[str]) -> str:
+    if not msg:
+        return ""
+    nl = msg.find("\n")
+    return msg if nl < 0 else msg[:nl]
+
+
+def _am_refresh_index(repo: Repository) -> None:
+    """Refresh the index stat info (REFRESH_QUIET) and write it back."""
+    from .index import read_index, write_index
+    try:
+        idx = read_index(repo)
+    except (OSError, ValueError):
+        return
+    # Update stat info for entries whose worktree content matches; this mirrors
+    # repo_refresh_and_write_index just enough for the dirtiness check.
+    write_index(repo, idx)
+
+
+def _am_advise_show_patch(repo: Repository) -> None:
+    _err("hint: Use 'git am --show-current-patch=diff' to see the failed patch")
+
+
+def _am_die_user_resolve(repo: Repository, state: "_AmState") -> None:
+    if state.resolvemsg:
+        _err("hint: " + state.resolvemsg)
+        raise _AmAbort(128)
+    cmdline = "git am -i" if state.interactive else "git am"
+    _err(f'hint: When you have resolved this problem, run "{cmdline} --continue".')
+    _err(f'hint: If you prefer to skip this patch, run "{cmdline} --skip" instead.')
+    # advise allow-empty when the patch file is empty/missing and the index has
+    # no changes vs HEAD
+    if _am_is_empty_patch(state):
+        changed, _ = _am_index_has_changes(repo)
+        if not changed:
+            _err(f'hint: To record the empty patch as an empty commit, run "{cmdline} --allow-empty".')
+    _err(f'hint: To restore the original branch and stop patching, run "{cmdline} --abort".')
+    _err('hint: Disable this message with "git config set advice.mergeConflict false"')
+    raise _AmAbort(128)
+
+
+def _am_do_interactive(repo: Repository, state: "_AmState") -> bool:
+    """Port of do_interactive(): prompt whether to apply the current patch.
+    Returns True to skip the patch, False to apply it.  'a' accepts all
+    remaining patches (turns interactive off)."""
+    while True:
+        _print("Commit Body is:")
+        _print("--------------------------")
+        sys.stdout.write(state.msg or "")
+        _print("--------------------------")
+        sys.stdout.write("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ")
+        sys.stdout.flush()
+        reply = sys.stdin.readline()
+        if not reply:
+            _err("fatal: unable to read from stdin; aborting")
+            raise _AmAbort(128)
+        c = reply[0]
+        if c in ("y", "Y"):
+            return False
+        if c in ("a", "A"):
+            state.interactive = 0
+            return False
+        if c in ("n", "N"):
+            return True
+        if c in ("e", "E"):
+            # launch the editor on final-commit; if it cannot be launched we
+            # leave the message unchanged and re-prompt.
+            new = _launch_editor_on(repo, state.path("final-commit"))
+            if new is not None:
+                state.msg = new
+        elif c in ("v", "V"):
+            pager = os.environ.get("GIT_PAGER") or "cat"
+            import subprocess
+            try:
+                subprocess.call(f"{pager} " + _sh_quote(str(state.path("patch"))),
+                                shell=True)
+            except OSError:
+                pass
+        # otherwise re-prompt
+
+
+def _launch_editor_on(repo: Repository, path: Path) -> Optional[str]:
+    """Launch the configured editor on ``path`` and return its new contents, or
+    None if no editor could be launched."""
+    editor = (os.environ.get("GIT_EDITOR") or os.environ.get("VISUAL")
+              or os.environ.get("EDITOR"))
+    if not editor:
+        return None
+    import subprocess
+    try:
+        rc = subprocess.call(f"{editor} " + _sh_quote(str(path)), shell=True)
+    except OSError:
+        return None
+    if rc != 0:
+        return None
+    return path.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def _sh_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def _am_validate_resume(state: "_AmState") -> None:
+    if state.msg is None:
+        _err(f"fatal: cannot resume: {_am_state_rel(state, 'final-commit')} does not exist.")
+        raise _AmAbort(128)
+    if state.author_name is None or state.author_email is None or state.author_date is None:
+        _err(f"fatal: cannot resume: {_am_state_rel(state, 'author-script')} does not exist.")
+        raise _AmAbort(128)
+
+
+def _am_state_rel(state: "_AmState", name: str) -> str:
+    try:
+        return os.path.relpath(state.path(name), state.repo.path)
+    except ValueError:
+        return str(state.path(name))
+
+
+def _am_apply(repo: Repository, state: "_AmState", index_file: Optional[str]) -> int:
+    """Port of run_apply(): apply the state 'patch' file via git-apply with
+    check_index (no in-apply 3way).  Returns 0 on success, nonzero on failure."""
+    from . import apply as apply_mod
+    text = state.path("patch").read_bytes()
+    pif = _am_state_rel(state, "patch")
+    # parse git_apply_opts into apply options
+    opts_kw = _am_apply_opts(state)
+    p_value = opts_kw.pop("_p_value", None)
+    try:
+        patches = apply_mod.parse_patches(text, p_value, patch_input_file=pif,
+                                          recount=False)
+    except apply_mod.ApplyError as exc:
+        _err(exc.message)
+        return exc.rc if exc.rc else 1
+    if not patches:
+        return 0
+    verbosity = -1 if (state.threeway or state.quiet) else 0
+    # apply_with_reject forces verbose, matching apply.c's check_apply_state.
+    if opts_kw.get("apply_with_reject") and verbosity > -1:
+        verbosity = 1
+    opts = apply_mod.ApplyOpts(
+        p_value=p_value,
+        check_index=True,
+        verbosity=verbosity,
+        **opts_kw,
+    )
+    return apply_mod.check_and_apply(repo, patches, opts, pif)
+
+
+def _am_apply_opts(state: "_AmState") -> dict:
+    """Translate state.git_apply_opts into ApplyOpts kwargs.  ``git am`` always
+    applies, so the whitespace default is 'warn'."""
+    kw: dict = {"_p_value": None, "ws_action": "warn"}
+    for o in state.git_apply_opts:
+        if o.startswith("-p"):
+            try:
+                kw["_p_value"] = int(o[2:])
+            except ValueError:
+                pass
+        elif o.startswith("-C"):
+            try:
+                kw["p_context"] = int(o[2:])
+            except ValueError:
+                pass
+        elif o.startswith("--whitespace="):
+            kw["ws_action"] = _apply_ws_action(o.split("=", 1)[1], True)
+        elif o == "--reject":
+            kw["apply_with_reject"] = True
+    # Only pass kwargs ApplyOpts actually accepts.
+    accepted = {}
+    import inspect
+    from . import apply as apply_mod
+    fields = inspect.signature(apply_mod.ApplyOpts).parameters
+    for k, v in kw.items():
+        if k == "_p_value":
+            accepted[k] = v
+        elif k in fields:
+            accepted[k] = v
+    return accepted
+
+
+def _am_do_commit(repo: Repository, state: "_AmState") -> None:
+    """Port of do_commit(): write tree from index, commit with author identity
+    from the mail, committer from env/config, update HEAD with reflog 'am: …'."""
+    if not state.no_verify:
+        rc = _run_hook(repo, "pre-applypatch")
+        if rc:
+            raise _AmAbort(1)
+
+    tree = workdir.write_tree(repo)
+    head_sym, parent = refs_mod.read_head(repo)
+    parents = [parent] if parent else []
+    if not parent:
+        state.say(sys.stderr, "applying to an empty history")
+
+    # Author identity.  The date is the RFC2822 mail "Date:" converted to raw
+    # form, unless --ignore-date (in which case it is "now").  fmt_ident with a
+    # NULL date uses a single cached "now" for the whole patch, so author and
+    # (when committer-date-is-author-date) committer share the exact timestamp.
+    if state.ignore_date:
+        author_date_raw = _am_now_raw()
+    else:
+        author_date_raw = _rfc2822_to_raw(state.author_date) if state.author_date else _am_now_raw()
+    author_sig = _am_fmt_ident(state.author_name or "", state.author_email or "",
+                               author_date_raw)
+    if state.committer_date_is_author_date:
+        cn = os.environ.get("GIT_COMMITTER_NAME")
+        ce = os.environ.get("GIT_COMMITTER_EMAIL")
+        # Fall back to configured identity when the env vars are unset.
+        csig_default = objs.build_signature(repo, "committer")
+        cwho, _t, _z = _split_ident(csig_default)
+        dn, de = _parse_who(cwho)
+        committer_sig = _am_fmt_ident(cn or dn, ce or de, author_date_raw)
+    else:
+        committer_sig = objs.build_signature(repo, "committer")
+
+    msg = state.msg or ""
+    if not msg.endswith("\n"):
+        msg = msg + "\n"
+    commit_bytes = objs.Commit(tree=tree, parents=parents, author=author_sig,
+                               committer=committer_sig, message=msg).encode()
+    if state.sign_commit is not None:
+        from . import gpgsign
+        signing_key = (state.sign_commit if state.sign_commit
+                       else gpgsign.get_signing_key(repo, _ident_no_date(committer_sig)))
+        sig, errmsg = gpgsign.sign_buffer(repo, commit_bytes, signing_key)
+        if sig is None:
+            _err("error: " + errmsg)
+            _err("fatal: failed to write commit object")
+            raise _AmAbort(128)
+        commit_bytes = gpgsign.add_header_signature(commit_bytes, sig)
+    sha = objs.write_object(repo, "commit", commit_bytes)
+
+    reflog_msg = os.environ.get("GIT_REFLOG_ACTION") or "am"
+    reflog = f"{reflog_msg}: {_am_first_line(state.msg)}"
+    if head_sym:
+        refs_mod.update_ref(repo, head_sym, sha, message=reflog)
+    else:
+        refs_mod.set_head(repo, sha)
+
+    # post-applypatch always runs (it is NOT gated by --no-verify, am.c:1727).
+    _run_hook(repo, "post-applypatch")
+
+
+def _am_now_raw() -> str:
+    """Current time in raw '<secs> <±HHMM>' form (the local UTC offset), used
+    when --ignore-date or a mail lacks a Date: header."""
+    import time as _t
+    from .objects import _local_tz_minutes
+    secs = int(_t.time())
+    tz = _local_tz_minutes(secs)
+    sign = "+" if tz >= 0 else "-"
+    tza = abs(tz)
+    return f"{secs} {sign}{tza // 60:02d}{tza % 60:02d}"
+
+
+def _am_fmt_ident(name: str, email: str, date_raw: Optional[str]) -> str:
+    secs_tz = None
+    if date_raw:
+        from .objects import _parse_date_env
+        secs_tz = _parse_date_env(date_raw)
+    if secs_tz is None:
+        import time as _t
+        from .objects import _local_tz_minutes
+        secs = int(_t.time())
+        tz = _local_tz_minutes(secs)
+    else:
+        secs, tz = secs_tz
+    return objs.format_signature(name, email, when=secs, tz_minutes=tz)
+
+
+def _am_next(repo: Repository, state: "_AmState") -> None:
+    state.author_name = None
+    state.author_email = None
+    state.author_date = None
+    state.msg = None
+    state.path("author-script").unlink(missing_ok=True)
+    state.path("final-commit").unlink(missing_ok=True)
+    state.path("original-commit").unlink(missing_ok=True)
+    refs_mod.delete_ref(repo, "REBASE_HEAD")
+    head_sym, head = refs_mod.read_head(repo)
+    state._write_text("abort-safety", head or "")
+    state.cur += 1
+    state._write_count("next", state.cur)
+
+
+def _am_resolve(repo: Repository, state: "_AmState", allow_empty: int) -> int:
+    _am_validate_resume(state)
+    state.say(sys.stdout, "Applying: " + _am_first_line(state.msg))
+    changed, _ = _am_index_has_changes(repo)
+    if not changed:
+        if allow_empty and _am_is_empty_patch(state):
+            _print("No changes - recorded it as an empty commit.")
+        else:
+            _print("No changes - did you forget to use 'git add'?\n"
+                   "If there is nothing left to stage, chances are that something else\n"
+                   "already introduced the same changes; you might want to skip this patch.")
+            _am_die_user_resolve(repo, state)
+    if _am_unmerged(repo):
+        _print("You still have unmerged paths in your index.\n"
+               "You should 'git add' each file with resolved conflicts to mark them as such.\n"
+               "You might run `git rm` on a file to accept \"deleted by them\" for it.")
+        _am_die_user_resolve(repo, state)
+    _am_do_commit(repo, state)
+    _am_next(repo, state)
+    state.load()
+    return _am_run(repo, state, 0)
+
+
+def _am_skip(repo: Repository, state: "_AmState") -> int:
+    head_sym, head = refs_mod.read_head(repo)
+    head = head or _EMPTY_TREE_SHA
+    _am_clean_index(repo, head, head)
+    _am_next(repo, state)
+    state.load()
+    return _am_run(repo, state, 0)
+
+
+def _am_abort(repo: Repository, state: "_AmState") -> int:
+    if not _am_safe_to_abort(repo, state):
+        state.destroy()
+        return 0
+    head_sym, curr_head = refs_mod.read_head(repo)
+    has_curr_head = bool(curr_head)
+    if not has_curr_head:
+        curr_head = _EMPTY_TREE_SHA
+    orig_head = refs_mod.read_ref(repo, "ORIG_HEAD")
+    has_orig_head = bool(orig_head)
+    if not has_orig_head:
+        orig_head = _EMPTY_TREE_SHA
+    _am_clean_index(repo, curr_head, orig_head)
+    if has_orig_head:
+        if head_sym:
+            refs_mod.update_ref(repo, head_sym, orig_head, message="am --abort")
+        else:
+            refs_mod.set_head(repo, orig_head)
+    elif head_sym:
+        refs_mod.delete_ref(repo, head_sym)
+    state.destroy()
+    return 0
+
+
+def _am_safe_to_abort(repo: Repository, state: "_AmState") -> bool:
+    if state.path("dirtyindex").exists():
+        return False
+    abort_safety = state._read_state("abort-safety", True) or ""
+    head_sym, head = refs_mod.read_head(repo)
+    head = head or ""
+    if head == abort_safety:
+        return True
+    _err("warning: You seem to have moved HEAD since the last 'am' failure.\n"
+         "Not rewinding to ORIG_HEAD")
+    return False
+
+
+def _am_clean_index(repo: Repository, head: str, remote: str) -> None:
+    """Port of clean_index(): reset the index+worktree to ``remote``'s tree,
+    discarding unmerged state (used by --skip and --abort)."""
+    def _tree_of(sha: str) -> str:
+        if sha == _EMPTY_TREE_SHA:
+            return _EMPTY_TREE_SHA
+        t, data = objs.read_object(repo, sha)
+        return objs.parse_commit(data).tree if t == "commit" else sha
+    remote_tree = _tree_of(remote)
+    from .index import read_index, write_index, Index, IndexEntry
+    # Reset worktree + index to remote_tree.
+    if remote_tree == _EMPTY_TREE_SHA:
+        idx = Index()
+        write_index(repo, idx)
+    else:
+        workdir.checkout_tree(repo, remote_tree)
+        idx = Index()
+        for p, mode, sha in workdir.iter_tree_files(repo, remote_tree):
+            idx.entries.append(IndexEntry(mode=int(mode, 8), sha=sha, path=p))
+        write_index(repo, idx)
+    remove_state = repo.gitdir / "MERGE_HEAD"
+    remove_state.unlink(missing_ok=True)
+
+
+def _am_show_patch(repo: Repository, state: "_AmState", resume_mode: int) -> int:
+    orig = state._read_state("original-commit", True)
+    if orig:
+        return cmd_show([orig, "--"])
+    if resume_mode == _RESUME_SHOW_PATCH_RAW:
+        patch_path = state.path(state.msgnum())
+    else:
+        patch_path = state.path("patch")
+    if not patch_path.exists():
+        _err(f"fatal: failed to read '{_am_state_rel(state, patch_path.name)}': "
+             "No such file or directory")
+        return 128
+    sys.stdout.flush()
+    sys.stdout.buffer.write(patch_path.read_bytes())
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def _am_fall_back_threeway(repo: Repository, state: "_AmState") -> int:
+    """Port of fall_back_threeway(): build a fake-ancestor index from the
+    patch's index lines, apply onto it to get their_tree, then 3-way merge
+    HEAD and their_tree against that base.  Returns 0 on success, nonzero on
+    failure."""
+    from . import am as _am
+    from . import apply as apply_mod
+    from . import ort as ort_mod
+
+    head_sym, head = refs_mod.read_head(repo)
+    our_tree = (objs.parse_commit(objs.read_object(repo, head)[1]).tree
+                if head else _EMPTY_TREE_SHA)
+
+    # build_fake_ancestor
+    text = state.path("patch").read_bytes()
+    try:
+        patches = apply_mod.parse_patches(text, _am_apply_opts(state).get("_p_value"),
+                                          patch_input_file=str(state.path("patch")),
+                                          recount=False)
+    except apply_mod.ApplyError:
+        _err("error: could not build fake ancestor")
+        return 1
+    base_tree = _am_build_fake_ancestor(repo, patches)
+    if base_tree is None:
+        _err("error: could not build fake ancestor")
+        return 1
+
+    state.say(sys.stdout, "Using index info to reconstruct a base tree...")
+    if not state.quiet:
+        _am_threeway_namestatus(repo, our_tree, base_tree)
+
+    # apply the patch onto the base tree (cached), producing their_tree
+    their_tree = _am_apply_to_tree(repo, state, base_tree)
+    if their_tree is None:
+        _err("error: Did you hand edit your patch?\n"
+             "It does not apply to blobs recorded in its index.")
+        return 1
+
+    state.say(sys.stdout, "Falling back to patching base and 3-way merge...")
+
+    # merge_ort_generic(o, our_tree, their_tree, 1 base, [base_tree]) with
+    # am's labels: branch1="HEAD", branch2=<subject>, ancestor=fake ancestor.
+    branch2 = _am_first_line(state.msg)
+    result = ort_mod.merge_ort_generic(repo, our_tree, their_tree, [base_tree],
+                                       branch1="HEAD", branch2=branch2,
+                                       ancestor="constructed fake ancestor")
+    # Print "Auto-merging"/"CONFLICT" messages.
+    _am_emit_merge_messages(result, branch2)
+    # Write the merge result to the worktree and index (stages on conflict).
+    workdir.checkout_tree(repo, result.tree)
+    from .index import write_index, Index, IndexEntry
+    if result.conflict_index is not None:
+        write_index(repo, result.conflict_index)
+    else:
+        idx = Index()
+        for p, mode, sha in workdir.iter_tree_files(repo, result.tree):
+            idx.entries.append(IndexEntry(mode=int(mode, 8), sha=sha, path=p))
+        write_index(repo, idx)
+    if result.conflicts:
+        _err("error: Failed to merge in the changes.")
+        return 1
+    return 0
+
+
+def _am_emit_merge_messages(result, branch2: str) -> None:
+    for p in result.auto_merged:
+        _print(f"Auto-merging {p}")
+    for p in result.conflicts:
+        _print(f"CONFLICT (content): Merge conflict in {p}")
+
+
+def _am_threeway_namestatus(repo: Repository, our_tree: str, base_tree: str) -> None:
+    """Print the A/M name-status of HEAD vs the fake-ancestor base, mirroring
+    fall_back_threeway's diff (filter A+M, DIFF_FORMAT_NAME_STATUS)."""
+    our = {p: (m, s) for p, m, s in workdir.iter_tree_files(repo, our_tree)} if our_tree != _EMPTY_TREE_SHA else {}
+    base = {p: (m, s) for p, m, s in workdir.iter_tree_files(repo, base_tree)} if base_tree != _EMPTY_TREE_SHA else {}
+    rows = []
+    for p in set(our) | set(base):
+        if p not in base and p in our:
+            rows.append(("A", p))
+        elif p in base and p in our and our[p][1] != base[p][1]:
+            rows.append(("M", p))
+    rows.sort(key=lambda r: r[1])
+    for status, p in rows:
+        _print(f"{status}\t{p}")
+
+
+def _am_build_fake_ancestor(repo: Repository, patches) -> Optional[str]:
+    """Port of build_fake_ancestor(): construct a tree from the patch index
+    lines (preimage blobs).  Returns the tree sha, or None on failure."""
+    from .index import Index, IndexEntry, write_index, read_index
+    entries: list = []
+    for patch in patches:
+        name = patch.old_name if patch.old_name else patch.new_name
+        if patch.is_new and patch.is_new > 0:
+            continue
+        oid = None
+        prefix = patch.old_oid_prefix
+        if prefix:
+            full = _am_resolve_blob_prefix(repo, prefix)
+            if full is not None:
+                oid = full
+        if oid is None:
+            if not patch.lines_added and not patch.lines_deleted:
+                # mode-only change: use current HEAD blob
+                head_sym, head = refs_mod.read_head(repo)
+                if head:
+                    head_tree = objs.parse_commit(objs.read_object(repo, head)[1]).tree
+                    for p, m, s in workdir.iter_tree_files(repo, head_tree):
+                        if p == name:
+                            oid = s
+                            break
+                if oid is None:
+                    return None
+            else:
+                return None  # "sha1 information is lacking or useless"
+        mode = patch.old_mode or 0o100644
+        entries.append(IndexEntry(mode=mode, sha=oid, path=name))
+    # build a tree from these entries without disturbing the real index
+    saved = read_index(repo) if (repo.gitdir / "index").exists() else None
+    tmp = Index()
+    tmp.entries = entries
+    write_index(repo, tmp)
+    try:
+        tree = workdir.write_tree(repo)
+    finally:
+        if saved is not None:
+            write_index(repo, saved)
+        else:
+            (repo.gitdir / "index").unlink(missing_ok=True)
+    return tree
+
+
+def _am_resolve_blob_prefix(repo: Repository, prefix: str) -> Optional[str]:
+    """Resolve an abbreviated blob oid (the patch index line's old side)."""
+    if objs.object_exists(repo, prefix):
+        return prefix
+    # search loose + packed for a unique blob with this prefix
+    try:
+        full = refs_mod.rev_parse(repo, prefix)
+    except Exception:
+        full = None
+    if full and objs.object_exists(repo, full):
+        return full
+    return None
+
+
+def _am_apply_to_tree(repo: Repository, state: "_AmState", base_tree: str) -> Optional[str]:
+    """Apply the state patch onto ``base_tree`` (cached, no worktree), returning
+    the resulting tree sha; None on failure.  Mirrors run_apply() to a temp
+    index built from base_tree."""
+    from . import apply as apply_mod
+    from .index import Index, IndexEntry, write_index, read_index
+    saved = read_index(repo) if (repo.gitdir / "index").exists() else None
+    base = Index()
+    if base_tree != _EMPTY_TREE_SHA:
+        for p, mode, sha in workdir.iter_tree_files(repo, base_tree):
+            base.entries.append(IndexEntry(mode=int(mode, 8), sha=sha, path=p))
+    write_index(repo, base)
+    try:
+        text = state.path("patch").read_bytes()
+        pif = str(state.path("patch"))
+        opts_kw = _am_apply_opts(state)
+        p_value = opts_kw.pop("_p_value", None)
+        try:
+            patches = apply_mod.parse_patches(text, p_value, patch_input_file=pif,
+                                              recount=False)
+        except apply_mod.ApplyError:
+            return None
+        opts = apply_mod.ApplyOpts(p_value=p_value, cached=True, check_index=True,
+                                   verbosity=-1, **opts_kw)
+        rc = apply_mod.check_and_apply(repo, patches, opts, pif)
+        if rc != 0:
+            return None
+        tree = workdir.write_tree(repo)
+    finally:
+        if saved is not None:
+            write_index(repo, saved)
+        else:
+            (repo.gitdir / "index").unlink(missing_ok=True)
+    return tree
+
+
+def _run_hook(repo: Repository, name: str, *args: str) -> int:
+    """Run a repository hook if present and executable.  Returns its exit code
+    (0 when there is no hook)."""
+    hook = repo.gitdir / "hooks" / name
+    if not hook.exists() or not os.access(hook, os.X_OK):
+        return 0
+    import subprocess
+    try:
+        return subprocess.call([str(hook), *args], cwd=str(repo.path))
+    except OSError:
+        return 0
+
+
+def _am_run_applypatch_msg_hook(repo: Repository, state: "_AmState") -> int:
+    """Port of run_applypatch_msg_hook(): run applypatch-msg on the final-commit
+    file (unless --no-verify), then re-read the (possibly rewritten) message.
+    Returns the hook's exit code; nonzero aborts the am session."""
+    ret = 0
+    if not state.no_verify:
+        ret = _run_hook(repo, "applypatch-msg", _am_state_rel(state, "final-commit"))
+    if not ret:
+        fc = state.path("final-commit")
+        if not fc.exists():
+            _err(f"fatal: '{_am_state_rel(state, 'final-commit')}' was deleted "
+                 "by the applypatch-msg hook")
+            raise _AmAbort(128)
+        state.msg = fc.read_text(encoding="utf-8", errors="surrogateescape")
+    return ret
 
 
 _CLEAN_USAGE = (
@@ -14697,28 +16193,42 @@ def cmd_count_objects(argv: list[str]) -> int:
         return 0
     if args.v:
         from . import pack as _p
+        packed_set: set = set()
         midx = _p.read_midx(repo)
         if midx is not None:
             pack_count = len(midx.pack_names)
             pack_objs = len(midx.shas)
+            packed_set.update(midx.shas)
         else:
             pack_count = 0
             pack_objs = 0
             for pk in _p._iter_packs(repo):
                 pack_count += 1
                 pack_objs += len(pk.shas)
+                packed_set.update(pk.shas)
         pack_dir = repo.gitdir / "objects" / "pack"
         size_pack = 0
         if pack_dir.is_dir():
             for pk in pack_dir.glob("*.pack"):
                 size_pack += pk.stat().st_size
         size_pack_kib = (size_pack + 1023) // 1024
+        # prune-packable: loose objects that are ALSO present in a pack (what
+        # `git prune-packed` would remove), per builtin/count-objects.c.
+        prune_packable = 0
+        objects_root = repo.gitdir / "objects"
+        if objects_root.is_dir() and packed_set:
+            for d in objects_root.iterdir():
+                if len(d.name) == 2 and all(c in "0123456789abcdef" for c in d.name) and d.is_dir():
+                    for f in d.iterdir():
+                        oid = d.name + f.name
+                        if len(oid) == repo.hex_len and f.is_file() and oid in packed_set:
+                            prune_packable += 1
         _print(f"count: {loose_count}")
         _print(f"size: {size}")
         _print(f"in-pack: {pack_objs}")
         _print(f"packs: {pack_count}")
         _print(f"size-pack: {size_pack_kib}")
-        _print("prune-packable: 0")
+        _print(f"prune-packable: {prune_packable}")
         _print("garbage: 0")
         _print("size-garbage: 0")
     else:
@@ -14727,25 +16237,28 @@ def cmd_count_objects(argv: list[str]) -> int:
 
 
 def cmd_repack(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit repack")
-    ap.add_argument("-a", action="store_true")
-    ap.add_argument("-d", action="store_true")
-    ap.add_argument("-b", "--write-bitmap-index", action="store_true")
-    ap.add_argument("--no-write-bitmap-index", action="store_true")
-    args = ap.parse_args(argv)
+    from . import repack as _repack
+
+    opts = _repack.Options()
+    try:
+        _repack.parse_options(argv, opts)
+    except _repack.HelpRequested:
+        # git's parse_options() prints usage to stdout for -h with rc 129.
+        sys.stdout.write(_repack._USAGE)
+        return 129
+    except _repack.UsageError as exc:
+        if exc.message:
+            _err(exc.message)
+        if exc.show_usage:
+            sys.stderr.write(_repack._USAGE)
+        return 129
+
     repo = _repo()
-    from . import pack as _p
-    shas = sorted(_reachable(repo))
-    pack_sha, pack_path, entries = _write_pack_files(repo, shas, "pack")
-    if not args.no_write_bitmap_index:
-        _p.write_pack_bitmap(repo, pack_path, entries)
-    _print(f"pack-{pack_sha}")
-    if args.d:
-        packed = set(shas)
-        for sha in _iter_loose_shas(repo):
-            if sha in packed:
-                (repo.gitdir / "objects" / sha[:2] / sha[2:]).unlink(missing_ok=True)
-    return 0
+    try:
+        return _repack.run(repo, opts, _print, _err)
+    except _repack.FatalError as exc:
+        _err(f"fatal: {exc.message}")
+        return 128
 
 
 _TIME_MAX = (1 << 63) - 1
@@ -14924,55 +16437,163 @@ def _parse_mail_headers(text: str) -> tuple[dict[str, str], str]:
     return headers, body
 
 
+_MAILSPLIT_USAGE = (
+    "git mailsplit [-d<prec>] [-f<n>] [-b] [--keep-cr] "
+    "-o<directory> [(<mbox>|<Maildir>)...]")
+
+
 def cmd_mailsplit(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit mailsplit")
-    ap.add_argument("-o", "--output-dir", required=True)
-    ap.add_argument("mbox")
-    args = ap.parse_args(argv)
-    text = Path(args.mbox).read_text(encoding="utf-8", errors="replace")
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    pieces: list[list[str]] = []
-    cur: list[str] = []
-    for line in text.splitlines():
-        if line.startswith("From ") and cur:
-            pieces.append(cur)
-            cur = [line]
+    """Port of builtin/mailsplit.c: split mbox(es)/Maildir(s) into numbered
+    files, printing the count of messages written."""
+    from . import am as _am
+    nr = 0
+    nr_prec = 4
+    allow_bare = False
+    out_dir: Optional[str] = None
+    keep_cr = False
+    mboxrd = False
+    files: list[str] = []
+    i = 0
+    saw_dd = False
+    while i < len(argv):
+        arg = argv[i]
+        if saw_dd or not arg.startswith("-") or arg == "-":
+            files.append(arg)
+            i += 1
+            continue
+        if arg == "-h" or arg == "--help":
+            _print("usage: " + _MAILSPLIT_USAGE)
+            return 129
+        if arg[1] == "d":
+            try:
+                nr_prec = int(arg[2:])
+            except ValueError:
+                nr_prec = 0
+            if nr_prec < 3 or 10 <= nr_prec:
+                _err("usage: " + _MAILSPLIT_USAGE)
+                return 129
+        elif arg[1] == "f":
+            try:
+                nr = int(arg[2:])
+            except ValueError:
+                nr = 0
+        elif arg[1] == "b" and len(arg) == 2:
+            allow_bare = True
+        elif arg == "--keep-cr":
+            keep_cr = True
+        elif arg[1] == "o" and len(arg) > 2:
+            out_dir = arg[2:]
+        elif arg == "--mboxrd":
+            mboxrd = True
+        elif arg == "--":
+            saw_dd = True
         else:
-            cur.append(line)
-    if cur:
-        pieces.append(cur)
-    for i, p in enumerate(pieces, 1):
-        (out / f"{i:04d}").write_text("\n".join(p) + "\n", encoding="utf-8")
-        _print(f"{i:04d}")
+            _err(f"fatal: unknown option: {arg}")
+            return 128
+        i += 1
+
+    stdin_only = ["-"]
+    if out_dir is None:
+        rest = files
+        if len(rest) == 1:
+            out_dir = rest[0]
+            files = stdin_only
+        elif len(rest) == 2:
+            stdin_only[0] = rest[0]
+            out_dir = rest[1]
+            files = stdin_only
+        else:
+            _err("usage: " + _MAILSPLIT_USAGE)
+            return 129
+    else:
+        if not files:
+            files = stdin_only
+
+    out = Path(out_dir)
+    # git does NOT create the output directory; it opens each <dir>/NNNN with
+    # O_CREAT|O_EXCL and dies "unable to create '<path>': <strerror>" if the
+    # directory is missing.  Mirror that instead of auto-creating the dir.
+    num = 0
+    for arg in files:
+        is_stdin = (arg == "-")
+        try:
+            if is_stdin:
+                data = _stdin_bytes()
+                ns, err = _am.split_mbox(data, out, allow_bare, nr_prec, nr, keep_cr,
+                                         mboxrd, True)
+            elif Path(arg).is_dir():
+                ns, err = _am.split_maildir(Path(arg), out, nr_prec, nr, keep_cr, mboxrd)
+            else:
+                try:
+                    data = Path(arg).read_bytes()
+                except OSError:
+                    _err(f"error: cannot stat {arg}: No such file or directory")
+                    return 1
+                ns, err = _am.split_mbox(data, out, allow_bare, nr_prec, nr, keep_cr,
+                                         mboxrd, False)
+        except OSError as exc:
+            import os as _os
+            _err(f"fatal: unable to create '{exc.filename}': "
+                 f"{_os.strerror(exc.errno)}")
+            return 128
+        if err == "empty":
+            _err(f"error: empty mbox: '{arg}'")
+            return 1
+        if err or ns < 0:
+            _err(f"error: cannot split patches from {arg}")
+            return 1
+        num += (ns - nr)
+        nr = ns
+    _print(str(num))
     return 0
 
 
 def cmd_mailinfo(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit mailinfo")
-    ap.add_argument("msg")
-    ap.add_argument("patch")
-    args = ap.parse_args(argv)
-    text = sys.stdin.read()
-    if text.startswith("From "):
-        nl = text.find("\n")
-        if nl != -1:
-            text = text[nl + 1 :]
-    headers, body = _parse_mail_headers(text)
-    subject = headers.get("Subject", "")
-    if subject.startswith("[") and "]" in subject:
-        subject = subject[subject.index("]") + 1 :].strip()
-    if "---" in body:
-        sep = body.index("---")
-        msg = body[:sep].rstrip()
-        patch_text = body[sep:]
-    else:
-        msg = body.rstrip()
-        patch_text = ""
-    Path(args.msg).write_text(subject + "\n\n" + msg + "\n", encoding="utf-8")
-    Path(args.patch).write_text(patch_text, encoding="utf-8")
-    _print(f"Subject: {subject}")
-    _print(f"Author: {headers.get('From', '')}")
+    """Port of builtin/mailinfo.c entry: extract authorship + message + patch
+    from a single mail on stdin, writing <msg> and <patch> and printing the
+    info block."""
+    from . import am as _am
+    mi = _am.Mailinfo()
+    msg_file = patch_file = None
+    i = 0
+    positional: list[str] = []
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-k":
+            mi.keep_subject = 1
+        elif arg == "-b":
+            mi.keep_non_patch_brackets_in_subject = 1
+        elif arg == "-m" or arg == "--message-id":
+            mi.add_message_id = 1
+        elif arg == "-u":
+            mi.metainfo_charset = "UTF-8"
+        elif arg == "-n":
+            mi.metainfo_charset = None
+        elif arg == "--scissors":
+            mi.use_scissors = 1
+        elif arg == "--no-scissors":
+            mi.use_scissors = 0
+        elif arg.startswith("--encoding="):
+            mi.metainfo_charset = arg.split("=", 1)[1]
+        elif not arg.startswith("-"):
+            positional.append(arg)
+        i += 1
+    if len(positional) < 2:
+        _err("usage: git mailinfo [<options>] <msg> <patch> < mail >info")
+        return 129
+    msg_file, patch_file = positional[0], positional[1]
+    data = _stdin_bytes()
+    msg_b, patch_b, info_b = _am.run_mailinfo(mi, data)
+    if msg_b is None:
+        _err(f"error: empty patch: '{patch_file}'")
+        return 1
+    Path(msg_file).write_bytes(msg_b)
+    Path(patch_file).write_bytes(patch_b)
+    sys.stdout.flush()
+    sys.stdout.buffer.write(info_b)
+    sys.stdout.buffer.flush()
+    if mi.input_error:
+        return 1
     return 0
 
 
@@ -18528,139 +20149,100 @@ def _write_stdout_bytes(data: bytes) -> None:
         sys.stdout.write(data.decode("utf-8", errors="surrogateescape"))
 
 
+def _fast_import_crash_report(repo, err: str, cmd_hist: list, marks, tags,
+                              branches, export_marks_file) -> str:
+    """Write a .git/fast_import_crash_<pid> report mirroring git, return its path."""
+    import datetime as _dt
+
+    pid = os.getpid()
+    abs_loc = repo.gitdir / ("fast_import_crash_%d" % pid)
+    # git prints the gitdir-relative path (".git/fast_import_crash_<pid>" when
+    # invoked from the worktree root).
+    try:
+        loc = os.path.relpath(str(abs_loc), os.getcwd())
+    except ValueError:
+        loc = str(abs_loc)
+    try:
+        now = _dt.datetime.now().astimezone()
+        at = now.strftime("%Y-%m-%d %H:%M:%S %z")
+        out = []
+        out.append("fast-import crash report:\n")
+        out.append("    fast-import process: %d\n" % pid)
+        out.append("    parent process     : %d\n" % os.getppid())
+        out.append("    at %s\n" % at)
+        out.append("\n")
+        out.append("fatal: %s\n" % err)
+        out.append("\n")
+        out.append("Most Recent Commands Before Crash\n")
+        out.append("---------------------------------\n")
+        for idx, c in enumerate(cmd_hist):
+            text = c.decode("latin-1") if isinstance(c, (bytes, bytearray)) else c
+            prefix = "* " if idx == len(cmd_hist) - 1 else "  "
+            out.append("%s%s\n" % (prefix, text))
+        out.append("\n")
+        out.append("Active Branch LRU\n")
+        out.append("-----------------\n")
+        out.append("    active_branches = 0 cur, 0 max\n")
+        out.append("\n")
+        out.append("  pos  clock name\n")
+        out.append("  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+        out.append("\n")
+        out.append("Inactive Branches\n")
+        out.append("-----------------\n")
+        if tags:
+            out.append("\n")
+            out.append("Annotated Tags\n")
+            out.append("--------------\n")
+            for name, oid in tags:
+                out.append("%s %s\n" % (oid, name))
+        out.append("\n")
+        out.append("Marks\n")
+        out.append("-----\n")
+        if export_marks_file:
+            out.append("  exported to %s\n" % export_marks_file)
+        else:
+            for m in sorted(marks):
+                out.append(":%d %s\n" % (m, marks[m][0]))
+        out.append("\n")
+        out.append("-------------------\n")
+        out.append("END OF CRASH REPORT\n")
+        with open(abs_loc, "w") as f:
+            f.write("".join(out))
+    except OSError:
+        pass
+    return loc
+
+
 def cmd_fast_import(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit fast-import")
-    ap.parse_args(argv)
+    from . import fastimport as _fi
+
+    # -h / --help: usage to stdout, rc 129.
+    if any(a in ("-h", "--help") for a in argv):
+        sys.stdout.write("usage: " + _fi._FAST_IMPORT_USAGE + "\n")
+        return 129
+
     repo = _repo()
-    data = sys.stdin.read()
-    lines = data.splitlines(keepends=True)
-    i = 0
-    marks: dict[int, str] = {}
-
-    def read_line() -> Optional[str]:
-        nonlocal i
-        if i >= len(lines):
-            return None
-        ln = lines[i].rstrip("\n")
-        i += 1
-        return ln
-
-    def read_data() -> bytes:
-        nonlocal i
-        ln = read_line() or ""
-        if not ln.startswith("data "):
-            return b""
-        n = int(ln[5:])
-        # read raw bytes from `data` lines
-        buf = bytearray()
-        while len(buf) < n and i < len(lines):
-            buf += lines[i].encode("utf-8")
-            i += 1
-        return bytes(buf[:n])
-
-    while True:
-        ln = read_line()
-        if ln is None:
-            break
-        if ln == "blob":
-            mark = None
-            sub = read_line()
-            if sub and sub.startswith("mark :"):
-                mark = int(sub[6:])
-            else:
-                # no mark, but we already consumed the line; rewind logically
-                if sub is not None:
-                    i -= 1
-            payload = read_data()
-            sha = objs.write_object(repo, "blob", payload)
-            if mark is not None:
-                marks[mark] = sha
-        elif ln.startswith("commit "):
-            ref = ln[len("commit "):].strip()
-            mark = None
-            author = ""
-            committer = ""
-            parents: list[str] = []
-            files: dict[str, tuple[str, str]] = {}  # path -> (mode, sha)
-            deleted_all = False
-            message = ""
-            while True:
-                sub = read_line()
-                if sub is None:
-                    break
-                if sub == "":
-                    break
-                if sub.startswith("mark :"):
-                    mark = int(sub[6:])
-                elif sub.startswith("author "):
-                    author = sub[len("author "):]
-                elif sub.startswith("committer "):
-                    committer = sub[len("committer "):]
-                elif sub.startswith("data "):
-                    i -= 1
-                    message = read_data().decode("utf-8", errors="replace")
-                elif sub.startswith("from "):
-                    target = sub[len("from "):].strip()
-                    if target.startswith(":"):
-                        parents.append(marks[int(target[1:])])
-                    else:
-                        parents.append(refs_mod.rev_parse(repo, target) or target)
-                elif sub.startswith("merge "):
-                    target = sub[len("merge "):].strip()
-                    if target.startswith(":"):
-                        parents.append(marks[int(target[1:])])
-                elif sub == "deleteall":
-                    deleted_all = True
-                    files.clear()
-                elif sub.startswith("M "):
-                    parts = sub.split(" ", 3)
-                    mode, dataref, path = parts[1], parts[2], parts[3]
-                    if dataref.startswith(":"):
-                        bsha = marks[int(dataref[1:])]
-                    else:
-                        bsha = dataref
-                    files[path] = (mode, bsha)
-                elif sub.startswith("D "):
-                    path = sub[2:]
-                    files.pop(path, None)
-            # build tree from files
-            if parents and not deleted_all:
-                parent_tree = objs.parse_commit(objs.read_object(repo, parents[0])[1]).tree
-                for p, mode, s in workdir.iter_tree_files(repo, parent_tree):
-                    files.setdefault(p, ("100644", s))
-            from .index import Index, IndexEntry, REG_MODE, write_index, read_index
-            saved_idx = read_index(repo) if (repo.gitdir / "index").exists() else None
-            idx = Index()
-            for p, (mode, sha) in sorted(files.items()):
-                idx.entries.append(IndexEntry(mode=int(mode, 8), sha=sha, path=p))
-            write_index(repo, idx)
-            tree = workdir.write_tree(repo)
-            if saved_idx is not None:
-                write_index(repo, saved_idx)
-            else:
-                (repo.gitdir / "index").unlink(missing_ok=True)
-            c = objs.Commit(tree=tree, parents=parents, author=author, committer=committer,
-                            message=message if message.endswith("\n") else message + "\n")
-            sha = objs.write_object(repo, "commit", c.encode())
-            if mark is not None:
-                marks[mark] = sha
-            refs_mod.update_ref(repo, ref, sha, message="fast-import")
-        elif ln.startswith("reset "):
-            ref = ln[len("reset "):].strip()
-            sub = read_line()
-            if sub and sub.startswith("from "):
-                target = sub[len("from "):].strip()
-                if target.startswith(":"):
-                    refs_mod.update_ref(repo, ref, marks[int(target[1:])], message="fast-import reset")
-                else:
-                    s = refs_mod.rev_parse(repo, target)
-                    if s:
-                        refs_mod.update_ref(repo, ref, s, message="fast-import reset")
-            elif sub is not None:
-                # No "from" line follows this reset; let the main loop see it.
-                i -= 1
-        # ignore other directives
-    return 0
+    data = sys.stdin.buffer.read()
+    fi = _fi.FastImport(repo)
+    fi.set_argv(argv)
+    try:
+        return fi.run(data)
+    except _fi.FastImportUsage:
+        sys.stderr.write("usage: " + _fi._FAST_IMPORT_USAGE + "\n")
+        return 129
+    except _fi.FastImportDie as exc:
+        msg = str(exc)
+        sys.stderr.write("fatal: %s\n" % msg)
+        loc = _fast_import_crash_report(
+            repo, msg, fi.cmd_hist, fi.marks, fi.tags, fi.branches,
+            fi.export_marks_file)
+        sys.stderr.write("fast-import: dumping crash report to %s\n" % loc)
+        # write any marks gathered so far, like die_nicely -> dump_marks
+        try:
+            fi._dump_marks()
+        except Exception:
+            pass
+        return 128
 
 
 _IT_USAGE = (
@@ -24325,7 +25907,8 @@ def cmd_multi_pack_index(argv: list[str]) -> int:
         except (OSError, ValueError) as exc:
             _err(f"multi-pack-index verify failed: {exc}")
             return 1
-        _print(f"ok ({packs} packs, {objects} objects)")
+        # git's multi-pack-index verify is silent on success.
+        del packs, objects
         return 0
     if args.action in ("expire", "repack"):
         return 0

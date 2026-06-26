@@ -231,6 +231,35 @@ def merge_commits(
     return _ort_result(repo, tree, opt)
 
 
+def merge_ort_generic(
+    repo: Repository,
+    our_tree: str,
+    their_tree: str,
+    base_trees: list[str],
+    *,
+    branch1: str = "HEAD",
+    branch2: str = "",
+    ancestor: str = "constructed fake ancestor",
+    cfg: "Optional[mergeort.MergeConfig]" = None,
+) -> OrtResult:
+    """Port of merge_ort_generic() (merge-ort-wrappers.c): a non-recursive
+    merge of two trees against a single given base tree, with explicit
+    branch/ancestor labels for conflict markers (used by ``git am -3``).
+
+    ``base_trees`` is the bases list (am passes exactly one fake-ancestor
+    tree).  Returns an OrtResult whose ``tree``/``conflicts``/
+    ``conflict_index`` describe the merge outcome.
+    """
+    base_tree = base_trees[0] if base_trees else objs.hash_bytes("tree", b"", repo)[0]
+    if cfg is None:
+        cfg = _build_config(repo, base_tree, our_tree, their_tree)
+    opt = mergeort.Opt(repo, ancestor, branch1, branch2, **_cfg_kwargs(cfg))
+    opt.detect_directory_renames = 0  # MERGE_DIRECTORY_RENAMES_NONE
+    tree, _clean = mergeort.merge_incore_nonrecursive(
+        opt, base_tree, our_tree, their_tree)
+    return _ort_result(repo, tree, opt)
+
+
 def _cfg_kwargs(cfg) -> dict:
     if cfg is None:
         return {}

@@ -3226,3 +3226,127 @@ def test_batch11_gpg_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch11_gpg_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+BATCH11_ENG_CASES = [
+    ('am-basic', [('write', 'f.txt', 'line1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n')], ['am', 'p.mbox']),
+    ('am-basic-log', [('write', 'f.txt', 'line1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox']], ['log', '--format=%H %an <%ae> %ad | %s | %b', '--date=raw']),
+    ('am-conflict', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n')], ['am', 'p.mbox']),
+    ('am-conflict-abort', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox']], ['am', '--abort']),
+    ('am-conflict-skip', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox']], ['am', '--skip']),
+    ('am-continue-resolve', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox'], ('write', 'f.txt', 'line1\nline2\n'), ['add', '-A']], ['am', '--continue']),
+    ('am-continue-no-changes', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox']], ['am', '--continue']),
+    ('am-show-raw', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', 'p.mbox']], ['am', '--show-current-patch=raw']),
+    ('am-signoff', [('write', 'f.txt', 'line1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'), ['am', '-s', 'p.mbox']], ['log', '-1', '--format=%B']),
+    ('am-empty-stop', [('write', 'f.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'e.mbox', 'From 35979d65c898595d969b01edfded6f6e9130c00d Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] empty patch subject\n\nempty body\n-- \n2.54.0\n')], ['am', 'e.mbox']),
+    ('am-empty-keep-log', [('write', 'f.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'e.mbox', 'From 35979d65c898595d969b01edfded6f6e9130c00d Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] empty patch subject\n\nempty body\n-- \n2.54.0\n'), ['am', '--empty=keep', 'e.mbox']], ['log', '--format=%s|%b']),
+    ('am-3way-conflict', [('write', 'f.txt', 'a\nb\nc\nd\ne\nf\ng\nh\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'f.txt', 'a\nb\nC\nD\nE\nf\ng\nh\n'), ['add', '-A'], ['commit', '-m', 'up'], ('write', 'wa.mbox', 'From bad3116cc3e160a3b979456418fa1336c03e014d Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] insert X\n\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex 71ac1b5..ca5eeb3 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -2,6 +2,7 @@ a\n b\n c\n d\n+X\n e\n f\n g\n-- \n2.54.0\n')], ['am', '-3', 'wa.mbox']),
+    ('am-3way-index', [('write', 'f.txt', 'a\nb\nc\nd\ne\nf\ng\nh\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'f.txt', 'a\nb\nC\nD\nE\nf\ng\nh\n'), ['add', '-A'], ['commit', '-m', 'up'], ('write', 'wa.mbox', 'From bad3116cc3e160a3b979456418fa1336c03e014d Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] insert X\n\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex 71ac1b5..ca5eeb3 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -2,6 +2,7 @@ a\n b\n c\n d\n+X\n e\n f\n g\n-- \n2.54.0\n'), ['am', '-3', 'wa.mbox']], ['ls-files', '-s']),
+    ('am-binary-tree', [('write', 'del.txt', 'content\n'), ('write', 'ren.txt', 'old\n'), ('write', 'b.bin', ' bin\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'bin.mbox', 'From ff205d13cefb95c223414cf4396366eb87842558 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] change binary\n\n---\n b.bin | Bin\n\ndiff --git a/b.bin b/b.bin\nindex 20f982d561018f3bfdd8f3230d65ded24d81c79c..be50f221a926f4ca621910d18897933ce210d61e 100644\nGIT binary patch\nliteral 8\nPcmezW@2``mpAi=T7^Vae\n\nliteral 7\nOcmZQzWJ=1+;{pH!zyU`9\n\n-- \n2.54.0\n'), ['am', 'bin.mbox']], ['cat-file', '-p', 'HEAD^{tree}']),
+    ('am-whitespace-fix', [('write', 'w.txt', 'hello\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'ws.mbox', 'From e79f53051276e28001fdef0e5c3f223f9fee9e58 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] add ws\n\n---\n w.txt | 1 +\n\ndiff --git a/w.txt b/w.txt\nindex ce01362..1e69bc7 100644\n--- a/w.txt\n+++ b/w.txt\n@@ -1 +1,2 @@\n hello\n+world  \n-- \n2.54.0\n')], ['am', '--whitespace=fix', 'ws.mbox']),
+    ('am-whitespace-error', [('write', 'w.txt', 'hello\n'), ['add', '-A'], ['commit', '-m', 'base'], ('write', 'ws.mbox', 'From e79f53051276e28001fdef0e5c3f223f9fee9e58 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] add ws\n\n---\n w.txt | 1 +\n\ndiff --git a/w.txt b/w.txt\nindex ce01362..1e69bc7 100644\n--- a/w.txt\n+++ b/w.txt\n@@ -1 +1,2 @@\n hello\n+world  \n-- \n2.54.0\n')], ['am', '--whitespace=error', 'ws.mbox']),
+    ('am-reject', [('write', 'f.txt', 'different\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n')], ['am', '--reject', 'p.mbox']),
+    ('am-cdiad-dates', [('write', 'a.txt', 'alpha\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'p.mbox', 'From abc1230000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: Alice <alice@example.com>\nDate: Sun, 13 Sep 2020 14:26:40 +0000\nSubject: [PATCH] feat thing\n\nbody here\n---\n a.txt | 2 +-\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n'), ['am', '--committer-date-is-author-date', 'p.mbox']], ['log', '-1', '--format=%an|%ae|%ad|%cn|%cd', '--date=raw']),
+    ('am-no-session-continue', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '--continue']),
+    ('am-bad-empty', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '--empty=bogus', 'p.mbox']),
+    ('am-bad-patch-format', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '--patch-format=bogus']),
+    ('am-bad-quoted-cr', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '--quoted-cr=bogus', 'p.mbox']),
+    ('am-two-cmdmodes', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '--skip', '--abort']),
+    ('am-interactive-no-patches', [('write', 'f.txt', 'a\n'), ['add', '-A'], ['commit', '-m', 'i']], ['am', '-i']),
+    ('am-dirty-index', [('write', 'f.txt', 'line1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'other.txt', 'x\n'), ['add', 'other.txt'], ('write', 'p.mbox', 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n')], ['am', 'p.mbox']),
+    ('mailsplit-multi', [('write', 'm.mbox', 'From 88cc9bfe7e17d8a3e461d18654b86332d751d767 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nSubject: [PATCH 1/2] one\n\nbody1\n\nFrom ef28e0a3abb4d3111ce6da1f6acdabc3680247e5 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nSubject: [PATCH 2/2] two\n\nbody2\n')], ['mailsplit', '-osplit', '-b', 'm.mbox']),
+]
+
+BATCH11_ENG_STDIN_CASES = [
+    ('am-stdin', [('write', 'f.txt', 'line1\n'), ['add', '-A'], ['commit', '-m', 'init']], ['am'], 'From b9c5a12fc2eac585f2426f1397ad623c1701d2a8 Mon Sep 17 00:00:00 2001\nFrom: Parity <parity@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nSubject: [PATCH] second commit\n\nbody of second\n---\n f.txt | 1 +\n\ndiff --git a/f.txt b/f.txt\nindex a29bdeb..c0d0fb4 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1,2 @@\n line1\n+line2\n-- \n2.54.0\n\n'),
+    ('repack -a -d collapses loose into one pack, deletes loose', [('write', 'a.txt', 'hello\n'), ['add', 'a.txt'], ['commit', '-m', 'first'], ('write', 'b.txt', 'world\n'), ['add', 'b.txt'], ['commit', '-m', 'second'], ['repack', '-a', '-d']], ['count-objects', '-v'], ''),
+    ('plain repack is incremental (keeps loose objects, prune-packable nonzero)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack']], ['count-objects', '-v'], ''),
+    ('repack -n is no-update-server-info, not dry-run', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-n']], ['count-objects', '-v'], ''),
+    ('repack -d on already-fully-packed repo prints Nothing new to pack', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-a', '-d']], ['repack', '-d'], ''),
+    ('repack -q -d on packed repo suppresses Nothing new to pack', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-a', '-d']], ['repack', '-q', '-d'], ''),
+    ('repack -a -d -k folds unreachable into single pack (no loose)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'c.txt', 'extra\n'), ['add', 'c.txt'], ['commit', '-m', 'c2'], ['reset', '--hard', 'HEAD~1'], ['reflog', 'expire', '--expire=now', '--all'], ['repack', '-a', '-d', '-k']], ['count-objects', '-v'], ''),
+    ('repack -A -d packs reachable, loosens unreachable', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'c.txt', 'extra\n'), ['add', 'c.txt'], ['commit', '-m', 'c2'], ['reset', '--hard', 'HEAD~1'], ['reflog', 'expire', '--expire=now', '--all'], ['repack', '-A', '-d']], ['count-objects', '-v'], ''),
+    ('repack --cruft -d --cruft-expiration=now drops old unreachable from cruft', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'c.txt', 'extra\n'), ['add', 'c.txt'], ['commit', '-m', 'c2'], ['reset', '--hard', 'HEAD~1'], ['reflog', 'expire', '--expire=now', '--all'], ['repack', '--cruft', '-d', '--cruft-expiration=now']], ['count-objects', '-v'], ''),
+    ('repack --geometric=2 -d combines packs, preserves object set', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-d'], ('write', 'a.txt', 'hi\nworld\n'), ['add', 'a.txt'], ['commit', '-m', 'c2'], ['repack', '-d'], ['repack', '--geometric=2', '-d']], ['count-objects', '-v'], ''),
+    ('repack -a -d --max-pack-size below 1MiB warns to stderr', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '-a', '-d', '--max-pack-size=100'], ''),
+    ('repack -a -d -q --max-pack-size still warns (warning not gated by -q)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '-a', '-d', '-q', '--max-pack-size=100'], ''),
+    ('repack -a -d -m writes a valid multi-pack-index', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-a', '-d', '-m']], ['multi-pack-index', 'verify'], ''),
+    ('repack -a -d preserves full object set (cat-file batch-all-objects)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ('write', 'b.txt', 'yo\n'), ['add', 'b.txt'], ['commit', '-m', 'c2'], ['repack', '-a', '-d']], ['cat-file', '--batch-all-objects', '--batch-check'], ''),
+    ('repack --geometric=2 -a is incompatible (fatal rc 128)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--geometric=2', '-a'], ''),
+    ('repack -A -k incompatible (fatal rc 128)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '-A', '-k'], ''),
+    ('repack -k --cruft incompatible (fatal rc 128)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '-k', '--cruft'], ''),
+    ('repack --bogus unknown option prints error + usage (rc 129)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--bogus'], ''),
+    ('repack --window without value prints error only (rc 129, no usage)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--window'], ''),
+    ('repack --geometric=abc expects integer (rc 129, no usage)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--geometric=abc'], ''),
+    ('repack --max-pack-size=abc non-negative integer error (rc 129)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--max-pack-size=abc'], ''),
+    ('repack --missing rejected as unknown option (rc 129)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--missing=allow-any'], ''),
+    ('repack --filter-to without --filter is fatal (rc 128)', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1']], ['repack', '--filter-to=x'], ''),
+    ('repack -h prints usage to stdout (rc 129)', [], ['repack', '-h'], ''),
+    ('repack -a -d --window/--depth/--threads accepted, same object result', [('write', 'a.txt', 'hi\n'), ['add', 'a.txt'], ['commit', '-m', 'c1'], ['repack', '-a', '-d', '--window=10', '--depth=5', '--threads=2']], ['rev-list', '--all', '--count'], ''),
+    ('repack -a -d on empty repo writes nothing, no pack', [['repack', '-a', '-d']], ['count-objects', '-v'], ''),
+    ('help_flag', [], ['fast-import', '-h'], ''),
+    ('positional_usage', [], ['fast-import', 'extra'], ''),
+]
+
+@pytest.mark.parametrize("case", BATCH11_ENG_CASES, ids=[c[0] for c in BATCH11_ENG_CASES])
+def test_batch11_eng_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH11_ENG_STDIN_CASES, ids=[c[0] for c in BATCH11_ENG_STDIN_CASES])
+def test_batch11_eng_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# repack with --cruft / --filter produces multiple packs whose exact byte sizes
+# differ between git and pygit (different delta/compression), so count-objects's
+# `size`/`size-pack` KiB fields are not byte-lockable. These verify every OTHER
+# count-objects field (count/in-pack/packs/prune-packable/garbage) — i.e. the
+# object set and pack topology — with the two size lines normalized away.
+BATCH11_REPACK_CO_CASES = [
+    ("repack-cruft-d-two-packs",
+     [("write", "a.txt", "hi\n"), ["add", "a.txt"], ["commit", "-m", "c1"],
+      ("write", "c.txt", "extra\n"), ["add", "c.txt"], ["commit", "-m", "c2"],
+      ["reset", "--hard", "HEAD~1"], ["reflog", "expire", "--expire=now", "--all"],
+      ["repack", "--cruft", "-d"]],
+     ["count-objects", "-v"]),
+    ("repack-filter-blob-none-two-packs",
+     [("write", "a.txt", "hi\n"), ["add", "a.txt"], ["commit", "-m", "c1"],
+      ("write", "d.txt", "deep\n"), ["add", "d.txt"], ["commit", "-m", "c2"],
+      ["repack", "-a", "-d"], ["repack", "--filter=blob:none", "-a", "-d"]],
+     ["count-objects", "-v"]),
+]
+
+
+@pytest.mark.parametrize("case", BATCH11_REPACK_CO_CASES, ids=[c[0] for c in BATCH11_REPACK_CO_CASES])
+def test_batch11_repack_countobjects_parity(case, tmp_path: Path, git_254_oracle: str):
+    import re
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, probe = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    def norm(s: str) -> str:
+        # pack/loose KiB sizes are not byte-reproducible across implementations
+        s = re.sub(r"(?m)^(size|size-pack|size-garbage): \d+$", r"\1: X", s)
+        return s
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, text=True, capture_output=True)
+        results[tool] = (proc.returncode, norm(proc.stdout), proc.stderr)
+
+    assert results["pygit"] == results["oracle"]
