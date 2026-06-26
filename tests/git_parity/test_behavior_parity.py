@@ -3179,3 +3179,50 @@ def test_batch10_network_parity(case, tmp_path: Path, git_254_oracle: str):
         results[tool] = (proc.returncode, norm(proc.stdout), norm(proc.stderr),
                          norm(packed), [(k, norm(v)) for k, v in refs])
     assert results['pygit'] == results['oracle']
+
+
+BATCH11_GPG_CASES = [
+    ('commit -t missing template 128', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['commit', '--allow-empty', '-t', '/tmp/pygit_no_such_template_xyz']),
+    ('commit -t ignored when -m given', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['commit', '--allow-empty', '-t', '/tmp/pygit_no_such_template_xyz', '-m', 'kept']], ['log', '-1', '--format=%B']),
+    ('commit -S broken gpg 128', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'gpg.program', '/bin/false']], ['commit', '--allow-empty', '-S', '-m', 'sign']),
+    ('commit -S gpg no SIG_CREATED 128', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'gpg.program', '/bin/true']], ['commit', '--allow-empty', '-S', '-m', 'sign']),
+    ('commit.gpgsign true broken gpg 128', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'commit.gpgsign', 'true'], ['config', 'gpg.program', '/bin/false']], ['commit', '--allow-empty', '-m', 'x']),
+    ('no-gpg-sign overrides config 0', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'commit.gpgsign', 'true'], ['config', 'gpg.program', '/bin/false']], ['commit', '--allow-empty', '--no-gpg-sign', '-m', 'unsigned']),
+    ('commit -t requires value 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['commit', '-t']),
+    ('commit -F requires value 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['commit', '-F']),
+    ('tag -s broken gpg 128', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'gpg.program', '/bin/false']], ['tag', '-s', '-m', 'tm', 'sigtag']),
+    ('tag -u requires value 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['tag', '-u']),
+    ('tag --local-user requires value 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['tag', '--local-user']),
+    ('tag -F requires value 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['tag', '-F']),
+    ('verify-commit unsigned 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', 'HEAD']),
+    ('verify-commit -v unsigned 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', '-v', 'HEAD']),
+    ('verify-commit --raw unsigned 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', '--raw', 'HEAD']),
+    ('verify-commit no args 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit']),
+    ('verify-commit unknown long option 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', '--bogus']),
+    ('verify-commit unknown short switch 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', '-Z']),
+    ('verify-commit nonexistent 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', 'nope']),
+    ('verify-commit on tag object 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['tag', '-a', '-m', 't', 'v1']], ['verify-commit', 'v1']),
+    ('verify-commit multi one bad 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-commit', 'HEAD', 'nope']),
+    ('verify-tag no args 129', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-tag']),
+    ('verify-tag missing 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-tag', 'notag']),
+    ('verify-tag unsigned annotated 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['tag', '-a', '-m', 't', 'v1']], ['verify-tag', 'v1']),
+    ('verify-tag -v unsigned annotated 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['tag', '-a', '-m', 't', 'v1']], ['verify-tag', '-v', 'v1']),
+    ('verify-tag on commit object 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init']], ['verify-tag', 'HEAD']),
+    ('tag -v unsigned annotated 1', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['tag', '-a', '-m', 't', 'v1']], ['tag', '-v', 'v1']),
+]
+
+BATCH11_GPG_STDIN_CASES = [
+    ('commit -t seeds message via core.editor', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ('write', 'ed.sh', 'printf \'X\\n\' >> "$1"\n'), ['config', 'core.editor', 'sh ed.sh'], ('write', 't.txt', 'Subj\nBody\n'), ['commit', '--no-status', '--allow-empty', '-t', 't.txt']], ['log', '-1', '--format=%B'], ''),
+    ('commit -t unchanged template aborts', [('write', 'f', 'hi\n'), ['add', 'f'], ['commit', '-m', 'init'], ['config', 'core.editor', 'true'], ('write', 't.txt', 'Untouched\n'), ['commit', '--no-status', '--allow-empty', '-t', 't.txt']], ['log', '--oneline'], ''),
+]
+
+@pytest.mark.parametrize("case", BATCH11_GPG_CASES, ids=[c[0] for c in BATCH11_GPG_CASES])
+def test_batch11_gpg_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH11_GPG_STDIN_CASES, ids=[c[0] for c in BATCH11_GPG_STDIN_CASES])
+def test_batch11_gpg_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)

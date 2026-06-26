@@ -3712,6 +3712,268 @@ def _commit_message_conflict(args) -> Optional[str]:
     return None
 
 
+def _require_value_flags(argv: list[str], specs: "dict[str, str]") -> None:
+    """Raise _SwitchParseError when a value-taking flag appears as the final
+    token (or before the next option) with no value, matching parse-options.
+
+    *specs* maps each accepted token form to the error word to quote.  Short
+    flags (``-x``) report ``switch `x'``; long flags report ``option `name'``.
+    Only the separate-token form is checked here (the attached ``-xval`` /
+    ``--long=val`` forms always carry a value).  Tokens after ``--`` skipped.
+    """
+    i = 0
+    n = len(argv)
+    while i < n:
+        t = argv[i]
+        if t == "--":
+            break
+        if t in specs:
+            if i + 1 >= n:
+                if t.startswith("--"):
+                    raise _SwitchParseError(
+                        f"error: option `{t[2:]}' requires a value")
+                raise _SwitchParseError(
+                    f"error: switch `{t[1]}' requires a value")
+            i += 2
+            continue
+        i += 1
+
+
+def _extract_gpg_sign_optarg(argv: list[str]) -> tuple[list[str], Optional[str], bool]:
+    """Strip ``-S`` / ``-Skeyid`` / ``--gpg-sign`` / ``--gpg-sign=keyid`` and
+    ``--no-gpg-sign`` from *argv*, honoring git's PARSE_OPT_OPTARG semantics:
+    only the *attached* forms supply a key-id; a following token is never taken
+    as the value.  Returns (argv_without_them, gpg_sign_value_or_None,
+    no_gpg_sign_seen).  Tokens after ``--`` are left untouched."""
+    out: list[str] = []
+    gpg_sign: Optional[str] = None
+    no_sign = False
+    i = 0
+    n = len(argv)
+    seen_ddash = False
+    while i < n:
+        t = argv[i]
+        if seen_ddash:
+            out.append(t)
+            i += 1
+            continue
+        if t == "--":
+            seen_ddash = True
+            out.append(t)
+            i += 1
+            continue
+        if t == "--no-gpg-sign":
+            no_sign = True
+            gpg_sign = None
+            i += 1
+            continue
+        if t == "--gpg-sign":
+            gpg_sign = ""
+            no_sign = False
+            i += 1
+            continue
+        if t.startswith("--gpg-sign="):
+            gpg_sign = t[len("--gpg-sign="):]
+            no_sign = False
+            i += 1
+            continue
+        if t == "-S":
+            gpg_sign = ""
+            no_sign = False
+            i += 1
+            continue
+        if t.startswith("-S") and len(t) > 2 and not t.startswith("--"):
+            gpg_sign = t[2:]
+            no_sign = False
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out, gpg_sign, no_sign
+
+
+def _strbuf_stripspace(text: str, strip_comments_char: Optional[str]) -> str:
+    """Port of strbuf_stripspace(): trim trailing whitespace on each line, drop
+    leading/trailing blank lines, collapse runs of blank lines into a single
+    one.  When *strip_comments_char* is given, lines beginning with it are
+    removed entirely (cleanup=all)."""
+    out: list[str] = []
+    pending_blank = False
+    started = False
+    for raw in text.split("\n"):
+        line = raw.rstrip(" \t\r\f\v")
+        if strip_comments_char is not None and line.startswith(strip_comments_char):
+            continue
+        if line == "":
+            if started:
+                pending_blank = True
+            continue
+        if pending_blank:
+            out.append("")
+            pending_blank = False
+        out.append(line)
+        started = True
+    result = "\n".join(out)
+    if result:
+        result += "\n"
+    return result
+
+
+def _rest_is_empty(sb: str, start: int) -> bool:
+    """Port of rest_is_empty() (sequencer.c): the remainder is only whitespace
+    and Signed-off-by trailers."""
+    sign_off = "Signed-off-by: "
+    i = start
+    n = len(sb)
+    while i < n:
+        nl = sb.find("\n", i)
+        eol = nl if nl >= 0 else n
+        if eol - i >= len(sign_off) and sb.startswith(sign_off, i):
+            i = eol
+            if nl >= 0:
+                i += 1
+            continue
+        while i < eol:
+            if not sb[i].isspace():
+                return False
+            i += 1
+        if nl >= 0:
+            i += 1
+        else:
+            break
+    return True
+
+
+def _template_untouched(sb: str, template_text: Optional[str], cleanup_all: bool) -> bool:
+    """Port of template_untouched() (sequencer.c): true if the edited buffer is
+    still the (stripped) template followed by nothing but whitespace/sign-offs.
+    Here cleanup is NONE only when --cleanup=verbatim; otherwise the template
+    is stripspace'd before comparison."""
+    if template_text is None:
+        return False
+    tmpl = _strbuf_stripspace(template_text, "#" if cleanup_all else None)
+    if not tmpl:
+        return False
+    if sb.startswith(tmpl):
+        start = len(tmpl)
+    else:
+        start = 0
+    return _rest_is_empty(sb, start)
+
+
+def _commit_apply_template(repo: Repository, args) -> Optional[int]:
+    """Handle ``commit -t/--template``.  Returns None to continue, or an exit
+    code to return immediately (missing template, unedited template, or
+    editor-aborted commit)."""
+    if args.template is None:
+        return None
+    # Any explicit message source (-m/-F/-C/-c/--fixup/--squash) wins; the
+    # template file is never even opened in that case (prepare_to_commit order).
+    if args.message is not None:
+        return None
+    try:
+        with open(args.template, "rb") as fh:
+            template_text = fh.read().decode("utf-8", "replace")
+    except OSError as e:
+        import errno
+        _err(f"fatal: could not read '{args.template}': {os.strerror(e.errno or errno.ENOENT)}")
+        return 128
+    # cleanup mode: default/strip => clean (strip comments), verbatim => NONE.
+    cleanup_none = (args.cleanup == "verbatim")
+    cleanup_all = args.cleanup in (None, "default", "strip", "whitespace", "all", "scissors")
+    # prepare_to_commit: with a template, clean_message_contents=0, so the seed
+    # written to COMMIT_EDITMSG is the raw template (no stripspace yet).
+    seed = template_text
+    edited = _launch_commit_editor(repo, seed)
+    if edited is None:
+        _err("error: There was a problem with the editor '%s'." % _commit_editor_name(repo))
+        _err("Please supply the message using either -m or -F option.")
+        return 1
+    # cleanup of the editor result.
+    if cleanup_none:
+        cleaned = edited
+    else:
+        cleaned = _strbuf_stripspace(edited, "#" if cleanup_all else None)
+    # message_is_empty / template_untouched aborts (unless --allow-empty-message).
+    if not args.allow_empty_message:
+        if _commit_message_is_empty(cleaned, cleanup_none):
+            _err("Aborting commit due to empty commit message.")
+            return 1
+        if _template_untouched(cleaned, template_text, cleanup_all):
+            _err("Aborting commit; you did not edit the message.")
+            return 1
+    args.message = cleaned
+    # The message is already cleaned here; _cleanup_commit_message later is a
+    # no-op on already-stripped text, matching C Git's single cleanup pass.
+    return None
+
+
+def _commit_message_is_empty(sb: str, cleanup_none: bool) -> bool:
+    """Port of message_is_empty()."""
+    if cleanup_none and sb:
+        return False
+    return _rest_is_empty(sb, 0)
+
+
+def _commit_editor_name(repo: Repository) -> str:
+    from . import addpatch
+    return addpatch._editor_command(repo)
+
+
+def _launch_commit_editor(repo: Repository, seed: str) -> Optional[str]:
+    """Write *seed* to .git/COMMIT_EDITMSG, run the configured editor, and read
+    the file back.  Returns the edited text, or None if the editor failed."""
+    import subprocess
+    from . import addpatch
+    editor = addpatch._editor_command(repo)
+    path = repo.gitdir / "COMMIT_EDITMSG"
+    path.write_text(seed, encoding="utf-8")
+    try:
+        rc = subprocess.call(
+            "%s %s" % (editor, addpatch._shell_quote(str(path))), shell=True)
+    except OSError:
+        return None
+    if rc != 0:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _resolve_sign_commit(repo: Repository, args) -> Optional[str]:
+    """Resolve the effective ``sign_commit`` value (commit.c semantics):
+
+      * config commit.gpgsign=true  -> "" (sign with default key)
+      * -S / --gpg-sign             -> "" (or the inline key-id)
+      * --no-gpg-sign               -> None (disable)
+
+    Returns the signing-key string ("" = default), or None when unsigned.
+    """
+    from . import gitconfig
+    sign: Optional[str] = None
+    try:
+        cfg = gitconfig.get(repo, "commit.gpgsign")
+    except Exception:
+        cfg = None
+    if cfg is not None and _git_config_bool(cfg):
+        sign = ""
+    if getattr(args, "gpg_sign", None) is not None:
+        sign = args.gpg_sign
+    if getattr(args, "no_gpg_sign", False):
+        sign = None
+    return sign
+
+
+def _ident_no_date(signature: str) -> str:
+    """From a 'Name <email> <ts> <tz>' signature line, return 'Name <email>'
+    (git_committer_info(IDENT_NO_DATE))."""
+    gt = signature.rfind(">")
+    if gt >= 0:
+        return signature[:gt + 1]
+    return signature
+
+
 def cmd_commit(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit commit", add_help=False)
     ap.add_argument("-m", "--message", action="append", default=None)
@@ -3761,8 +4023,31 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("-z", "--null", dest="nul", action="store_true")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-t", "--template", dest="template", default=None)
+    # -S / --gpg-sign carry an OPTIONAL inline key-id (PARSE_OPT_OPTARG): only
+    # the attached forms `-Skeyid` / `--gpg-sign=keyid` supply a value; a bare
+    # `-S` / `--gpg-sign` means "sign with the default key" (sentinel "").
+    ap.add_argument("--gpg-sign-arg", dest="gpg_sign", default=None)
+    ap.add_argument("--no-gpg-sign", dest="no_gpg_sign", action="store_true")
     ap.add_argument("pathspec", nargs="*")
+    # Pre-pass: pull out -S/--gpg-sign with OPTARG semantics so a following
+    # token is never swallowed as the key-id (matches PARSE_OPT_OPTARG).
+    argv, gpg_sign_pre, no_gpg_sign_pre = _extract_gpg_sign_optarg(argv)
+    # -t/--template (and -F/--file, -F's value) require a value: report the
+    # exact parse-options error instead of argparse's generic usage dump.
+    try:
+        _require_value_flags(argv, {
+            "-t": "t", "--template": "template",
+            "-F": "F", "--file": "file",
+        })
+    except _SwitchParseError as exc:
+        _err(exc.message)
+        return exc.rc
     args = ap.parse_args(argv)
+    if no_gpg_sign_pre:
+        args.no_gpg_sign = True
+    if gpg_sign_pre is not None:
+        args.gpg_sign = gpg_sign_pre
     repo = _repo()
 
     # commit -p/--patch implies --interactive.  The interactive machinery stages
@@ -3853,6 +4138,14 @@ def cmd_commit(argv: list[str]) -> int:
         args.message = header
     else:
         args.message = body
+    # commit -t/--template: seed the editor with the template, but only when no
+    # other message source applies (prepare_to_commit precedence: -m/-F/-C/-c/
+    # --fixup/MERGE_MSG/SQUASH_MSG all win over the template).  When the editor
+    # leaves the template intact, the commit aborts ("you did not edit the
+    # message").  Errors surfacing the missing file are byte-exact with C Git.
+    template_aborted = _commit_apply_template(repo, args)
+    if template_aborted is not None:
+        return template_aborted
     try:
         from . import rerere as _rr
         _rr.scan_and_record(repo)
@@ -4008,7 +4301,22 @@ def cmd_commit(argv: list[str]) -> int:
         return 1
     msg = message if message.endswith("\n") else message + "\n"
     c = objs.Commit(tree=tree, parents=parents, author=author_sig, committer=committer_sig, message=msg)
-    sha = objs.write_object(repo, "commit", c.encode())
+    commit_bytes = c.encode()
+    # GPG signing: -S/--gpg-sign[=keyid] or commit.gpgsign=true, unless
+    # --no-gpg-sign.  Sign the commit payload and fold the signature into a
+    # gpgsig header.  On gpg failure git aborts before writing the object.
+    sign_commit = _resolve_sign_commit(repo, args)
+    if sign_commit is not None:
+        from . import gpgsign
+        signing_key = (sign_commit if sign_commit
+                       else gpgsign.get_signing_key(repo, _ident_no_date(committer_sig)))
+        sig, errmsg = gpgsign.sign_buffer(repo, commit_bytes, signing_key)
+        if sig is None:
+            _err("error: " + errmsg)
+            _err("fatal: failed to write commit object")
+            return 128
+        commit_bytes = gpgsign.add_header_signature(commit_bytes, sig)
+    sha = objs.write_object(repo, "commit", commit_bytes)
     verb = "commit (amend)" if args.amend else ("commit (initial)" if not parents else "commit")
     reflog_msg = f"{verb}: {msg.splitlines()[0]}"
     if head_sym:
@@ -4126,6 +4434,42 @@ def _pad_column(text: str, spec) -> str:
     return text + " " * pad
 
 
+def _gpg_format_placeholders(repo: Repository, sha: str, fmt: str
+                            ) -> "list[tuple[str, str]]":
+    """Expand the %G* signature placeholders (pretty.c).  Returns (token, value)
+    pairs.  When no %G token is present the commit is never read/verified and
+    every placeholder expands to empty (matching git's lazy behavior)."""
+    empty = [("%GG", ""), ("%GS", ""), ("%GK", ""), ("%GP", ""),
+             ("%GF", ""), ("%GT", ""), ("%G?", "")]
+    if "%G" not in fmt:
+        return empty
+    from . import gpgsign
+    try:
+        _t, data = objs.read_object(repo, sha)
+    except KeyError:
+        return empty
+    fields = gpgsign.check_commit_signature_full(repo, data)
+    result = fields["result"]
+    # %G? : 'G' good (unless trust UNDEFINED/NEVER -> 'U'); B/E/N/X/Y/R verbatim.
+    if result == "G":
+        gq = "U" if fields["trust_level"] in (0, 1) else "G"
+    elif result in ("B", "E", "N", "X", "Y", "R"):
+        gq = result
+    else:
+        gq = ""
+    # %GT : trust level name, but only meaningful once a signature was checked.
+    gt = fields["trust_name"] if result != "N" else "undefined"
+    return [
+        ("%GG", fields["output"]),
+        ("%GS", fields["signer"]),
+        ("%GK", fields["key"]),
+        ("%GP", fields["primary_key_fingerprint"]),
+        ("%GF", fields["fingerprint"]),
+        ("%GT", gt),
+        ("%G?", gq),
+    ]
+
+
 def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: dict,
                           date_mode: str = "default", abbrev: int = 7,
                           reflog=None, date_given: bool = False) -> str:
@@ -4177,11 +4521,9 @@ def _expand_commit_format(repo: Repository, sha: str, c, fmt: str, decorations: 
         # %e (encoding) is empty for unencoded commits; %N is the commit's note.
         ("%e", ""),
         ("%N", _note_text(repo, sha) if "%N" in fmt else ""),
-        # Signature placeholders: pythongit does not verify GPG signatures, so
-        # commits read as unsigned ("N", empty detail fields), like unsigned
-        # commits under C Git.
-        ("%G?", "N"), ("%GG", ""), ("%GS", ""), ("%GK", ""),
-        ("%GP", ""), ("%GF", ""), ("%GT", ""),
+        # Signature placeholders (%G*): lazily verify the commit's gpgsig like
+        # C Git (only when a %G token is present), per pretty.c.
+        *_gpg_format_placeholders(repo, sha, fmt),
         ("%s", subject), ("%D", deco_d), ("%d", deco),
         # %m is the left/right/boundary mark; without --left-right it is ">".
         ("%m", ">"),
@@ -6591,13 +6933,29 @@ def cmd_tag(argv: list[str]) -> int:
             continue
         pre.append(t)
         i += 1
+    # -u/--local-user (key-id) and -F/--file require a value: emit the exact
+    # parse-options error rather than argparse's generic usage dump.
+    try:
+        _require_value_flags(pre, {
+            "-u": "u", "--local-user": "local-user",
+            "-F": "F", "--file": "file",
+        })
+    except _SwitchParseError as exc:
+        _err(exc.message)
+        return exc.rc
     args = ap.parse_args(pre)
     repo = _repo()
     if args.verify:
+        # builtin/tag.c verify_tag(): GPG_VERIFY_VERBOSE by default, or
+        # GPG_VERIFY_OMIT_STATUS when --format is given (then pretty-print).
+        from . import gpgsign
         rc = 0
+        head_sym, _ = refs_mod.read_head(repo)
+        use_format = args.format is not None
+        flags = 4 if use_format else _GPG_VERIFY_VERBOSE  # OMIT_STATUS / VERBOSE
         for name in [n for n in (args.name, args.target) if n]:
-            ref = f"refs/tags/{name}"
-            sha = refs_mod.read_ref(repo, ref)
+            sha = (refs_mod.rev_parse(repo, name)
+                   or refs_mod.read_ref(repo, f"refs/tags/{name}"))
             if sha is None:
                 _err(f"error: tag '{name}' not found.")
                 rc = 1
@@ -6607,12 +6965,23 @@ def cmd_tag(argv: list[str]) -> int:
                 _err(f"error: {name}: cannot verify a non-tag object of type {otype}.")
                 rc = 1
                 continue
-            # We cannot GPG-verify; print the tag payload like git, then report
-            # the missing signature (unsigned tags fail verification).
-            payload = data.decode("utf-8", "replace")
-            sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
-            _err("error: no signature found")
-            rc = 1
+            payload, signature = gpgsign.parse_signature(data)
+            if not signature:
+                if flags & _GPG_VERIFY_VERBOSE:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+                _err("error: no signature found")
+                rc = 1
+                continue
+            status, gpg_stderr, gpg_status = gpgsign.verify_signed(repo, payload, signature)
+            if not (flags & 4):
+                _emit_signature_buffer(payload, flags, gpg_stderr, gpg_status)
+            if status:
+                rc = 1
+                continue
+            if use_format:
+                # pretty_print_ref() uses the bare command-line name as refname.
+                _print(_fer_expand(repo, name, sha, args.format, head_sym))
         return rc
     if (args.list or args.num is not None or args.sort is not None
             or args.points_at is not None or args.format is not None
@@ -6733,7 +7102,19 @@ def cmd_tag(argv: list[str]) -> int:
     if not target:
         _err(f"fatal: Failed to resolve '{args.target or 'HEAD'}' as a valid ref.")
         return 128
-    annotated = (args.annotate or args.sign or args.message is not None
+    # Effective signing: -s/--sign or -u/--local-user force signing; otherwise
+    # tag.gpgsign=true signs annotated tags created (builtin/tag.c: opt.sign).
+    # -u also selects the signing key (set_signing_key(keyid)).
+    do_sign = bool(args.sign or args.local_user is not None)
+    if not do_sign:
+        from . import gitconfig
+        try:
+            tcfg = gitconfig.get(repo, "tag.gpgsign")
+        except Exception:
+            tcfg = None
+        if tcfg is not None and _git_config_bool(tcfg):
+            do_sign = True
+    annotated = (args.annotate or do_sign or args.message is not None
                  or args.file is not None or args.local_user is not None
                  or args.trailer is not None)
     old_sha = refs_mod.read_ref(repo, ref)
@@ -6758,7 +7139,25 @@ def cmd_tag(argv: list[str]) -> int:
             f"tagger {tagger}\n"
             f"\n{message}"
         )
-        tag_sha = objs.write_object(repo, "tag", body.encode("utf-8"))
+        body_bytes = body.encode("utf-8")
+        if do_sign:
+            from . import gpgsign
+            signing_key = (args.local_user if args.local_user
+                           else gpgsign.get_signing_key(repo, _ident_no_date(tagger)))
+            sig, errmsg = gpgsign.sign_buffer(repo, body_bytes, signing_key)
+            if sig is None:
+                # builtin/tag.c: do_sign() failure -> "unable to sign the tag",
+                # and the message is preserved in .git/TAG_EDITMSG.
+                _err("error: " + errmsg)
+                _err("error: unable to sign the tag")
+                try:
+                    (repo.gitdir / "TAG_EDITMSG").write_bytes(message.encode("utf-8"))
+                except OSError:
+                    pass
+                _err("The tag message has been left in .git/TAG_EDITMSG")
+                return 128
+            body_bytes = body_bytes + sig
+        tag_sha = objs.write_object(repo, "tag", body_bytes)
         refs_mod.update_ref(repo, ref, tag_sha)
         new_sha = tag_sha
     else:
@@ -19128,58 +19527,173 @@ def _it_apply_if_missing(head, arg):
             head.insert(0, new_item)
 
 
+_VERIFY_COMMIT_USAGE = (
+    "usage: git verify-commit [-v | --verbose] [--raw] <commit>...\n"
+    "\n"
+    "    -v, --[no-]verbose    print commit contents\n"
+    "    --[no-]raw            print raw gpg status output\n"
+    "\n")
+_VERIFY_TAG_USAGE = (
+    "usage: git verify-tag [-v | --verbose] [--format=<format>] [--raw] <tag>...\n"
+    "\n"
+    "    -v, --[no-]verbose    print tag contents\n"
+    "    --[no-]raw            print raw gpg status output\n"
+    "    --[no-]format <format>\n"
+    "                          format to use for the output\n"
+    "\n")
+
+# print_signature_buffer() flags
+_GPG_VERIFY_VERBOSE = 1
+_GPG_VERIFY_RAW = 2
+
+
+def _verify_parse_flags(argv: list[str], usage: str, allow_format: bool
+                        ) -> "tuple[int, list[str], Optional[str], Optional[int]]":
+    """Parse the shared verify-commit/verify-tag flags.  Returns
+    (flags, names, format_or_None, rc_or_None).  When rc is not None the caller
+    should return it (usage error)."""
+    flags = 0
+    names: list[str] = []
+    fmt: Optional[str] = None
+    i = 0
+    n = len(argv)
+    while i < n:
+        t = argv[i]
+        if t in ("-v", "--verbose"):
+            flags |= _GPG_VERIFY_VERBOSE
+        elif t == "--raw":
+            flags |= _GPG_VERIFY_RAW
+        elif allow_format and t == "--format":
+            i += 1
+            fmt = argv[i] if i < n else ""
+        elif allow_format and t.startswith("--format="):
+            fmt = t[len("--format="):]
+        elif t == "--":
+            i += 1
+            names.extend(argv[i:])
+            break
+        elif t.startswith("--"):
+            name = t[2:].split("=", 1)[0]
+            _err(f"error: unknown option `{name}'")
+            _err(usage)
+            return flags, names, fmt, 129
+        elif t.startswith("-") and t != "-":
+            _err(f"error: unknown switch `{t[1]}'")
+            _err(usage)
+            return flags, names, fmt, 129
+        else:
+            names.append(t)
+        i += 1
+    if not names:
+        _err(usage)
+        return flags, names, fmt, 129
+    return flags, names, fmt, None
+
+
+def _emit_signature_buffer(payload: Optional[bytes], flags: int,
+                           gpg_stderr: str, gpg_status: str) -> None:
+    """Port of print_signature_buffer(): payload to stdout when verbose, then
+    the gpg relay (raw status, or stderr) to stderr."""
+    output = gpg_status if (flags & _GPG_VERIFY_RAW) else gpg_stderr
+    if (flags & _GPG_VERIFY_VERBOSE) and payload:
+        sys.stdout.buffer.write(payload)
+        sys.stdout.flush()
+    if output:
+        sys.stderr.write(output)
+        sys.stderr.flush()
+
+
 def cmd_verify_commit(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit verify-commit", add_help=False)
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--raw", action="store_true")
-    ap.add_argument("revs", nargs="+")
-    args = ap.parse_args(argv)
+    flags, names, _fmt, rc_usage = _verify_parse_flags(
+        argv, _VERIFY_COMMIT_USAGE, allow_format=False)
+    if rc_usage is not None:
+        return rc_usage
     repo = _repo()
-    rc = 0
-    for r in args.revs:
-        s = refs_mod.rev_parse(repo, r)
+    from . import gpgsign
+    had_error = 0
+    for name in names:
+        s = refs_mod.rev_parse(repo, name)
         if not s:
-            _err(f"error: {r}: no such commit")
-            rc = 1
+            _err(f"error: commit '{name}' not found.")
+            had_error = 1
             continue
-        t, data = objs.read_object(repo, s)
+        try:
+            t, data = objs.read_object(repo, s)
+        except KeyError:
+            _err(f"error: {name}: unable to read file.")
+            had_error = 1
+            continue
         if t != "commit":
-            _err(f"error: {r}: cannot verify a non-commit object of type {t}.")
-            rc = 1
+            _err(f"error: {name}: cannot verify a non-commit object of type {t}.")
+            had_error = 1
             continue
-        # pythongit cannot verify GPG signatures, so a commit is treated as
-        # unverifiable — matching git's exit status for unsigned commits, which
-        # produce no output and a failure code.
-        rc = 1
-    return rc
+        # check_commit_signature(): split off the gpgsig header, verify the
+        # remaining payload against the detached signature.
+        payload, signature = gpgsign.parse_commit_signature(data)
+        if not signature:
+            # No gpgsig header: verify_commit_buffer returns 1 with sigc->payload
+            # left NULL, so print_signature_buffer emits nothing (not even the
+            # commit body under -v).
+            _emit_signature_buffer(None, flags, "", "")
+            had_error = 1
+            continue
+        status, gpg_stderr, gpg_status = gpgsign.verify_signed(repo, payload, signature)
+        _emit_signature_buffer(payload, flags, gpg_stderr, gpg_status)
+        if status:
+            had_error = 1
+    return had_error
 
 
 def cmd_verify_tag(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit verify-tag", add_help=False)
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--raw", action="store_true")
-    ap.add_argument("tags", nargs="+")
-    args = ap.parse_args(argv)
+    flags, names, fmt, rc_usage = _verify_parse_flags(
+        argv, _VERIFY_TAG_USAGE, allow_format=True)
+    if rc_usage is not None:
+        return rc_usage
+    if fmt is not None:
+        # With --format git omits the gpg status relay and pretty-prints the ref.
+        flags |= 4  # GPG_VERIFY_OMIT_STATUS
     repo = _repo()
-    rc = 0
-    for r in args.tags:
-        s = refs_mod.rev_parse(repo, r) or refs_mod.read_ref(repo, f"refs/tags/{r}")
+    from . import gpgsign
+    had_error = 0
+    head_sym, _ = refs_mod.read_head(repo)
+    for name in names:
+        s = (refs_mod.rev_parse(repo, name)
+             or refs_mod.read_ref(repo, f"refs/tags/{name}"))
         if not s:
-            _err(f"error: tag '{r}' not found.")
-            rc = 1
+            _err(f"error: tag '{name}' not found.")
+            had_error = 1
             continue
-        t, data = objs.read_object(repo, s)
+        try:
+            t, data = objs.read_object(repo, s)
+        except KeyError:
+            _err(f"error: {name}: unable to read file.")
+            had_error = 1
+            continue
         if t != "tag":
-            _err(f"error: {r}: cannot verify a non-tag object of type {t}.")
-            rc = 1
+            _err(f"error: {name}: cannot verify a non-tag object of type {t}.")
+            had_error = 1
             continue
-        if b"-----BEGIN PGP SIGNATURE-----" not in data and b"-----BEGIN SSH SIGNATURE-----" not in data:
+        payload, signature = gpgsign.parse_signature(data)
+        if not signature:
+            # run_gpg_verify(): no signature -> (verbose) dump whole buffer to
+            # stdout, then error("no signature found").
+            if flags & _GPG_VERIFY_VERBOSE:
+                sys.stdout.buffer.write(data)
+                sys.stdout.flush()
             _err("error: no signature found")
-            rc = 1
+            had_error = 1
             continue
-        # A signature is present but pythongit cannot verify it.
-        rc = 1
-    return rc
+        status, gpg_stderr, gpg_status = gpgsign.verify_signed(repo, payload, signature)
+        if not (flags & 4):  # not GPG_VERIFY_OMIT_STATUS
+            _emit_signature_buffer(payload, flags, gpg_stderr, gpg_status)
+        if status:
+            had_error = 1
+            continue
+        if fmt is not None:
+            # pretty_print_ref() uses the bare name given on the command line as
+            # the refname (not the fully-qualified refs/tags/<name>).
+            _print(_fer_expand(repo, name, s, fmt, head_sym))
+    return had_error
 
 
 def cmd_commit_graph(argv: list[str]) -> int:
