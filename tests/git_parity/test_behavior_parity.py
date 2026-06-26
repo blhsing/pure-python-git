@@ -2872,3 +2872,173 @@ def test_batch8_archive_binary_parity(case, tmp_path: Path, git_254_oracle: str)
         results[tool] = (proc.returncode, proc.stdout, proc.stderr)
 
     assert results["pygit"] == results["oracle"]
+
+
+BATCH9_CASES = [
+    ('diff-files -c combined diff of a content conflict', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files', '-c']),
+    ('diff-files --cc dense combined diff', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files', '--cc']),
+    ('diff-files -c --raw combined raw line', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files', '-c', '--raw']),
+    ('diff-files -c --name-status combined', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files', '-c', '--name-status']),
+    ('diff-files plain raw on unmerged (U line + comparison)', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files']),
+    ('diff-files -2 selects ours stage', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'f.txt', 'l1\nA2\nl3\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'f.txt', 'l1\nB2\nl3\n'), ['commit', '-am', 'B'], ['merge', 'branchA']], ['diff-files', '-2']),
+    ('diff-files -c multi-hunk all shown', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '-c']),
+    ('diff-files --cc multi-hunk partial elision', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '--cc']),
+    ('diff-files -c -U0 multi-hunk zero context', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '-c', '-U0']),
+    ('diff-files -c --combined-all-paths header per-parent', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '-c', '--combined-all-paths']),
+    ('diff-files -c --name-only', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '-c', '--name-only']),
+    ('diff-files -c --shortstat (combined emits nothing)', [('write', 'm.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n'), ['add', 'm.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nA9\n10\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('write', 'm.txt', '1\nB2\n3\n4\n5\n6\n7\n8\nB9\n10\n'), ['commit', '-am', 'B'], ['merge', 'branchA'], ('write', 'm.txt', '1\nA2\n3\n4\n5\n6\n7\n8\nZZ\n10\n')], ['diff-files', '-c', '--shortstat']),
+    ('diff-files -c on modify/delete conflict (* Unmerged path)', [('write', 'g.txt', 'x\ny\nz\n'), ['add', 'g.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'g.txt', 'x\nA\nz\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('rm', 'g.txt'), ['commit', '-m', 'del'], ['merge', 'branchA']], ['diff-files', '-c']),
+    ('diff-files --cc on modify/delete conflict', [('write', 'g.txt', 'x\ny\nz\n'), ['add', 'g.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'g.txt', 'x\nA\nz\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('rm', 'g.txt'), ['commit', '-m', 'del'], ['merge', 'branchA']], ['diff-files', '--cc']),
+    ('diff-files plain on modify/delete (U raw line)', [('write', 'g.txt', 'x\ny\nz\n'), ['add', 'g.txt'], ['commit', '-m', 'base'], ['checkout', '-b', 'branchA'], ('write', 'g.txt', 'x\nA\nz\n'), ['commit', '-am', 'A'], ['checkout', 'main'], ['checkout', '-b', 'branchB'], ('rm', 'g.txt'), ['commit', '-m', 'del'], ['merge', 'branchA']], ['diff-files']),
+    ('diff-files --combined-all-paths without -c errors rc=128', [('write', 'f.txt', 'l1\nl2\nl3\n'), ['add', 'f.txt'], ['commit', '-m', 'base']], ['diff-files', '--combined-all-paths']),
+    ('extcmd no-prompt', [('write', 'f.txt', 'a\nb\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'a\nC\n')], ['difftool', '-y', '-x', 'sh -c \'echo R=[$(cat "$2")]\' x']),
+    ('multi counter', [('write', 'a.txt', 'a1\n'), ('write', 'b.txt', 'b1\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'a.txt', 'a2\n'), ('write', 'b.txt', 'b2\n')], ['difftool', '-y', '-x', "sh -c 'echo C=$GIT_DIFF_PATH_COUNTER T=$GIT_DIFF_PATH_TOTAL P=$BASE' x"]),
+    ('no changes', [('write', 'f.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'init']], ['difftool', '-y', '-x', 'echo X']),
+    ('add del mod', [('write', 'kept.txt', 'keep\n'), ('write', 'del.txt', 'del\n'), ['add', '-A'], ['commit', '-m', 'init'], ('rm', 'del.txt'), ('write', 'kept.txt', 'keep2\n')], ['difftool', '-y', '-x', 'sh -c \'echo M=$BASE L=[$(cat "$1" 2>/dev/null)] R=[$(cat "$2" 2>/dev/null)]\' x']),
+    ('empty tool', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '--tool=']),
+    ('empty extcmd', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '--extcmd=']),
+    ('unknown tool', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '--tool=nonexistenttool']),
+    ('merge-only', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '-t', 'tortoisemerge']),
+    ('gui tool conflict', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-g', '-t', 'foo', '-y']),
+    ('config tool', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n'), ['config', 'difftool.mt.cmd', 'echo R=$REMOTE B=$BASE']], ['difftool', '-y', '-t', 'mt']),
+    ('diff.tool', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n'), ['config', 'difftool.mt.cmd', 'echo VIA $REMOTE'], ['config', 'diff.tool', 'mt']], ['difftool', '-y']),
+    ('gui guitool', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n'), ['config', 'difftool.gt.cmd', 'echo G $REMOTE'], ['config', 'diff.guitool', 'gt']], ['difftool', '-g', '-y']),
+    ('trust died', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '--trust-exit-code', '-x', 'false']),
+    ('no-trust swallow', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '-x', 'false']),
+    ('exit127', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '-x', 'sh -c "exit 127"']),
+    ('bad trust with -h', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ['config', 'difftool.trustexitcode', 'maybe']], ['difftool', '-h']),
+    ('cached', [('write', 'f.txt', 'base\n'), ['add', '-A'], ['commit', '-m', 'init'], ('write', 'f.txt', 'mod\n'), ['add', 'f.txt']], ['difftool', '--cached', '-y', '-x', 'sh -c \'echo L=[$(cat "$1")] R=[$(cat "$2")]\' x']),
+    ('cached unborn', [('write', 'n.txt', 'new\n'), ['add', 'n.txt']], ['difftool', '--cached', '-y', '-x', 'sh -c \'echo R=[$(cat "$2")]\' x']),
+    ('range', [('write', 'f.txt', 'v1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'f.txt', 'v2\n'), ['add', '-A'], ['commit', '-m', 'c2']], ['difftool', '-y', 'HEAD~1', 'HEAD', '-x', 'sh -c \'echo R=[$(cat "$2")]\' x']),
+    ('dir-diff false', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-d', '-y', '-x', 'false']),
+    ('dir-diff notfound', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-d', '-y', '-x', 'nonexistentprog123']),
+    ('dir-diff slash exec', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-d', '-y', '-x', './nope/prog']),
+    ('dir-diff unknown', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-d', '-y', '-t', 'bogus99']),
+    ('dir no-index conflict', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-d', '--no-index', '-y', '-x', 'diff']),
+    ('attached tt', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n'), ['config', 'difftool.t.cmd', 'echo D $REMOTE']], ['difftool', '-tt', '-y']),
+    ('dash h', [], ['difftool', '-h']),
+    ('sparse with pathspec shows commits dense prunes (shared subtree)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', 'HEAD', '--', 'shared']),
+    ('dense with pathspec prunes treesame commits (baseline, unchanged)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', 'HEAD', '--', 'shared']),
+    ('sparse with pathspec sub1 keeps the intervening untouched commit', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', 'HEAD', '--', 'sub1']),
+    ('dense with pathspec sub1 (baseline, unchanged)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', 'HEAD', '--', 'sub1']),
+    ('sparse --count with pathspec counts the full walk', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '--count', 'HEAD', '--', 'shared']),
+    ('dense --count with pathspec (baseline, unchanged)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--count', 'HEAD', '--', 'shared']),
+    ('sparse without pathspec is a no-op (equals plain walk)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', 'HEAD']),
+    ('sparse with --objects (no pathspec) is a no-op vs --objects', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--objects', '--sparse', 'HEAD']),
+    ('sparse with --topo-order and pathspec', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '--topo-order', 'HEAD', '--', 'sub2']),
+    ('sparse with --reverse and pathspec', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '--reverse', 'HEAD', '--', 'shared']),
+    ('--dense then --sparse: last flag wins (sparse)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--dense', '--sparse', 'HEAD', '--', 'shared']),
+    ('--sparse then --dense: last flag wins (dense)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '--dense', 'HEAD', '--', 'shared']),
+    ('sparse with multiple pathspecs', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', 'HEAD', '--', 'shared', 'sub2']),
+    ('sparse with -n max-count and pathspec', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '-n', '2', 'HEAD', '--', 'sub1']),
+    ('sparse with --parents and pathspec (non-merge, no rewrite needed)', [('write', 'shared/s.txt', 'shared content\n'), ('write', 'sub1/a.txt', 'a1\n'), ('write', 'root.txt', 'root1\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub2/b.txt', 'b2\n'), ('write', 'root.txt', 'root2\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'sub1/a.txt', 'a3\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', '--parents', 'HEAD', '--', 'sub1']),
+    ('sparse range where dense yields empty output (root touch path)', [('write', 'other.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub/f.txt', 'y\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'other.txt', 'z\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', '--sparse', 'HEAD', '--', 'sub']),
+    ('dense counterpart of root-touch-path case (baseline, unchanged)', [('write', 'other.txt', 'x\n'), ['add', '-A'], ['commit', '-m', 'c1'], ('write', 'sub/f.txt', 'y\n'), ['add', '-A'], ['commit', '-m', 'c2'], ('write', 'other.txt', 'z\n'), ['add', '-A'], ['commit', '-m', 'c3']], ['rev-list', 'HEAD', '--', 'sub']),
+]
+
+BATCH9_STDIN_CASES = [
+    ('add -p stage first hunk skip second', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['add', '-p', 'f.txt'], 'y\nn\n'),
+    ('add -p resulting staged state', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n'), ['add', '-p', 'f.txt']], ['status', '--short'], 'y\nn\n'),
+    ('add -p help then quit', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['add', '-p', 'f.txt'], '?\nq\n'),
+    ('add -p split a single splittable hunk', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\nNINE\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n')], ['add', '-p', 'f.txt'], 's\ny\nn\n'),
+    ('add -p split staged state', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', '1\n2\n3\n4\nFIVE\n6\n7\n8\nNINE\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', '-p', 'f.txt']], ['status', '--short'], 's\ny\nn\n'),
+    ('add -p invalid and two-letter commands', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['add', '-p', 'f.txt'], 'z\nyy\ny\nK\nq\n'),
+    ('add -p goto and search on three hunks', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'A\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\nB\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\nC\n')], ['add', '-p', 'f.txt'], 'g\n2\n/C\nq\n'),
+    ('add -p -U1 reduced context', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['add', '-p', '-U1', 'f.txt'], 'y\nn\n'),
+    ('add -e edit with non-interactive editor (success)', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['config', 'core.editor', 'true'], ['add', '-e', 'f.txt']], ['status', '--short'], ''),
+    ('add -p e edit hunk via editor then staged', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['config', 'core.editor', 'sed -i /^+AAA/d'], ['add', '-p', 'f.txt']], ['status', '--short'], 'e\n'),
+    ('add -p -U without -p errors', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'a\nb\n')], ['add', '-U2', 'f.txt'], ''),
+    ('reset -p unstage on HEAD', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'c1'], ('write', 'f.txt', 'A\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZ\n'), ['add', 'f.txt']], ['reset', '-p', 'f.txt'], 'y\nn\n'),
+    ('reset -p unstage staged state', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'c1'], ('write', 'f.txt', 'A\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZ\n'), ['add', 'f.txt'], ['reset', '-p', 'f.txt']], ['status', '--short'], 'y\nn\n'),
+    ('reset --hard -p conflict error', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'c1'], ('write', 'f.txt', 'b\n'), ['add', 'f.txt']], ['reset', '--hard', '-p', 'f.txt'], ''),
+    ('stash push -p stash first hunk', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['stash', 'push', '-p'], 'y\nn\n'),
+    ('stash push -p worktree after selection', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n'), ['stash', 'push', '-p']], ['diff'], 'y\nn\n'),
+    ('stash push -p no hunk selected', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['stash', 'push', '-p'], 'n\nn\n'),
+    ('stash push -p with -u conflict', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'i'], ('write', 'f.txt', 'b\n')], ['stash', 'push', '-p', '-u'], 'q\n'),
+    ('commit -p commit selected hunk', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['commit', '-p', '-m', 'partial'], 'y\nn\n'),
+    ('commit -p committed tree contains only selected hunk', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n'), ['commit', '-p', '-m', 'partial']], ['show', '--stat', 'HEAD'], 'y\nn\n'),
+    ('commit -p select nothing reports unstaged', [('write', 'f.txt', '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n'), ['add', 'f.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f.txt', 'AAA\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nZZZ\n')], ['commit', '-p', '-m', 'none'], 'n\nn\n'),
+    ('add -i quit menu', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n')], ['add', '-i'], 'q\n'),
+    ('add -i help command', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n')], ['add', '-i'], 'h\nq\n'),
+    ('add -i update one file', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n')], ['add', '-i'], '2\n1\n\nq\n'),
+    ('add -i update resulting staged state', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n'), ['add', '-i']], ['status', '--short'], '2\n1\n\nq\n'),
+    ('add -i update prompt help and Huh error', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n')], ['add', '-i'], '2\n?\n99\n\nq\n'),
+    ('add -i patch nested hunk selection', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n')], ['add', '-i'], '5\n1\n\ny\nq\n'),
+    ('add -i revert staged file', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n'), ['add', 'f1.txt', 'f2.txt']], ['add', '-i'], '3\n1\n\nq\n'),
+    ('add -i diff of staged file', [('write', 'f1.txt', 'a\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nz\n'), ['add', 'f1.txt', 'f2.txt'], ['commit', '-q', '-m', 'init'], ('write', 'f1.txt', 'A\nb\nc\n'), ('write', 'f2.txt', 'x\ny\nZ\n'), ['add', 'f1.txt']], ['add', '-i'], '6\n1\nq\n'),
+    ('add -p new file added', [('write', 'nf.txt', 'x\ny\n')], ['add', '-p', 'nf.txt'], 'y\n'),
+    ('add -p deleted file', [('write', 'd.txt', 'a\n'), ['add', 'd.txt'], ['commit', '-q', '-m', 'i'], ('rm', 'd.txt')], ['add', '-p', 'd.txt'], 'y\n'),
+    ('add -p mode change', [('write', 'm.txt', 'a\n'), ['add', 'm.txt'], ['commit', '-q', '-m', 'i']], ['add', '-p', 'm.txt'], 'y\n'),
+    ('prompt n', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-x', 'echo DIFF'], 'n\n'),
+    ('bad-bool prompt', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n'), ['config', 'difftool.prompt', 'maybe']], ['difftool', '-x', 'echo D'], 'n\n'),
+    ('precedence y prompt', [('write', 'f.txt', 'a\n'), ['add', 'f.txt'], ['commit', '-m', 'init'], ('write', 'f.txt', 'b\n')], ['difftool', '-y', '--prompt', '-x', 'echo D'], 'n\n'),
+]
+
+@pytest.mark.parametrize("case", BATCH9_CASES, ids=[c[0] for c in BATCH9_CASES])
+def test_batch9_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)
+
+
+@pytest.mark.parametrize("case", BATCH9_STDIN_CASES, ids=[c[0] for c in BATCH9_STDIN_CASES])
+def test_batch9_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe, stdin = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# difftool copies the "left" version of each file pair into a random temp dir
+# (/tmp/git-blob-XXXX/, and /tmp/git-difftool-XXXX/ for --dir-diff), whose name
+# appears in -x/extcmd output. The behavior is byte-exact apart from that random
+# component, so these normalize it away before comparing.
+BATCH9_DIFFTOOL_TMP_CASES = [
+    ("difftool-extcmd-eq", [("write", "f.txt", "a\n"), ["add", "f.txt"], ["commit", "-m", "init"],
+                            ("write", "f.txt", "b\n")],
+     ["difftool", "--no-prompt", "--extcmd=echo DIFF"], None),
+    ("difftool-x-prompt-false",
+     [("write", "f.txt", "a\n"), ["add", "f.txt"], ["commit", "-m", "init"], ("write", "f.txt", "b\n"),
+      ["config", "difftool.prompt", "false"]],
+     ["difftool", "-x", "echo D"], None),
+    ("difftool-dir-diff",
+     [("write", "f.txt", "l1\nl2\n"), ["add", "f.txt"], ["commit", "-m", "init"], ("write", "f.txt", "l1\nX\n")],
+     ["difftool", "-d", "-y", "-x", "diff"], None),
+    ("difftool-x-prompt-y",
+     [("write", "f.txt", "a\n"), ["add", "f.txt"], ["commit", "-m", "init"], ("write", "f.txt", "b\n")],
+     ["difftool", "-x", "echo DIFF"], "y\n"),
+    ("difftool-x-prompt-n",
+     [("write", "f.txt", "a\n"), ["add", "f.txt"], ["commit", "-m", "init"], ("write", "f.txt", "b\n")],
+     ["difftool", "-x", "echo LAUNCHED"], "N\n"),
+]
+
+
+@pytest.mark.parametrize("case", BATCH9_DIFFTOOL_TMP_CASES, ids=[c[0] for c in BATCH9_DIFFTOOL_TMP_CASES])
+def test_batch9_difftool_tmpnorm_parity(case, tmp_path: Path, git_254_oracle: str):
+    import re
+    import subprocess
+    from tests.git_parity.support import DETERMINISTIC_ENV, ROOT, pygit_cmd
+
+    _id, setup, probe, stdin = case
+    env = dict(__import__("os").environ)
+    env.update(DETERMINISTIC_ENV)
+    env["PYTHONPATH"] = str(ROOT)
+
+    def norm(s: str) -> str:
+        # collapse the random temp-dir component git/pygit picks per run
+        s = re.sub(r"git-blob-\w+", "git-blob-X", s)
+        s = re.sub(r"git-difftool[.\-]\w+", "git-difftool-X", s)
+        return s
+
+    results = {}
+    for tool, base in (("oracle", [git_254_oracle]), ("pygit", pygit_cmd())):
+        repo = tmp_path / tool
+        repo.mkdir()
+        subprocess.run([*base, "init", "-b", "main", "."], cwd=repo, env=env, capture_output=True)
+        for step in setup:
+            if isinstance(step, tuple) and step and step[0] == "write":
+                (repo / step[1]).write_text(step[2])
+            else:
+                subprocess.run([*base, *step], cwd=repo, env=env, capture_output=True)
+        proc = subprocess.run([*base, *probe], cwd=repo, env=env, input=stdin,
+                              text=True, capture_output=True)
+        results[tool] = (proc.returncode, norm(proc.stdout), norm(proc.stderr))
+
+    assert results["pygit"] == results["oracle"]

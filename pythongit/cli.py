@@ -2347,6 +2347,15 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--timestamp", action="store_true")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--exclude-hidden", dest="exclude_hidden", default=None)
+    # --sparse/--dense toggle history simplification density (revs->dense).
+    # dense (the default) prunes TREESAME single-parent commits during a
+    # pathspec-limited walk; --sparse leaves every non-merge/root commit in
+    # the output (C: try_to_simplify_commit early-returns for `!dense &&
+    # !commit->parents->next`, so they never get the TREESAME flag, and
+    # get_commit_action only prunes when `prune && dense`). Without a pathspec
+    # neither flag has any effect.
+    ap.add_argument("--sparse", dest="dense", action="store_false", default=True)
+    ap.add_argument("--dense", dest="dense", action="store_true")
     ap.add_argument("revs", nargs="*")
     # Split a trailing "-- <pathspec>..." off before argparse consumes the "--".
     rl_paths: list[str] = []
@@ -2700,7 +2709,23 @@ def cmd_rev_list(argv: list[str]) -> int:
                 if (before.sha if before else None) != (after.sha if after else None):
                     return True
             return False
-        out = [s for s in out if _touches(s)]
+
+        if args.dense:
+            out = [s for s in out if _touches(s)]
+        else:
+            # --sparse: TREESAME pruning is disabled for single-parent and root
+            # commits, so they are always shown (revision.c try_to_simplify_commit
+            # early-returns for `!dense && !commit->parents->next`, leaving the
+            # TREESAME flag unset; get_commit_action only drops a commit when
+            # `prune && dense`). Merge commits still follow the change test.
+            def _keep_sparse(s: str) -> bool:
+                info = _commit_tree_parents(repo, s, graph)
+                if info is None:
+                    return False
+                if len(info[1]) <= 1:
+                    return True
+                return _touches(s)
+            out = [s for s in out if _keep_sparse(s)]
     out = _filter_commits(repo, out, args)
     if args.unpacked:
         out = [s for s in out if objs._loose_path(repo, s).exists()]
@@ -2945,6 +2970,90 @@ def _pathspec_matches(repo: Repository, pathspec: str, tracked: set[str]) -> boo
     return any(t == norm or t.startswith(norm + "/") for t in tracked)
 
 
+def _add_interactive(repo: Repository, args, *, patch: bool) -> int:
+    """Dispatch `git add -p` / `git add -i` to the shared add-patch engine."""
+    from . import addpatch
+    pathspec = list(args.paths)
+    if patch:
+        rc = addpatch.run_add_p(
+            repo, "add", None, pathspec,
+            context=args.unified, interhunkcontext=args.interhunkcontext,
+            auto_advance=args.auto_advance)
+        return 1 if rc else 0
+    rc = addpatch.run_add_i(
+        repo, pathspec,
+        context=args.unified, interhunkcontext=args.interhunkcontext,
+        auto_advance=args.auto_advance)
+    return 1 if rc else 0
+
+
+def _commit_interactive(repo: Repository, args) -> Optional[int]:
+    """Stage interactively-selected changes for `git commit -p/--interactive`.
+
+    Returns None to let the normal commit proceed from the updated index, or an
+    rc to abort (mirrors die("interactive add failed"))."""
+    from . import addpatch
+    pathspec = list(args.pathspec)
+    if args.patch:
+        rc = addpatch.run_add_p(
+            repo, "add", None, pathspec,
+            context=args.unified, interhunkcontext=args.interhunkcontext,
+            auto_advance=args.auto_advance)
+    else:
+        rc = addpatch.run_add_i(
+            repo, pathspec,
+            context=args.unified, interhunkcontext=args.interhunkcontext,
+            auto_advance=args.auto_advance)
+    if rc:
+        _err("fatal: interactive add failed")
+        return 128
+    return None
+
+
+def _add_edit_patch(repo: Repository, paths: list[str]) -> int:
+    """Port of builtin/add.c edit_patch(): diff -U7, edit, apply --recount --cached."""
+    from . import addpatch
+    # Generate the worktree-vs-index diff with 7 lines of context.
+    buf = addpatch._run_capture(cmd_diff_files, ["-U7", "-p", "--"] + list(paths))
+    path = repo.gitdir / "ADD_EDIT.patch"
+    # git names the file via repo_git_path() -> "$GIT_DIR/ADD_EDIT.patch"; from
+    # the worktree root that displays as the relative ".git/ADD_EDIT.patch".
+    try:
+        disp = os.path.relpath(str(path), os.getcwd())
+    except ValueError:
+        disp = str(path)
+    path.write_text(buf, encoding="utf-8")
+    import subprocess
+    editor = addpatch._editor_command(repo)
+    try:
+        rc = subprocess.call("%s %s" % (editor, addpatch._shell_quote(str(path))),
+                             shell=True)
+    except OSError:
+        _err("fatal: editing patch failed")
+        return 128
+    if rc != 0:
+        _err("fatal: editing patch failed")
+        return 128
+    try:
+        data = path.read_bytes()
+    except OSError:
+        _err(f"fatal: could not stat '{disp}'")
+        return 128
+    if not data:
+        _err("fatal: empty patch. aborted")
+        return 128
+    rc = addpatch._run_apply(repo, data.decode("utf-8", "surrogateescape"),
+                             ["--recount", "--cached"])
+    if rc != 0:
+        _err(f"fatal: could not apply '{disp}'")
+        return 128
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return 0
+
+
 def cmd_add(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit add", add_help=False)
     ap.add_argument("-A", "--all", action="store_true")
@@ -2953,12 +3062,52 @@ def cmd_add(argv: list[str]) -> int:
     ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("-u", "--update", action="store_true")
     ap.add_argument("-N", "--intent-to-add", dest="intent_to_add", action="store_true")
+    ap.add_argument("-p", "--patch", dest="patch", action="store_true")
+    ap.add_argument("-i", "--interactive", dest="interactive", action="store_true")
+    ap.add_argument("-e", "--edit", dest="edit", action="store_true")
+    ap.add_argument("-U", "--unified", dest="unified", type=int, default=-1)
+    ap.add_argument("--inter-hunk-context", dest="interhunkcontext", type=int, default=-1)
+    ap.add_argument("--auto-advance", dest="auto_advance", action="store_true", default=True)
+    ap.add_argument("--no-auto-advance", dest="auto_advance", action="store_false")
     ap.add_argument("--no-all", "--ignore-removal", dest="no_all", action="store_true")
     ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
     ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+
+    # Interactive / patch machinery (builtin/add.c cmd_add ordering).
+    if args.unified < -1:
+        _err("fatal: '--unified' cannot be negative")
+        return 128
+    if args.interhunkcontext < -1:
+        _err("fatal: '--inter-hunk-context' cannot be negative")
+        return 128
+    if args.patch:
+        args.interactive = True
+    if args.interactive:
+        if args.dry_run:
+            _err("fatal: options '--dry-run' and '--interactive/--patch' cannot be used together")
+            return 128
+        if args.pathspec_from_file is not None:
+            _err("fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together")
+            return 128
+        return _add_interactive(repo, args, patch=args.patch)
+    else:
+        if args.unified != -1:
+            _err("fatal: the option '--unified' requires '--interactive/--patch'")
+            return 128
+        if args.interhunkcontext != -1:
+            _err("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'")
+            return 128
+        if not args.auto_advance:
+            _err("fatal: the option '--no-auto-advance' requires '--interactive/--patch'")
+            return 128
+    if args.edit:
+        if args.pathspec_from_file is not None:
+            _err("fatal: options '--pathspec-from-file' and '--edit' cannot be used together")
+            return 128
+        return _add_edit_patch(repo, args.paths)
     # --pathspec-from-file supplies the pathspecs instead of the command line.
     if args.pathspec_from_file is not None:
         raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
@@ -3582,6 +3731,12 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("--cleanup", default=None)
     ap.add_argument("-o", "--only", action="store_true")
     ap.add_argument("-i", "--include", action="store_true")
+    ap.add_argument("-p", "--patch", dest="patch", action="store_true")
+    ap.add_argument("--interactive", dest="interactive", action="store_true")
+    ap.add_argument("-U", "--unified", dest="unified", type=int, default=-1)
+    ap.add_argument("--inter-hunk-context", dest="interhunkcontext", type=int, default=-1)
+    ap.add_argument("--auto-advance", dest="auto_advance", action="store_true", default=True)
+    ap.add_argument("--no-auto-advance", dest="auto_advance", action="store_false")
     ap.add_argument("-n", "--no-verify", dest="no_verify", action="store_true")
     ap.add_argument("--verify", dest="verify", action="store_true")
     ap.add_argument("--no-post-rewrite", dest="no_post_rewrite", action="store_true")
@@ -3609,6 +3764,32 @@ def cmd_commit(argv: list[str]) -> int:
     ap.add_argument("pathspec", nargs="*")
     args = ap.parse_args(argv)
     repo = _repo()
+
+    # commit -p/--patch implies --interactive.  The interactive machinery stages
+    # the selected hunks/files into the index, then a normal full-index commit
+    # proceeds from there (builtin/commit.c prepare_to_commit's interactive
+    # block, which uses a temporary index and commits with COMMIT_NORMAL).
+    if args.patch:
+        args.interactive = True
+    if args.interactive:
+        if args.pathspec_from_file is not None:
+            _err("fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together")
+            return 128
+        rc = _commit_interactive(repo, args)
+        if rc is not None:
+            return rc
+        # fall through: the index now holds the selected changes; commit as-is.
+        args.pathspec = []
+        args.all = False
+        args.include = False
+    else:
+        if args.unified != -1:
+            _err("fatal: the option '--unified' requires '--interactive/--patch'")
+            return 128
+        if args.interhunkcontext != -1:
+            _err("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'")
+            return 128
+
     # --pathspec-from-file supplies the pathspec for a partial commit.
     if args.pathspec_from_file is not None:
         raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
@@ -5542,7 +5723,8 @@ def _diff_check(repo: Repository, changes: list) -> int:
 
 
 def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, context: int = 3,
-                    word_diff=None, a_prefix: str = "a", b_prefix: str = "b") -> None:
+                    word_diff=None, a_prefix: str = "a", b_prefix: str = "b",
+                    inter_hunk_context: int = 0) -> None:
     if a.sha == b.sha and a.mode == b.mode:
         return
     # Under -R the working-side prefixes are swapped (b/<path> a/<path>). The
@@ -5567,20 +5749,26 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
             return
         a_text = (a.data or b"").decode("utf-8", errors="replace")
         b_text = (b.data or b"").decode("utf-8", errors="replace")
-        _print(f"--- {pa + '/' + path if a.present else '/dev/null'}")
-        _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
         if word_diff:
+            _print(f"--- {pa + '/' + path if a.present else '/dev/null'}")
+            _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
             sys.stdout.write(diff_mod.word_diff_hunks(
                 a_text.splitlines(), b_text.splitlines(), context, mode=word_diff))
             return
-        body = diff_mod.format_hunks(
+        body = diff_mod.format_hunks_ex(
             a_text.splitlines(), b_text.splitlines(),
             context,
             a_no_newline=bool(a_text) and not a_text.endswith("\n"),
             b_no_newline=bool(b_text) and not b_text.endswith("\n"),
+            inter_hunk_context=inter_hunk_context,
         )
-        for line in body:
-            _print(line)
+        # git emits the ---/+++ file header only when there is a hunk body
+        # (an empty new/deleted file stops after the `index` line).
+        if body:
+            _print(f"--- {pa + '/' + path if a.present else '/dev/null'}")
+            _print(f"+++ {pb + '/' + path if b.present else '/dev/null'}")
+            for line in body:
+                _print(line)
 
 
 def _pprint_rename(a: str, b: str) -> str:
@@ -5623,13 +5811,17 @@ def _pprint_rename(a: str, b: str) -> str:
 
 
 def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None,
-               complete=None, order=None) -> None:
+               complete=None, order=None, unmerged=None) -> None:
     # rows carry (sort_key, name, ins, del, total); sort_key orders the output
     # by the diff queue (via ``order`` map keyed on dst/path) when provided.
+    # ``unmerged`` rows render as "<name> | Unmerged" (total == -2) and never
+    # contribute to the summary line.
     rows: list[tuple, ...] = []
     total_ins = total_del = 0
     complete = complete or {}
     order = order or {}
+    for _k, name in (unmerged or []):
+        rows.append((_k, name, 0, 0, -2))
     for src, dst, _sim, src_side, dst_side in (renames or []):
         a_lines = (src_side.data or b"").decode("utf-8", errors="replace").splitlines()
         b_lines = (dst_side.data or b"").decode("utf-8", errors="replace").splitlines()
@@ -5668,13 +5860,22 @@ def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None,
         rows.sort(key=lambda r: r[0])
     name_w = max(len(r[1]) for r in rows)
     count_w = max(len(str(t if t >= 0 else 0)) for *_, t in rows)
+    n_files = 0
     for _k, path, ins, dele, total in rows:
+        if total == -2:
+            _print(f" {path:<{name_w}} | Unmerged")
+            continue
+        n_files += 1
         if total < 0:
             _print(f" {path:<{name_w}} | Bin")
             continue
         bar = "+" * ins + "-" * dele
         _print(f" {path:<{name_w}} | {total:>{count_w}}{(' ' + bar) if bar else ''}")
-    _print(_stat_summary_line(len(rows), total_ins, total_del))
+    if n_files == 0:
+        # All rows were unmerged: git prints just " 0 files changed".
+        _print(" 0 files changed")
+    else:
+        _print(_stat_summary_line(n_files, total_ins, total_del))
 
 
 def _diff_shortstat(changes: list[tuple[str, _Side, _Side]]) -> None:
@@ -5960,13 +6161,17 @@ def _diff_counts(a: _Side, b: _Side) -> tuple[int, int]:
 
 
 def _diff_numstat(changes: list, renames=None, nul: bool = False,
-                  complete=None, order=None) -> None:
+                  complete=None, order=None, unmerged=None) -> None:
     # In -z mode renames emit 'ins<TAB>del<TAB>\0src\0dst\0'; otherwise the
     # compact 'src => dst' name terminated by newline. ``order`` (dst/path ->
     # queue index) reorders output to match the diff queue when provided.
+    # Unmerged ('U') paths emit '0\t0\t<path>' (builtin_diffstat: added=deleted=0).
     complete = complete or {}
     order = order or {}
     out: list[tuple[int, str]] = []
+    for _k, path in (unmerged or []):
+        line = f"0\t0\t{path}\0" if nul else f"0\t0\t{path}\n"
+        out.append((_k, line))
     for src, dst, _sim, sa, db in (renames or []):
         ins, dele = _diff_counts(sa, db)
         cnt = "-\t-\t" if ins < 0 else f"{ins}\t{dele}\t"
@@ -5990,7 +6195,8 @@ def _diff_numstat(changes: list, renames=None, nul: bool = False,
         sys.stdout.write(line)
 
 
-def _diff_shortstat(changes: list, renames=None, complete=None) -> None:
+def _diff_shortstat(changes: list, renames=None, complete=None,
+                    n_unmerged: int = 0) -> None:
     files = total_ins = total_del = 0
     complete = complete or {}
     for _src, _dst, _sim, sa, db in (renames or []):
@@ -6011,6 +6217,9 @@ def _diff_shortstat(changes: list, renames=None, complete=None) -> None:
         if dele > 0:
             total_del += dele
     if files == 0:
+        # Unmerged-only queue still prints the summary as " 0 files changed".
+        if n_unmerged:
+            _print(" 0 files changed")
         return
     _print(_stat_summary_line(files, total_ins, total_del))
 
@@ -7369,6 +7578,7 @@ def cmd_reset(argv: list[str]) -> int:
     g.add_argument("--merge", action="store_true")
     g.add_argument("--keep", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-p", "--patch", dest="patch", action="store_true")
     ap.add_argument("-N", "--intent-to-add", dest="intent_to_add", action="store_true")
     ap.add_argument("--no-refresh", dest="no_refresh", action="store_true")
     ap.add_argument("--refresh", action="store_true")
@@ -7402,6 +7612,24 @@ def cmd_reset(argv: list[str]) -> int:
 
     mode = ("soft" if args.soft else "hard" if args.hard else "merge" if args.merge
             else "keep" if args.keep else "mixed")
+
+    # reset --patch: hand the selected pathspec to the shared add-patch engine.
+    if args.patch:
+        if args.pathspec_from_file is not None:
+            _err("fatal: options '--pathspec-from-file' and '--patch' cannot be used together")
+            return 128
+        reset_type_given = args.soft or args.hard or args.merge or args.keep
+        if reset_type_given:
+            _err("fatal: options '--patch' and '--{hard,mixed,soft}' cannot be used together")
+            return 128
+        # The revision was split out above (default "HEAD").
+        if refs_mod.rev_parse(repo, treeish) is None:
+            _err(f"fatal: Failed to resolve '{treeish}' as a valid tree.")
+            return 128
+        from . import addpatch
+        rc = addpatch.run_add_p(repo, "reset", treeish, paths)
+        return 1 if rc else 0
+
     if paths and mode != "mixed":
         _err(f"fatal: Cannot do {mode} reset with paths.")
         return 128
@@ -8631,10 +8859,43 @@ def _stash_push(argv: list[str], save: bool) -> int:
             return 129
         i += 1
 
-    # --patch (interactive) is deferred.
+    # --patch interactive hunk selection (do_push_stash patch branch).
     if patch_mode:
-        _err("fatal: pygit: stash --patch (interactive) is not supported")
-        return 128
+        if pathspec_from_file is not None:
+            _err("fatal: options '--pathspec-from-file' and '--patch' cannot be used together")
+            return 128
+        if include_untracked:
+            _err("Can't use --patch and --include-untracked or --all at the same time")
+            return 1
+        # --patch overrides --staged; keep_index defaults to 1 in patch mode.
+        repo = _repo()
+        ps_items = None
+        if pathspecs:
+            try:
+                cwd = os.path.realpath(os.getcwd())
+                root = os.path.realpath(str(repo.path))
+                prefix = os.path.relpath(cwd, root)
+                if prefix == ".":
+                    prefix = ""
+            except (OSError, ValueError):
+                prefix = ""
+            try:
+                ps_items = stash.parse_pathspecs(prefix, pathspecs)
+            except stash.PathspecParseError as exc:
+                _err(f"fatal: {exc}")
+                return 128
+        result = stash.push_patch(repo, message, pathspecs=ps_items, quiet=quiet)
+        if result is None:
+            if not quiet:
+                _print("No local changes to save")
+            return 0
+        if result == "no-head":
+            return 1
+        if result == 1:
+            return 1
+        if result == "apply-failed":
+            return 1
+        return 0
 
     # --pathspec-from-file conflicts (push_stash, in C-source order: --patch is
     # checked first, then --staged, then command-line pathspec args).
@@ -9307,6 +9568,7 @@ def cmd_apply(argv: list[str]) -> int:
     ap.add_argument("--unidiff-zero", dest="unidiff_zero", action="store_true")
     ap.add_argument("--allow-overlap", dest="allow_overlap", action="store_true")
     ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("--recount", dest="recount", action="store_true")
     ap.add_argument("-N", "--intent-to-add", dest="ita", action="store_true")
     ap.add_argument("--index", dest="index", action="store_true")
     ap.add_argument("--cached", dest="cached", action="store_true")
@@ -9329,7 +9591,8 @@ def cmd_apply(argv: list[str]) -> int:
             else Path(args.file).read_bytes())
     pif = args.file if args.file else "<stdin>"
     try:
-        patches = apply_mod.parse_patches(text, args.p_value, patch_input_file=pif)
+        patches = apply_mod.parse_patches(text, args.p_value, patch_input_file=pif,
+                                          recount=args.recount)
     except apply_mod.ApplyError as exc:
         _err(exc.message)
         return exc.rc
@@ -17996,13 +18259,16 @@ def cmd_diff_tree(argv: list[str]) -> int:
     ap.add_argument("-r", action="store_true", help="recurse")
     ap.add_argument("-t", dest="show_trees", action="store_true")
     ap.add_argument("-p", "--patch", action="store_true")
+    ap.add_argument("-U", "--unified", type=int, default=3)
+    ap.add_argument("--inter-hunk-context", dest="inter_hunk_context", type=int, default=0)
     ap.add_argument("--root", action="store_true")
     ap.add_argument("--no-commit-id", dest="no_commit_id", action="store_true")
     ap.add_argument("--name-only", action="store_true")
     ap.add_argument("--name-status", action="store_true")
     ap.add_argument("rev1")
     ap.add_argument("rev2", nargs="?")
-    args = ap.parse_args(argv)
+    ap.add_argument("paths", nargs="*")
+    args = ap.parse_args([a for a in argv if a != "--"])
     repo = _repo()
 
     def _resolve_to_tree(name: str) -> Optional[str]:
@@ -18068,10 +18334,16 @@ def cmd_diff_tree(argv: list[str]) -> int:
             if ln:
                 _print(ln)
     if args.patch:
-        for p, a_entry, b_entry in changes:
+        sel = changes
+        if args.paths:
+            wanted = set(args.paths)
+            sel = [(p, a, b) for (p, a, b) in changes
+                   if p in wanted or any(p.startswith(w.rstrip("/") + "/") for w in args.paths)]
+        for p, a_entry, b_entry in sel:
             a_side = _side_from_object(repo, a_entry.mode, a_entry.sha) if a_entry else _ABSENT
             b_side = _side_from_object(repo, b_entry.mode, b_entry.sha) if b_entry else _ABSENT
-            _emit_file_diff(p, a_side, b_side)
+            _emit_file_diff(p, a_side, b_side, context=args.unified,
+                            inter_hunk_context=args.inter_hunk_context)
     return 0
 
 
@@ -18107,11 +18379,58 @@ def _df_extract_value(argv, i, opt):
     return None, i + 1
 
 
+def _emit_combined_unmerged(buf, repo, path, parent_oids, parent_modes, present,
+                            dense, fmt_patch, fmt_raw, name_only, name_status,
+                            full_index, abbrev, nul, context=3,
+                            combined_all_paths=False):
+    """Render one unmerged path's combined diff (show_combined_diff dispatch).
+
+    RAW/NAME/NAME-STATUS take precedence over PATCH (combine-diff.c). The result
+    oid is always null (worktree result), parents are stages #2/#3."""
+    from . import combine
+    num_parent = len(parent_oids)
+    if fmt_raw or name_only or name_status:
+        # show_raw_diff: combined raw line / name / name-status.
+        raw_width = 40 if (full_index or abbrev is None) else max(4, abbrev)
+        result_mode = combine._canon_mode_from_content(repo, path) if present else 0
+        line_term = b"\0" if nul else b"\n"
+        rfmt = "name" if name_only else ("name-status" if name_status else "raw")
+        combine.show_raw_combined(
+            buf, path, parent_oids, parent_modes, ["M"] * num_parent,
+            "0" * 40, result_mode, num_parent, raw_width,
+            fmt=rfmt, line_term=line_term,
+            combined_all_paths=combined_all_paths)
+        return
+    if fmt_patch:
+        result_content = None
+        if present:
+            full = repo.path / path
+            if full.is_symlink():
+                result_content = os.readlink(full).encode("utf-8", "surrogateescape")
+            else:
+                try:
+                    result_content = full.read_bytes()
+                except OSError:
+                    result_content = None
+        header_abbrev = 40 if full_index else 7
+        combine.show_patch_diff_files(
+            buf, repo, path, parent_oids, parent_modes,
+            result_content if result_content is not None else b"",
+            present and result_content is not None,
+            dense, header_abbrev, context=context,
+            combined_all_paths=combined_all_paths)
+        return
+    # stat/numstat/shortstat: show_combined_diff emits nothing for these.
+    return
+
+
 def cmd_diff_files(argv: list[str]) -> int:
     """Show the diff between the index and the working tree (plumbing)."""
+    import io
     ap = argparse.ArgumentParser(prog="pygit diff-files", add_help=False)
     ap.add_argument("--name-only", dest="name_only", action="store_true")
     ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--raw", dest="raw", action="store_true")
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--numstat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
@@ -18125,6 +18444,7 @@ def cmd_diff_files(argv: list[str]) -> int:
     ap.add_argument("-a", "--text", dest="text", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
+    ap.add_argument("--inter-hunk-context", dest="inter_hunk_context", type=int, default=0)
     # rename/copy/break/pickaxe/order/limit options
     ap.add_argument("--no-renames", dest="no_renames", action="store_true")
     ap.add_argument("--find-copies-harder", dest="find_copies_harder", action="store_true")
@@ -18144,9 +18464,44 @@ def cmd_diff_files(argv: list[str]) -> int:
     pickaxe_kind = None         # 'S' or 'G'
     orderfile = None
     rename_limit = -1           # OPT_INTEGER default before diff std sets 1000
+    # Combined-diff / stage-selection flags (combine-diff.c + builtin/diff-files.c).
+    # combine_merges/dense mirror -c/--cc; max_count is the stage to diff against
+    # (-1 = unset -> defaults to 2; --base/--ours/--theirs = 1/2/3).
+    combine_merges = False
+    dense_combined = False
+    combined_all_paths = False
+    max_count = -1
     i = 0
     while i < len(argv):
         a = argv[i]
+        if a == "-c":
+            combine_merges, dense_combined = True, False
+            i += 1
+            continue
+        if a == "--combined-all-paths":
+            combined_all_paths = True
+            i += 1
+            continue
+        if a == "--cc":
+            combine_merges, dense_combined = True, True
+            i += 1
+            continue
+        if a in ("-0", "-1", "-2", "-3"):
+            max_count = int(a[1:])
+            i += 1
+            continue
+        if a == "--base":
+            max_count = 1
+            i += 1
+            continue
+        if a == "--ours":
+            max_count = 2
+            i += 1
+            continue
+        if a == "--theirs":
+            max_count = 3
+            i += 1
+            continue
         if a == "-M" or a == "--find-renames" or a.startswith("-M") or a.startswith("--find-renames="):
             if a.startswith("--find-renames="):
                 val = a.split("=", 1)[1]
@@ -18242,12 +18597,99 @@ def cmd_diff_files(argv: list[str]) -> int:
     from .index import read_index
     idx = read_index(repo)
 
+    # Determine the effective output format (combine-diff dispatch order mirrors
+    # show_combined_diff: RAW/NAME/NAME-STATUS take precedence over PATCH). For
+    # a bare `-c`/`--cc` (no explicit format) the merge implies a patch.
+    fmt_patch = bool(args.patch or args.patch_with_raw or args.patch_with_stat)
+    explicit_fmt = (args.raw or args.name_only or args.name_status or args.stat or
+                    args.numstat or args.shortstat or fmt_patch)
+    fmt_raw = (args.raw or not explicit_fmt)
+    if combine_merges and not explicit_fmt:
+        # `-c`/`--cc` with no explicit format implies a (combined) patch.
+        fmt_patch = True
+        fmt_raw = False
+    # --combined-all-paths requires -c/--cc. This is checked in
+    # diff_merges_setup_revs (BEFORE the patch densify below), so an implicit
+    # densified `-p` does not satisfy it.
+    if combined_all_paths and not combine_merges:
+        _err("fatal: --combined-all-paths makes no sense without -c or --cc")
+        return 128
+    # "diff-files -p" on unmerged paths densifies to --cc unless -c/--cc given
+    # explicitly (builtin/diff-files.c:diff_merges_set_dense_combined_if_unset).
+    if (max_count == -1 and fmt_patch and not combine_merges):
+        combine_merges = True
+        dense_combined = True
+
     # Build index-vs-worktree filepairs. Intent-to-add entries are treated as
     # new files (ita_invisible_in_index), so their index side is absent.
     pairs: list[_DFPair] = []
     all_index: dict[str, tuple[int, str]] = {}   # path -> (mode, sha) for copy sources
-    for e in idx.entries:
+    # Combined diffs for unmerged paths are written immediately (during the
+    # cache walk in run_diff_files), before any queued regular pairs are flushed.
+    combined_buf = io.BytesIO()
+    diff_unmerged_stage = max_count if max_count >= 0 else 2
+    # ce_path_match (run_diff_files line 147): a cache entry whose path is not
+    # matched by the pathspec is skipped entirely (no combined diff / U pair).
+    _ps = list(args.paths)
+    def _ce_path_match(p):
+        if not _ps:
+            return True
+        return (p in _ps or
+                any(p.startswith(w.rstrip("/") + "/") for w in _ps))
+    entries = idx.entries
+    n_entries = len(entries)
+    ei = 0
+    while ei < n_entries:
+        e = entries[ei]
         if getattr(e, "stage", 0) != 0:
+            # Gather all consecutive stage entries for this path.
+            path = e.path
+            stage_entries: dict[int, "object"] = {}
+            ce = e  # entry selected for the worktree comparison (default stage 2)
+            full = repo.path / path
+            present = full.exists() or full.is_symlink()
+            wt_mode = _wt_mode(full) if present else "000000"
+            num_compare_stages = 0
+            while ei < n_entries and entries[ei].path == path and entries[ei].stage != 0:
+                nce = entries[ei]
+                st = nce.stage
+                stage_entries[st] = nce
+                if st >= 2:
+                    num_compare_stages += 1
+                if st == diff_unmerged_stage:
+                    ce = nce
+                ei += 1
+            if not _ce_path_match(path):
+                continue
+            if combine_merges and num_compare_stages == 2:
+                # show_combined_diff(dpath, 2): parents are stages #2 (ours) and
+                # #3 (theirs); the result is the working-tree file.
+                p_oids = [stage_entries[2].sha, stage_entries[3].sha]
+                p_modes = [int(stage_entries[2].mode_str(), 8),
+                           int(stage_entries[3].mode_str(), 8)]
+                _emit_combined_unmerged(
+                    combined_buf, repo, path, p_oids, p_modes, present,
+                    dense_combined, fmt_patch, fmt_raw, args.name_only,
+                    args.name_status, args.full_index, args.abbrev, args.nul,
+                    context=args.unified, combined_all_paths=combined_all_paths)
+                continue
+            # Non-combined: queue the unmerge ('U') pair, then optionally the
+            # worktree-vs-selected-stage comparison pair.
+            two = _Side(wt_mode if present else None, "0" * 40, None,
+                        worktree=True) if present else _Side(None, "0" * 40, None)
+            upair = _DFPair(path, path, _ABSENT, two, "U")
+            pairs.append(upair)
+            if ce.stage != diff_unmerged_stage:
+                continue
+            # Compare the selected stage's blob against the worktree. An unmerged
+            # cache entry has zeroed stat data, so run_diff_files always treats it
+            # as changed: the raw line is shown unconditionally (worktree oid is
+            # null), while the patch is empty when the content is identical
+            # (builtin_diff emits no header). A removed worktree file -> 'D'.
+            a = _side_from_object(repo, ce.mode_str(), ce.sha)
+            b = _side_from_worktree(repo, path) if present else _ABSENT
+            status = "A" if not a.present else ("D" if not b.present else "M")
+            pairs.append(_DFPair(path, path, a, b, status))
             continue
         full = repo.path / e.path
         present = full.exists() or full.is_symlink()
@@ -18256,6 +18698,7 @@ def cmd_diff_files(argv: list[str]) -> int:
         b = _side_from_worktree(repo, e.path) if present else _ABSENT
         if not ita:
             all_index[e.path] = (int(e.mode_str(), 8), e.sha)
+        ei += 1
         if a.sha == b.sha and a.mode == b.mode:
             continue
         status = "A" if not a.present else ("D" if not b.present else "M")
@@ -18266,6 +18709,8 @@ def cmd_diff_files(argv: list[str]) -> int:
     # break detection sees the reversed source/destination roles.
     if args.reverse:
         for p in pairs:
+            if p.status == "U":
+                continue  # an unmerged pair has no direction to reverse
             p.one, p.two = p.two, p.one
             p.status = "A" if not p.one.present else ("D" if not p.two.present else "M")
 
@@ -18304,26 +18749,60 @@ def cmd_diff_files(argv: list[str]) -> int:
           for p in pairs if p.status in ("R", "C")]
     cr = {id(p): (_count_lines(p.two.data or b""), _count_lines(p.one.data or b""))
           for p in pairs if p.status == "M" and p.score}
-    changes = [(p.b_path, p.one, p.two) for p in pairs if p.status not in ("R", "C")]
+    # Unmerged ('U') pairs are excluded from the plain-change set: they render as
+    # "<path> | Unmerged" in --stat (never counted), "0\t0\t<path>" in --numstat,
+    # and are dropped from --shortstat totals (diff.c builtin_diffstat/show_*).
+    changes = [(p.b_path, p.one, p.two) for p in pairs
+               if p.status not in ("R", "C", "U")]
+    um_paths = [p.b_path for p in pairs if p.status == "U"]
     cr_counts = {p.b_path: cr[id(p)] for p in pairs if id(p) in cr}
+    # Stat output applies diffcore_skip_stat_unmatch: a pair that is dirty only by
+    # stat (both sides valid, one oid unknown, same mode, identical content) is
+    # dropped from --stat/--numstat/--shortstat (but kept in raw/patch). The only
+    # such pairs here are unmerged comparison pairs whose worktree matches the
+    # selected stage; stage-0 pairs are already content-filtered.
+    def _stat_unmatch(p):
+        # Binary pairs are always shown in --stat ("Bin") even when identical, so
+        # only non-binary stat-only-dirty pairs are dropped.
+        return (p.status == "M" and p.one.present and p.two.present and
+                p.two.worktree and p.one.sha == p.two.sha and
+                p.one.mode == p.two.mode and
+                not _is_binary(p.one.data) and not _is_binary(p.two.data))
+    stat_changes = [(p.b_path, p.one, p.two) for p in pairs
+                    if p.status not in ("R", "C", "U") and not _stat_unmatch(p)]
     # Queue order (by destination path) so stat/numstat interleave renames and
     # plain changes the way the diff queue does.
     order = {p.b_path: i for i, p in enumerate(pairs)}
 
+    # Immediate combined diffs (written during the cache walk in C) precede all
+    # queued regular pairs. They carry their own format, so flush the buffer
+    # before the format dispatch below.
+    combined_bytes = combined_buf.getvalue()
+
     # Sides are already oriented for -R (pre-swapped), so the stat helpers see
-    # the correct direction and naturally flip insertions/deletions.
+    # the correct direction and naturally flip insertions/deletions. Unmerged
+    # ('U') pairs render as "<path> | Unmerged" and never count toward totals.
     if args.stat or args.patch_with_stat:
-        _diff_stat(changes, rn, cr_counts, order=order)
+        if combined_bytes:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(combined_bytes)
+        _diff_stat(stat_changes, rn, cr_counts, order=order,
+                   unmerged=[(order.get(p, len(order)), p) for p in um_paths])
         if not args.patch_with_stat:
             return 0
     if args.numstat:
-        _diff_numstat(changes, rn, nul=args.nul, complete=cr_counts, order=order)
+        _diff_numstat(stat_changes, rn, nul=args.nul, complete=cr_counts, order=order,
+                      unmerged=[(order.get(p, len(order)), p) for p in um_paths])
         return 0
     if args.shortstat:
-        _diff_shortstat(changes, rn, complete=cr_counts)
+        _diff_shortstat(stat_changes, rn, complete=cr_counts, n_unmerged=len(um_paths))
         return 0
     sep = "\0" if args.nul else "\t"
     term = "\0" if args.nul else "\n"
+    if combined_bytes:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(combined_bytes)
+        sys.stdout.buffer.flush()
     if args.name_only:
         for p in pairs:
             sys.stdout.write(p.b_path + term)
@@ -18332,13 +18811,18 @@ def cmd_diff_files(argv: list[str]) -> int:
         for p in pairs:
             sys.stdout.write(_df_name_status(p, sep, args.reverse) + term)
         return 0
-    if args.patch or args.patch_with_raw or args.patch_with_stat:
-        if args.patch_with_raw:
+    # fmt_patch is also set when `-c`/`--cc` (or densified `-p`) implies a patch
+    # without an explicit -p. When BOTH raw and patch bits are present (e.g.
+    # `--raw -p`), diff_flush emits the raw block, a blank line, then the patch
+    # (the --patch-with-raw layout). fmt_raw alone -> raw only; fmt_patch alone
+    # -> patch only.
+    if fmt_patch:
+        if (fmt_raw or args.patch_with_raw) and pairs:
             for p in pairs:
                 sys.stdout.write(_df_raw_line(p, args.abbrev, args.full_index, args.reverse, sep))
             _print("")
         for p in pairs:
-            _df_emit_patch(p, args.reverse, args.unified)
+            _df_emit_patch(p, args.reverse, args.unified, args.inter_hunk_context)
         return 0
     # Default: the raw diff line per change.
     for p in pairs:
@@ -18421,6 +18905,8 @@ def _df_detect_renames(repo: Repository, pairs: list["_DFPair"], all_index: dict
     src_side_map: dict[str, _Side] = {}     # path -> source-side _Side
     data_map: dict[str, bytes] = {}         # worktree blob content by path
     for p in pairs:
+        if p.status == "U":
+            continue  # unmerged pairs are inert in diffcore-rename
         if p.one.present and not p.two.present:
             src_map[p.a_path] = (int(p.one.mode, 8), p.one.sha)
             by_src[p.a_path] = p
@@ -18563,6 +19049,8 @@ def _df_pickaxe(repo: Repository, pairs: list["_DFPair"], needle: str, kind: str
         return False
 
     def _match(p: _DFPair) -> bool:
+        if p.status == "U":
+            return True  # unmerged pairs are always kept by diffcore-pickaxe
         if not p.one.present and not p.two.present:
             return False
         # unmodified pair (same content) never matches
@@ -18676,11 +19164,16 @@ def _df_raw_line(p: "_DFPair", abbrev: Optional[int], full_index: bool,
     return f":{a_mode} {b_mode} {a_id} {b_id} {st}{sep}{p.b_path}{term}"
 
 
-def _df_emit_patch(p: "_DFPair", reverse: bool, context: int) -> None:
+def _df_emit_patch(p: "_DFPair", reverse: bool, context: int,
+                   inter_hunk_context: int = 0) -> None:
     """Emit a diff-files patch for one pair, including rename/copy headers and
     the -B 'dissimilarity index' header. Sides are pre-swapped for -R, so only
     the a/b prefix labels are flipped here."""
     pa, pb = ("b", "a") if reverse else ("a", "b")
+    if p.status == "U":
+        # An unmerged pair in patch format (run_diff -> DIFF_PAIR_UNMERGED).
+        _print(f"* Unmerged path {p.b_path}")
+        return
     if p.status in ("R", "C"):
         src, dst = p.a_path, p.b_path
         sim = int(p.score * 100 / 60000.0)
@@ -18703,10 +19196,11 @@ def _df_emit_patch(p: "_DFPair", reverse: bool, context: int) -> None:
         b_text = (b_side.data or b"").decode("utf-8", "replace")
         _print(f"--- {pa}/{src}")
         _print(f"+++ {pb}/{dst}")
-        for line in diff_mod.format_hunks(
+        for line in diff_mod.format_hunks_ex(
                 a_text.splitlines(), b_text.splitlines(), context,
                 a_no_newline=bool(a_text) and not a_text.endswith("\n"),
-                b_no_newline=bool(b_text) and not b_text.endswith("\n")):
+                b_no_newline=bool(b_text) and not b_text.endswith("\n"),
+                inter_hunk_context=inter_hunk_context):
             _print(line)
         return
     # M/A/D, possibly broken (-B) with a dissimilarity index.
@@ -18715,7 +19209,8 @@ def _df_emit_patch(p: "_DFPair", reverse: bool, context: int) -> None:
         return
     # Plain change: sides already oriented; pass prefixes, no further reverse.
     _emit_file_diff(p.b_path, p.one, p.two, False, context,
-                    a_prefix=pa, b_prefix=pb)
+                    a_prefix=pa, b_prefix=pb,
+                    inter_hunk_context=inter_hunk_context)
 
 
 def _count_lines(data: bytes) -> int:
@@ -24632,17 +25127,9 @@ def _register_phase8() -> None:
                                   smtp_oauth2_token=args.smtp_oauth2_token,
                                   use_credential_helpers=not args.no_credential_helper)
 
-    def _cmd_difftool(argv):
-        ap = argparse.ArgumentParser(prog="pygit difftool")
-        ap.add_argument("-t", "--tool", default=None)
-        ap.parse_args(argv)
-        return bridges.run_difftool(_repo(), args_tool := None) or 0
-
     def _cmd_difftool2(argv):
-        ap = argparse.ArgumentParser(prog="pygit difftool")
-        ap.add_argument("-t", "--tool", default=None)
-        a = ap.parse_args(argv)
-        return bridges.run_difftool(_repo(), a.tool)
+        from . import difftool as _difftool
+        return _difftool.cmd_difftool(argv)
 
     def _cmd_mergetool(argv):
         ap = argparse.ArgumentParser(prog="pygit mergetool")

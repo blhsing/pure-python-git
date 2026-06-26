@@ -384,14 +384,23 @@ def _guess_p_value(nameline: str, prefix: Optional[str]) -> int:
 # patch parsing
 
 
+# When set, hunk headers' line counts are recomputed from the body (apply
+# --recount).  This is a parse-time concern threaded through module state so the
+# existing call graph stays untouched.
+_RECOUNT = False
+
+
 def parse_patches(text: bytes, p_value_opt: Optional[int],
                   prefix: Optional[str] = None,
-                  patch_input_file: Optional[str] = None) -> list[Patch]:
+                  patch_input_file: Optional[str] = None,
+                  recount: bool = False) -> list[Patch]:
     """Parse all patches from the input.  p_value_opt is the user's -p<n> or
     None (meaning the default of 1, with traditional-diff guessing).
 
     Raises ApplyError(rc=128) on a git-diff header whose filename cannot be
     resolved, exactly like parse_git_diff_header()."""
+    global _RECOUNT
+    _RECOUNT = recount
     raw = text.decode("utf-8", "surrogateescape")
     lines = raw.splitlines(keepends=True)
     patches: list[Patch] = []
@@ -638,6 +647,28 @@ def _parse_one_hunk(lines: list[str], i: int) -> tuple[Optional[Fragment], int]:
         return None, i + 1
     i += 1
     n = len(lines)
+    if _RECOUNT:
+        # Port of recount_diff(): recompute counts from the hunk body, stopping
+        # at the next "@@ "/"diff " header or EOF.
+        old_r = new_r = 0
+        j = i
+        while j < n:
+            ln = lines[j]
+            c = ln[:1]
+            if c in (" ", "\n") or ln == "":
+                new_r += 1
+                old_r += 1
+            elif c == "-":
+                old_r += 1
+            elif c == "+":
+                new_r += 1
+            elif c == "\\":
+                pass
+            else:
+                break
+            j += 1
+        frag.oldlines = old_r
+        frag.newlines = new_r
     oldlines = frag.oldlines
     newlines = frag.newlines
     leading = 0

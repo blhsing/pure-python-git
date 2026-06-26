@@ -711,6 +711,110 @@ def push(repo: Repository, message: str = "", *, keep_index: bool = False,
     return w_commit
 
 
+def push_patch(repo: Repository, message: str = "", *,
+               keep_index: bool = True, pathspecs: Optional[list["Pathspec"]] = None,
+               quiet: bool = False,
+               context: int = -1, interhunkcontext: int = -1,
+               auto_advance: bool = True) -> object:
+    """`git stash push --patch`: stash interactively-selected hunks.
+
+    Mirrors do_create_stash(patch_mode) + stash_patch() + do_push_stash's
+    patch branch.  Returns the stash commit sha on success, ``None`` for no
+    local changes, ``"no-head"`` when there is no initial commit, ``1`` when no
+    hunks were selected ("No changes selected"), and ``"apply-failed"`` if the
+    reverse-apply that removes the selected changes from the worktree fails.
+    """
+    from . import addpatch
+
+    head_sym, head_sha = refs_mod.read_head(repo)
+    if not head_sha:
+        if not quiet:
+            sys.stderr.write("You do not have the initial commit yet\n")
+        return "no-head"
+
+    status = workdir.status(repo)
+    tracked_changes = bool(
+        status["staged_new"] or status["staged_mod"] or status["staged_del"]
+        or status["modified"] or status["missing"]
+    )
+    if not tracked_changes:
+        return None
+
+    branch, msg_core = _msg_core(repo, head_sym, head_sha)
+    head_tree = objs.parse_commit(objs.read_object(repo, head_sha)[1]).tree
+
+    # i_tree / i_commit: the current index state.
+    idx_tree = workdir.write_tree(repo)
+    i_commit = _commit_tree(repo, idx_tree, [head_sha], f"index on {msg_core}\n")
+
+    # stash_patch(): seed a scratch index with HEAD, run add-p in STASH mode to
+    # stage the selected hunks into it, then w_tree = that index's tree.  We use
+    # the real index as scratch and restore it afterwards (pygit has no
+    # GIT_INDEX_FILE), so the user's staged state is preserved exactly.
+    saved_idx = read_index(repo)
+    pspec = [_ps_original(p) for p in pathspecs] if pathspecs else []
+    try:
+        workdir.read_tree(repo, head_tree)
+        rc = addpatch.run_add_p(
+            repo, "stash", None, pspec,
+            context=context, interhunkcontext=interhunkcontext,
+            auto_advance=auto_advance)
+        w_tree = workdir.write_tree(repo)
+    finally:
+        write_index(repo, saved_idx)
+
+    # patch = diff-tree -p -U1 HEAD w_tree (the selected change set).
+    patch = _diff_tree_patch(repo, head_tree, w_tree, pspec)
+    if not patch:
+        if not quiet:
+            sys.stderr.write("No changes selected\n")
+        return 1
+
+    # Build and store the stash commit.
+    if message:
+        msg = f"On {branch}: {message}"
+    else:
+        msg = f"WIP on {msg_core}"
+    w_commit = _commit_tree(repo, w_tree, [head_sha, i_commit], msg)
+    refs_mod.update_ref(repo, "refs/stash", w_commit, message=msg)
+
+    if not quiet:
+        sys.stdout.write(f"Saved working directory and index state {msg}\n")
+
+    # Reverse-apply the selected patch to drop those changes from the worktree.
+    rc = _apply_reverse(repo, patch)
+    if rc != 0:
+        if not quiet:
+            sys.stderr.write("Cannot remove worktree changes\n")
+        return "apply-failed"
+
+    return w_commit
+
+
+def _ps_original(p: "Pathspec") -> str:
+    return getattr(p, "match", "") or getattr(p, "original", "")
+
+
+def _diff_tree_patch(repo: Repository, a_tree: str, b_tree: str,
+                     pathspec: list[str]) -> str:
+    """Capture `git diff-tree -p -U1 <a> <b> -- <ps>` output as text."""
+    import io
+    from . import cli
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        cli.cmd_diff_tree(["-p", "-U1", a_tree, b_tree, "--"] + pathspec)
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
+
+def _apply_reverse(repo: Repository, patch: str) -> int:
+    from . import addpatch
+    return addpatch._run_apply(repo, patch, ["-R"])
+
+
 def _staged_apply_failing_paths(repo: Repository, head_tree: str,
                                 idx_tree: str) -> list[str]:
     """Paths whose reverse-apply of the staged patch would fail.
