@@ -12825,6 +12825,7 @@ def cmd_merge(argv: list[str]) -> int:
     ap.add_argument("-s", "--strategy", default=None)
     ap.add_argument("-X", "--strategy-option", dest="strategy_option", action="append", default=None)
     ap.add_argument("-S", "--gpg-sign", dest="gpg_sign", nargs="?", const="", default=None)
+    ap.add_argument("--no-gpg-sign", dest="no_gpg_sign", action="store_true")
     ap.add_argument("--no-verify", dest="no_verify", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--allow-unrelated-histories", dest="allow_unrelated",
@@ -12833,6 +12834,16 @@ def cmd_merge(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     repo = _repo()
     from . import merge as _m
+
+    # Resolve GPG signing for the merge commit: -S/--gpg-sign[=keyid] or
+    # commit.gpgsign=true, disabled by --no-gpg-sign (builtin/merge.c sign_commit).
+    # merge_sign_key is None when unsigned, else the resolved signing key.
+    _sign_commit = _resolve_sign_commit(repo, args)
+    merge_sign_key = None
+    if _sign_commit is not None:
+        from . import gpgsign as _gpgsign
+        merge_sign_key = _sign_commit or _gpgsign.get_signing_key(
+            repo, _ident_no_date(objs.build_signature(repo, "committer")))
 
     # Resolve the merge strategy (default ort; recursive is its alias) and
     # -X ours/theirs favor. Unknown strategies fail exactly like C Git.
@@ -12911,7 +12922,16 @@ def cmd_merge(argv: list[str]) -> int:
         committer = objs.build_signature(repo, "committer")
         c = objs.Commit(tree=old_tree, parents=[head_sha, other_sha],
                         author=author, committer=committer, message=message)
-        sha = objs.write_object(repo, "commit", c.encode())
+        commit_bytes = c.encode()
+        if merge_sign_key is not None:
+            from . import gpgsign
+            sig, errmsg = gpgsign.sign_buffer(repo, commit_bytes, merge_sign_key)
+            if sig is None:
+                _err("error: " + errmsg)
+                _err("fatal: failed to write commit object")
+                return 128
+            commit_bytes = gpgsign.add_header_signature(commit_bytes, sig)
+        sha = objs.write_object(repo, "commit", commit_bytes)
         if head_sym:
             refs_mod.update_ref(repo, head_sym, sha, message=f"merge {args.other}: Merge made by the 'ours' strategy.")
         else:
@@ -12948,7 +12968,16 @@ def cmd_merge(argv: list[str]) -> int:
     from . import porcelain_merge as pm
     try:
         sha, conflicts, auto_merged = pm.merge(repo, args.other, message=args.message,
-                                               no_ff=args.no_ff, favor=favor)
+                                               no_ff=args.no_ff, favor=favor,
+                                               sign_key=merge_sign_key)
+    except pm.MergeSignFailure as e:
+        # builtin/merge.c: the auto-merge notices print, then commit_tree's
+        # sign failure aborts with the gpg error and rc 128.
+        for p in e.auto_merged:
+            _print(f"Auto-merging {p}")
+        _err("error: " + e.errmsg)
+        _err("fatal: failed to write commit object")
+        return 128
     except RuntimeError as e:
         _err(f"fatal: {e}")
         return 1
@@ -23157,6 +23186,8 @@ def cmd_pull(argv: list[str]) -> int:
     strategies: list[str] = []
     strategy_opts: list[str] = []
     fetch_opts: list[str] = []   # forwarded to the fetch step
+    gpg_sign = None              # None=unset, ""=sign default key, "<keyid>"
+    no_gpg_sign = False
     positional: list[str] = []
 
     i = 0
@@ -23226,8 +23257,24 @@ def cmd_pull(argv: list[str]) -> int:
             fetch_opts.append(a)
         elif a in ("--ipv4", "-4", "--ipv6", "-6"):
             fetch_opts.append(a)
+        elif a in ("-S", "--gpg-sign"):
+            # PARSE_OPT_OPTARG: bare -S signs with the default key.
+            gpg_sign = ""
+        elif a.startswith("--gpg-sign="):
+            gpg_sign = a.split("=", 1)[1]
+        elif a.startswith("-S"):
+            gpg_sign = a[2:]
+        elif a == "--no-gpg-sign":
+            no_gpg_sign = True
         elif a.startswith("-") and a != "-":
-            _err(f"error: unknown option `{a.lstrip('-')}'")
+            # parse-options error wording: long -> "unknown option", short ->
+            # "unknown switch", followed by the full usage block (builtin/pull.c).
+            from ._transport_usage import PULL_USAGE
+            if a.startswith("--"):
+                _err(f"error: unknown option `{a[2:]}'")
+            else:
+                _err(f"error: unknown switch `{a[1]}'")
+            sys.stderr.write(PULL_USAGE)
             return 129
         else:
             positional.append(a)
@@ -23301,6 +23348,11 @@ def cmd_pull(argv: list[str]) -> int:
         merge_argv.extend(["-X", x])
     if no_commit:
         merge_argv.append("--no-commit")
+    # Forward GPG signing to the merge step (builtin/pull.c OPT_PASSTHRU).
+    if no_gpg_sign:
+        merge_argv.append("--no-gpg-sign")
+    elif gpg_sign is not None:
+        merge_argv.append("-S" + gpg_sign)
 
     if opt_rebase:
         if can_ff:

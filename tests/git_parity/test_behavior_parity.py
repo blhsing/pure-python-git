@@ -3775,3 +3775,47 @@ def test_batch15_parity(case, tmp_path: Path, git_254_oracle: str):
 def test_batch15_stdin_parity(case, tmp_path: Path, git_254_oracle: str):
     _id, setup, probe, stdin = case
     assert_command_parity(git_254_oracle, tmp_path, setup, probe, stdin=stdin)
+
+
+# BATCH16: GPG-signing for merge/pull, and pull's parse-options error wording.
+# A divergent (non-ff) two-branch history reused by the merge-signing cases.
+_DIV_DISTINCT = [
+    ('write', 'f', 'base\n'), ['add', 'f'], ['commit', '-qm', 'base'],
+    ['checkout', '-b', 'side'], ('write', 's', 'side\n'), ['add', 's'], ['commit', '-qm', 'side'],
+    ['checkout', 'main'], ('write', 'm', 'main\n'), ['add', 'm'], ['commit', '-qm', 'main'],
+]
+_DIV_SAMEFILE = [
+    ('write', 'f', 'a\nb\nc\nd\ne\n'), ['add', 'f'], ['commit', '-qm', 'base'],
+    ['checkout', '-b', 'side'], ('write', 'f', 'A\nb\nc\nd\ne\n'), ['add', 'f'], ['commit', '-qm', 'side'],
+    ['checkout', 'main'], ('write', 'f', 'a\nb\nc\nd\nE\n'), ['add', 'f'], ['commit', '-qm', 'main'],
+]
+
+BATCH16_CASES = [
+    # merge --no-gpg-sign is accepted (was a parser gap); up to date -> rc 0.
+    ('merge --no-gpg-sign up-to-date', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['merge', '--no-gpg-sign', 'HEAD']),
+    # merge -S actually signs: broken gpg (/bin/false) -> rc 128, gpg error block,
+    # HEAD unchanged (no merge commit), proving signing is attempted.
+    ('merge -S broken-gpg distinct files', _DIV_DISTINCT + [['config', 'gpg.program', '/bin/false']], ['merge', '-S', '-m', 'msg', 'side']),
+    # Same with an auto-merged file: the "Auto-merging" notice prints before the error.
+    ('merge -S broken-gpg auto-merge same file', _DIV_SAMEFILE + [['config', 'gpg.program', '/bin/false']], ['merge', '-S', '-m', 'msg', 'side']),
+    # --no-gpg-sign overrides commit.gpgsign=true even with a broken gpg -> merge succeeds unsigned.
+    ('merge --no-gpg-sign overrides commit.gpgsign broken-gpg', _DIV_DISTINCT + [['config', 'commit.gpgsign', 'true'], ['config', 'gpg.program', '/bin/false']], ['merge', '--no-gpg-sign', '-m', 'msg', 'side']),
+    # commit.gpgsign=true makes a plain merge attempt signing too -> broken gpg rc 128.
+    ('merge config gpgsign broken-gpg rc128', _DIV_DISTINCT + [['config', 'commit.gpgsign', 'true'], ['config', 'gpg.program', '/bin/false']], ['merge', '-m', 'msg', 'side']),
+    # pull now accepts -S / --gpg-sign[=keyid] / --no-gpg-sign (forwarded to merge);
+    # with no upstream configured it reaches the no-tracking-information error (rc 1).
+    ('pull -S no-tracking', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '-S']),
+    ('pull --gpg-sign=keyid no-tracking', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '--gpg-sign=DEADBEEF']),
+    ('pull --no-gpg-sign no-tracking', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '--no-gpg-sign']),
+    # pull's parse-options error wording: short -> "unknown switch", long ->
+    # "unknown option", each followed by the full usage block.
+    ('pull -m unknown switch + usage', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '-m', 'x']),
+    ('pull --bogus unknown option + usage', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '--bogus']),
+    ('pull -Z unknown switch + usage', [('write', 'f', 'x\n'), ['add', 'f'], ['commit', '-qm', 'c1']], ['pull', '-Z']),
+]
+
+
+@pytest.mark.parametrize("case", BATCH16_CASES, ids=[c[0] for c in BATCH16_CASES])
+def test_batch16_parity(case, tmp_path: Path, git_254_oracle: str):
+    _id, setup, probe = case
+    assert_command_parity(git_254_oracle, tmp_path, setup, probe)

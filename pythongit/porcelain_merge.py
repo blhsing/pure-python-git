@@ -10,6 +10,17 @@ from . import workdir
 from .repo import Repository
 
 
+class MergeSignFailure(Exception):
+    """Raised by merge() when GPG-signing the merge commit fails, mirroring
+    builtin/merge.c's abort-before-write.  Carries the gpg error text and the
+    auto-merge notices so the caller can reproduce git's exact output."""
+
+    def __init__(self, errmsg: str, auto_merged: list):
+        super().__init__(errmsg)
+        self.errmsg = errmsg
+        self.auto_merged = auto_merged
+
+
 def _default_merge_message(repo: Repository, other_rev: str, head_sym: Optional[str]) -> str:
     """Compose the default merge commit subject the way ``git merge`` names it.
 
@@ -34,8 +45,13 @@ def _default_merge_message(repo: Repository, other_rev: str, head_sym: Optional[
 
 
 def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
-          allow_ff: bool = True, no_ff: bool = False, favor: int = 0) -> tuple[str, list[str]]:
-    """Return (result_sha, conflicts). result_sha is "" on conflicts."""
+          allow_ff: bool = True, no_ff: bool = False, favor: int = 0,
+          sign_key: Optional[str] = None) -> tuple[str, list[str], list[str]]:
+    """Return (result_sha, conflicts, auto_merged). result_sha is "" on conflicts.
+
+    When *sign_key* is not None the merge commit is GPG-signed with that key
+    (``""`` resolves to the default signing key), mirroring builtin/merge.c's
+    sign_commit path so ``git merge -S`` produces a verifiable merge commit."""
     head_sym, head = refs_mod.read_head(repo)
     if not head:
         raise RuntimeError("no HEAD")
@@ -90,7 +106,18 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
     committer_sig = objs.build_signature(repo, "committer")
     c = objs.Commit(tree=new_tree, parents=[head, other], author=author_sig, committer=committer_sig,
                     message=msg if msg.endswith("\n") else msg + "\n")
-    sha = objs.write_object(repo, "commit", c.encode())
+    commit_bytes = c.encode()
+    if sign_key is not None:
+        from . import gpgsign
+        sig, errmsg = gpgsign.sign_buffer(repo, commit_bytes, sign_key)
+        if sig is None:
+            # builtin/merge.c aborts before writing the commit when signing
+            # fails; the worktree is already merged (checkout above) but HEAD
+            # is left unchanged.  Carry the gpg errmsg + the auto-merge notices
+            # so cmd_merge can reproduce git's exact output ordering.
+            raise MergeSignFailure(errmsg, auto_merged)
+        commit_bytes = gpgsign.add_header_signature(commit_bytes, sig)
+    sha = objs.write_object(repo, "commit", commit_bytes)
     if head_sym:
         refs_mod.update_ref(repo, head_sym, sha, message=f"merge {other_rev}: Merge made by the 'ort' strategy.")
     else:
