@@ -46,22 +46,24 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
         return head, []
 
     bases = merge_mod.merge_bases(repo, head, other)
-    if not bases:
-        raise RuntimeError("no common ancestor")
-    base = bases[0]
+    # With no common ancestor, the caller (cmd_merge) has already enforced the
+    # --allow-unrelated-histories gate; here we fall straight through to the
+    # 3-way merge, whose engine builds a virtual empty-tree base.
+    base = bases[0] if bases else None
 
-    # already up-to-date
-    if base == other:
-        return head, []
-    # fast-forward
-    if base == head and allow_ff and not no_ff:
-        if head_sym:
-            refs_mod.update_ref(repo, head_sym, other, message=f"merge {other_rev}: Fast-forward")
-        else:
-            refs_mod.set_head(repo, other)
-        tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
-        workdir.checkout_tree(repo, tree)
-        return other, []
+    if base is not None:
+        # already up-to-date
+        if base == other:
+            return head, []
+        # fast-forward
+        if base == head and allow_ff and not no_ff:
+            if head_sym:
+                refs_mod.update_ref(repo, head_sym, other, message=f"merge {other_rev}: Fast-forward")
+            else:
+                refs_mod.set_head(repo, other)
+            tree = objs.parse_commit(objs.read_object(repo, other)[1]).tree
+            workdir.checkout_tree(repo, tree)
+            return other, []
 
     # three-way merge — recursive ort (handles 1, 2+, or 0 merge bases via a
     # virtual ancestor), matching `git merge`.

@@ -711,6 +711,85 @@ def push(repo: Repository, message: str = "", *, keep_index: bool = False,
     return w_commit
 
 
+def create(repo: Repository, message: str = "", *,
+           include_untracked: int = 0) -> object:
+    """`git stash create`: build the stash (w_commit) WITHOUT storing it in
+    refs/stash and WITHOUT touching the worktree/index.
+
+    Mirrors create_stash() -> do_create_stash(). Returns the stash commit sha on
+    success, ``None`` when there are no tracked changes (create_stash uses
+    check_changes_tracked_files, so untracked-only worktrees yield nothing), and
+    ``"no-head"`` when there is no initial commit yet.
+    """
+    head_sym, head_sha = refs_mod.read_head(repo)
+    # create_stash: check_changes_tracked_files() returns -1 (no HEAD) -> proceed
+    # into do_create_stash which dies "You do not have the initial commit yet".
+    if not head_sha:
+        sys.stderr.write("You do not have the initial commit yet\n")
+        return "no-head"
+
+    status = workdir.status(repo)
+    tracked_changes = bool(
+        status["staged_new"] or status["staged_mod"] or status["staged_del"]
+        or status["modified"] or status["missing"]
+    )
+    if not tracked_changes:
+        return None  # create_stash returns 0 with no output
+
+    untracked_files: list[str] = []
+    if include_untracked:
+        untracked_files = _untracked_files(repo, include_untracked, None)
+
+    branch, msg_core = _msg_core(repo, head_sym, head_sha)
+
+    # index-state commit ("index on <core>\n").
+    idx_tree = workdir.write_tree(repo)
+    i_commit = _commit_tree(repo, idx_tree, [head_sha],
+                            f"index on {msg_core}\n")
+    parents = [head_sha, i_commit]
+    if include_untracked:
+        files: dict[str, tuple[int, str]] = {}
+        for rel in untracked_files:
+            full = repo.path / rel
+            data = workdir._blob_data(full)
+            sha = objs.write_object(repo, "blob", data)
+            files[rel] = (workdir._mode_for(full), sha)
+        u_tree = _build_tree_from_blobs(repo, files)
+        u_commit = _commit_tree(repo, u_tree, [], f"untracked files on {msg_core}\n")
+        parents.append(u_commit)
+
+    # working-tree commit: stage every tracked path, build the tree, restore the
+    # original index (create never mutates the on-disk index).
+    saved_idx = read_index(repo)
+    tracked = sorted(read_index(repo).by_path())
+    workdir.add_paths(repo, tracked)
+    w_tree = workdir.write_tree(repo)
+    write_index(repo, saved_idx)
+
+    if message:
+        msg = f"On {branch}: {message}"
+    else:
+        msg = f"WIP on {msg_core}"
+    return _commit_tree(repo, w_tree, parents, msg)
+
+
+def store(repo: Repository, oid: str, message: Optional[str] = None,
+          quiet: bool = False) -> int:
+    """`git stash store`: record an existing stash commit in refs/stash.
+
+    Mirrors store_stash()/do_store_stash(). Returns 0 on success, 1 on a bad
+    object (after printing "Cannot update refs/stash with <arg>")."""
+    w_commit = refs_mod.rev_parse(repo, oid)
+    if not w_commit:
+        if not quiet:
+            sys.stderr.write(f"Cannot update refs/stash with {oid}\n")
+        return 1
+    if message is None:
+        message = "Created via \"git stash store\"."
+    refs_mod.update_ref(repo, "refs/stash", w_commit, message=message)
+    return 0
+
+
 def push_patch(repo: Repository, message: str = "", *,
                keep_index: bool = True, pathspecs: Optional[list["Pathspec"]] = None,
                quiet: bool = False,

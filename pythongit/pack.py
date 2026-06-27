@@ -517,8 +517,13 @@ def write_midx(
         if p.with_suffix(".pack").exists()
     ]
     pack_names = [p.name for p in idx_paths]
+    # midx-write.c dedup compares packed_git->mtime, which packfile.c sets to
+    # the .pack file's st_mtime — whole SECONDS, not nanoseconds.  Two packs
+    # created within the same second therefore tie, and the dedup falls through
+    # to the lower pack_int_id.  Using nanosecond mtimes here would break that
+    # tie incorrectly, so match C and read whole-second .pack mtimes.
     mtimes = [
-        max(p.stat().st_mtime_ns, p.with_suffix(".pack").stat().st_mtime_ns)
+        int(p.with_suffix(".pack").stat().st_mtime)
         for p in idx_paths
     ]
 
@@ -530,13 +535,19 @@ def write_midx(
             shas_i, offsets_i = _read_idx(idx_path, hash_len)
             pack_objects.append((shas_i, offsets_i))
             if shas_i:
-                nonempty_packs.append((idx_path.with_suffix(".pack").stat().st_mtime_ns, pack_id))
+                nonempty_packs.append((mtimes[pack_id], pack_id))
         if nonempty_packs:
             preferred_pack_id = min(nonempty_packs)[1]
     else:
         for idx_path in idx_paths:
             pack_objects.append(_read_idx(idx_path, hash_len))
 
+    # Deduplicate shared objects exactly like midx-write.c:midx_oid_compare:
+    # for two copies of the same OID, the winner is (in priority order) the
+    # preferred pack, then the pack with the HIGHER mtime, then the LOWER
+    # pack_int_id.  We iterate packs in ascending id, so a later pack only
+    # wins when it is preferred-and-the-incumbent-isn't, or shares preferred
+    # status and has a strictly greater mtime (a tie keeps the lower id).
     selected: dict[str, tuple[int, int, int, bool]] = {}
     for pack_id, idx_path in enumerate(idx_paths):
         shas_i, offsets_i = pack_objects[pack_id]
@@ -544,11 +555,18 @@ def write_midx(
         preferred = preferred_pack_id is not None and pack_id == preferred_pack_id
         for sha, off in zip(shas_i, offsets_i):
             prev = selected.get(sha)
-            if (
-                prev is None
-                or (preferred and not prev[3])
-                or (preferred == prev[3] and (mtime, pack_id) >= (prev[2], prev[0]))
-            ):
+            if prev is None:
+                selected[sha] = (pack_id, off, mtime, preferred)
+                continue
+            prev_pack_id, _prev_off, prev_mtime, prev_pref = prev
+            # Determine whether the current entry sorts strictly before prev.
+            if preferred != prev_pref:
+                better = preferred  # preferred beats non-preferred
+            elif mtime != prev_mtime:
+                better = mtime > prev_mtime  # higher mtime wins
+            else:
+                better = pack_id < prev_pack_id  # lower id wins (never, ascending)
+            if better:
                 selected[sha] = (pack_id, off, mtime, preferred)
 
     shas = sorted(selected)

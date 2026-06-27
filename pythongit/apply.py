@@ -1388,22 +1388,38 @@ def _check_and_apply_inner(repo, patches: list[Patch], opts: ApplyOpts,
     idx = read_index(repo) if (opts.check_index or update_index) else None
 
     # ---- check_patch_list: per-patch check_preimage + apply_data --------------
+    # Mirror apply.c:check_patch_list, which checks EVERY patch and accumulates
+    # the result (err |= res), bailing only on the fatal -128 code.  This lets a
+    # multi-file patch emit an error pair for each failing file before apply
+    # gives up, rather than stopping at the first failure.
+    err = 0
     for patch in patches:
         if opts.verbosity > 0:
             _say_patch_name("Checking patch %s...", patch)
         rc = _check_one(repo, idx, patch, opts)
         if rc is not None:
-            return rc
+            # _check_one's non-None returns correspond to apply.c error() (rc
+            # -1, accumulated); 128 stands in for the fatal -128 that stops the
+            # whole run immediately (check_patch_list: `if (res==-128) return`).
+            if rc == 128:
+                return 128
+            err |= rc
+            continue
         if patch.is_delete > 0:
             patch.result = b""
         else:
             if _apply_data(repo, idx, patch, opts) < 0:
                 name = patch.old_name if patch.old_name else patch.new_name
                 _stderr("error: %s: patch does not apply" % name)
-                return 1
+                err |= 1
+
+    # In C, a check_patch_list failure aborts before write_out_results unless
+    # --reject is in effect (apply_with_reject keeps going to emit .rej files).
+    if err and not opts.apply_with_reject:
+        return 1
 
     if opts.check:
-        return 0
+        return 1 if err else 0
 
     # die_on_ws_error (--whitespace=error): abort before writing anything out.
     if opts.ws_action == "error" and _WS_ERROR_COUNT:

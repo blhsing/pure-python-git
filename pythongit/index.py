@@ -276,11 +276,20 @@ def write_index(repo: Repository, idx: Index) -> None:
 
 
 def stat_to_entry(path: str, st: os.stat_result, sha: str, mode: int) -> IndexEntry:
+    # Git stores the nanosecond component as the integral nanosecond timestamp
+    # modulo 1e9 (fill_stat_cache_info -> ST_CTIME_NSEC == st_ctim.tv_nsec).
+    # Deriving it from the float st_ctime is lossy and produces a value that
+    # differs by tens of nanoseconds from what git wrote for the same file, so
+    # any stat comparison against a git-written index would spuriously fail.
+    ctime_ns = getattr(st, "st_ctime_ns", None)
+    mtime_ns = getattr(st, "st_mtime_ns", None)
     return IndexEntry(
         ctime_s=int(st.st_ctime),
-        ctime_n=int((st.st_ctime - int(st.st_ctime)) * 1e9),
+        ctime_n=(ctime_ns % 1_000_000_000) if ctime_ns is not None
+        else int((st.st_ctime - int(st.st_ctime)) * 1e9),
         mtime_s=int(st.st_mtime),
-        mtime_n=int((st.st_mtime - int(st.st_mtime)) * 1e9),
+        mtime_n=(mtime_ns % 1_000_000_000) if mtime_ns is not None
+        else int((st.st_mtime - int(st.st_mtime)) * 1e9),
         dev=getattr(st, "st_dev", 0),
         ino=getattr(st, "st_ino", 0),
         mode=mode,

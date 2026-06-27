@@ -299,13 +299,18 @@ def tracked_paths(repo: Repository) -> set[str]:
 # status / diff target lists
 
 
-def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list[str]]:
-    """Return groups: staged_new, staged_mod, staged_del, mod, untracked."""
+def status(repo: Repository, *, include_ignored: bool = False,
+           reference: Optional[str] = None) -> dict[str, list[str]]:
+    """Return groups: staged_new, staged_mod, staged_del, mod, untracked.
+
+    ``reference`` overrides the HEAD baseline the staged-changes diff compares
+    against (used by ``commit --amend --dry-run``, which compares against
+    HEAD^1 the way C Git's run_status sets s->reference)."""
     idx = read_index(repo)
     by_path = idx.by_path()
     ignores = None if include_ignored else ignore_mod.load(repo.path)
 
-    head_tree = _head_tree_map(repo)
+    head_tree = _head_tree_map(repo, reference)
 
     def _frozen(entry) -> bool:
         # Assume-unchanged (CE_VALID 0x8000) and skip-worktree entries are not
@@ -359,8 +364,11 @@ def status(repo: Repository, *, include_ignored: bool = False) -> dict[str, list
     }
 
 
-def _head_tree_map(repo: Repository) -> dict[str, str]:
-    _, head_sha = refs_mod.read_head(repo)
+def _head_tree_map(repo: Repository, reference: Optional[str] = None) -> dict[str, str]:
+    if reference is not None:
+        head_sha = refs_mod.rev_parse(repo, reference)
+    else:
+        _, head_sha = refs_mod.read_head(repo)
     if not head_sha:
         return {}
     try:

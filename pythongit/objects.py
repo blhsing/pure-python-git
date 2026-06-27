@@ -208,6 +208,45 @@ def _parse_date_env(value: str) -> Optional[tuple[int, int]]:
         off = dt.utcoffset()
         tzmin = int(off.total_seconds()) // 60 if off is not None else 0
         return int(dt.timestamp()), tzmin
+
+    # RFC2822 / abbreviated-month forms (git's date.c parse_date accepts these,
+    # e.g. "Mon, 3 Jul 2006 17:18:43 +0200" and the weekday/comma-less variants
+    # "Jul 3 17:18:43 2006 +0200", "3 Jul 2006 17:18:43 +0200"). Pull off an
+    # explicit ±HHMM offset and parse the remainder against month-name formats,
+    # treating the parsed wall-clock as being in that offset to recover the
+    # UTC epoch (matching parse_date_basic's tm_to_time_t over the named tz).
+    mtz = re.search(r"\s([+-])(\d{2})(\d{2})\s*$", value)
+    explicit_off = None
+    body = value
+    if mtz:
+        explicit_off = (1 if mtz.group(1) == "+" else -1) * (
+            int(mtz.group(2)) * 60 + int(mtz.group(3)))
+        body = value[:mtz.start()].strip()
+    body = body.rstrip(",").strip()
+    # Drop a leading weekday token ("Mon" / "Mon,") — git ignores it. Only strip
+    # actual weekday names so a leading month ("Jul 3 ...") is left intact.
+    body = re.sub(r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+", "", body,
+                  flags=re.IGNORECASE)
+    naive_fmts = (
+        "%d %b %Y %H:%M:%S",   # 3 Jul 2006 17:18:43
+        "%b %d %H:%M:%S %Y",   # Jul 3 17:18:43 2006
+        "%b %d %Y %H:%M:%S",   # Jul 3 2006 17:18:43
+        "%Y-%m-%d %H:%M:%S",
+    )
+    for fmt in naive_fmts:
+        try:
+            dt = datetime.datetime.strptime(body, fmt)
+        except ValueError:
+            continue
+        if explicit_off is not None:
+            # Interpret the wall-clock as offset-local; epoch = UTC seconds.
+            dt = dt.replace(tzinfo=datetime.timezone(
+                datetime.timedelta(minutes=explicit_off)))
+            return int(dt.timestamp()), explicit_off
+        # No explicit tz: treat as local time (git uses the local zone).
+        secs = int(dt.replace(
+            tzinfo=datetime.datetime.now().astimezone().tzinfo).timestamp())
+        return secs, _local_tz_minutes(secs)
     return None
 
 
