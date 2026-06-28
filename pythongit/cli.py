@@ -2999,9 +2999,20 @@ def cmd_commit_tree(argv: list[str]) -> int:
 
 
 _UPDATE_REF_USAGE = (
-    "usage: git update-ref [<options>] -d <refname> [<old-val>]\n"
-    "   or: git update-ref [<options>]    <refname> <new-val> [<old-val>]\n"
-    "   or: git update-ref [<options>] --stdin [-z] [--batch-updates]\n"
+    'usage: git update-ref [<options>] -d <refname> [<old-oid>]\n'
+    '   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]\n'
+    '   or: git update-ref [<options>] --stdin [-z] [--batch-updates]\n'
+    '\n'
+    '    -m <reason>           reason of the update\n'
+    '    -d                    delete the reference\n'
+    '    --no-deref            update <refname> not the one it points to\n'
+    '    --deref               opposite of --no-deref\n'
+    '    -z                    stdin has NUL-terminated arguments\n'
+    '    --[no-]stdin          read updates from stdin\n'
+    '    --[no-]create-reflog  create a reflog\n'
+    '    -0, --[no-]batch-updates\n'
+    '                          batch reference updates\n'
+    '\n'
 )
 
 
@@ -3015,7 +3026,9 @@ def cmd_update_ref(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit update-ref", add_help=False)
     ap.add_argument("-d", dest="delete", action="store_true")
     ap.add_argument("-m", dest="message", default="")
-    ap.add_argument("--no-deref", action="store_true")
+    ap.add_argument("--no-deref", dest="no_deref", action="store_true", default=False)
+    # git update-ref.c: --deref is "opposite of --no-deref" (the default).
+    ap.add_argument("--deref", dest="no_deref", action="store_false")
     ap.add_argument("-z", dest="end_null", action="store_true")
     ap.add_argument("--stdin", dest="read_stdin", action="store_true")
     ap.add_argument("--create-reflog", dest="create_reflog", action="store_true")
@@ -13744,6 +13757,9 @@ def cmd_restore(argv: list[str]) -> int:
     overlay = None  # None unset, True/False
     pathspec_from_file = None
     pathspec_file_nul = False
+    patch_mode = False
+    unified_seen = False        # -U / --unified
+    ihc_seen = False            # --inter-hunk-context
     paths: list[str] = []
     i, n = 0, len(argv)
     dd = False
@@ -13782,16 +13798,31 @@ def cmd_restore(argv: list[str]) -> int:
             pathspec_file_nul = True
         elif a in ("--ours", "--theirs", "--ignore-unmerged", "--progress",
                    "--no-progress", "-m", "--merge", "--ignore-skip-worktree-bits",
-                   "-p", "--patch", "--recurse-submodules", "--no-recurse-submodules",
+                   "--recurse-submodules", "--no-recurse-submodules",
                    "-2", "-3"):
             pass  # accepted; conflict-resolution variants not modeled here
+        elif a in ("-p", "--patch"):
+            patch_mode = True
         elif a == "--conflict" or a.startswith("--conflict="):
             if a == "--conflict":
                 i += 1  # consume the style value
-        elif a in ("-U", "--inter-hunk-context"):
-            i += 1  # consume the value
-        elif a.startswith("--inter-hunk-context=") or a.startswith("-U"):
-            pass
+        elif a in ("-U", "--unified"):
+            # -U/--unified take a value; bare form -> "requires a value" rc 129.
+            i += 1
+            if i >= n:
+                sys.stderr.write("error: option `unified' requires a value\n")
+                return 129
+            unified_seen = True
+        elif a.startswith("--unified=") or (a.startswith("-U") and len(a) > 2):
+            unified_seen = True
+        elif a == "--inter-hunk-context":
+            i += 1
+            if i >= n:
+                sys.stderr.write("error: option `inter-hunk-context' requires a value\n")
+                return 129
+            ihc_seen = True
+        elif a.startswith("--inter-hunk-context="):
+            ihc_seen = True
         elif a.startswith("-") and a != "-":
             if a.startswith("--"):
                 sys.stderr.write(f"error: unknown option `{a[2:]}'\n")
@@ -13801,6 +13832,15 @@ def cmd_restore(argv: list[str]) -> int:
         else:
             paths.append(a)
         i += 1
+
+    # builtin/checkout.c: --unified (-U) and --inter-hunk-context only apply to
+    # the interactive patch flow, so they die unless --patch is also given.
+    if unified_seen and not patch_mode:
+        _err("fatal: the option '--unified' requires '--patch'")
+        return 128
+    if ihc_seen and not patch_mode:
+        _err("fatal: the option '--inter-hunk-context' requires '--patch'")
+        return 128
 
     if pathspec_from_file is not None:
         raw = (sys.stdin.buffer.read() if pathspec_from_file == "-"
@@ -27528,6 +27568,11 @@ _PACK_OBJECTS_VALUE_OPTS = {
     "window-memory": "uint",
     "max-pack-size": "uint",
     "name-hash-version": "int",
+    # string-valued options (no numeric validation): bare form -> "requires a
+    # value" + usage rc 129, matching git's parse-options.
+    "keep-pack": "str",
+    "filter": "str",
+    "missing": "str",
 }
 
 
@@ -27584,7 +27629,6 @@ def cmd_pack_objects(argv: list[str]) -> int:
                 i += 1
                 if i >= n:
                     _err("error: option `index-version' requires a value")
-                    sys.stderr.write(_PACK_OBJECTS_USAGE)
                     return 129
                 val = argv[i]
             else:
@@ -27602,28 +27646,34 @@ def cmd_pack_objects(argv: list[str]) -> int:
             else:
                 i += 1
                 if i >= n:
+                    # git parse-options prints ONLY the error line (no usage
+                    # block) when a value option is missing its argument.
                     _err(f"error: option `{name}' requires a value")
-                    sys.stderr.write(_PACK_OBJECTS_USAGE)
                     return 129
                 val = argv[i]
             from . import repack as _repack
             try:
                 if kind == "uint":
                     _repack._parse_uint(name, val)
-                else:
+                elif kind == "int":
                     _repack._parse_int(name, val)
+                # kind == "str": git accepts any value (filter spec, pack name,
+                # missing-action) — no numeric validation here.
             except _repack.UsageError as exc:
                 if exc.message:
                     _err(exc.message)
                 return 129
-        elif arg.startswith(("--keep-pack=", "--filter=", "--missing=",
-                             "--cruft-expiration=", "--uri-protocol=",
+        elif arg.startswith(("--cruft-expiration=", "--uri-protocol=",
                              "--unpack-unreachable=")):
             pass
         elif arg in ("--keep-unreachable", "--pack-loose-unreachable",
                      "--cruft", "--use-bitmap-index", "--no-use-bitmap-index",
                      "--shallow", "--exclude-promisor-objects",
-                     "--exclude-promisor-objects-best-effort"):
+                     "--exclude-promisor-objects-best-effort",
+                     # --path-walk is OPT_BOOL; --cruft-expiration is
+                     # PARSE_OPT_OPTARG so its bare form is accepted (then the
+                     # missing object-list falls through to the usage block).
+                     "--path-walk", "--cruft-expiration"):
             pass
         elif arg == "--":
             positionals.extend(argv[i + 1:])

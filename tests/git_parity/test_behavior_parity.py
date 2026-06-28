@@ -4276,6 +4276,19 @@ BATCH18_CASES = [
     ('apply-index:ui-fsmonitor', [('write', 'a.txt', 'hi\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['update-index', '--fsmonitor']),
     ('apply-index:ui-split-index', [('write', 'a.txt', 'hi\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1']], ['update-index', '--split-index']),
     ('apply-index:mi-h-stdout', [], ['mailinfo', '-h']),
+    ('regr:pack-objects --keep-pack requires value', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--keep-pack']),
+    ('regr:pack-objects --filter requires value', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--filter']),
+    ('regr:pack-objects --missing requires value', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--missing']),
+    ('regr:pack-objects --cruft-expiration bare usage', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--cruft-expiration']),
+    ('regr:pack-objects --path-walk bare usage', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--path-walk']),
+    ('regr:pack-objects --window requires value (no usage)', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['pack-objects', '--window']),
+    ('regr:restore --unified requires value', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['restore', '--unified']),
+    ('regr:restore --unified without --patch dies', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['restore', '--unified=3', 'a']),
+    ('regr:restore -U without --patch dies', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['restore', '-U3', 'a']),
+    ('regr:restore --inter-hunk-context without --patch dies', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['restore', '--inter-hunk-context=2', 'a']),
+    ('regr:update-ref --deref usage', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['update-ref', '--deref']),
+    ('regr:update-ref --no-deref usage', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['update-ref', '--no-deref']),
+    ('regr:update-ref -z usage', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['update-ref', '-z']),
 ]
 
 BATCH18_STDIN_CASES = [
