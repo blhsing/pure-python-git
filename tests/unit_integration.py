@@ -419,10 +419,13 @@ def test_pack_objects_and_unpack(tmprepo):
     for i in range(5):
         commit_one(repo, "a", f"v{i}\n", f"c{i}")
     assert cli_run("pack-objects", "pack", "--all") == 0
-    pack_dir = repo.gitdir / "objects" / "pack"
-    assert list(pack_dir.glob("pack-*.pack"))
+    # git's `pack-objects <base-name>` writes <base>-<sha>.{pack,idx,rev}
+    # relative to the CURRENT WORKING DIRECTORY (the repo root here), not the
+    # object store.
+    written = list(repo.path.glob("pack-*.pack"))
+    assert written
     # verify
-    assert cli_run("verify-pack", *[str(p) for p in pack_dir.glob("pack-*.pack")]) == 0
+    assert cli_run("verify-pack", *[str(p) for p in written]) == 0
 
 
 def test_commit_graph_binary_passes_real_git(tmprepo):

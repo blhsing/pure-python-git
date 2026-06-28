@@ -146,10 +146,14 @@ _LONG_VALUE_OPTS = {
     "max-cruft-size": ("max_cruft_size", "uint"),
     "name-hash-version": ("name_hash_version", "int"),
     "unpack-unreachable": ("unpack_unreachable", "str"),
-    "window": ("window", "str"),
-    "window-memory": ("window_memory", "str"),
-    "depth": ("depth", "str"),
-    "threads": ("threads", "str"),
+    # window/depth/threads are OPT_STRING in repack.c but are forwarded verbatim
+    # to `git pack-objects`, where window/depth/threads are OPT_INTEGER and
+    # window-memory is OPT_MAGNITUDE. git validates them in the child; we port
+    # that validation here so a bad value fails identically (rc 129).
+    "window": ("window", "int"),
+    "window-memory": ("window_memory", "uint"),
+    "depth": ("depth", "int"),
+    "threads": ("threads", "int"),
     "max-pack-size": ("max_pack_size", "uint"),
     "keep-pack": ("keep_pack_list", "list"),
     "geometric": ("geometric", "int"),
@@ -189,6 +193,22 @@ def _parse_uint(name: str, value: str) -> int:
     if n < 0:
         raise UsageError(msg, show_usage=False)
     return n * mult
+
+
+def _parse_int(name: str, value: str) -> int:
+    """Port of OPT_INTEGER: parse a (possibly signed) integer with k/m/g suffix."""
+    msg = (f"error: option `{name}' expects an integer value "
+           "with an optional k/m/g suffix")
+    v = value.strip()
+    mult = 1
+    if v and v[-1] in "kKmMgG":
+        unit = v[-1].lower()
+        mult = {"k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}[unit]
+        v = v[:-1]
+    body = v[1:] if v[:1] in ("+", "-") else v
+    if not body or not body.isdigit():
+        raise UsageError(msg, show_usage=False)
+    return int(v, 10) * mult
 
 
 def parse_options(argv: list[str], opts: Options) -> None:
@@ -233,13 +253,7 @@ def parse_options(argv: list[str], opts: Options) -> None:
                 if kind == "uint":
                     setattr(opts, attr, _parse_uint(name, val))
                 elif kind == "int":
-                    try:
-                        setattr(opts, attr, int(val, 10))
-                    except ValueError:
-                        raise UsageError(
-                            f"error: option `{name}' expects an integer value "
-                            "with an optional k/m/g suffix",
-                            show_usage=False)
+                    setattr(opts, attr, _parse_int(name, val))
                 elif kind == "list":
                     getattr(opts, attr).append(val)
                 else:
@@ -321,10 +335,13 @@ def parse_options(argv: list[str], opts: Options) -> None:
                 j += 1
             i += 1
             continue
-        # Non-option argument: repack takes none.
-        raise UsageError(f"error: unknown argument `{arg}'")
-    if i < n:
-        raise UsageError(f"error: unknown argument `{argv[i]}'")
+        # Non-option (positional) argument: repack calls parse_options(..., 0),
+        # which permutes non-options to the end and never inspects the leftover
+        # argv, so positionals are silently ignored (rc 0) while later options
+        # are still parsed. Skip this token and keep going.
+        i += 1
+        continue
+    # Anything after `--` is ignored as well (repack consumes no positionals).
 
 
 # ---------------------------------------------------------------------------

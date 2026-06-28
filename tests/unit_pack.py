@@ -200,8 +200,12 @@ def test_pack_bitmap_written_and_real_git_uses_it(tmprepo):
         commit_one(repo, "a.txt", f"v{i}\n", f"c{i}")
 
     # git only writes a .bitmap when --write-bitmap-index is given (no default).
-    assert cli.main(["pack-objects", "pack", "--all", "--write-bitmap-index"]) == 0
+    # pack-objects writes <base-name>-<sha>.{pack,idx,rev,bitmap} relative to the
+    # CWD, so to land the pack in the object store (where real git looks for
+    # bitmaps) we give the base-name under objects/pack.
     pack_dir = repo.gitdir / "objects" / "pack"
+    base = str(pack_dir / "pack")
+    assert cli.main(["pack-objects", base, "--all", "--write-bitmap-index"]) == 0
     bitmaps = list(pack_dir.glob("pack-*.bitmap"))
     assert len(bitmaps) == 1
     objects, commits = pack.verify_pack_bitmap(repo, bitmaps[0])

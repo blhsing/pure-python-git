@@ -1125,6 +1125,7 @@ def unpack_objects_stream(
     *,
     dry_run: bool = False,
     recover: bool = False,
+    max_input_size: int = 0,
     write_err=None,
 ) -> int:
     """Port of builtin/unpack-objects.c semantics over an in-memory pack buffer.
@@ -1143,6 +1144,12 @@ def unpack_objects_stream(
     pos = 0
     has_errors = 0
 
+    def check_input_size() -> None:
+        # git's use(): `if (max_input_size && consumed_bytes > max_input_size)
+        # die("pack exceeds maximum allowed size")` — consumed_bytes == pos.
+        if max_input_size and pos > max_input_size:
+            raise UnpackDie("pack exceeds maximum allowed size")
+
     def fill(min_bytes: int) -> int:
         # git's fill() dies with "early EOF" when stdin can't satisfy the read.
         if pos + min_bytes > n:
@@ -1158,6 +1165,7 @@ def unpack_objects_stream(
         raise UnpackDie("unknown pack file version %d" % version)
     nr_objects = int.from_bytes(buf[8:12], "big")
     pos = 12
+    check_input_size()
 
     # Held objects for in-pack delta bases (offset and ref resolution).
     by_offset: dict[int, tuple[str, bytes]] = {}
@@ -1226,6 +1234,7 @@ def unpack_objects_stream(
             objs.write_object(repo, obj_type_name, payload)
 
     for _i in range(nr_objects):
+        check_input_size()
         offset = pos
         obj_type, size = read_varint_header()
         if obj_type in (OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG):
@@ -1360,6 +1369,35 @@ def write_idx_v2(pack_bytes: bytes, shas_offsets: list[tuple[str, int, int]], ha
     """Build a v2 idx for the given pack. shas_offsets: list of (sha, offset, crc32)."""
     hash_len = _hash_len_for_algo(hash_algo)
     return write_idx_v2_from_checksum(pack_bytes[-hash_len:], shas_offsets, hash_algo)
+
+
+def write_rev_file_bytes(
+    pack_checksum: bytes,
+    shas_offsets: list[tuple[str, int, int]],
+    hash_algo: str = "sha1",
+) -> bytes:
+    """Build a pack reverse-index (.rev) file (gitformat-pack: RIDX).
+
+    Port of pack-write.c write_rev_file: header (RIDX, version 1, oid_version),
+    then for each object in pack (offset) order its position in the .idx (oid
+    order), then the pack checksum, then the file's own trailing hash.
+    """
+    n = len(shas_offsets)
+    # idx (oid) order gives each object's index position.
+    by_oid = sorted(range(n), key=lambda i: shas_offsets[i][0])
+    pos_in_idx = [0] * n
+    for idx_pos, orig in enumerate(by_oid):
+        pos_in_idx[orig] = idx_pos
+    # pack (offset) order: emit each object's idx position.
+    by_offset = sorted(range(n), key=lambda i: shas_offsets[i][1])
+    oid_version = 2 if hash_algo == "sha256" else 1
+    buf = bytearray()
+    buf += struct.pack(">III", 0x52494458, 1, oid_version)  # RIDX, ver 1, oidver
+    for orig in by_offset:
+        buf += struct.pack(">I", pos_in_idx[orig])
+    buf += pack_checksum
+    buf += _hash_bytes_for_algo(hash_algo, bytes(buf))
+    return bytes(buf)
 
 
 def _encode_pack_object_header(obj_type: int, size: int) -> bytes:

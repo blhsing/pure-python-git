@@ -52,9 +52,11 @@ def main() -> int:
         check(rc == 0, "count-objects -v")
 
         # pack-objects --all
-        rc = run("pack-objects", "pack", "--all")
-        check(rc == 0, "pack-objects --all")
+        # pack-objects writes <base>-<sha>.{pack,idx,rev} relative to the CWD;
+        # give the base-name under objects/pack so the pack lands in the store.
         pack_dir = tmp / ".git" / "objects" / "pack"
+        rc = run("pack-objects", str(pack_dir / "pack"), "--all")
+        check(rc == 0, "pack-objects --all")
         packs = list(pack_dir.glob("pack-*.pack"))
         idxs = list(pack_dir.glob("pack-*.idx"))
         check(len(packs) == 1 and len(idxs) == 1, "pack + idx written")

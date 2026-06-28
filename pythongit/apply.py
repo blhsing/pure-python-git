@@ -857,6 +857,12 @@ class ApplyOpts:
     patch_input_file: str = ""
     # --reject: apply hunk-by-hunk, write .rej for failures (forces verbose).
     apply_with_reject: bool = False
+    # --ignore-whitespace / --ignore-space-change: ws_ignore_action == change
+    # enables line-by-line whitespace-insensitive fuzzy matching.
+    ws_ignore: bool = False
+    # --inaccurate-eof: tolerate a missing trailing newline at EOF (the last
+    # preimage/postimage line's trailing '\n' is dropped before matching).
+    inaccurate_eof: bool = False
 
 
 # --- whitespace-error checking (ws.c) --------------------------------------
@@ -1047,15 +1053,113 @@ def _build_pre_post(frag: Fragment, opts: ApplyOpts) -> tuple[Image, Image, bool
         # '@' '\\' ignored
         k += 1
 
+    # --inaccurate-eof (apply.c apply_one_fragment): when both the preimage and
+    # the postimage end with a trailing newline, drop it from the last line of
+    # each so a patch that mishandles the final EOL still matches.
+    if (opts.inaccurate_eof
+            and pre.lines and pre.lines[-1].endswith(b"\n")
+            and post.lines and post.lines[-1].endswith(b"\n")):
+        pre.lines[-1] = pre.lines[-1][:-1]
+        post.lines[-1] = post.lines[-1][:-1]
+
     match_beginning = (frag.oldpos == 0 or
                        (frag.oldpos == 1 and not opts.unidiff_zero))
     match_end = (not opts.unidiff_zero) and (frag.trailing == 0)
     return pre, post, match_beginning, match_end
 
 
+def _isspace_byte(b: int) -> bool:
+    # C isspace() for ASCII: space, \t, \n, \v, \f, \r.
+    return b in (0x20, 0x09, 0x0a, 0x0b, 0x0c, 0x0d)
+
+
+def _fuzzy_matchlines(s1: bytes, s2: bytes) -> bool:
+    """Port of apply.c fuzzy_matchlines(): compare two lines ignoring runs of
+    whitespace and trailing line endings."""
+    e1 = len(s1)
+    e2 = len(s2)
+    while e1 > 0 and s1[e1 - 1] in (0x0d, 0x0a):
+        e1 -= 1
+    while e2 > 0 and s2[e2 - 1] in (0x0d, 0x0a):
+        e2 -= 1
+    i = j = 0
+    while i < e1 and j < e2:
+        if _isspace_byte(s1[i]):
+            if not _isspace_byte(s2[j]):
+                return False
+            while i < e1 and _isspace_byte(s1[i]):
+                i += 1
+            while j < e2 and _isspace_byte(s2[j]):
+                j += 1
+        elif s1[i] != s2[j]:
+            return False
+        else:
+            i += 1
+            j += 1
+    return i == e1 and j == e2
+
+
+def _line_by_line_fuzzy_match(img: Image, pre: Image, post: Image,
+                              current_lno: int, preimage_limit: int) -> bool:
+    """Port of apply.c line_by_line_fuzzy_match() for the list-based Image.
+
+    On success, rewrite the preimage lines to the matched target lines and the
+    common context lines of the postimage to use the target's whitespace."""
+    # Per-line fuzzy comparison against the target image.
+    for i in range(preimage_limit):
+        if not _fuzzy_matchlines(img.lines[current_lno + i], pre.lines[i]):
+            return False
+    # Any preimage lines beyond the end of the image must be all whitespace.
+    for i in range(preimage_limit, pre.line_nr):
+        if any(not _isspace_byte(b) for b in pre.lines[i]):
+            return False
+    # The matched target lines (with the original preimage's trailing
+    # whitespace-only lines appended) become the new preimage.
+    matched = list(img.lines[current_lno:current_lno + preimage_limit])
+    tail = list(pre.lines[preimage_limit:])
+    new_pre_lines = matched + tail
+    new_pre_flags = list(pre.flags)
+    # Adjust the common context lines in the postimage to mirror the fixed
+    # preimage (update_pre_post_images): walk postimage commons against the
+    # fixed preimage commons in order.
+    ctx = 0
+    reduced = 0
+    new_post_lines = list(post.lines)
+    new_post_flags = list(post.flags)
+    out_lines: list[bytes] = []
+    out_flags: list[int] = []
+    for i in range(len(new_post_lines)):
+        if not (new_post_flags[i] & LINE_COMMON):
+            out_lines.append(new_post_lines[i])
+            out_flags.append(new_post_flags[i])
+            continue
+        while ctx < len(new_pre_lines) and not (new_pre_flags[ctx] & LINE_COMMON):
+            ctx += 1
+        if ctx >= len(new_pre_lines):
+            reduced += 1
+            continue
+        out_lines.append(new_pre_lines[ctx])
+        out_flags.append(new_post_flags[i])
+        ctx += 1
+    pre.lines = new_pre_lines
+    pre.flags = new_pre_flags
+    post.lines = out_lines
+    post.flags = out_flags
+    return True
+
+
+def _hash_line(b: bytes) -> int:
+    """Port of apply.c hash_line(): whitespace-insensitive line hash."""
+    h = 0
+    for c in b:
+        if not _isspace_byte(c):
+            h = (h * 3 + c) & 0xFFFFFFFF
+    return h
+
+
 def _match_fragment(img: Image, pre: Image, current_lno: int,
                     match_beginning: bool, match_end: bool,
-                    opts: ApplyOpts) -> bool:
+                    opts: ApplyOpts, post: Optional[Image] = None) -> bool:
     pre_nr = pre.line_nr
     if pre_nr + current_lno <= img.line_nr:
         preimage_limit = pre_nr
@@ -1068,6 +1172,27 @@ def _match_fragment(img: Image, pre: Image, current_lno: int,
     if match_beginning and current_lno:
         return False
 
+    if opts.ws_ignore:
+        # Whitespace-insensitive "quick hash check" (apply.c hash_line), so
+        # whitespace-different context lines survive to the fuzzy matcher.
+        for k in range(preimage_limit):
+            if img.flags[current_lno + k] & LINE_PATCHED:
+                return False
+            if _hash_line(pre.lines[k]) != _hash_line(img.lines[current_lno + k]):
+                return False
+        # Exact match short-circuit (memcmp): preimage equals the target.
+        if preimage_limit == pre_nr and all(
+                pre.lines[k] == img.lines[current_lno + k]
+                for k in range(preimage_limit)):
+            return True
+        # Otherwise run the line-by-line whitespace-ignoring fuzzy match, which
+        # rewrites pre/post to the target's whitespace on success.
+        if post is not None:
+            return _line_by_line_fuzzy_match(img, pre, post, current_lno, preimage_limit)
+        # No postimage to rewrite (find-only): just confirm the fuzzy match.
+        return all(_fuzzy_matchlines(img.lines[current_lno + k], pre.lines[k])
+                   for k in range(preimage_limit))
+
     # quick line check (hash via direct compare) + LINE_PATCHED guard
     for k in range(preimage_limit):
         if img.flags[current_lno + k] & LINE_PATCHED:
@@ -1078,7 +1203,8 @@ def _match_fragment(img: Image, pre: Image, current_lno: int,
 
 
 def _find_pos(img: Image, pre: Image, line: int,
-              match_beginning: bool, match_end: bool, opts: ApplyOpts) -> int:
+              match_beginning: bool, match_end: bool, opts: ApplyOpts,
+              post: Optional[Image] = None) -> int:
     if (opts.allow_overlap and match_beginning and match_end and
             img.line_nr - pre.line_nr != 0):
         match_beginning = False
@@ -1097,7 +1223,7 @@ def _find_pos(img: Image, pre: Image, line: int,
     backwards_lno = forwards_lno = current_lno = line
     i = 0
     while True:
-        if _match_fragment(img, pre, current_lno, match_beginning, match_end, opts):
+        if _match_fragment(img, pre, current_lno, match_beginning, match_end, opts, post):
             return current_lno
         # again:
         while True:
@@ -1143,7 +1269,7 @@ def _apply_one_fragment(img: Image, frag: Fragment, opts: ApplyOpts,
     pos = (frag.newpos - 1) if frag.newpos else 0
 
     while True:
-        applied_pos = _find_pos(img, pre, pos, match_beginning, match_end, opts)
+        applied_pos = _find_pos(img, pre, pos, match_beginning, match_end, opts, post)
         if applied_pos >= 0:
             break
         if leading <= opts.p_context and trailing <= opts.p_context:

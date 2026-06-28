@@ -44,14 +44,26 @@ def _default_merge_message(repo: Repository, other_rev: str, head_sym: Optional[
     return subject + "\n"
 
 
+def _merge_result_tree(repo: Repository, other_rev: str, *, favor: int = 0) -> str:
+    """Run the ort 3-way merge of HEAD with *other_rev* and return the merged
+    tree sha (used by --squash, which stages the result without committing)."""
+    from . import ort as ort_mod
+    return ort_mod.merge_commits(repo, "HEAD", other_rev, favor=favor).tree
+
+
 def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
           allow_ff: bool = True, no_ff: bool = False, favor: int = 0,
-          sign_key: Optional[str] = None) -> tuple[str, list[str], list[str]]:
+          sign_key: Optional[str] = None,
+          commit: bool = True) -> tuple[str, list[str], list[str]]:
     """Return (result_sha, conflicts, auto_merged). result_sha is "" on conflicts.
 
     When *sign_key* is not None the merge commit is GPG-signed with that key
     (``""`` resolves to the default signing key), mirroring builtin/merge.c's
-    sign_commit path so ``git merge -S`` produces a verifiable merge commit."""
+    sign_commit path so ``git merge -S`` produces a verifiable merge commit.
+
+    When *commit* is False (``--no-commit`` / ``--squash``) the merge result is
+    left staged in the index/worktree and MERGE_HEAD/MERGE_MSG are written, but
+    no commit is created and HEAD is not moved; the returned sha is None."""
     head_sym, head = refs_mod.read_head(repo)
     if not head:
         raise RuntimeError("no HEAD")
@@ -102,6 +114,15 @@ def merge(repo: Repository, other_rev: str, *, message: Optional[str] = None,
         return "", conflicts, auto_merged
 
     msg = message or _default_merge_message(repo, other_rev, head_sym)
+    if not commit:
+        # --no-commit: clean auto-merge but stop before committing.  The result
+        # is already staged in the worktree/index by checkout_tree above; record
+        # MERGE_HEAD + MERGE_MSG so a later `git commit` finalizes it
+        # (builtin/merge.c write_merge_state).
+        (repo.gitdir / "MERGE_HEAD").write_text(other + "\n", encoding="utf-8")
+        (repo.gitdir / "MERGE_MSG").write_text(
+            msg if msg.endswith("\n") else msg + "\n", encoding="utf-8")
+        return None, [], auto_merged
     author_sig = objs.build_signature(repo, "author")
     committer_sig = objs.build_signature(repo, "committer")
     c = objs.Commit(tree=new_tree, parents=[head, other], author=author_sig, committer=committer_sig,

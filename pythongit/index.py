@@ -220,7 +220,10 @@ def _read_reuc(data: bytes, rawsz: int) -> dict[str, dict[int, tuple[int, str]]]
     return out
 
 
-def write_index(repo: Repository, idx: Index) -> None:
+def serialize_index(repo: Repository, idx: Index) -> bytes:
+    """Serialize an Index to its on-disk byte form (DIRC). Shared by
+    write_index() and callers that need to write to an arbitrary path
+    (e.g. git apply --build-fake-ancestor)."""
     buf = bytearray()
     # The index is upgraded to v3 only when an entry carries extended flags
     # (intent-to-add / skip-worktree); otherwise it stays byte-identical v2.
@@ -266,9 +269,14 @@ def write_index(repo: Repository, idx: Index) -> None:
                 body += bytes.fromhex(sha)
         buf += b"REUC" + struct.pack(">I", len(body)) + bytes(body)
     buf += repo.hash_bytes(buf)
+    return bytes(buf)
+
+
+def write_index(repo: Repository, idx: Index) -> None:
+    buf = serialize_index(repo, idx)
     p = _index_path(repo)
     tmp = p.with_suffix(".tmp")
-    tmp.write_bytes(bytes(buf))
+    tmp.write_bytes(buf)
     os.replace(tmp, p)
 
 

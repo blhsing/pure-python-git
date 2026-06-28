@@ -81,11 +81,22 @@ def main() -> int:
         rc = run("check-mailmap", "Old <old@e.com>")
         check(rc == 0, "check-mailmap")
 
-        # show-index — pack first, then read its idx
-        run("pack-objects", "pack", "--all")
-        idx_files = list((tmp / ".git" / "objects" / "pack").glob("pack-*.idx"))
-        rc = run("show-index", str(idx_files[0]))
-        check(rc == 0, "show-index (file)")
+        # show-index — pack first, then read its idx from STDIN (git's
+        # show-index only reads the idx on stdin; it takes no path argument).
+        pack_dir = tmp / ".git" / "objects" / "pack"
+        run("pack-objects", str(pack_dir / "pack"), "--all")
+        idx_files = list(pack_dir.glob("pack-*.idx"))
+        import io as _io7
+
+        class _IdxStdin:
+            buffer = _io7.BytesIO(idx_files[0].read_bytes())
+        _saved_stdin = sys.stdin
+        sys.stdin = _IdxStdin()
+        try:
+            rc = run("show-index")
+        finally:
+            sys.stdin = _saved_stdin
+        check(rc == 0, "show-index (stdin)")
 
         # unpack-file
         from pythongit import objects as o
