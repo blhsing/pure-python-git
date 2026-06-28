@@ -2631,7 +2631,7 @@ def cmd_read_tree(argv: list[str]) -> int:
         "merge": False, "reset": False, "prefix": None, "update": False,
         "index_only": False, "dry_run": False, "verbose": False, "quiet": False,
         "trivial": False, "aggressive": False, "empty": False,
-        "index_output": None, "no_sparse": False,
+        "index_output": None, "no_sparse": False, "exclude_per_directory": None,
     }
     trees: list[str] = []
 
@@ -2686,6 +2686,22 @@ def cmd_read_tree(argv: list[str]) -> int:
                     opts[spec[0]] = spec[1]
                 else:
                     opts[spec] = True
+            elif name == "exclude-per-directory":
+                # builtin/read-tree.c exclude_per_directory_cb fires AT PARSE TIME
+                # and checks the CURRENT -u state, so this validation is
+                # order-dependent (-u must precede the flag).  PARSE_OPT_NONEG.
+                if attached is not None:
+                    v = attached
+                else:
+                    i += 1
+                    if i >= n:
+                        _err("error: option `exclude-per-directory' requires a value")
+                        return 129
+                    v = argv[i]
+                if not opts["update"]:
+                    _err("fatal: --exclude-per-directory is meaningless unless -u")
+                    return 128
+                opts["exclude_per_directory"] = v
             elif name in long_value:
                 if attached is not None:
                     v = attached

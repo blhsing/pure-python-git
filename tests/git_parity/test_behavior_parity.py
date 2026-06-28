@@ -4005,6 +4005,10 @@ BATCH17_CASES = [
     ('network:push-signed-no', [('write', 'a.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['remote', 'add', 'origin', '../dst.git']], ['push', '--signed=no', 'origin', 'main']),
     ('network:push-recurse-submodules-no', [('write', 'a.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['remote', 'add', 'origin', '../dst.git']], ['push', '--recurse-submodules=no', 'origin', 'main']),
     ('network:push-porcelain-uptodate', [('write', 'a.txt', 'a\n'), ['add', '-A'], ['commit', '-q', '-m', 'c1'], ['remote', 'add', 'origin', '../dst.git'], ['push', '-q', 'origin', 'main']], ['push', '--porcelain', 'origin', 'main']),
+    ('cat-tree:read-tree --exclude-per-directory bare requires value', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['read-tree', '--exclude-per-directory']),
+    ('cat-tree:read-tree --exclude-per-directory valued without -u', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['read-tree', '--exclude-per-directory=.gitignore', 'HEAD']),
+    ('cat-tree:read-tree --exclude-per-directory before -u dies (order-dependent cb)', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['read-tree', '--exclude-per-directory=.gitignore', '-u', '-m', 'HEAD']),
+    ('cat-tree:read-tree -u -m --exclude-per-directory ok', [('write', 'a', 'a\n'), ['add', 'a'], ['commit', '-q', '-m', 'c1']], ['read-tree', '-u', '-m', '--exclude-per-directory=.gitignore', 'HEAD']),
 ]
 
 BATCH17_STDIN_CASES = [
