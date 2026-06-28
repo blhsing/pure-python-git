@@ -229,12 +229,14 @@ def would_add_report(repo: Repository, paths: Iterable[str], *,
 
 def add_paths(repo: Repository, paths: Iterable[str], *,
               ignore_removal: bool = False, update_only: bool = False,
-              intent_to_add: bool = False, force: bool = False) -> None:
+              intent_to_add: bool = False, force: bool = False,
+              chmod: "str | None" = None) -> None:
     """Stage worktree paths into the index. ``update_only`` (git add -u) limits
     to already-tracked files; ``ignore_removal`` (git add --no-all) keeps the
     index entries of files removed from the worktree; ``intent_to_add``
     (git add -N) records new paths with the empty blob and the intent-to-add
-    flag rather than their content."""
+    flag rather than their content. ``chmod`` ('+x'/'-x', git add --chmod)
+    overrides the stored executable bit of each added regular file."""
     idx = read_index(repo)
     tracked = set(idx.by_path())
     to_add = _gather_add_candidates(repo, paths, tracked, force=force)
@@ -263,7 +265,12 @@ def add_paths(repo: Repository, paths: Iterable[str], *,
         data = _blob_data(full)
         sha = objs.write_object(repo, "blob", data)
         st = full.lstat()
-        entry = stat_to_entry(rel, st, sha, _mode_for(full))
+        mode = _mode_for(full)
+        # git add --chmod=(+|-)x overrides the exec bit for non-symlink regular
+        # files (builtin/add.c chmod_index_entry / read-cache.c).
+        if chmod is not None and mode in (0o100644, 0o100755):
+            mode = 0o100755 if chmod == "+x" else 0o100644
+        entry = stat_to_entry(rel, st, sha, mode)
         # clear conflict stages (1/2/3) on add — resolution. Record the dropped
         # stages into resolve-undo first (git's record_resolve_undo), so a later
         # `update-index --unresolve` can restore them.

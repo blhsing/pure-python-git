@@ -111,6 +111,28 @@ PATCH_MODE_RESET_HEAD = PatchMode(
     ),
 )
 
+PATCH_MODE_CHECKOUT_INDEX = PatchMode(
+    diff_cmd=["diff-files"],
+    apply_args=["-R"],
+    apply_check_args=["-R"],
+    is_reverse=True,
+    prompt_mode=[
+        "Discard mode change from worktree%s [y,n,q,a,d%s,?]? ",
+        "Discard deletion from worktree%s [y,n,q,a,d%s,?]? ",
+        "Discard addition from worktree%s [y,n,q,a,d%s,?]? ",
+        "Discard this hunk from worktree%s [y,n,q,a,d%s,?]? ",
+    ],
+    edit_hunk_hint=("If the patch applies cleanly, the edited hunk "
+                    "will immediately be marked for discarding."),
+    help_patch_text=(
+        "y - discard this hunk from worktree\n"
+        "n - do not discard this hunk from worktree\n"
+        "q - quit; do not discard this hunk or any of the remaining ones\n"
+        "a - discard this hunk and all later hunks in the file\n"
+        "d - do not discard this hunk or any of the later hunks in the file\n"
+    ),
+)
+
 PATCH_MODE_RESET_NOTHEAD = PatchMode(
     diff_cmd=["diff-index", "-R", "--cached"],
     apply_args=["--cached"],
@@ -1329,6 +1351,10 @@ def run_add_p(repo, mode_kind: str, revision: Optional[str],
             mode = PATCH_MODE_RESET_HEAD
         else:
             mode = PATCH_MODE_RESET_NOTHEAD
+    elif mode_kind == "checkout":
+        # `git checkout -p` with no tree-ish: discard worktree hunks
+        # (patch_mode_checkout_index).
+        mode = PATCH_MODE_CHECKOUT_INDEX
     else:
         mode = PATCH_MODE_ADD
 

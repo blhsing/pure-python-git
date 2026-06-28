@@ -1255,6 +1255,15 @@ def cmd_difftool(argv):
     if no_index:
         return _do_noindex(repo, dt, noindex_paths, difftool_cmd, use_gui)
 
+    changes = _compute_changes(repo, cached, revs, paths)
+
+    # git resolves/guesses the diff tool lazily, per file pair (the
+    # "diff.tool is not configured" guess only fires when a pair is actually
+    # processed). With no file pairs to show, difftool is silent and exits 0 —
+    # so skip tool selection entirely on an empty diff.
+    if not changes:
+        return 0
+
     # Resolve the tool (unless using extcmd).
     if not extcmd:
         if difftool_cmd:
@@ -1268,8 +1277,6 @@ def cmd_difftool(argv):
                 dt.tool = None
             else:
                 dt.tool = tool
-
-    changes = _compute_changes(repo, cached, revs, paths)
 
     if dir_diff:
         return _run_dir_diff(repo, dt, changes)

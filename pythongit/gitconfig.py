@@ -183,6 +183,16 @@ def _config_files(repo: Optional[Repository]) -> list[Path]:
     return files
 
 
+def _scope_of(path: Path, repo: Optional[Repository]) -> str:
+    if repo is not None and path == repo.gitdir / "config":
+        return "local"
+    if not os.environ.get("GIT_CONFIG_NOSYSTEM"):
+        system = os.environ.get("GIT_CONFIG_SYSTEM")
+        if path == (Path(system) if system else Path("/etc/gitconfig")):
+            return "system"
+    return "global"
+
+
 def list_all(repo: Optional[Repository]) -> list[tuple[str, str]]:
     """All ``(full_key, value)`` pairs across system/global/local and ``-c``."""
     pairs: list[tuple[str, str]] = []
@@ -194,6 +204,26 @@ def list_all(repo: Optional[Repository]) -> list[tuple[str, str]]:
         pairs.extend(_parse_text(text))
     pairs.extend(_parameters_pairs())
     return pairs
+
+
+def list_all_scoped(repo: Optional[Repository]):
+    """Like :func:`list_all` but yields ``(scope, origin_path, key, value)``.
+
+    ``origin_path`` is the config file path (or ``None`` for ``-c`` params),
+    ``scope`` is one of ``system``/``global``/``local``/``command``.
+    """
+    out: list[tuple[str, Optional[Path], str, str]] = []
+    for path in _config_files(repo):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        scope = _scope_of(path, repo)
+        for key, value in _parse_text(text):
+            out.append((scope, path, key, value))
+    for key, value in _parameters_pairs():
+        out.append(("command", None, key, value))
+    return out
 
 
 def get_all(repo: Optional[Repository], name: str) -> list[str]:
@@ -378,3 +408,319 @@ def split_key(name: str) -> Optional[tuple[str, Optional[str], str]]:
     if dot:
         return section.lower(), sub, key.lower()
     return section.lower(), None, key.lower()
+
+
+def rename_section(path: Path, old: str, new: Optional[str]) -> int:
+    """Rename ``[old]`` to ``[new]`` (or remove it when ``new`` is None).
+
+    ``old`` and ``new`` are full section names (``section`` or
+    ``section.subsection``).  Returns the number of section headers renamed,
+    or a negative value on a write/parse error.  Mirrors C Git's
+    git_config_rename_section_in_file: matching headers are rewritten in place,
+    and when removing, the section's variable lines are dropped too.
+    """
+    def _parse(spec: str) -> tuple[str, Optional[str]]:
+        s, dot, sub = spec.partition(".")
+        return s.lower(), (sub if dot else None)
+
+    old_sec, old_sub = _parse(old)
+    new_spec = _parse(new) if new is not None else None
+    if not path.exists():
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    out: list[str] = []
+    found = 0
+    in_target = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            header = stripped[1:].split("]", 1)[0]
+            sec, sub = _parse_header(header)
+            in_target = (sec, sub) == (old_sec, old_sub)
+            if in_target:
+                found += 1
+                if new_spec is None:
+                    # remove-section: drop the header line entirely.
+                    continue
+                # rename-section: rewrite the header, preserving any trailing
+                # content after the ']' on the same line.
+                trailing = ""
+                bracket = line.find("]")
+                if bracket != -1:
+                    trailing = line[bracket + 1:]
+                out.append(_header_for(new_spec[0], new_spec[1]) + trailing
+                           if trailing.strip("\r\n ")
+                           else _header_for(new_spec[0], new_spec[1]) + "\n")
+                continue
+        elif in_target and new_spec is None:
+            # remove-section: drop variable lines belonging to the section.
+            continue
+        out.append(line)
+    if found:
+        path.write_text("".join(out), encoding="utf-8")
+    return found
+
+
+# --- value type normalization / formatting (config.c) --------------------
+
+class ConfigValueError(Exception):
+    """Raised when a typed config value fails validation."""
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def _get_unit_factor(end: str) -> int:
+    if end == "":
+        return 1
+    low = end.lower()
+    if low == "k":
+        return 1024
+    if low == "m":
+        return 1024 * 1024
+    if low == "g":
+        return 1024 * 1024 * 1024
+    return 0
+
+
+_INT_MAX = (1 << 63) - 1
+
+
+def parse_signed(value: str) -> Optional[tuple[int, str]]:
+    """Port of git_parse_signed: parse a (possibly unit-suffixed) integer.
+
+    Returns ``(result, error)`` where exactly one element is meaningful:
+    ``error`` is ``""`` on success, ``"invalid unit"`` for a bad/garbage
+    suffix, or ``"out of range"`` for overflow.  Returns ``None`` only when
+    the value is empty.
+    """
+    if value is None or value == "":
+        return None
+    # strtoimax(value, &end, base=0): leading whitespace, optional sign, then
+    # decimal / 0x-hex / 0-octal digits.  `end` is the first unconsumed char.
+    s = value
+    n = len(s)
+    i = 0
+    while i < n and s[i] in " \t\n\r\f\v":
+        i += 1
+    sign = 1
+    if i < n and s[i] in "+-":
+        if s[i] == "-":
+            sign = -1
+        i += 1
+    base = 10
+    num_start = i
+    if i < n and s[i] == "0":
+        if i + 1 < n and s[i + 1] in "xX":
+            base = 16
+            i += 2
+            num_start = i
+        else:
+            base = 8
+            # leading 0 is itself a consumed octal digit
+    digset = ("0123456789abcdefABCDEF" if base == 16
+              else "01234567" if base == 8 else "0123456789")
+    j = i
+    while j < n and s[j] in digset:
+        j += 1
+    if j == num_start:
+        # No digits at all after the prefix -> end==value (EINVAL).
+        return (0, "invalid unit")
+    body = s[num_start:j]
+    try:
+        val = int(body, base) * sign
+    except ValueError:
+        return (0, "invalid unit")
+    end = s[j:]
+    factor = _get_unit_factor(end)
+    if factor == 0:
+        return (0, "invalid unit")
+    # overflow check against signed 64-bit max
+    if (val < 0 and (-_INT_MAX - 1) // factor > val) or \
+       (val > 0 and _INT_MAX // factor < val):
+        return (0, "out of range")
+    return (val * factor, "")
+
+
+def parse_maybe_bool_text(value: Optional[str]) -> int:
+    """git_parse_maybe_bool_text: 1=true, 0=false, -1=not a bool."""
+    if value is None:
+        return 1
+    if value == "":
+        return 0
+    low = value.lower()
+    if low in ("true", "yes", "on"):
+        return 1
+    if low in ("false", "no", "off"):
+        return 0
+    return -1
+
+
+def parse_maybe_bool(value: Optional[str]) -> int:
+    v = parse_maybe_bool_text(value)
+    if v >= 0:
+        return v
+    parsed = parse_signed(value or "")
+    if parsed is not None and parsed[1] == "":
+        return 1 if parsed[0] else 0
+    return -1
+
+
+def config_int64(key: str, value: str) -> int:
+    """git_config_int64: parse or die with the 'bad numeric config value'."""
+    parsed = parse_signed(value if value is not None else "")
+    if parsed is None or parsed[1] != "":
+        reason = parsed[1] if parsed is not None else "invalid unit"
+        raise ConfigValueError(
+            f"bad numeric config value '{value}' for '{key}': {reason}")
+    return parsed[0]
+
+
+def config_bool(key: str, value: Optional[str]) -> bool:
+    """git_config_bool: bool text, else nonzero int, else die."""
+    v = parse_maybe_bool_text(value)
+    if v >= 0:
+        return bool(v)
+    parsed = parse_signed(value or "")
+    if parsed is not None and parsed[1] == "":
+        return bool(parsed[0])
+    raise ConfigValueError(
+        f"bad boolean config value '{value}' for '{key}'")
+
+
+def config_bool_or_int(key: str, value: str) -> tuple[int, bool]:
+    """git_config_bool_or_int: (value, is_bool)."""
+    v = parse_maybe_bool_text(value)
+    if v >= 0:
+        return v, True
+    return config_int64(key, value), False
+
+
+# --- color parsing (color.c color_parse) ---------------------------------
+
+_COLOR_NAMES = ("black", "red", "green", "yellow",
+                "blue", "magenta", "cyan", "white")
+_COLOR_ATTRS = {
+    "bold": (1, 22), "dim": (2, 22), "italic": (3, 23), "ul": (4, 24),
+    "blink": (5, 25), "reverse": (7, 27), "strike": (9, 29),
+}
+
+
+def _parse_one_color(word: str):
+    """Return a ('normal'|'ansi'|'256'|'rgb', payload) tuple or None."""
+    low = word.lower()
+    if low == "normal":
+        return ("normal", None)
+    if len(word) in (7, 4) and word[0] == "#":
+        per = 2 if len(word) == 7 else 1
+        body = word[1:]
+        try:
+            comps = []
+            for k in range(3):
+                seg = body[k * per:k * per + per]
+                comps.append(int(seg[0] + seg[-1], 16))
+            return ("rgb", tuple(comps))
+        except ValueError:
+            return None
+    # ANSI named
+    name = low
+    offset = 30
+    if name == "default":
+        return ("ansi", 9 + 30)
+    if name.startswith("bright"):
+        offset = 90
+        name = name[6:]
+    for i, cn in enumerate(_COLOR_NAMES):
+        if name == cn:
+            return ("ansi", i + offset)
+    # literal 256-color number: strtol(name, &end, 10) must consume all of word
+    body = word
+    sign = ""
+    if body[:1] in "+-":
+        sign, body = word[0], word[1:]
+    if not body or not body.isdigit():
+        return None
+    val = int(word, 10)
+    if val < -1:
+        return None
+    if val < 0:
+        return ("normal", None)
+    if val < 8:
+        return ("ansi", val + 30)
+    if val < 16:
+        return ("ansi", val - 8 + 90)
+    if val < 256:
+        return ("256", val)
+    return None
+
+
+def _color_output(c, background: bool) -> str:
+    offset = 10 if background else 0
+    kind, payload = c
+    if kind in ("normal",):
+        return ""
+    if kind == "ansi":
+        return str(payload + offset)
+    if kind == "256":
+        return f"{38 + offset};5;{payload}"
+    if kind == "rgb":
+        r, g, b = payload
+        return f"{38 + offset};2;{r};{g};{b}"
+    return ""
+
+
+def _color_empty(c) -> bool:
+    return c is None or c[0] in ("unspecified", "normal")
+
+
+def color_parse(value: str) -> Optional[str]:
+    """color_parse_quietly: ANSI escape for ``value`` or None if invalid."""
+    ptr = value
+    # leading whitespace
+    ptr = ptr.lstrip()
+    if not ptr.strip():
+        return ""
+    words = ptr.split()
+    has_reset = False
+    attr = 0
+    fg = None
+    bg = None
+    for word in words:
+        if word.lower() == "reset":
+            has_reset = True
+            continue
+        c = _parse_one_color(word)
+        if c is not None:
+            if fg is None:
+                fg = c
+                continue
+            if bg is None:
+                bg = c
+                continue
+            return None
+        low = word.lower()
+        negate = False
+        nm = low
+        if nm.startswith("no"):
+            nm = nm[2:]
+            if nm.startswith("-"):
+                nm = nm[1:]
+            negate = True
+        if nm in _COLOR_ATTRS:
+            val = _COLOR_ATTRS[nm][1] if negate else _COLOR_ATTRS[nm][0]
+            attr |= (1 << val)
+        else:
+            return None
+    if not (has_reset or attr or not _color_empty(fg) or not _color_empty(bg)):
+        return ""
+    parts: list[str] = []
+    if has_reset:
+        parts.append("")
+    for i in range(32):
+        if attr & (1 << i):
+            parts.append(str(i))
+    if not _color_empty(fg):
+        parts.append(_color_output(fg, False))
+    if not _color_empty(bg):
+        parts.append(_color_output(bg, True))
+    return "\033[" + ";".join(parts) + "m"

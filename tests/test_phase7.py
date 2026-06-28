@@ -106,8 +106,10 @@ def main() -> int:
         rc = run("unpack-file", blob_sha)
         check(rc == 0, "unpack-file")
 
-        # merge-index (stub)
-        rc = run("merge-index", "true")
+        # merge-index: with a clean index, "-a" walks no conflicted entries and
+        # exits 0 (git's merge_all no-op).  ("merge-index true" alone is argc<3
+        # and is a usage error, matching builtin/merge-index.c.)
+        rc = run("merge-index", "true", "-a")
         check(rc == 0, "merge-index (no-op)")
 
         # hook — list (no hooks installed) and run absent

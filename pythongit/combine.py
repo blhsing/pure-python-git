@@ -597,11 +597,16 @@ def _split_lines(data: bytes) -> list[bytes]:
 
 def show_patch_diff_files(out, repo, path, parent_oids, parent_modes,
                           result_content, result_present, dense, abbrev,
-                          flags=0, context=3, combined_all_paths=False):
+                          flags=0, context=3, combined_all_paths=False,
+                          result_oid=None, result_mode_override=None):
     """Emit a combined PATCH diff for one unmerged path (working-tree file).
 
     parent_oids/parent_modes: lists (len num_parent) for stages #2.. (ours first).
     result_content: worktree bytes (None if file is missing -> deleted).
+
+    For a commit's combined diff (diff-tree -c/--cc) the result is an object, not
+    a worktree file: ``result_oid`` and ``result_mode_override`` supply the real
+    result oid (shown on the ``index`` line) and tree mode.
     """
     global _context
     _context = context
@@ -609,7 +614,8 @@ def show_patch_diff_files(out, repo, path, parent_oids, parent_modes,
     result_deleted = 0
     if result_present:
         result = result_content
-        result_mode = _canon_mode_from_content(repo, path)
+        result_mode = (result_mode_override if result_mode_override is not None
+                       else _canon_mode_from_content(repo, path))
     else:
         result_deleted = 1
         result = b""
@@ -632,7 +638,7 @@ def show_patch_diff_files(out, repo, path, parent_oids, parent_modes,
                 break
     if is_binary:
         _show_combined_header(out, path, parent_oids, parent_modes, parent_status,
-                              None, result_mode, num_parent, dense, abbrev,
+                              result_oid, result_mode, num_parent, dense, abbrev,
                               mode_differs, 0, combined_all_paths)
         out.write(b"Binary files differ\n")
         return
@@ -661,7 +667,7 @@ def show_patch_diff_files(out, repo, path, parent_oids, parent_modes,
 
     if show_hunks or mode_differs or True:  # working_tree_file is always true
         _show_combined_header(out, path, parent_oids, parent_modes, parent_status,
-                              None, result_mode, num_parent, dense, abbrev,
+                              result_oid, result_mode, num_parent, dense, abbrev,
                               mode_differs, 1, combined_all_paths)
         _dump_sline(out, sline, cnt, num_parent, result_deleted)
 

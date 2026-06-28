@@ -137,6 +137,65 @@ def merge_bases(repo: Repository, a: str, b: str) -> list[str]:
     return _remove_redundant(repo, result)
 
 
+def merge_bases_many(repo: Repository, one: str, twos: list[str]) -> list[str]:
+    """repo_get_merge_bases_many: merge bases of ``one`` against the set
+    ``twos`` (de-duplicated, redundant bases removed)."""
+    if not twos:
+        return []
+    if one in twos:
+        return [one]
+    res_shas, flags = _paint_down_to_common(repo, one, twos)
+    result = [s for s in res_shas if not (flags.get(s, 0) & STALE)]
+    if len(result) <= 1:
+        return result
+    return _remove_redundant(repo, result)
+
+
+def get_fork_point(repo: Repository, refname: str, commit: str):
+    """Port of commit.c:get_fork_point.
+
+    Collect the reflog history of ``refname`` (the old-oid of the first entry
+    plus each new-oid) and return the unique merge base of ``commit`` against
+    those commits, but only when that base is itself one of the reflog
+    entries.  Returns the fork-point oid or None."""
+    from . import reflog as _reflog
+    entries = _reflog.read(repo, refname)  # oldest-first (old, new, ident, msg)
+    stack: list[str] = []
+    seen: set[str] = set()
+
+    def add(oid: str):
+        if oid is None or set(oid) == {"0"}:
+            return
+        # must be a parseable commit
+        try:
+            t, _data = objs.read_object(repo, oid)
+        except Exception:
+            return
+        if t != "commit":
+            return
+        if oid in seen:
+            return
+        seen.add(oid)
+        stack.append(oid)
+
+    if entries:
+        add(entries[0][0])  # ooid of the first (initial) entry
+        for old, new, _i, _m in entries:
+            add(new)
+    if not stack:
+        # fall back to the current ref value
+        from . import refs as _refs
+        cur = _refs.read_ref(repo, refname) or _refs.rev_parse(repo, refname)
+        if cur:
+            add(cur)
+    bases = merge_bases_many(repo, commit, stack)
+    if len(bases) != 1:
+        return None
+    if bases[0] not in stack:
+        return None
+    return bases[0]
+
+
 def is_ancestor(repo: Repository, ancestor: str, descendant: str) -> bool:
     if ancestor == descendant:
         return True
@@ -154,13 +213,35 @@ def _split(text: bytes) -> list[bytes]:
 
 
 def merge_blob(base: bytes, ours: bytes, theirs: bytes) -> tuple[bytes, bool]:
-    """Return (merged, had_conflict). Uses a simple LCS-based 3-way merge."""
+    """Return (merged, had_conflict) using the default conflict markers."""
+    hunks = merge_blob_hunks(base, ours, theirs)
+    out = bytearray()
+    conflict = False
+    for h in hunks:
+        if h[0] == "stable":
+            out += b"".join(h[1])
+        else:
+            conflict = True
+            out += b"<<<<<<< ours\n"
+            out += b"".join(h[1])
+            out += b"=======\n"
+            out += b"".join(h[3])
+            out += b">>>>>>> theirs\n"
+    return bytes(out), conflict
+
+
+def merge_blob_hunks(base: bytes, ours: bytes, theirs: bytes):
+    """Three-way merge returning a list of hunks.
+
+    Each hunk is ``("stable", lines)`` or
+    ``("conflict", ours_lines, base_lines, theirs_lines)``.
+    """
     if ours == theirs:
-        return ours, False
+        return [("stable", _split(ours))]
     if base == ours:
-        return theirs, False
+        return [("stable", _split(theirs))]
     if base == theirs:
-        return ours, False
+        return [("stable", _split(ours))]
 
     a = _split(base)
     o = _split(ours)
@@ -213,35 +294,37 @@ def merge_blob(base: bytes, ours: bytes, theirs: bytes) -> tuple[bytes, bool]:
     g_o = align(ops_o, o)
     g_t = align(ops_t, t)
 
-    # Walk base linearly merging changes. For overlapping ranges that disagree, emit conflict.
-    out = bytearray()
+    # Walk base linearly merging changes. For overlapping ranges that disagree,
+    # emit a conflict hunk (carrying ours/base/theirs lines).
+    hunks: list = []
+    stable: list = []  # pending stable lines
+
+    def flush_stable():
+        if stable:
+            hunks.append(("stable", list(stable)))
+            stable.clear()
+
     pos = 0
     i_o = i_t = 0
-    conflict = False
     while pos <= len(a):
         # Find next change that starts at >= pos on either side
         next_o = g_o[i_o] if i_o < len(g_o) else None
         next_t = g_t[i_t] if i_t < len(g_t) else None
-        # advance any group whose range ended before pos (shouldn't happen, but safe)
         if next_o and next_o[1] < pos:
             i_o += 1
             continue
         if next_t and next_t[1] < pos:
             i_t += 1
             continue
-        # next event position
         no_start = next_o[0] if next_o else len(a) + 1
         nt_start = next_t[0] if next_t else len(a) + 1
         ev = min(no_start, nt_start)
-        # emit untouched base lines [pos:ev]
-        out += b"".join(a[pos:ev])
+        stable.extend(a[pos:ev])
         pos = ev
         if pos > len(a):
             break
-        # gather all overlapping groups
         o_grp = next_o if next_o and next_o[0] == pos else None
         t_grp = next_t if next_t and next_t[0] == pos else None
-        # Expand overlap until both sides converge
         if o_grp and t_grp:
             o_end = o_grp[1]
             t_end = t_grp[1]
@@ -249,7 +332,6 @@ def merge_blob(base: bytes, ours: bytes, theirs: bytes) -> tuple[bytes, bool]:
             t_lines = list(t_grp[2])
             i_o += 1
             i_t += 1
-            # consume any further groups overlapping the union range
             while True:
                 changed = False
                 while i_o < len(g_o) and g_o[i_o][0] < max(o_end, t_end):
@@ -265,24 +347,22 @@ def merge_blob(base: bytes, ours: bytes, theirs: bytes) -> tuple[bytes, bool]:
                 if not changed:
                     break
             end = max(o_end, t_end)
+            base_lines = list(a[pos:end])
             if o_lines == t_lines:
-                out += b"".join(o_lines)
+                stable.extend(o_lines)
             else:
-                conflict = True
-                out += b"<<<<<<< ours\n"
-                out += b"".join(o_lines)
-                out += b"=======\n"
-                out += b"".join(t_lines)
-                out += b">>>>>>> theirs\n"
+                flush_stable()
+                hunks.append(("conflict", o_lines, base_lines, t_lines))
             pos = end
         elif o_grp:
-            out += b"".join(o_grp[2])
+            stable.extend(o_grp[2])
             pos = o_grp[1]
             i_o += 1
         elif t_grp:
-            out += b"".join(t_grp[2])
+            stable.extend(t_grp[2])
             pos = t_grp[1]
             i_t += 1
         else:
             break
-    return bytes(out), conflict
+    flush_stable()
+    return hunks

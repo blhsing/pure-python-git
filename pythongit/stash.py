@@ -784,6 +784,17 @@ def store(repo: Repository, oid: str, message: Optional[str] = None,
         if not quiet:
             sys.stderr.write(f"Cannot update refs/stash with {oid}\n")
         return 1
+    # do_store_stash -> assert_stash_like(oid_to_hex(w_commit)): the commit must
+    # be stash-shaped (a merge with at least a second parent). die() rc 128, and
+    # the message uses the full object id, not the user's selector.
+    try:
+        c = objs.parse_commit(objs.read_object(repo, w_commit)[1])
+        is_stash_like = len(c.parents) >= 2
+    except (KeyError, ValueError):
+        is_stash_like = False
+    if not is_stash_like:
+        sys.stderr.write(f"fatal: '{w_commit}' is not a stash-like commit\n")
+        return 128
     if message is None:
         message = "Created via \"git stash store\"."
     refs_mod.update_ref(repo, "refs/stash", w_commit, message=message)
@@ -1112,6 +1123,12 @@ def _reflog_range_error(repo: Repository, revision: str) -> Optional[str]:
     if not m:
         return None
     refname, n = m.group(1), int(m.group(2))
+    # When refs/stash does not exist at all, get_oid fails before the reflog
+    # range check, so git reports "is not a valid reference" (rc 1) instead of
+    # the "log for ... only has N entries" range die. Only emit the range error
+    # once the stash ref exists.
+    if refs_mod.read_ref(repo, "refs/stash") is None:
+        return None
     entries = reflog_mod.read(repo, "refs/stash")
     if n >= len(entries):
         return f"fatal: log for '{refname}' only has {len(entries)} entries"

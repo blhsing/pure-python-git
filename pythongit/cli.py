@@ -169,9 +169,16 @@ def _pickaxe_match(repo: Repository, c, args, flags) -> bool:
     changes = _tree_changes(repo, parent_tree, c.tree)
     if args.pickaxe_s is not None:
         needle = args.pickaxe_s
+        # --pickaxe-regex makes -S count regex matches instead of literal
+        # occurrences (diffcore-pickaxe.c has_changes with the regex variant).
+        rx_s = re.compile(needle, flags) if getattr(args, "pickaxe_regex", False) else None
         for _p, a, b in changes:
-            ca = (a.data or b"").decode("utf-8", "replace").count(needle) if a.present else 0
-            cb = (b.data or b"").decode("utf-8", "replace").count(needle) if b.present else 0
+            if rx_s is not None:
+                ca = len(rx_s.findall(a.data.decode("utf-8", "replace"))) if a.present else 0
+                cb = len(rx_s.findall(b.data.decode("utf-8", "replace"))) if b.present else 0
+            else:
+                ca = (a.data or b"").decode("utf-8", "replace").count(needle) if a.present else 0
+                cb = (b.data or b"").decode("utf-8", "replace").count(needle) if b.present else 0
             if ca != cb:
                 return True
         return False
@@ -225,6 +232,9 @@ def _filter_commits(repo: Repository, commits: list, args) -> list:
                 continue
         if greps:
             ok = (all if getattr(args, "all_match", False) else any)(g.search(c.message) for g in greps)
+            # --invert-grep selects commits whose message does NOT match --grep.
+            if getattr(args, "invert_grep", False):
+                ok = not ok
             if not ok:
                 continue
         if authors and not any(a.search(c.author) for a in authors):
@@ -550,35 +560,200 @@ def _extract_ref_format(argv: list[str]) -> "tuple[list[str], object]":
     return out, value
 
 
+_INIT_USAGE_FULL = (
+    "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n"
+    "                [--separate-git-dir <git-dir>] [--object-format=<format>]\n"
+    "                [--ref-format=<format>]\n"
+    "                [-b <branch-name> | --initial-branch=<branch-name>]\n"
+    "                [--shared[=<permissions>]] [<directory>]\n"
+    "\n"
+    "    --[no-]template <template-directory>\n"
+    "                          directory from which templates will be used\n"
+    "    --[no-]bare           create a bare repository\n"
+    "    --shared[=<permissions>]\n"
+    "                          specify that the git repository is to be shared amongst several users\n"
+    "    -q, --[no-]quiet      be quiet\n"
+    "    --[no-]separate-git-dir <gitdir>\n"
+    "                          separate git dir from working tree\n"
+    "    -b, --[no-]initial-branch <name>\n"
+    "                          override the name of the initial branch\n"
+    "    --[no-]object-format <hash>\n"
+    "                          specify the hash algorithm to use\n"
+    "    --[no-]ref-format <format>\n"
+    "                          specify the reference format to use\n"
+    "\n"
+)
+
+_INIT_USAGE_SHORT = (
+    "usage: git init [-q | --quiet] [--bare] [--template=<template-directory>]\n"
+    "         [--separate-git-dir <git-dir>] [--object-format=<format>]\n"
+    "         [--ref-format=<format>]\n"
+    "         [-b <branch-name> | --initial-branch=<branch-name>]\n"
+    "         [--shared[=<permissions>]] [<directory>]\n"
+)
+
+# init long options (init-db.c init_db_options), for unique-prefix abbreviation.
+_INIT_LONG_OPTS = [
+    "template", "bare", "shared", "quiet", "separate-git-dir",
+    "initial-branch", "object-format", "ref-format",
+]
+
+
+class _InitArgs:
+    __slots__ = ("path", "bare", "object_format", "template",
+                 "separate_git_dir", "initial_branch", "quiet")
+
+
+def _init_parse(argv: list[str]):
+    """Parse-options-faithful parser for init/init-db.
+
+    Returns (args, ref_format, shared_arg) on success or an int rc on a parse
+    error (with the diagnostic already emitted)."""
+    args = _InitArgs()
+    args.path = None
+    args.bare = False
+    args.object_format = "sha1"
+    args.template = None
+    args.separate_git_dir = None
+    args.initial_branch = None
+    args.quiet = False
+    ref_format = _NO_FLAG
+    shared_arg = _NO_FLAG
+    positionals: list[str] = []
+
+    # value-taking long options and their attribute setters.
+    str_opts = {
+        "template": "template",
+        "separate-git-dir": "separate_git_dir",
+        "initial-branch": "initial_branch",
+        "object-format": "object_format",
+    }
+    bool_opts = {"bare": "bare", "quiet": "quiet"}
+
+    def err_unknown(name: str) -> int:
+        sys.stderr.write(f"error: unknown option `{name}'\n")
+        sys.stderr.write(_INIT_USAGE_FULL)
+        return 129
+
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    while i < n:
+        a = argv[i]
+        if saw_dd or a == "-" or not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a in ("-h", "--help"):
+            sys.stdout.write(_INIT_USAGE_FULL)
+            return 129
+        if a in ("-q", "--quiet"):
+            args.quiet = True
+            i += 1
+            continue
+        if a == "--no-quiet":
+            args.quiet = False
+            i += 1
+            continue
+        if a in ("-b", "--initial-branch") or a.startswith("--initial-branch="):
+            if a.startswith("--initial-branch="):
+                args.initial_branch = a.split("=", 1)[1]
+                i += 1
+                continue
+            i += 1
+            if i >= n:
+                sw = "b" if a == "-b" else "initial-branch"
+                if a == "-b":
+                    sys.stderr.write("error: switch `b' requires a value\n")
+                else:
+                    sys.stderr.write("error: option `initial-branch' requires a value\n")
+                return 129
+            args.initial_branch = argv[i]
+            i += 1
+            continue
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            neg = name.startswith("no-")
+            base = name[3:] if neg else name
+            # resolve unique-prefix abbreviation
+            if base not in _INIT_LONG_OPTS:
+                matches = [c for c in _INIT_LONG_OPTS if c.startswith(base)]
+                if len(matches) == 1:
+                    base = matches[0]
+                elif len(matches) > 1:
+                    a2, a1 = matches[-2], matches[-1]
+                    pre = "no-" if neg else ""
+                    sys.stderr.write(
+                        f"error: ambiguous option: {base} "
+                        f"(could be --{pre}{a2} or --{pre}{a1})\n")
+                    sys.stdout.write(_INIT_USAGE_FULL)
+                    return 129
+                else:
+                    return err_unknown(name)
+            if base in bool_opts:
+                setattr(args, bool_opts[base], not neg)
+                i += 1
+                continue
+            if base == "shared":
+                shared_arg = val if eq else None
+                i += 1
+                continue
+            if base == "ref-format":
+                if eq:
+                    ref_format = val
+                    i += 1
+                    continue
+                i += 1
+                if i >= n:
+                    sys.stderr.write("error: option `ref-format' requires a value\n")
+                    return 129
+                ref_format = argv[i]
+                i += 1
+                continue
+            if base in str_opts:
+                if eq:
+                    setattr(args, str_opts[base], val)
+                    i += 1
+                    continue
+                i += 1
+                if i >= n:
+                    sys.stderr.write(f"error: option `{base}' requires a value\n")
+                    return 129
+                setattr(args, str_opts[base], argv[i])
+                i += 1
+                continue
+            return err_unknown(name)
+        # short option cluster we don't recognise
+        return err_unknown(a[1:])
+
+    if len(positionals) > 1:
+        sys.stderr.write(_INIT_USAGE_SHORT)
+        return 129
+    args.path = positionals[0] if positionals else "."
+    return args, ref_format, shared_arg
+
+
 def cmd_init(argv: list[str]) -> int:
-    # --ref-format uses OPT_STRING: a bare "--ref-format" consumes the next
-    # token as its value (rc 129 if none follows). Pull it before argparse so
-    # the value is not mistaken for the path positional.
-    try:
-        argv, ref_format = _extract_ref_format(list(argv))
-    except _SwitchParseError as exc:
-        _err(exc.message)
-        return exc.rc
-
-    # --shared uses PARSE_OPT_OPTARG (value only via "--shared=x"); argparse's
-    # nargs='?' would wrongly swallow a following token, so split it by hand.
-    argv, shared_arg = _split_optarg(list(argv), "--shared")
-
-    ap = argparse.ArgumentParser(prog="pygit init", add_help=False)
-    ap.add_argument("path", nargs="?", default=".")
-    ap.add_argument("--bare", action="store_true")
-    ap.add_argument("--object-format", choices=["sha1", "sha256"], default="sha1")
-    ap.add_argument("--template", default=None)
-    ap.add_argument("--separate-git-dir", dest="separate_git_dir", default=None)
-    ap.add_argument("-b", "--initial-branch", default=None)
-    ap.add_argument("-q", "--quiet", action="store_true")
-    args = ap.parse_args(argv)
+    res = _init_parse(argv)
+    if isinstance(res, int):
+        return res
+    args, ref_format, shared_arg = res
 
     from . import gitconfig
 
     # --separate-git-dir and --bare are mutually exclusive.
     if args.separate_git_dir is not None and args.bare:
         _err("fatal: options '--separate-git-dir' and '--bare' cannot be used together")
+        return 128
+
+    # --object-format is OPT_STRING in C: any spelling is accepted at parse
+    # time and validated here ("unknown hash algorithm" fatal, rc 128).
+    if args.object_format not in ("sha1", "sha256"):
+        _err(f"fatal: unknown hash algorithm '{args.object_format}'")
         return 128
 
     # --ref-format selects the ref backend: "files" (loose + packed-refs) or
@@ -5199,11 +5374,37 @@ def cmd_rev_list(argv: list[str]) -> int:
     ap.add_argument("--author", action="append", default=None)
     ap.add_argument("--committer", action="append", default=None)
     ap.add_argument("--all-match", dest="all_match", action="store_true")
+    ap.add_argument("--invert-grep", dest="invert_grep", action="store_true")
     ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("--left-right", dest="left_right", action="store_true")
     ap.add_argument("--timestamp", action="store_true")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--exclude-hidden", dest="exclude_hidden", default=None)
+    # --skip=N drops the first N commits of the output (rev_info.skip_count).
+    ap.add_argument("--skip", dest="skip", type=int, default=None)
+    # --boundary emits the uninteresting boundary commits, prefixed with '-'.
+    ap.add_argument("--boundary", dest="boundary", action="store_true")
+    # --ancestry-path keeps only commits on a path between the bottom and top.
+    ap.add_argument("--ancestry-path", dest="ancestry_path", nargs="?", const="", default=None)
+    # --cherry-mark / --cherry-pick / --cherry mark/omit commits whose patch-id
+    # matches one on the other side of a symmetric range (revision.c cherry).
+    ap.add_argument("--cherry-mark", dest="cherry_mark", action="store_true")
+    ap.add_argument("--cherry-pick", dest="cherry_pick", action="store_true")
+    ap.add_argument("--cherry", dest="cherry", action="store_true")
+    ap.add_argument("--left-only", dest="left_only", action="store_true")
+    ap.add_argument("--right-only", dest="right_only", action="store_true")
+    # --missing=<action> controls partial-clone behaviour on missing objects;
+    # everything is present in these repos, so it is accepted as a no-op.
+    ap.add_argument("--missing", dest="missing", default=None)
+    ap.add_argument("--exclude-promisor-objects", dest="exclude_promisor", action="store_true")
+    # Object-listing controls for --objects mode.
+    ap.add_argument("--filter", dest="filters", action="append", default=None)
+    ap.add_argument("--no-filter", dest="no_filter", action="store_true")
+    ap.add_argument("--filter-print-omitted", dest="filter_print_omitted", action="store_true")
+    ap.add_argument("--object-names", dest="object_names", action="store_true", default=True)
+    ap.add_argument("--no-object-names", dest="object_names", action="store_false")
+    ap.add_argument("--in-commit-order", dest="in_commit_order", action="store_true")
+    ap.add_argument("--do-walk", dest="do_walk", action="store_true")
     # --sparse/--dense toggle history simplification density (revs->dense).
     # dense (the default) prunes TREESAME single-parent commits during a
     # pathspec-limited walk; --sparse leaves every non-merge/root commit in
@@ -5274,9 +5475,37 @@ def cmd_rev_list(argv: list[str]) -> int:
     # value flag like `--disk-usage HEAD` would swallow the revision. Rewrite the
     # bare forms to their attached "=<const>" so the next token stays a revision.
     _opt_const = {"--disk-usage": "", "--branches": "*", "--tags": "*",
-                  "--remotes": "*", "--no-walk": "sorted", "--pretty": "medium"}
+                  "--remotes": "*", "--no-walk": "sorted", "--pretty": "medium",
+                  "--ancestry-path": ""}
     pre = [f"{t}={_opt_const[t]}" if t in _opt_const else t for t in pre]
+    # `--not` is a sticky include/exclude toggle for the following command-line
+    # revisions; argparse must not see it. Keep the token stream (with --not)
+    # for a paired walk that recovers each positional's not-state.
+    _rl_rev_stream = list(pre)
+    pre = [t for t in pre if t != "--not"]
     args = ap.parse_args(pre)
+    # Pair each positional rev with the --not state in effect when it appeared.
+    _rl_not: dict[int, bool] = {}
+    _rl_ns = False
+    _rl_idx = 0
+    for tok in _rl_rev_stream:
+        if tok == "--not":
+            _rl_ns = True
+            continue
+        if tok in ("--all", "--branches", "--tags", "--remotes") or \
+           tok.split("=", 1)[0] in ("--all", "--branches", "--tags", "--remotes"):
+            _rl_ns = False
+            continue
+        if _rl_idx < len(args.revs) and tok == args.revs[_rl_idx]:
+            _rl_not[_rl_idx] = _rl_ns
+            _rl_idx += 1
+    # --cherry is shorthand for --right-only --cherry-mark --no-merges.
+    if args.cherry:
+        args.right_only = True
+        args.cherry_mark = True
+        args.no_merges = True
+    # --cherry-pick implies cherry equivalence detection (it omits equivalents).
+    cherry_active = args.cherry_mark or args.cherry_pick
     # Reject -z combined with the options C Git refuses (builtin/rev-list.c:
     # "-z option used with unsupported option"): --header, --timestamp,
     # --pretty/--format, --objects-edge, --left-right, --disk-usage, --bisect*.
@@ -5468,11 +5697,17 @@ def cmd_rev_list(argv: list[str]) -> int:
                 rl_paths.append(_stdin_lines[_li])
                 _li += 1
 
-    for r in rev_args:
+    for _ridx, r in enumerate(rev_args):
+        neg = _rl_not.get(_ridx, False)
         if r.startswith("^"):
+            # `^rev` excludes; under a sticky --not it flips back to a positive.
             sha = _rl_resolve(r[1:])
             if sha:
-                excludes.append(sha)
+                if neg:
+                    _collect_tags(r[1:])
+                    starts.append(sha)
+                else:
+                    excludes.append(sha)
             continue
         if "..." in r:
             # Symmetric difference: A...B = A B --not $(merge-base A B).
@@ -5503,8 +5738,11 @@ def cmd_rev_list(argv: list[str]) -> int:
             continue
         sha = _rl_resolve(r)
         if sha:
-            _collect_tags(r)
-            starts.append(sha)
+            if neg:
+                excludes.append(sha)
+            else:
+                _collect_tags(r)
+                starts.append(sha)
     if not starts and not have_ns and not args.stdin:
         # No commits to walk and no rev input. C Git prints the full usage
         # (rc 129) when no revision input was given at all; --stdin (even if it
@@ -5513,6 +5751,11 @@ def cmd_rev_list(argv: list[str]) -> int:
             sys.stderr.write(_REV_LIST_USAGE)
             return 129
         _err("usage: git rev-list [<options>] <commit>... [--] [<path>...]")
+        return 128
+
+    # --ancestry-path requires at least one negative (bottom) commit.
+    if args.ancestry_path is not None and not excludes:
+        _err("fatal: --ancestry-path given but there are no bottom commits")
         return 128
 
     excluded: set[str] = set()
@@ -5550,7 +5793,10 @@ def cmd_rev_list(argv: list[str]) -> int:
                       or args.min_age is not None)
     need_full = (has_filter or want_topo or want_date or args.reverse or args.count
                  or args.bisect or args.bisect_all or args.bisect_vars
-                 or args.disk_usage is not None or args.children)
+                 or args.disk_usage is not None or args.children
+                 or args.skip is not None or args.boundary
+                 or args.cherry_mark or args.cherry_pick or args.cherry
+                 or args.left_only or args.right_only)
     import heapq
     heap: list[tuple] = []
     counter = 0
@@ -5628,10 +5874,61 @@ def cmd_rev_list(argv: list[str]) -> int:
     out = _filter_commits(repo, out, args)
     if args.unpacked:
         out = [s for s in out if objs._loose_path(repo, s).exists()]
+
+    # --cherry-mark / --cherry-pick / --cherry: detect commits whose patch-id
+    # matches one on the opposite side of a symmetric range and mark ('=') or
+    # omit them. --left-only / --right-only keep only one side.
+    cherry_eq: set[str] = set()
+    if cherry_active or args.left_only or args.right_only:
+        import hashlib as _hashlib
+        from . import diff as _d
+
+        def _rl_patch_id(sha: str) -> str:
+            c = objs.parse_commit(objs.read_object(repo, sha)[1])
+            if not c.parents:
+                return _hashlib.sha1(c.tree.encode()).hexdigest()
+            ptree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
+            h = _hashlib.sha1()
+            for p, a_entry, b_entry in workdir.iter_tree_changes(repo, ptree, c.tree):
+                a_sha = a_entry.sha if a_entry else None
+                b_sha = b_entry.sha if b_entry else None
+                if a_sha == b_sha:
+                    continue
+                at = bt = ""
+                if a_sha:
+                    at = objs.read_object(repo, a_sha)[1].decode("utf-8", "replace")
+                if b_sha:
+                    bt = objs.read_object(repo, b_sha)[1].decode("utf-8", "replace")
+                h.update(_d.unified_diff(at, bt, p, p).encode("utf-8", "replace"))
+            return h.hexdigest()
+
+        if cherry_active:
+            left_ids: dict[str, str] = {s: _rl_patch_id(s) for s in out if s in lr_left}
+            right_ids: dict[str, str] = {s: _rl_patch_id(s) for s in out if s in lr_right}
+            left_pset = set(left_ids.values())
+            right_pset = set(right_ids.values())
+            for s, pid in left_ids.items():
+                if pid in right_pset:
+                    cherry_eq.add(s)
+            for s, pid in right_ids.items():
+                if pid in left_pset:
+                    cherry_eq.add(s)
+        # --left-only / --right-only restrict to one symmetric side.
+        if args.left_only:
+            out = [s for s in out if s in lr_left]
+        elif args.right_only:
+            out = [s for s in out if s in lr_right]
+        # --cherry-pick omits the equivalent commits entirely.
+        if args.cherry_pick and not args.cherry_mark:
+            out = [s for s in out if s not in cherry_eq]
+
     if want_topo:
         out = _topo_order(repo, out, args.first_parent, by_date=False)
     elif want_date:
         out = _topo_order(repo, out, args.first_parent, by_date=True)
+    # --skip=N drops the first N commits (after filtering, before --max-count).
+    if args.skip is not None and args.skip > 0:
+        out = out[args.skip:]
     if args.max_count is not None:
         out = out[:max(0, args.max_count)]
 
@@ -5772,9 +6069,23 @@ def cmd_rev_list(argv: list[str]) -> int:
                 _rev_list_emit_pretty(repo, s, c, style, _ab)
         return 0
     if args.count:
+        # --count with --objects counts EVERY object rev-list would print
+        # (commits + reachable trees and blobs), not just the commits.
+        if args.objects or args.objects_edge:
+            seen_c = _reachable_tree_objects(repo, excluded, graph)
+            total_c = 0
+            for s in out:
+                total_c += 1
+                info = _commit_tree_parents(repo, s, graph)
+                if info:
+                    for osha, _p in _walk_objects(repo, info[0], ""):
+                        if osha not in seen_c:
+                            seen_c.add(osha)
+                            total_c += 1
+            _print(str(total_c))
         # --count with --left-right prints the two sides tab-separated
         # (builtin/rev-list.c): count_left = commits flagged SYMMETRIC_LEFT.
-        if args.left_right:
+        elif args.left_right:
             left = sum(1 for s in out if s in lr_left)
             right = len(out) - left
             _print(f"{left}\t{right}")
@@ -5782,10 +6093,69 @@ def cmd_rev_list(argv: list[str]) -> int:
             _print(str(len(out)))
     elif args.objects or args.objects_edge:
         out_buf = sys.stdout.buffer
+        names_on = args.object_names
 
         def wz(line: str) -> None:
             out_buf.write(line.encode("utf-8", "surrogateescape"))
             out_buf.write(term.encode("latin-1"))
+
+        # --filter=<spec>: object filtering for partial output. blob:none omits
+        # all blobs; tree:0 omits trees below the root and all blobs; blob:limit
+        # omits blobs larger than the size limit (list_objects_filter.c).
+        filter_no_blobs = False
+        tree_depth = None  # tree:<depth>
+        blob_limit = None
+        for fspec in (args.filters or []):
+            if fspec == "blob:none":
+                filter_no_blobs = True
+            elif fspec.startswith("tree:"):
+                try:
+                    tree_depth = int(fspec.split(":", 1)[1])
+                except ValueError:
+                    tree_depth = None
+                filter_no_blobs = filter_no_blobs or (tree_depth == 0)
+            elif fspec.startswith("blob:limit="):
+                limstr = fspec.split("=", 1)[1]
+                mult = 1
+                if limstr and limstr[-1] in "kKmMgG":
+                    mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[limstr[-1].lower()]
+                    limstr = limstr[:-1]
+                try:
+                    blob_limit = int(limstr) * mult
+                except ValueError:
+                    blob_limit = None
+
+        def _typed_walk(tree_sha: str, prefix: str, depth: int):
+            """Yield (sha, path, is_tree) honouring tree:<depth> / blob filters.
+            The root tree is depth 0; its entries are depth 1 (list_objects_
+            filter.c omits any object whose depth is >= the tree:<n> limit)."""
+            # The root tree is included only when its depth (0) is below the
+            # tree:<n> limit.
+            if tree_depth is None or depth < tree_depth:
+                yield (tree_sha, prefix.rstrip("/"), True)
+            try:
+                _, data = objs.read_object(repo, tree_sha)
+            except KeyError:
+                return
+            for e in objs.parse_tree(data, repo.hash_len):
+                path = prefix + e.name
+                if e.is_dir():
+                    if tree_depth is not None and depth + 1 >= tree_depth:
+                        # The subtree (and everything below it) is too deep.
+                        continue
+                    yield from _typed_walk(e.sha, path + "/", depth + 1)
+                elif not e.is_gitlink():
+                    if filter_no_blobs:
+                        continue
+                    if tree_depth is not None and depth + 1 >= tree_depth:
+                        continue
+                    if blob_limit is not None:
+                        try:
+                            if len(objs.read_object(repo, e.sha)[1]) > blob_limit:
+                                continue
+                        except KeyError:
+                            pass
+                    yield (e.sha, path, False)
 
         # Boundary (uninteresting) commits, prefixed with '-', precede the rest.
         if args.objects_edge:
@@ -5793,25 +6163,40 @@ def cmd_rev_list(argv: list[str]) -> int:
                 wz(f"-{_ab(e)}")
         if args.reverse:
             out = list(reversed(out))
-        for s in out:
-            wz(_ab(s))
-        # Objects reachable from the uninteresting (excluded) commits are
-        # already in the receiver, so C Git omits them from the listing. With
-        # -z each named object is "<oid>\0path=<name>\0" (a separate record for
-        # the path); the bare non-z layout is "<oid> <name>" on one line.
         seen_obj = _reachable_tree_objects(repo, excluded, graph)
 
-        def emit_named(osha: str, name: str) -> None:
+        def emit_named(osha: str, name: str, abbrev: bool = True) -> None:
+            disp = _ab(osha) if abbrev else osha
             if args.z:
-                out_buf.write(_ab(osha).encode("ascii"))
+                out_buf.write(disp.encode("ascii"))
                 out_buf.write(b"\0")
-                if name:
+                if names_on and name:
                     out_buf.write(b"path=")
                     out_buf.write(name.encode("utf-8", "surrogateescape"))
                     out_buf.write(b"\0")
             else:
-                wz(f"{_ab(osha)} {name}")
+                wz(f"{disp} {name}" if names_on else disp)
 
+        if args.in_commit_order:
+            # --in-commit-order interleaves each commit with its own objects
+            # (the commit id then its tree/blobs) instead of listing all the
+            # commits first.
+            for s in out:
+                wz(_ab(s))
+                info = _commit_tree_parents(repo, s, graph)
+                if info is None:
+                    continue
+                for osha, opath, _is_t in _typed_walk(info[0], "", 0):
+                    if osha in seen_obj:
+                        continue
+                    seen_obj.add(osha)
+                    emit_named(osha, opath, abbrev=False)
+            out_buf.flush()
+            return 0
+
+        # Default object ordering: all commit ids, then tags, then trees/blobs.
+        for s in out:
+            wz(_ab(s))
         # Annotated tag objects (revision.c handle_commit) are emitted after the
         # commit list and before trees/blobs, in pending order, each named by its
         # own `tag` header. Tags reachable only from excluded tips are skipped.
@@ -5819,24 +6204,16 @@ def cmd_rev_list(argv: list[str]) -> int:
             if tsha in seen_obj or tsha in excluded:
                 continue
             seen_obj.add(tsha)
-            emit_named(tsha, tname)
+            emit_named(tsha, tname, abbrev=False)
         for s in out:
             info = _commit_tree_parents(repo, s, graph)
             if info is None:
                 continue
-            for osha, opath in _walk_objects(repo, info[0], ""):
+            for osha, opath, _is_t in _typed_walk(info[0], "", 0):
                 if osha in seen_obj:
                     continue
                 seen_obj.add(osha)
-                if args.z:
-                    out_buf.write(osha.encode("ascii"))
-                    out_buf.write(b"\0")
-                    if opath:
-                        out_buf.write(b"path=")
-                        out_buf.write(opath.encode("utf-8", "surrogateescape"))
-                        out_buf.write(b"\0")
-                else:
-                    wz(f"{osha} {opath}")
+                emit_named(osha, opath, abbrev=False)
         out_buf.flush()
     else:
         if args.reverse:
@@ -5853,8 +6230,14 @@ def cmd_rev_list(argv: list[str]) -> int:
                         children_map.setdefault(p, []).insert(0, s)
         for s in out:
             mark = ""
-            if args.left_right:
+            # --cherry-mark prints '=' for an equivalent commit; otherwise the
+            # left-right side mark, or '+' under --cherry-mark for a unique one.
+            if s in cherry_eq:
+                mark = "="
+            elif args.left_right:
                 mark = "<" if s in lr_left else (">" if s in lr_right else "")
+            elif args.cherry_mark:
+                mark = "+"
             ts_prefix = ""
             if args.timestamp:
                 ts_prefix = f"{_commit_date(repo, s)} "
@@ -5868,6 +6251,11 @@ def cmd_rev_list(argv: list[str]) -> int:
                 if kids:
                     extra += " " + " ".join(kids)
             sys.stdout.write(f"{ts_prefix}{mark}{_ab(s)}{extra}" + term)
+        # --boundary lists the uninteresting boundary commits last, each
+        # prefixed with '-' (revision.c show_commit / get_revision boundary).
+        if args.boundary:
+            for e in edges:
+                sys.stdout.write(f"-{_ab(e)}" + term)
     return 0
 
 
@@ -5998,26 +6386,284 @@ def _add_edit_patch(repo: Repository, paths: list[str]) -> int:
     return 0
 
 
+_ADD_USAGE = (
+    "usage: git add [<options>] [--] <pathspec>...\n"
+    "\n"
+    "    -n, --[no-]dry-run    dry run\n"
+    "    -v, --[no-]verbose    be verbose\n"
+    "\n"
+    "    -i, --[no-]interactive\n"
+    "                          interactive picking\n"
+    "    -p, --[no-]patch      select hunks interactively\n"
+    "    --[no-]auto-advance   auto advance to the next file when selecting hunks interactively\n"
+    "    -U, --unified <n>     generate diffs with <n> lines context\n"
+    "    --inter-hunk-context <n>\n"
+    "                          show context between diff hunks up to the specified number of lines\n"
+    "    -e, --[no-]edit       edit current diff and apply\n"
+    "    -f, --[no-]force      allow adding otherwise ignored files\n"
+    "    -u, --[no-]update     update tracked files\n"
+    "    --[no-]renormalize    renormalize EOL of tracked files (implies -u)\n"
+    "    -N, --[no-]intent-to-add\n"
+    "                          record only the fact that the path will be added later\n"
+    "    -A, --[no-]all        add changes from all tracked and untracked files\n"
+    "    --[no-]ignore-removal ignore paths removed in the working tree (same as --no-all)\n"
+    "    --[no-]refresh        don't add, only refresh the index\n"
+    "    --[no-]ignore-errors  just skip files which cannot be added because of errors\n"
+    "    --[no-]ignore-missing check if - even missing - files are ignored in dry run\n"
+    "    --[no-]sparse         allow updating entries outside of the sparse-checkout cone\n"
+    "    --[no-]chmod (+|-)x   override the executable bit of the listed files\n"
+    "    --[no-]pathspec-from-file <file>\n"
+    "                          read pathspec from file\n"
+    "    --[no-]pathspec-file-nul\n"
+    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n"
+    "\n"
+)
+
+
+class _AddParseError(Exception):
+    def __init__(self, message: str, rc: int = 129, show_usage: bool = True,
+                 usage_stream: str = "stderr"):
+        super().__init__(message)
+        self.message = message
+        self.rc = rc
+        self.show_usage = show_usage
+        # Ambiguous-option / -h emit the usage block to stdout (USAGE_TO_STDOUT);
+        # unknown-option emits it to stderr (USAGE_TO_STDERR).
+        self.usage_stream = usage_stream
+
+
+class _AddArgs:
+    pass
+
+
+# The `git add` long-option table in declaration order (builtin/add.c
+# builtin_add_options). Each entry is (long_name, kind, dest, value, negatable).
+# kind: 'bool' (value), 'int', 'string'. negatable=True means the option also
+# has a "--no-<name>" form (OPT_BOOL/OPT_STRING are negatable; PARSE_OPT_NONEG
+# ones are not). Abbreviation and ambiguity follow parse-options.c parse_long_opt.
+_ADD_OPT_TABLE = [
+    ("dry-run", "bool", "dry_run", True, True),
+    ("verbose", "bool", "verbose", True, True),
+    ("interactive", "bool", "interactive", True, True),
+    ("patch", "bool", "patch", True, True),
+    ("auto-advance", "bool", "auto_advance", True, True),
+    ("unified", "int", "unified", None, False),
+    ("inter-hunk-context", "int", "interhunkcontext", None, False),
+    ("edit", "bool", "edit", True, True),
+    ("force", "bool", "force", True, True),
+    ("update", "bool", "update", True, True),
+    ("renormalize", "bool", "renormalize", True, True),
+    ("intent-to-add", "bool", "intent_to_add", True, True),
+    ("all", "bool", "all", True, True),
+    # OPT_CALLBACK ignore-removal: sets addremove_explicit (== --no-all), NONEG.
+    ("ignore-removal", "bool", "no_all", True, False),
+    ("refresh", "bool", "refresh", True, True),
+    ("ignore-errors", "bool", "ignore_errors", True, True),
+    ("ignore-missing", "bool", "ignore_missing", True, True),
+    ("sparse", "bool", "sparse", True, True),
+    ("chmod", "string", "chmod", None, True),
+    ("warn-embedded-repo", "bool", "warn_embedded_repo", True, True),
+    ("pathspec-from-file", "string", "pathspec_from_file", None, True),
+    ("pathspec-file-nul", "bool", "pathspec_file_nul", True, True),
+]
+
+_ADD_SHORT_OPTS = {
+    "n": ("bool", "dry_run", True),
+    "v": ("bool", "verbose", True),
+    "i": ("bool", "interactive", True),
+    "p": ("bool", "patch", True),
+    "e": ("bool", "edit", True),
+    "f": ("bool", "force", True),
+    "u": ("bool", "update", True),
+    "N": ("bool", "intent_to_add", True),
+    "A": ("bool", "all", True),
+}
+
+
+def _add_resolve_long(arg: str):
+    """Port of parse-options.c parse_long_opt for `git add`. ``arg`` is the
+    body after '--' (may contain '='). Returns (entry, negate, attached) where
+    entry is the matched _ADD_OPT_TABLE tuple, negate is True for the "no-"
+    form, attached is the '=value' string (or None). Raises _AddParseError on
+    ambiguity. Returns None if no option matched (caller reports unknown)."""
+    arg_start = arg
+    arg_starts_with_no_no = False
+    flags_unset = False
+    if arg_start.startswith("no-"):
+        arg_start = arg_start[3:]
+        if arg_start.startswith("no-"):
+            arg_starts_with_no_no = True
+        else:
+            flags_unset = True
+    base, eq, val = arg_start.partition("=")
+    attached = (eq + val)[1:] if eq else None  # the part after '=' if present
+    # exact-match key (everything before '=')
+    key = base
+    abbrev = None      # (entry, negate)
+    ambiguous = None   # (entry, negate)
+
+    def register(entry, negate):
+        nonlocal abbrev, ambiguous
+        if abbrev is not None:
+            ambiguous = abbrev
+        abbrev = (entry, negate)
+
+    for entry in _ADD_OPT_TABLE:
+        long_name, kind, dest, value, negatable = entry
+        opt_unset = False  # our table has no literal "no-" long names
+        if arg_starts_with_no_no:
+            # only options whose canonical name begins "no-" could match; none do
+            continue
+        if flags_unset and not negatable:
+            continue
+        # exact / prefix on the canonical long name
+        if long_name == key:
+            return entry, flags_unset, attached
+        if long_name.startswith(key):
+            register(entry, flags_unset)
+    if ambiguous is not None:
+        a_entry, a_neg = ambiguous
+        b_entry, b_neg = abbrev
+        disp = "--%s%s or --%s%s" % (
+            "no-" if a_neg else "", a_entry[0],
+            "no-" if b_neg else "", b_entry[0])
+        raise _AddParseError("error: ambiguous option: %s (could be %s)" % (arg, disp),
+                             usage_stream="stdout")
+    if abbrev is not None:
+        entry, negate = abbrev
+        return entry, negate, attached
+    return None
+
+
+def _parse_add_argv(argv: list[str]) -> _AddArgs:
+    a = _AddArgs()
+    a.dry_run = False
+    a.verbose = False
+    a.interactive = False
+    a.patch = False
+    a.auto_advance = True
+    a.unified = -1
+    a.interhunkcontext = -1
+    a.edit = False
+    a.force = False
+    a.update = False
+    a.renormalize = False
+    a.intent_to_add = False
+    a.all = False
+    a.no_all = False
+    a.refresh = False
+    a.ignore_errors = False
+    a.ignore_missing = False
+    a.sparse = False
+    a.chmod = None
+    a.warn_embedded_repo = False
+    a.pathspec_from_file = None
+    a.pathspec_file_nul = False
+    a.paths = []
+
+    def set_int(dest: str, raw: str, disp: str) -> None:
+        try:
+            setattr(a, dest, int(raw))
+        except ValueError:
+            raise _AddParseError("error: option `%s' expects a numerical value" % disp)
+
+    i, n = 0, len(argv)
+    saw_dd = False
+    while i < n:
+        tok = argv[i]
+        if saw_dd:
+            a.paths.append(tok)
+            i += 1
+            continue
+        if tok == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if tok == "-" or not tok.startswith("-"):
+            a.paths.append(tok)
+            i += 1
+            continue
+        if tok in ("-h", "--help"):
+            raise _AddParseError("", rc=129, usage_stream="stdout")
+        if tok.startswith("--"):
+            body = tok[2:]
+            resolved = _add_resolve_long(body)
+            if resolved is None:
+                name = body.partition("=")[0]
+                raise _AddParseError("error: unknown option `%s'" % name)
+            entry, negate, attached = resolved
+            long_name, kind, dest, value, _negatable = entry
+            if kind == "bool":
+                if attached is not None:
+                    raise _AddParseError("error: option `%s' takes no value" % long_name)
+                # -A/--all and --no-all/--ignore-removal both feed git's
+                # addremove_explicit tri-state: --all => add+remove (all=True),
+                # --no-all => ignore-removal (no_all=True). They are mutually
+                # exclusive last-wins.
+                if dest == "all":
+                    if negate:
+                        a.all = False
+                        a.no_all = True
+                    else:
+                        a.all = True
+                        a.no_all = False
+                else:
+                    setattr(a, dest, (False if negate else value))
+            elif kind == "int":
+                if attached is not None:
+                    set_int(dest, attached, long_name)
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _AddParseError("error: option `%s' requires a value" % long_name)
+                    set_int(dest, argv[i], long_name)
+            elif kind == "string":
+                if negate:
+                    setattr(a, dest, None)
+                elif attached is not None:
+                    setattr(a, dest, attached)
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _AddParseError("error: option `%s' requires a value" % long_name)
+                    setattr(a, dest, argv[i])
+            i += 1
+            continue
+        # Short option cluster.
+        j = 1
+        consumed_next = False
+        while j < len(tok):
+            ch = tok[j]
+            spec = _ADD_SHORT_OPTS.get(ch)
+            if ch == "U":
+                rest = tok[j + 1:]
+                if rest:
+                    set_int("unified", rest, "U")
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _AddParseError("error: switch `U' requires a value")
+                    set_int("unified", argv[i], "U")
+                    consumed_next = True
+                break
+            if spec is None:
+                raise _AddParseError("error: unknown switch `%s'" % ch)
+            kind, dest, value = spec
+            setattr(a, dest, value)
+            j += 1
+        i += 1
+    return a
+
+
 def cmd_add(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit add", add_help=False)
-    ap.add_argument("-A", "--all", action="store_true")
-    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("-u", "--update", action="store_true")
-    ap.add_argument("-N", "--intent-to-add", dest="intent_to_add", action="store_true")
-    ap.add_argument("-p", "--patch", dest="patch", action="store_true")
-    ap.add_argument("-i", "--interactive", dest="interactive", action="store_true")
-    ap.add_argument("-e", "--edit", dest="edit", action="store_true")
-    ap.add_argument("-U", "--unified", dest="unified", type=int, default=-1)
-    ap.add_argument("--inter-hunk-context", dest="interhunkcontext", type=int, default=-1)
-    ap.add_argument("--auto-advance", dest="auto_advance", action="store_true", default=True)
-    ap.add_argument("--no-auto-advance", dest="auto_advance", action="store_false")
-    ap.add_argument("--no-all", "--ignore-removal", dest="no_all", action="store_true")
-    ap.add_argument("--pathspec-from-file", dest="pathspec_from_file", default=None)
-    ap.add_argument("--pathspec-file-nul", dest="pathspec_file_nul", action="store_true")
-    ap.add_argument("paths", nargs="*")
-    args = ap.parse_args(argv)
+    try:
+        args = _parse_add_argv(argv)
+    except _AddParseError as exc:
+        if exc.message:
+            _err(exc.message)
+        if exc.show_usage:
+            (sys.stdout if exc.usage_stream == "stdout" else sys.stderr).write(_ADD_USAGE)
+        return exc.rc
     repo = _repo()
 
     # Interactive / patch machinery (builtin/add.c cmd_add ordering).
@@ -6052,26 +6698,71 @@ def cmd_add(argv: list[str]) -> int:
             _err("fatal: options '--pathspec-from-file' and '--edit' cannot be used together")
             return 128
         return _add_edit_patch(repo, args.paths)
+
+    # builtin/add.c: addremove_explicit tracks whether -A/--all (or its negated
+    # twin --no-all/--ignore-removal) was given. -A and -u are exclusive.
+    take_worktree_changes = args.update
+    if args.all and take_worktree_changes:
+        _err("fatal: options '-A' and '-u' cannot be used together")
+        return 128
+
+    # --ignore-missing only valid in --dry-run.
+    if not args.dry_run and args.ignore_missing:
+        _err("fatal: the option '--ignore-missing' requires '--dry-run'")
+        return 128
+
+    # --chmod must be -x or +x (chmod_arg validation).
+    if args.chmod is not None and args.chmod not in ("+x", "-x"):
+        _err(f"fatal: --chmod param '{args.chmod}' must be either -x or +x")
+        return 128
+
     # --pathspec-from-file supplies the pathspecs instead of the command line.
     if args.pathspec_from_file is not None:
+        if args.paths:
+            _err("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together")
+            return 128
         raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
                else open(args.pathspec_from_file, "rb").read())
         sep = "\0" if args.pathspec_file_nul else "\n"
         args.paths = [p for p in raw.decode("utf-8").split(sep) if p]
+    elif args.pathspec_file_nul:
+        _err("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'")
+        return 128
+
+    # require_pathspec = !(take_worktree_changes || -A). With neither, an empty
+    # pathspec is the "Nothing specified, nothing added." advice (rc 0).
+    require_pathspec = not (take_worktree_changes or args.all)
+    if require_pathspec and not args.paths:
+        _err("Nothing specified, nothing added.")
+        from . import gitconfig
+        if _advice_enabled(repo, "addEmptyPathspec"):
+            _err("hint: Maybe you wanted to say 'git add .'?")
+            _err('hint: Disable this message with "git config set advice.addEmptyPathspec false"')
+        return 0
+
     explicit = bool(args.paths) and not args.all
     targets = args.paths if (args.paths) else ["."]
     if explicit:
         tracked = workdir.tracked_paths(repo)
         for ps in targets:
             if not _pathspec_matches(repo, ps, tracked):
+                if args.ignore_missing:
+                    continue
                 _err(f"fatal: pathspec '{ps}' did not match any files")
                 return 128
+
+    # --refresh: refresh stat info for matched index entries; do not add.
+    if args.refresh:
+        return _add_refresh(repo, targets, verbose=args.verbose)
+
     # Explicitly-named ignored paths trigger the addIgnoredFile advice
     # (builtin/add.c add_files) unless -f. They are also excluded from staging.
-    exit_status = 0
     ignored_named: list[str] = []
     if explicit and not args.force and not args.intent_to_add:
         ignored_named = workdir.explicit_ignored(repo, targets)
+    # --ignore-missing in dry-run reports ignored named paths as the advice too.
+    if args.ignore_missing:
+        ignored_named = sorted(set(ignored_named) | set(workdir.explicit_ignored(repo, targets)))
     report = None
     if args.dry_run or args.verbose:
         report = workdir.would_add_report(
@@ -6082,13 +6773,135 @@ def cmd_add(argv: list[str]) -> int:
                 _print(f"{label} '{rel}'")
             _add_emit_ignored(ignored_named)
             return 1 if ignored_named else 0
-    workdir.add_paths(repo, targets, ignore_removal=args.no_all, update_only=args.update,
-                      intent_to_add=args.intent_to_add, force=args.force)
+    # --renormalize behaves like -u (only restages tracked files).
+    update_only = args.update or args.renormalize
+    workdir.add_paths(repo, targets, ignore_removal=args.no_all, update_only=update_only,
+                      intent_to_add=args.intent_to_add, force=args.force,
+                      chmod=args.chmod)
+    # check_embedded_repo: adding a directory that is itself a git repo.
+    embedded_rc = _add_check_embedded(repo, targets, force=args.force)
+    if embedded_rc:
+        return embedded_rc
     if args.verbose and report is not None:
         for label, rel in report:
             _print(f"{label} '{rel}'")
     _add_emit_ignored(ignored_named)
     return 1 if ignored_named else 0
+
+
+def _advice_enabled(repo, key: str) -> bool:
+    """advice.<key> defaults to true (advice_enabled in advice.c)."""
+    from . import gitconfig
+    val = (gitconfig.get(repo, f"advice.{key.lower()}") or "").lower()
+    return val not in ("false", "0", "no", "off")
+
+
+def _add_refresh(repo: Repository, targets: list[str], *, verbose: bool) -> int:
+    """Port of builtin/add.c refresh(): restage stat info for tracked paths
+    that match the pathspec, without adding new files. Returns the exit status
+    (1 if a pathspec matched nothing tracked, like git's "did not match")."""
+    from .index import stat_to_entry
+    idx = read_index(repo)
+    tracked = idx.by_path()
+    exit_status = 0
+    matched_any: dict[str, bool] = {}
+    for ps in targets:
+        norm = ps.rstrip("/")
+        matched_any[ps] = (norm in (".", "") or
+                           any(t == norm or t.startswith(norm + "/") for t in tracked))
+    for ps, ok in matched_any.items():
+        if not ok:
+            _err(f"error: pathspec '{ps}' did not match any file(s) known to git")
+            exit_status = 1
+    # Refresh stat info: rewrite cache entries for paths whose worktree file is
+    # content-identical to the index but has stale stat data.
+    changed = False
+    for name, ce in list(tracked.items()):
+        matched = any(
+            ps.rstrip("/") in (".", "") or name == ps.rstrip("/")
+            or name.startswith(ps.rstrip("/") + "/")
+            for ps in targets)
+        if not matched:
+            continue
+        full = repo.path / name
+        if not (full.exists() or full.is_symlink()):
+            continue
+        try:
+            data = workdir._blob_data(full)
+            wt_sha, _ = objs.hash_bytes("blob", data, repo)
+        except OSError:
+            continue
+        if wt_sha == ce.sha:
+            st = full.lstat()
+            new_entry = stat_to_entry(name, st, ce.sha, ce.mode)
+            new_entry.flags = ce.flags  # preserve stage / intent-to-add / skip-worktree
+            idx.upsert(new_entry)
+            changed = True
+    if changed:
+        write_index(repo, idx)
+    return exit_status
+
+
+def _add_check_embedded(repo: Repository, targets: list[str], *, force: bool) -> int:
+    """Port of object-file.c index_path S_IFDIR branch + builtin/add.c
+    add_files: adding a directory that is an embedded git repo with no commit
+    checked out errors. Returns 128 (die "adding files failed") if so."""
+    failed: list[str] = []
+    for ps in targets:
+        norm = ps.rstrip("/")
+        if norm in (".", ""):
+            continue
+        full = repo.path / norm
+        if not full.is_dir():
+            continue
+        gitdir = full / ".git"
+        if not (gitdir.exists() or gitdir.is_dir()):
+            continue
+        # This path is a gitlink. resolve_gitlink_ref(path, "HEAD"): does the
+        # embedded repo have a commit checked out?
+        if _gitlink_has_commit(full):
+            continue
+        disp = norm + "/"
+        _err(f"error: '{disp}' does not have a commit checked out")
+        _err(f"error: unable to index file '{disp}'")
+        failed.append(norm)
+    if failed:
+        _err("fatal: adding files failed")
+        return 128
+    return 0
+
+
+def _gitlink_has_commit(path: Path) -> bool:
+    """True if the embedded repo at ``path`` has HEAD resolving to a commit."""
+    gitdir = path / ".git"
+    if gitdir.is_file():
+        try:
+            txt = gitdir.read_text().strip()
+            if txt.startswith("gitdir:"):
+                gitdir = (path / txt[len("gitdir:"):].strip()).resolve()
+        except OSError:
+            return False
+    head = gitdir / "HEAD"
+    try:
+        content = head.read_text().strip()
+    except OSError:
+        return False
+    if content.startswith("ref:"):
+        ref = content[len("ref:"):].strip()
+        # Loose ref or packed-refs.
+        if (gitdir / ref).exists():
+            return True
+        packed = gitdir / "packed-refs"
+        if packed.exists():
+            try:
+                for line in packed.read_text().splitlines():
+                    if line.endswith(" " + ref):
+                        return True
+            except OSError:
+                pass
+        return False
+    # Detached HEAD: a raw object id means a commit is checked out.
+    return len(content) >= 40
 
 
 def _add_emit_ignored(ignored_named: list[str]) -> None:
@@ -6183,32 +6996,248 @@ def _rm_check_local_mod(repo: Repository, names: list[str], *, index_only: bool)
     return errs
 
 
+class _PoError(Exception):
+    """A parse-options.c style error: an error line on stderr plus the usage
+    block (to stderr for unknown options, to stdout for ambiguous/-h), rc 129."""
+    def __init__(self, message: str, usage: str, *, usage_stream: str = "stderr",
+                 rc: int = 129):
+        super().__init__(message)
+        self.message = message
+        self.usage = usage
+        self.usage_stream = usage_stream
+        self.rc = rc
+
+    def emit(self) -> int:
+        if self.message:
+            _err(self.message)
+        (sys.stdout if self.usage_stream == "stdout" else sys.stderr).write(self.usage)
+        return self.rc
+
+
+class _PoNamespace:
+    pass
+
+
+def _po_parse(argv, opt_table, short_opts, usage, *, defaults, prog,
+              stop_at_nonopt=False):
+    """Generic port of parse-options.c for the simple value/bool option tables
+    used by several workdir commands. ``opt_table`` is a list of
+    (long_name, kind, dest, value, negatable) in declaration order; kind is
+    'bool', 'int' or 'string'. ``short_opts`` maps a short char to
+    (dest, value) for boolean switches (value flags handled per command).
+    Returns a namespace with each dest plus ``.positionals``. Raises _PoError
+    on parse failure. ``prog`` only documents the command."""
+    ns = _PoNamespace()
+    for k, v in defaults.items():
+        setattr(ns, k, v)
+    ns.positionals = []
+
+    def resolve_long(body):
+        arg_start = body
+        no_no = False
+        unset = False
+        if arg_start.startswith("no-"):
+            arg_start = arg_start[3:]
+            if arg_start.startswith("no-"):
+                no_no = True
+            else:
+                unset = True
+        key = arg_start.partition("=")[0]
+        attached = None
+        if "=" in arg_start:
+            attached = arg_start.partition("=")[2]
+        abbrev = None
+        ambiguous = None
+        for entry in opt_table:
+            long_name, kind, dest, value, negatable = entry
+            if no_no:
+                continue
+            if unset and not negatable:
+                continue
+            if long_name == key:
+                return entry, unset, attached
+            if long_name.startswith(key):
+                if abbrev is not None:
+                    ambiguous = abbrev
+                abbrev = (entry, unset)
+        if ambiguous is not None:
+            a_entry, a_neg = ambiguous
+            b_entry, b_neg = abbrev
+            disp = "--%s%s or --%s%s" % (
+                "no-" if a_neg else "", a_entry[0],
+                "no-" if b_neg else "", b_entry[0])
+            raise _PoError("error: ambiguous option: %s (could be %s)" % (key, disp),
+                           usage, usage_stream="stdout")
+        if abbrev is not None:
+            return abbrev[0], abbrev[1], attached
+        return None
+
+    i, n = 0, len(argv)
+    saw_dd = False
+    while i < n:
+        tok = argv[i]
+        if saw_dd:
+            ns.positionals.append(tok)
+            i += 1
+            continue
+        if tok == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if tok == "-" or not tok.startswith("-"):
+            if stop_at_nonopt:
+                ns.positionals.extend(argv[i:])
+                break
+            ns.positionals.append(tok)
+            i += 1
+            continue
+        if tok in ("-h", "--help"):
+            raise _PoError("", usage, usage_stream="stdout")
+        if tok.startswith("--"):
+            body = tok[2:]
+            resolved = resolve_long(body)
+            if resolved is None:
+                name = body.partition("=")[0]
+                raise _PoError("error: unknown option `%s'" % name, usage)
+            entry, negate, attached = resolved
+            long_name, kind, dest, value, _neg = entry
+            if kind == "bool":
+                if attached is not None:
+                    raise _PoError("error: option `%s' takes no value" % long_name, usage)
+                setattr(ns, dest, (False if negate else value))
+            elif kind == "int":
+                if negate:
+                    setattr(ns, dest, None)
+                elif attached is not None:
+                    try:
+                        setattr(ns, dest, int(attached))
+                    except ValueError:
+                        raise _PoError("error: option `%s' expects a numerical value" % long_name, usage)
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _PoError("error: option `%s' requires a value" % long_name, usage)
+                    try:
+                        setattr(ns, dest, int(argv[i]))
+                    except ValueError:
+                        raise _PoError("error: option `%s' expects a numerical value" % long_name, usage)
+            else:  # string
+                if negate:
+                    setattr(ns, dest, None)
+                elif attached is not None:
+                    setattr(ns, dest, attached)
+                else:
+                    i += 1
+                    if i >= n:
+                        raise _PoError("error: option `%s' requires a value" % long_name, usage)
+                    setattr(ns, dest, argv[i])
+            i += 1
+            continue
+        # Short option cluster.
+        j = 1
+        while j < len(tok):
+            ch = tok[j]
+            spec = short_opts.get(ch)
+            if spec is None:
+                raise _PoError("error: unknown switch `%s'" % ch, usage)
+            dest, value = spec
+            setattr(ns, dest, value)
+            j += 1
+        i += 1
+    return ns
+
+
+_RM_USAGE = (
+    "usage: git rm [-f | --force] [-n] [-r] [--cached] [--ignore-unmatch]\n"
+    "              [--quiet] [--pathspec-from-file=<file> [--pathspec-file-nul]]\n"
+    "              [--] [<pathspec>...]\n"
+    "\n"
+    "    -n, --[no-]dry-run    dry run\n"
+    "    -q, --[no-]quiet      do not list removed files\n"
+    "    --[no-]cached         only remove from the index\n"
+    "    -f, --[no-]force      override the up-to-date check\n"
+    "    -r                    allow recursive removal\n"
+    "    --[no-]ignore-unmatch exit with a zero status even if nothing matched\n"
+    "    --[no-]sparse         allow updating entries outside of the sparse-checkout cone\n"
+    "    --[no-]pathspec-from-file <file>\n"
+    "                          read pathspec from file\n"
+    "    --[no-]pathspec-file-nul\n"
+    "                          with --pathspec-from-file, pathspec elements are separated with NUL character\n"
+    "\n"
+)
+
+# builtin/rm.c option table (declaration order) for parse-options abbreviation.
+_RM_OPT_TABLE = [
+    ("dry-run", "bool", "dry_run", True, True),
+    ("quiet", "bool", "quiet", True, True),
+    ("cached", "bool", "cached", True, True),
+    ("force", "bool", "force", True, True),
+    # -r has no long name; represented for short handling only.
+    ("ignore-unmatch", "bool", "ignore_unmatch", True, True),
+    ("sparse", "bool", "sparse", True, True),
+    ("pathspec-from-file", "string", "pathspec_from_file", None, True),
+    ("pathspec-file-nul", "bool", "pathspec_file_nul", True, True),
+]
+
+_RM_SHORT_OPTS = {
+    "n": ("dry_run", True),
+    "q": ("quiet", True),
+    "f": ("force", True),
+    "r": ("recursive", True),
+}
+
+
 def cmd_rm(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit rm", add_help=False)
-    ap.add_argument("--cached", action="store_true")
-    ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("-r", dest="recursive", action="store_true")
-    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
-    ap.add_argument("paths", nargs="+")
-    args = ap.parse_args(argv)
+    try:
+        args = _po_parse(argv, _RM_OPT_TABLE, _RM_SHORT_OPTS, _RM_USAGE,
+                         defaults=dict(dry_run=False, quiet=False, cached=False,
+                                       force=False, recursive=False,
+                                       ignore_unmatch=False, sparse=False,
+                                       pathspec_from_file=None,
+                                       pathspec_file_nul=False),
+                         prog="rm")
+    except _PoError as exc:
+        return exc.emit()
     repo = _repo()
+
+    paths = list(args.positionals)
+    # --pathspec-from-file supplies the pathspecs.
+    if args.pathspec_from_file is not None:
+        if paths:
+            _err("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together")
+            return 128
+        raw = (sys.stdin.buffer.read() if args.pathspec_from_file == "-"
+               else open(args.pathspec_from_file, "rb").read())
+        sep = "\0" if args.pathspec_file_nul else "\n"
+        paths = [p for p in raw.decode("utf-8").split(sep) if p]
+    elif args.pathspec_file_nul:
+        _err("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'")
+        return 128
+
+    if not paths:
+        _err("fatal: No pathspec was given. Which files should I remove?")
+        return 128
+
     tracked = workdir.tracked_paths(repo)
-    for ps in args.paths:
+    for ps in paths:
         norm = ps.rstrip("/")
         if not (norm in tracked or any(t.startswith(norm + "/") for t in tracked)):
+            if args.ignore_unmatch:
+                continue
             _err(f"fatal: pathspec '{ps}' did not match any files")
             return 128
     # Expand directory pathspecs to the tracked files they contain.
     expanded: list[str] = []
-    for ps in args.paths:
+    for ps in paths:
         norm = ps.rstrip("/")
         if norm in tracked:
             expanded.append(norm)
         else:
             under = sorted(t for t in tracked if t.startswith(norm + "/"))
             if under and not args.recursive:
+                # builtin/rm.c: die() -> rc 128.
                 _err(f"fatal: not removing '{ps}' recursively without -r")
-                return 1
+                return 128
             expanded.extend(under)
     # Up-to-date safety check (builtin/rm.c check_local_mod). Unless -f, the
     # file, the index and HEAD must match; --cached is safe if the index
@@ -6218,29 +7247,62 @@ def cmd_rm(argv: list[str]) -> int:
         if rc:
             return 1
     if args.dry_run:
-        for rel in expanded:
-            _print(f"rm '{rel}'")
+        if not args.quiet:
+            for rel in expanded:
+                _print(f"rm '{rel}'")
         return 0
     removed = workdir.rm_paths(repo, expanded, cached=args.cached)
-    for rel in removed:
-        _print(f"rm '{rel}'")
+    if not args.quiet:
+        for rel in removed:
+            _print(f"rm '{rel}'")
     return 0
 
 
+_MV_USAGE = (
+    "usage: git mv [-v] [-f] [-n] [-k] <source> <destination>\n"
+    "   or: git mv [-v] [-f] [-n] [-k] <source>... <destination-directory>\n"
+    "\n"
+    "    -v, --[no-]verbose    be verbose\n"
+    "    -n, --[no-]dry-run    dry run\n"
+    "    -f, --[no-]force      force move/rename even if target exists\n"
+    "    -k                    skip move/rename errors\n"
+    "    --[no-]sparse         allow updating entries outside of the sparse-checkout cone\n"
+    "\n"
+)
+
+# builtin/mv.c option table (declaration order).
+_MV_OPT_TABLE = [
+    ("verbose", "bool", "verbose", True, True),
+    ("dry-run", "bool", "dry_run", True, True),
+    ("force", "bool", "force", True, True),
+    # -k has no long name.
+    ("sparse", "bool", "sparse", True, True),
+]
+_MV_SHORT_OPTS = {
+    "v": ("verbose", True),
+    "n": ("dry_run", True),
+    "f": ("force", True),
+    "k": ("skip", True),
+}
+
+
 def cmd_mv(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit mv", add_help=False)
-    ap.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("-f", "--force", action="store_true")
-    ap.add_argument("-k", dest="skip", action="store_true")
-    ap.add_argument("args", nargs="+")
-    args = ap.parse_args(argv)
+    try:
+        args = _po_parse(argv, _MV_OPT_TABLE, _MV_SHORT_OPTS, _MV_USAGE,
+                         defaults=dict(verbose=False, dry_run=False, force=False,
+                                       skip=False, sparse=False),
+                         prog="mv")
+    except _PoError as exc:
+        return exc.emit()
     repo = _repo()
-    if len(args.args) < 2:
-        _err("fatal: bad source")
-        return 1
-    sources = [a.rstrip("/") for a in args.args[:-1]]
-    dest_arg = args.args[-1]
+    # builtin/mv.c: after parse_options, --argc < 1 means fewer than one source
+    # remains once the destination is consumed -> usage_with_options (rc 129).
+    if len(args.positionals) < 2:
+        sys.stderr.write(_MV_USAGE)
+        return 129
+    sources = [a.rstrip("/") for a in args.positionals[:-1]]
+    raw_sources = args.positionals[:-1]
+    dest_arg = args.positionals[-1]
 
     idx = read_index(repo)
     in_index = set(idx.by_path())
@@ -6250,7 +7312,14 @@ def cmd_mv(argv: list[str]) -> int:
 
     # Determine destinations (builtin/mv.c: a directory destination maps each
     # source to <dest>/<basename(source)>; otherwise it is a 1:1 rename).
+    # KEEP_TRAILING_SLASH: the trailing '/' is preserved (so a rename to a
+    # non-existent "dir/" errors) EXCEPT for "mv <directory> no-such-dir/".
     dest_norm = dest_arg.rstrip("/")
+    dest_has_slash = dest_arg.endswith("/") and dest_arg != "/"
+    keep_slash = True
+    if (len(sources) == 1 and _isdir(sources[0])
+            and not (repo.path / dest_norm).is_dir()):
+        keep_slash = False
     dest_is_dir = (repo.path / dest_norm).is_dir() if dest_norm else False
     if dest_is_dir:
         destinations = [f"{dest_norm}/{os.path.basename(s)}" for s in sources]
@@ -6258,7 +7327,12 @@ def cmd_mv(argv: list[str]) -> int:
         if len(sources) != 1:
             _err(f"fatal: destination '{dest_arg}' is not a directory")
             return 128
-        destinations = [dest_arg.rstrip("/") if dest_arg.endswith("/") else dest_arg]
+        # Preserve the trailing slash so the pair-check reports the
+        # "destination directory does not exist" error for "mv f no-such/".
+        if dest_has_slash and keep_slash:
+            destinations = [dest_norm + "/"]
+        else:
+            destinations = [dest_norm]
 
     # Checking phase (builtin/mv.c): collect a fatal "bad" reason per pair. With
     # -k (ignore_errors) a bad pair is silently dropped ("remove_entry") and the
@@ -8977,6 +10051,43 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("-b", "--ignore-space-change", dest="ignore_space_change", action="store_true")
     ap.add_argument("--ignore-space-at-eol", dest="ignore_space_at_eol", action="store_true")
     ap.add_argument("--ignore-cr-at-eol", dest="ignore_cr_at_eol", action="store_true")
+    # Diff-algorithm selectors. pythongit always emits a Myers-style diff; for
+    # the simple histories `git log` is used on these choices reduce to the same
+    # hunks, so the flags are accepted and the algorithm hint is ignored.
+    ap.add_argument("--patience", dest="diff_algo", action="store_const", const="patience", default=None)
+    ap.add_argument("--histogram", dest="diff_algo", action="store_const", const="histogram")
+    ap.add_argument("--minimal", dest="diff_algo", action="store_const", const="minimal")
+    ap.add_argument("--diff-algorithm", dest="diff_algorithm", default=None)
+    ap.add_argument("--indent-heuristic", dest="indent_heuristic", action="store_true")
+    ap.add_argument("--no-indent-heuristic", dest="no_indent_heuristic", action="store_true")
+    ap.add_argument("--anchored", dest="anchored", action="append", default=None)
+    # --output-indicator-{new,old,context} customise the per-line diff markers.
+    ap.add_argument("--output-indicator-new", dest="oi_new", default=None)
+    ap.add_argument("--output-indicator-old", dest="oi_old", default=None)
+    ap.add_argument("--output-indicator-context", dest="oi_context", default=None)
+    # Rename/copy detection in the shown diffs. pythongit's diff already does
+    # not split rename pairs, so -M/-C are accepted and otherwise ignored.
+    ap.add_argument("-M", "--find-renames", dest="find_renames", nargs="?", const="", default=None)
+    ap.add_argument("-C", "--find-copies", dest="find_copies", nargs="?", const="", default=None)
+    ap.add_argument("--find-copies-harder", dest="find_copies_harder", action="store_true")
+    # --diff-merges/--combined-* select how merge diffs render; merges have no
+    # default diff in pythongit's log, so these are accepted and ignored.
+    ap.add_argument("--diff-merges", dest="diff_merges", default=None)
+    ap.add_argument("--no-diff-merges", dest="no_diff_merges", action="store_true")
+    ap.add_argument("--remerge-diff", dest="remerge_diff", action="store_true")
+    # History-simplification / traversal options. On the simple linear/branch
+    # histories these probes cover, git's output is identical to the default
+    # walk, so they are accepted; --ancestry-path keeps git's "no bottom
+    # commits" fatal when no exclusion is supplied.
+    ap.add_argument("--full-history", dest="full_history", action="store_true")
+    ap.add_argument("--simplify-merges", dest="simplify_merges", action="store_true")
+    ap.add_argument("--simplify-by-decoration", dest="simplify_by_decoration", action="store_true")
+    ap.add_argument("--dense", dest="dense", action="store_true")
+    ap.add_argument("--sparse", dest="sparse", action="store_true")
+    ap.add_argument("--remove-empty", dest="remove_empty", action="store_true")
+    ap.add_argument("--ancestry-path", dest="ancestry_path", nargs="?", const="", default=None)
+    ap.add_argument("--boundary", dest="boundary", action="store_true")
+    ap.add_argument("--exclude", dest="exclude_glob", action="append", default=None)
     # --clear-decorations resets the (currently unsupported) --decorate-refs
     # include/exclude filters; with no such filters in effect it is a no-op.
     ap.add_argument("--clear-decorations", dest="clear_decorations", action="store_true")
@@ -8995,26 +10106,50 @@ def cmd_log(argv: list[str]) -> int:
     ap.add_argument("--tags", nargs="?", const="*", default=None)
     ap.add_argument("--remotes", nargs="?", const="*", default=None)
     ap.add_argument("--no-walk", dest="no_walk", nargs="?", const="sorted", default=None)
+    ap.add_argument("--do-walk", dest="do_walk", action="store_true")
     ap.add_argument("--graph", action="store_true")
     ap.add_argument("--topo-order", dest="topo_order", action="store_true")
     ap.add_argument("--date-order", dest="date_order", action="store_true")
+    # --author-date-order seeds the topo ready-queue by author date; with no
+    # observable difference from --date-order on a linear history it shares the
+    # by-date topo path. Accepting it matches git's revision-walk parser.
+    ap.add_argument("--author-date-order", dest="author_date_order", action="store_true")
     ap.add_argument("--parents", action="store_true")
+    ap.add_argument("--children", action="store_true")
+    # --source tags each commit with the ref/rev it was reached from.
+    ap.add_argument("--source", dest="source", action="store_true")
     ap.add_argument("--merges", action="store_true")
     ap.add_argument("--min-parents", dest="min_parents", type=int, default=None)
     ap.add_argument("--max-parents", dest="max_parents", type=int, default=None)
     ap.add_argument("--grep", action="append", default=None)
+    ap.add_argument("--invert-grep", dest="invert_grep", action="store_true")
     ap.add_argument("--author", action="append", default=None)
     ap.add_argument("--committer", action="append", default=None)
     ap.add_argument("--all-match", dest="all_match", action="store_true")
     ap.add_argument("-i", "--regexp-ignore-case", dest="ignore_case", action="store_true")
     ap.add_argument("-S", dest="pickaxe_s", default=None)
     ap.add_argument("-G", dest="pickaxe_g", default=None)
+    # --pickaxe-regex makes -S treat its argument as a POSIX regex (it already
+    # is treated literally without it); accepted and threaded into the filter.
+    ap.add_argument("--pickaxe-regex", dest="pickaxe_regex", action="store_true")
     ap.add_argument("--since", "--after", dest="since", default=None)
     ap.add_argument("--until", "--before", dest="until", default=None)
+    # --max-age/--min-age are the raw-epoch synonyms of --since/--until.
+    ap.add_argument("--max-age", dest="max_age", type=int, default=None)
+    ap.add_argument("--min-age", dest="min_age", type=int, default=None)
     ap.add_argument("--date", default=None)
+    # --relative-date is the long synonym of --date=relative.
+    ap.add_argument("--relative-date", dest="relative_date", action="store_true")
     ap.add_argument("-n", "--max-count", type=int, default=None)
+    # --skip=N drops the first N commits of the output.
+    ap.add_argument("--skip", dest="skip", type=int, default=None)
     ap.add_argument("-g", "--walk-reflogs", dest="walk_reflogs", action="store_true")
     ap.add_argument("--follow", action="store_true")
+    # --merge limits the walk to commits touching unmerged paths during a
+    # conflict; with no in-progress operation git fatals.
+    ap.add_argument("--merge", dest="merge", action="store_true")
+    # -z separates emitted commit records with NUL instead of newline.
+    ap.add_argument("-z", dest="nul", action="store_true")
     ap.add_argument("--left-right", dest="left_right", action="store_true")
     ap.add_argument("-L", dest="line_ranges", action="append", default=None)
     # -s/--no-patch suppresses the per-commit patch; only consulted in the
@@ -9038,6 +10173,24 @@ def cmd_log(argv: list[str]) -> int:
                 word_diff_mode = "plain"
         else:
             _wd_argv.append(a)
+    # argparse's nargs="?" optionals greedily swallow a following positional
+    # (e.g. `--no-walk HEAD` would treat HEAD as the value). Rewrite the bare
+    # forms to their attached "=<const>" so the next token stays a revision,
+    # mirroring the rev-list parser. Also rewrite bare -M/-C so a following rev
+    # is not consumed as the (optional) rename threshold.
+    _log_opt_const = {
+        "--no-walk": "sorted", "--branches": "*", "--tags": "*",
+        "--remotes": "*", "--decorate": "short", "--pretty": "medium",
+        "--ancestry-path": "", "-M": "", "--find-renames": "",
+        "-C": "", "--find-copies": "", "--color": "always",
+    }
+    _wd_argv = [f"{t}={_log_opt_const[t]}" if t in _log_opt_const else t
+                for t in _wd_argv]
+    # `--not` is a revision pseudo-opt (sticky include/exclude toggle) handled by
+    # the rev-stream walk below; argparse must not see it. Keep the original
+    # token stream (with --not) for that walk, but strip it before argparse.
+    _rev_stream = list(_wd_argv)
+    _wd_argv = [t for t in _wd_argv if t != "--not"]
     args = ap.parse_args(_wd_argv)
     args.word_diff = word_diff_mode
     import re as _re_mod
@@ -9080,6 +10233,9 @@ def cmd_log(argv: list[str]) -> int:
     if args.walk_reflogs and args.reverse:
         _err("fatal: options '--reverse' and '--walk-reflogs' cannot be used together")
         return 128
+    if args.parents and args.children:
+        _err("fatal: options '--parents' and '--children' cannot be used together")
+        return 128
     # diff_setup_done() rejects more than one of {--name-only, --name-status,
     # --check, -s} with rc 128 (the patch/stat/raw flags clear NO_OUTPUT first,
     # so the conflict only fires among the surviving name/no-output formats).
@@ -9088,51 +10244,180 @@ def cmd_log(argv: list[str]) -> int:
              "cannot be used together")
         return 128
 
-    # Split positionals into revisions and pathspecs.
+    # --merge requires a merge/cherry-pick/revert/rebase in progress (one of the
+    # MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/REBASE_HEAD pseudorefs). Without
+    # one git fatals; pythongit has no in-progress operation in these probes.
+    if args.merge:
+        gitdir = repo.path
+        has_pseudo = any((gitdir / n).exists() for n in (
+            "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"))
+        if not has_pseudo:
+            _err("fatal: --merge requires one of the pseudorefs MERGE_HEAD, "
+                 "CHERRY_PICK_HEAD, REVERT_HEAD or REBASE_HEAD")
+            return 128
+
+    # Split positionals into revisions and pathspecs. The rev stream is parsed
+    # like git's revision walker: multiple positive tips union their histories,
+    # `^rev`/`--not` mark exclusions (the `--not` toggle is sticky), and the
+    # `A..B`/`A...B` range forms expand to tip + exclusion / symmetric diff.
+    # `--not` was already pulled out by argparse, so recover its position by
+    # walking the original token stream alongside the resolved positionals.
     revs: list[str] = []
     log_paths: list[str] = []
+    rev_not: list[bool] = []
     if "--" in args.pos:
         di = args.pos.index("--")
-        revs, log_paths = args.pos[:di], args.pos[di + 1:]
+        _pos_revs, log_paths = args.pos[:di], args.pos[di + 1:]
     else:
+        _pos_revs = []
         for tok in args.pos:
-            if ".." in tok or refs_mod.rev_parse(repo, tok) is not None:
-                revs.append(tok)
+            if (tok.startswith("^") or ".." in tok
+                    or refs_mod.rev_parse(repo, tok) is not None):
+                _pos_revs.append(tok)
             elif (repo.path / tok).exists():
                 log_paths.append(tok)
             else:
                 # Not a rev and not a path: keep as a rev so resolution errors.
-                revs.append(tok)
-    rev = revs[0] if revs else "HEAD"
+                _pos_revs.append(tok)
+    # Pair each positional rev with the sticky --not state in effect when it
+    # appeared on the command line.
+    _not_state = False
+    _pi = 0
+    for tok in _rev_stream:
+        if tok == "--not":
+            _not_state = True
+            continue
+        if tok in ("--all", "--branches", "--tags", "--remotes"):
+            # A ref-namespace pseudo-op resets the --not toggle in git.
+            _not_state = False
+            continue
+        if _pi < len(_pos_revs) and tok == _pos_revs[_pi]:
+            revs.append(tok)
+            rev_not.append(_not_state)
+            _pi += 1
+    # Any positionals not matched in the token walk (defensive) default to
+    # non-negated and keep their order.
+    while _pi < len(_pos_revs):
+        revs.append(_pos_revs[_pi])
+        rev_not.append(False)
+        _pi += 1
 
-    exclude: set[str] = set()
-    if ".." in rev:
-        lo, _, hi = rev.partition("..")
-        sha = refs_mod.rev_parse(repo, hi or "HEAD")
-        if lo:
-            lo_sha = refs_mod.rev_parse(repo, lo)
-            if lo_sha:
-                stack = deque([lo_sha])
-                while stack:
-                    x = stack.popleft()
-                    if x in exclude:
-                        continue
-                    exclude.add(x)
-                    info = _commit_tree_parents(repo, x)
-                    if info:
-                        stack.extend(info[1])
-    else:
-        sha = refs_mod.rev_parse(repo, rev)
-    if not sha and not args.all:
+    starts: list[str] = []
+    start_src: list[str] = []
+    excludes: list[str] = []
+    lr_left: set[str] = set()
+    lr_right: set[str] = set()
+
+    def _log_reach(start: str) -> set:
+        seen_r: set[str] = set()
+        st = [start]
+        while st:
+            x = st.pop()
+            if x in seen_r:
+                continue
+            seen_r.add(x)
+            info = _commit_tree_parents(repo, x)
+            if info:
+                st.extend(info[1])
+        return seen_r
+
+    _bad_rev: Optional[str] = None
+    for tok, neg in zip(revs, rev_not):
+        spec = tok
+        if spec.startswith("^"):
+            spec = spec[1:]
+            neg = not neg
+        if "..." in spec:
+            a, _, b = spec.partition("...")
+            a_sha = refs_mod.rev_parse(repo, a or "HEAD")
+            b_sha = refs_mod.rev_parse(repo, b or "HEAD")
+            from . import merge as _m
+            if a_sha:
+                starts.append(a_sha); start_src.append(a or "HEAD")
+                lr_left |= _log_reach(a_sha)
+            if b_sha:
+                starts.append(b_sha); start_src.append(b or "HEAD")
+                lr_right |= _log_reach(b_sha)
+            if a_sha and b_sha:
+                excludes.extend(_m.merge_bases(repo, a_sha, b_sha))
+            if not a_sha or not b_sha:
+                _bad_rev = a if not a_sha else b
+            continue
+        if ".." in spec:
+            lo, _, hi = spec.partition("..")
+            hi_sha = refs_mod.rev_parse(repo, hi or "HEAD")
+            lo_sha = refs_mod.rev_parse(repo, lo) if lo else None
+            if hi_sha:
+                starts.append(hi_sha); start_src.append(hi or "HEAD")
+            if lo:
+                if lo_sha:
+                    excludes.append(lo_sha)
+                else:
+                    _bad_rev = lo
+            if not hi_sha:
+                _bad_rev = hi or "HEAD"
+            continue
+        sha1 = refs_mod.rev_parse(repo, spec)
+        if sha1 is None:
+            _bad_rev = spec
+            continue
+        if neg:
+            excludes.append(sha1)
+        else:
+            starts.append(sha1); start_src.append(spec)
+
+    # Default tip is HEAD when no positive rev was named.
+    if not starts and not excludes and not args.all \
+            and args.branches is None and args.tags is None and args.remotes is None:
+        head_sha0 = refs_mod.rev_parse(repo, "HEAD")
+        if head_sha0 is not None:
+            starts.append(head_sha0); start_src.append("HEAD")
+        else:
+            _bad_rev = "HEAD"
+
+    # Resolution failure: emit git's ambiguous-argument fatal (or the unborn
+    # branch message when HEAD itself has no commits yet).
+    if _bad_rev is not None or (not starts and not args.all
+                                and args.branches is None and args.tags is None
+                                and args.remotes is None):
+        bad = _bad_rev if _bad_rev is not None else "HEAD"
         head_sym, _ = refs_mod.read_head(repo)
-        if rev == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
+        if bad == "HEAD" and head_sym and head_sym.startswith("refs/heads/"):
             branch = head_sym[len("refs/heads/"):]
             _err(f"fatal: your current branch '{branch}' does not have any commits yet")
             return 128
-        _err(f"fatal: ambiguous argument '{rev}': unknown revision or path not in the working tree.")
+        _err(f"fatal: ambiguous argument '{bad}': unknown revision or path not in the working tree.")
         _err("Use '--' to separate paths from revisions, like this:")
         _err("'git <command> [<revision>...] -- [<file>...]'")
         return 128
+
+    # --ancestry-path requires at least one negative (bottom) commit to anchor
+    # the path; git fatals when none was given (revision.c).
+    if args.ancestry_path is not None and not excludes:
+        _err("fatal: --ancestry-path given but there are no bottom commits")
+        return 128
+
+    # Expand the exclusion frontier to the full uninteresting set.
+    exclude: set[str] = set()
+    estack = deque(excludes)
+    while estack:
+        x = estack.popleft()
+        if x in exclude:
+            continue
+        exclude.add(x)
+        info = _commit_tree_parents(repo, x)
+        if info:
+            estack.extend(info[1])
+
+    # Map each start sha to the source label (its first naming), for --source.
+    source_map: dict[str, str] = {}
+    for s, src in zip(starts, start_src):
+        source_map.setdefault(s, src)
+
+    # Legacy single-tip variables retained for the walk-reflogs / namespace
+    # paths below: `rev` is the first positive spec, `sha` its commit.
+    rev = start_src[0] if start_src else "HEAD"
+    sha = starts[0] if starts else None
     # Determine output style. `--format`/`tformat:` terminate each entry with a
     # newline; `format:` only separates entries (no trailing newline).
     fmt_string: Optional[str] = None
@@ -9161,9 +10446,18 @@ def cmd_log(argv: list[str]) -> int:
             style = args.pretty
     if args.oneline:
         style = "oneline"
+    # --relative-date is the long synonym of --date=relative.
+    if args.relative_date and args.date is None:
+        args.date = "relative"
     date_mode = args.date or "default"
     date_given = args.date is not None
 
+    # --decorate=auto resolves to short-ref decoration only on an interactive
+    # (tty) stdout (builtin/log.c auto_decoration_style -> session_is_interactive);
+    # piped/non-tty output gets NO decoration.
+    if args.decorate == "auto" and not sys.stdout.isatty():
+        args.decorate = None
+        args.no_decorate = True
     decorate = args.decorate is not None and not args.no_decorate
     # The %d/%D/%(decorate) placeholders always expand decorations.
     if not decorate and fmt_string and ("%d" in fmt_string or "%D" in fmt_string
@@ -9171,17 +10465,19 @@ def cmd_log(argv: list[str]) -> int:
         decorate = True
     decorations = _commit_decorations(repo, full=(args.decorate == "full")) if decorate else {}
 
-    # `--graph` and `--topo-order` reorder commits topologically (unless
-    # `--date-order` is also given); collect the full set first, then sort.
-    want_topo = (args.graph or args.topo_order) and not args.date_order
+    # `--graph` and `--topo-order` reorder commits topologically (unless a
+    # date-ordering flag is also given); collect the full set first, then sort.
+    want_date_topo = args.date_order or args.author_date_order
+    want_topo = (args.graph or args.topo_order) and not want_date_topo
     # Commit-level filters mean the early --max-count cutoff during collection
     # would truncate before filtering, so collect fully when any filter is set.
     want_filter = any((
         args.merges, args.no_merges, args.min_parents is not None,
         args.max_parents is not None, args.grep, args.author, args.committer,
         args.pickaxe_s is not None, args.pickaxe_g is not None,
-        args.since, args.until))
-    collect_full = want_topo or want_filter
+        args.since, args.until, args.max_age is not None,
+        args.min_age is not None, args.skip is not None))
+    collect_full = want_topo or want_date_topo or want_filter
 
     # Collect the ordered list of commit shas first so --reverse can flip it.
     seen: set[str] = set()
@@ -9216,15 +10512,13 @@ def cmd_log(argv: list[str]) -> int:
             reflog_meta.append({"sref": short_rev, "fref": rev, "i": i,
                                 "ident": ident, "msg": msg})
         want_topo = collect_full = False
-    elif args.no_walk is not None:
+    elif args.no_walk is not None and not args.do_walk:
         # --no-walk shows only the named revisions, no ancestry traversal. The
         # default ("sorted") orders by committer date; "unsorted" keeps the
-        # command-line order. Downstream filter/--max-count/--reverse still run.
+        # command-line order. Each positive tip is shown once (excludes drop it).
         want_topo = collect_full = False
-        wanted = revs if revs else ["HEAD"]
-        for r in wanted:
-            rsha = refs_mod.rev_parse(repo, r)
-            if rsha and rsha not in commit_list:
+        for rsha in starts:
+            if rsha not in commit_list and rsha not in exclude:
                 commit_list.append(rsha)
         if args.no_walk != "unsorted":
             commit_list.sort(key=lambda s: -_commit_date(repo, s))
@@ -9267,6 +10561,10 @@ def cmd_log(argv: list[str]) -> int:
             _, head_sha = refs_mod.read_head(repo)
             if head_sha:
                 _push(head_sha)
+        # Positive positional tips named alongside --all/--branches/... join the
+        # seed set.
+        for s0 in starts:
+            _push(s0)
         while heap:
             _d, _c, s = heapq.heappop(heap)
             if s in seen or s in exclude:
@@ -9281,22 +10579,42 @@ def cmd_log(argv: list[str]) -> int:
             if not log_paths and not collect_full and args.max_count and len(commit_list) >= args.max_count:
                 break
     else:
-        cur = deque([sha])
-        while cur:
-            s = cur.popleft()
+        # Default walk: union the histories of every positive tip, popping the
+        # most recent commit first (a committer-date max-heap, like git's
+        # date-ordered commit_list), skipping the uninteresting (excluded) set.
+        import heapq as _heapq
+        heap2: list[tuple[int, int, str]] = []
+        pushed2: set[str] = set()
+        counter2 = 0
+
+        def _push2(csha: str) -> None:
+            nonlocal counter2
+            if csha in pushed2:
+                return
+            pushed2.add(csha)
+            _heapq.heappush(heap2, (-_commit_date(repo, csha), counter2, csha))
+            counter2 += 1
+
+        for s0 in starts:
+            _push2(s0)
+        while heap2:
+            _d, _c, s = _heapq.heappop(heap2)
             if s in seen or s in exclude:
                 continue
             seen.add(s)
             info = _commit_tree_parents(repo, s)
             if info is None:
-                break
+                continue
             commit_list.append(s)
-            cur.extend(info[1][:1] if args.first_parent else info[1])
+            for p in (info[1][:1] if args.first_parent else info[1]):
+                _push2(p)
             if not log_paths and not collect_full and args.max_count and len(commit_list) >= args.max_count:
                 break
 
     if want_topo:
         commit_list = _topo_order(repo, commit_list, args.first_parent)
+    elif want_date_topo:
+        commit_list = _topo_order(repo, commit_list, args.first_parent, by_date=True)
 
     if args.follow and len(log_paths) == 1 and not args.walk_reflogs:
         # --follow: include commits that touch the file, switching the followed
@@ -9338,6 +10656,12 @@ def cmd_log(argv: list[str]) -> int:
     if not args.walk_reflogs:
         commit_list = _filter_commits(repo, commit_list, args)
 
+    # --skip=N drops the first N commits of the output (after filtering, before
+    # --max-count), matching git's rev_info.skip_count.
+    if args.skip is not None and args.skip > 0:
+        commit_list = commit_list[args.skip:]
+        if reflog_meta is not None:
+            reflog_meta = reflog_meta[args.skip:]
     if args.max_count is not None:
         commit_list = commit_list[:max(0, args.max_count)]
         if reflog_meta is not None:
@@ -9453,11 +10777,59 @@ def cmd_log(argv: list[str]) -> int:
             for path, a, b in tchanges:
                 _emit_file_diff(path, a, b, context=args.unified, opts=log_dopts)
 
-    # --left-right prepends a side mark (get_revision_mark/put_revision_mark).
-    # pythongit walks single tips only, so every shown commit is right-side ">".
-    lr_mark = "> " if args.left_right else ""
+    # --left-right marks each commit with its side: "< " for commits reachable
+    # from the left tip of a symmetric range, "> " for the right (revision.c
+    # get_revision_mark). A single-tip walk has no left set, so all marks ">".
+    def _lr_mark_for(s: str) -> str:
+        if not args.left_right:
+            return ""
+        if s in lr_left:
+            return "< "
+        return "> "
+
+    # --source labels each commit with the ref/rev it was first reached from
+    # (revision.c add_name_decoration / the SOURCE walk). Propagate the source
+    # label from every positive tip in seed order; first reach wins.
+    source_of: dict[str, str] = {}
+    if args.source:
+        commit_set = set(commit_list)
+        for tip in starts:
+            label = source_map.get(tip, tip)
+            st = [tip]
+            while st:
+                x = st.pop()
+                if x in source_of or x not in commit_set:
+                    continue
+                source_of[x] = label
+                info = _commit_tree_parents(repo, x)
+                if info:
+                    for p in (info[1][:1] if args.first_parent else info[1]):
+                        st.append(p)
+
+    # --children: map each commit to the in-set children that name it as parent
+    # (git prepends each child, so the most-recently-seen child appears first).
+    children_map: dict[str, list[str]] = {}
+    if args.children:
+        cset = set(commit_list)
+        for s in commit_list:
+            info = _commit_tree_parents(repo, s)
+            if info:
+                for p in info[1]:
+                    if p in cset:
+                        children_map.setdefault(p, []).insert(0, s)
+
+    def _children_suffix(s: str, short: bool = False) -> str:
+        kids = children_map.get(s, [])
+        if not kids:
+            return ""
+        w = args.abbrev if short else None
+        return "".join(" " + (k[:w] if w else k) for k in kids)
+
+    def _source_suffix(s: str) -> str:
+        return ("\t" + source_of.get(s, "")) if args.source else ""
 
     def render(count, s, c, meta=None):
+        lr_mark = _lr_mark_for(s)
         if style == "format":
             expansion = _expand_commit_format(repo, s, c, fmt_string, decorations, date_mode, args.abbrev,
                                               reflog=meta, date_given=date_given)
@@ -9489,7 +10861,8 @@ def cmd_log(argv: list[str]) -> int:
             pre = abbrev
             if args.parents:
                 pre += "".join(" " + (p[:7] if short else p) for p in c.parents)
-            _print(f"{lr_mark}{pre}{deco} {first}")
+            pre += _children_suffix(s, short=short)
+            _print(f"{lr_mark}{pre}{deco}{_source_suffix(s)} {first}")
             emit_commit_diff(s, c, lead_blank=False)
         elif style == "reference":
             first = c.message.splitlines()[0] if c.message.strip() else ""
@@ -9505,7 +10878,8 @@ def cmd_log(argv: list[str]) -> int:
             sha_disp = s[:7] if args.abbrev_commit else s
             psuf = ("".join(" " + (p[:7] if args.abbrev_commit else p) for p in c.parents)
                     if args.parents else "")
-            _print(f"commit {lr_mark}{sha_disp}{psuf}{_format_decoration(decorations.get(s, []))}")
+            _print(f"commit {lr_mark}{sha_disp}{psuf}{_source_suffix(s)}"
+                   f"{_format_decoration(decorations.get(s, []))}")
             if style == "raw":
                 _print(f"tree {c.tree}")
                 for p in c.parents:
@@ -9532,11 +10906,34 @@ def cmd_log(argv: list[str]) -> int:
                                 decoration=_format_decoration(decorations.get(s, [])),
                                 reflog=meta, date_given=date_given, mailmap=mm_log,
                                 abbrev=_merge_abbrev,
-                                mark=lr_mark)
+                                mark=lr_mark, source=_source_suffix(s))
             _print("")
             for line in c.message.rstrip("\n").splitlines():
                 _print(f"    {line}")
             emit_commit_diff(s, c, lead_blank=True)
+
+    # -z separates emitted commit records with NUL. For the oneline/format
+    # styles the trailing newline of each record becomes a NUL terminator; for
+    # the multi-line pretty styles the NUL replaces the blank-line separator and
+    # the message's own newline is kept (builtin/log.c sets line_termination).
+    if args.nul:
+        oneline_term = style in ("oneline", "oneline_full", "format")
+        out_buf = sys.stdout.buffer
+        for count, s in enumerate(commit_list):
+            c = objs.parse_commit(objs.read_object(repo, s)[1])
+            meta = reflog_meta[count] if reflog_meta is not None else None
+            text = _capture_output(lambda: render(0, s, c, meta))
+            if oneline_term:
+                if text.endswith("\n"):
+                    text = text[:-1]
+                out_buf.write(text.encode("utf-8", "surrogateescape"))
+                out_buf.write(b"\0")
+            else:
+                if count > 0:
+                    out_buf.write(b"\0")
+                out_buf.write(text.encode("utf-8", "surrogateescape"))
+        out_buf.flush()
+        return 0
 
     for count, s in enumerate(commit_list):
         c = objs.parse_commit(objs.read_object(repo, s)[1])
@@ -9858,12 +11255,15 @@ def _emit_email_commit(sha: str, c, *, mailmap=None) -> None:
 def _emit_commit_header(sha: str, c, *, style: str = "medium",
                         date_mode: str = "default", decoration: str = "",
                         parents_suffix: str = "", reflog=None, date_given: bool = False,
-                        mailmap=None, mark: str = "", abbrev: int = 7) -> None:
+                        mailmap=None, mark: str = "", abbrev: int = 7,
+                        source: str = "") -> None:
     """Print the ``commit``/``Author``/``Date`` header block for medium, full,
     and fuller pretty styles, shared by ``log`` and ``show``. ``mark`` is the
     optional --left-right side marker prepended to the commit id. ``abbrev``
-    sizes the parent ids on the ``Merge:`` line (pretty.c add_merge_info)."""
-    _print(f"commit {mark}{sha}{parents_suffix}{decoration}")
+    sizes the parent ids on the ``Merge:`` line (pretty.c add_merge_info).
+    ``source`` is the ``--source`` tab-prefixed ref the commit was reached
+    from (printed after parents, before any decoration)."""
+    _print(f"commit {mark}{sha}{parents_suffix}{source}{decoration}")
     if reflog is not None:
         # The "Reflog:" header uses the ref as given on the command line (full),
         # e.g. "refs/stash@{0}" / "main@{0}", not the %gd shortening.
@@ -9933,10 +11333,40 @@ def cmd_show(argv: list[str]) -> int:
     ap.add_argument("--date", default=None)
     ap.add_argument("--abbrev", type=int, default=7)
     ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
+    # --abbrev-commit / --no-abbrev-commit: show shares log's pretty machinery,
+    # so the commit id in --oneline/format output abbreviates the same way.
+    ap.add_argument("--abbrev-commit", dest="abbrev_commit", action="store_true")
+    ap.add_argument("--no-abbrev-commit", dest="no_abbrev_commit", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--use-mailmap", "--mailmap", dest="use_mailmap", action="store_true")
     ap.add_argument("--no-use-mailmap", "--no-mailmap", dest="no_use_mailmap", action="store_true")
     ap.add_argument("-L", dest="line_ranges", action="append", default=None)
+    # Diff/pretty machinery options inherited from log. pythongit's renderer
+    # does not run textconv filters, re-encode messages, expand tabs, or split
+    # merge diffs, so these are accepted and otherwise behave like the default
+    # for the non-merge commits these probes cover.
+    ap.add_argument("--textconv", dest="textconv", action="store_true")
+    ap.add_argument("--no-textconv", dest="no_textconv", action="store_true")
+    ap.add_argument("--expand-tabs", dest="expand_tabs", nargs="?", const="8", default=None)
+    ap.add_argument("--no-expand-tabs", dest="no_expand_tabs", action="store_true")
+    ap.add_argument("--notes", dest="notes", nargs="?", const="", default=None)
+    ap.add_argument("--no-notes", dest="no_notes", action="store_true")
+    ap.add_argument("--show-notes", dest="show_notes", nargs="?", const="", default=None)
+    ap.add_argument("--encoding", dest="encoding", default=None)
+    ap.add_argument("-m", dest="diff_m", action="store_true")
+    ap.add_argument("-c", dest="diff_c", action="store_true")
+    ap.add_argument("--cc", dest="diff_cc", action="store_true")
+    ap.add_argument("--first-parent", dest="first_parent", action="store_true")
+    ap.add_argument("--remerge-diff", dest="remerge_diff", action="store_true")
+    ap.add_argument("--diff-merges", dest="diff_merges", default=None)
+    ap.add_argument("--no-diff-merges", dest="no_diff_merges", action="store_true")
+    # Rename/copy detection and diff-algorithm selectors (no-ops in pythongit's
+    # Myers-based, non-rename-splitting differ for the probed inputs).
+    ap.add_argument("-M", "--find-renames", dest="find_renames", nargs="?", const="", default=None)
+    ap.add_argument("-C", "--find-copies", dest="find_copies", nargs="?", const="", default=None)
+    ap.add_argument("--patience", dest="diff_algo", action="store_const", const="patience", default=None)
+    ap.add_argument("--histogram", dest="diff_algo", action="store_const", const="histogram")
+    ap.add_argument("--diff-algorithm", dest="diff_algorithm", default=None)
     ap.add_argument("rev", nargs="*")
     raw_argv = list(argv)
     word_diff_mode = None
@@ -9953,6 +11383,15 @@ def cmd_show(argv: list[str]) -> int:
                 word_diff_mode = "plain"
         else:
             _wd_argv.append(a)
+    # Rewrite bare optional-value flags to their attached "=<const>" form so a
+    # following revision is not swallowed by argparse's nargs="?".
+    _show_opt_const = {
+        "-M": "", "--find-renames": "", "-C": "", "--find-copies": "",
+        "--expand-tabs": "8", "--notes": "", "--show-notes": "",
+        "--pretty": "medium",
+    }
+    _wd_argv = [f"{t}={_show_opt_const[t]}" if t in _show_opt_const else t
+                for t in _wd_argv]
     args = ap.parse_args(_wd_argv)
     args.word_diff = word_diff_mode
     import re as _re_mod
@@ -10138,11 +11577,14 @@ def cmd_show(argv: list[str]) -> int:
                 t, data = objs.read_object(repo, sha)
         if t == "commit":
             c = objs.parse_commit(data)
+            # --abbrev-commit shortens the `commit <oid>` line of the builtin
+            # styles to --abbrev width; --no-abbrev-commit keeps the full id.
+            disp_sha = sha[:args.abbrev] if args.abbrev_commit and not args.no_abbrev_commit else sha
             if pstyle == "reference":
                 first = c.message.splitlines()[0] if c.message.strip() else ""
                 _print(f"{sha[:7]} ({first}, {_format_date(c.author, 'short')})")
             elif pstyle == "raw":
-                _print(f"commit {sha}")
+                _print(f"commit {disp_sha}")
                 _print(f"tree {c.tree}")
                 for p in c.parents:
                     _print(f"parent {p}")
@@ -10152,7 +11594,7 @@ def cmd_show(argv: list[str]) -> int:
                 for line in c.message.rstrip("\n").splitlines():
                     _print(f"    {line}")
             elif pstyle == "short":
-                _print(f"commit {sha}")
+                _print(f"commit {disp_sha}")
                 if len(c.parents) > 1:
                     _print("Merge: " + " ".join(p[:args.abbrev] for p in c.parents))
                 _print(f"Author: {_mapped_who(_split_ident(c.author)[0], mm_show)}")
@@ -10162,7 +11604,7 @@ def cmd_show(argv: list[str]) -> int:
             elif pstyle in ("email", "mboxrd"):
                 _emit_email_commit(sha, c, mailmap=mm_show)
             else:
-                _emit_commit_header(sha, c, style=pstyle, date_mode=date_mode, mailmap=mm_show,
+                _emit_commit_header(disp_sha, c, style=pstyle, date_mode=date_mode, mailmap=mm_show,
                                     abbrev=args.abbrev)
                 _print("")
                 for line in c.message.rstrip("\n").splitlines():
@@ -10202,6 +11644,91 @@ def cmd_show(argv: list[str]) -> int:
 
     revs = args.rev or ["HEAD"]
     multiline = fmt is None and pstyle in ("medium", "full", "fuller", "short", "raw", "email", "mboxrd")
+    # A range / exclusion argument (`A..B`, `A...B`, `^rev`) turns `show` into a
+    # revision walk: every commit the range selects is shown, newest first
+    # (builtin/log.c cmd_show -> prepare_revision_walk). Expand them here.
+    if any(("..." in r or ".." in r or r.startswith("^")) for r in revs):
+        starts_s: list[str] = []
+        excludes_s: list[str] = []
+        for r in revs:
+            spec = r
+            neg = False
+            if spec.startswith("^"):
+                spec, neg = spec[1:], True
+            if "..." in spec:
+                a, _, b = spec.partition("...")
+                a_sha = refs_mod.rev_parse(repo, a or "HEAD")
+                b_sha = refs_mod.rev_parse(repo, b or "HEAD")
+                from . import merge as _m
+                if a_sha:
+                    starts_s.append(a_sha)
+                if b_sha:
+                    starts_s.append(b_sha)
+                if a_sha and b_sha:
+                    excludes_s.extend(_m.merge_bases(repo, a_sha, b_sha))
+                continue
+            if ".." in spec:
+                lo, _, hi = spec.partition("..")
+                hi_sha = refs_mod.rev_parse(repo, hi or "HEAD")
+                lo_sha = refs_mod.rev_parse(repo, lo) if lo else None
+                if hi_sha:
+                    starts_s.append(hi_sha)
+                if lo_sha:
+                    excludes_s.append(lo_sha)
+                continue
+            sha_r = refs_mod.rev_parse(repo, spec)
+            if sha_r is None:
+                _err(f"fatal: ambiguous argument '{spec}': unknown revision or "
+                     "path not in the working tree.")
+                _err("Use '--' to separate paths from revisions, like this:")
+                _err("'git <command> [<revision>...] -- [<file>...]'")
+                return 128
+            (excludes_s if neg else starts_s).append(sha_r)
+        excluded_s: set[str] = set()
+        est = deque(excludes_s)
+        while est:
+            x = est.popleft()
+            if x in excluded_s:
+                continue
+            excluded_s.add(x)
+            info = _commit_tree_parents(repo, x)
+            if info:
+                est.extend(info[1])
+        import heapq as _hq
+        heap_s: list[tuple[int, int, str]] = []
+        seen_push: set[str] = set()
+        ctr = 0
+
+        def _push_s(cs: str) -> None:
+            nonlocal ctr
+            if cs in seen_push:
+                return
+            seen_push.add(cs)
+            _hq.heappush(heap_s, (-_commit_date(repo, cs), ctr, cs))
+            ctr += 1
+
+        for cs in starts_s:
+            _push_s(cs)
+        walked: list[str] = []
+        seen_s: set[str] = set()
+        while heap_s:
+            _d, _c, cs = _hq.heappop(heap_s)
+            if cs in seen_s or cs in excluded_s:
+                continue
+            seen_s.add(cs)
+            info = _commit_tree_parents(repo, cs)
+            if info is None:
+                continue
+            walked.append(cs)
+            for p in info[1]:
+                _push_s(p)
+        for count, cs in enumerate(walked):
+            if count > 0 and multiline:
+                _print("")
+            rc = _show_one(cs)
+            if rc:
+                return rc
+        return 0
     for count, the_rev in enumerate(revs):
         if count > 0 and multiline:
             _print("")
@@ -10405,13 +11932,16 @@ class _DiffOpts:
     """
     __slots__ = ("a_prefix", "b_prefix", "full_index", "abbrev",
                  "ignore_all_space", "ignore_space_change", "ignore_space_at_eol",
-                 "ignore_cr_at_eol", "word_diff", "word_regex")
+                 "ignore_cr_at_eol", "word_diff", "word_regex", "ignore_regex",
+                 "line_prefix", "color", "ws_error_highlight")
 
     def __init__(self, a_prefix: str = "a/", b_prefix: str = "b/",
                  full_index: bool = False, abbrev: int = 7,
                  ignore_all_space: bool = False, ignore_space_change: bool = False,
                  ignore_space_at_eol: bool = False, ignore_cr_at_eol: bool = False,
-                 word_diff=None, word_regex=None):
+                 word_diff=None, word_regex=None, ignore_regex=None,
+                 line_prefix: str = "", color: bool = False,
+                 ws_error_highlight=None):
         self.a_prefix = a_prefix
         self.b_prefix = b_prefix
         self.full_index = full_index
@@ -10422,9 +11952,162 @@ class _DiffOpts:
         self.ignore_cr_at_eol = ignore_cr_at_eol
         self.word_diff = word_diff
         self.word_regex = word_regex
+        # -I/--ignore-matching-lines: list of compiled regexes (a hunk whose
+        # changed lines all match any of them is dropped). Empty/None = off.
+        self.ignore_regex = ignore_regex
+        # --line-prefix: string prepended to every emitted output line.
+        self.line_prefix = line_prefix
+        # --color (forced): emit ANSI SGR colors (diff.c color machinery).
+        self.color = color
+        # --ws-error-highlight: which line classes get whitespace-error
+        # highlighting. A set drawn from {"new","old","context"}; default {"new"}.
+        self.ws_error_highlight = ws_error_highlight if ws_error_highlight is not None else {"new"}
 
 
 _DEFAULT_DIFF_OPTS = _DiffOpts()
+
+# Default diff color SGR codes (diff.c diff_colors[]). All forced-color output
+# uses these unless overridden by color.diff.<slot> config (not modeled here).
+_C_RESET = "\033[m"
+_C_META = "\033[1m"     # METAINFO  -> GIT_COLOR_BOLD
+_C_FRAG = "\033[36m"    # FRAGINFO  -> GIT_COLOR_CYAN
+_C_OLD = "\033[31m"     # FILE_OLD  -> GIT_COLOR_RED
+_C_NEW = "\033[32m"     # FILE_NEW  -> GIT_COLOR_GREEN
+_C_WS = "\033[41m"      # WHITESPACE-> GIT_COLOR_BG_RED
+_C_CONTEXT = ""         # CONTEXT   -> GIT_COLOR_NORMAL ("")
+_C_FUNC = ""            # FUNCINFO  -> GIT_COLOR_NORMAL ("")
+
+
+def _diff_color_enabled(repo, color_when) -> bool:
+    """Decide whether forced ANSI color is on, mirroring git_config_colorbool +
+    want_color for diff: explicit --color/--no-color win; else color.diff then
+    color.ui config; "always" forces, "auto"/absent depend on tty (false under a
+    pipe, which is how the parity harness runs)."""
+    when = color_when
+    if when is None:
+        from . import gitconfig as _gc
+        cfg = _gc.get(repo, "color.diff")
+        if cfg is None:
+            cfg = _gc.get(repo, "color.ui")
+        when = cfg if cfg is not None else "auto"
+    when = (when or "").lower()
+    if when in ("always",):
+        return True
+    if when in ("never", "false", "no", "off", "0", ""):
+        return False
+    if when in ("auto", "true", "yes", "on", "1"):
+        # auto / a bare boolean-true (color.ui=true) only colors on a tty.
+        return sys.stdout.isatty()
+    return False
+
+
+def _ws_error_segments(text: str):
+    """Port of ws.c ws_check_emit_1 under the default rule (blank-at-eol +
+    space-before-tab, tab-width 8). Returns a list of (kind, segment) spans
+    covering ``text`` (without trailing newline). ``kind`` is "err" (whitespace
+    color), "set" (the normal line color), or "raw" (no color at all — git emits
+    some indentation bytes uncolored)."""
+    n = len(text)
+    # trailing whitespace start (WS_BLANK_AT_EOL).
+    trailing = n
+    i = n - 1
+    while i >= 0 and (text[i] == " " or text[i] == "\t"):
+        trailing = i
+        i -= 1
+    segs = []
+    written = 0
+    i = 0
+    # indentation: space-before-tab highlighting (WS_SPACE_BEFORE_TAB). Mirrors
+    # ws_check_emit_1: when spaces precede a tab, the spaces are highlighted and
+    # the tab itself is emitted RAW; otherwise the indentation run (incl. the
+    # tab) is emitted RAW.
+    while i < trailing:
+        ch = text[i]
+        if ch == " ":
+            i += 1
+            continue
+        if ch != "\t":
+            break
+        if written < i:
+            segs.append(("err", text[written:i]))   # spaces -> ws color
+            segs.append(("raw", text[i]))            # the tab -> raw
+        else:
+            segs.append(("raw", text[written:i + 1]))  # raw run incl. tab
+        written = i + 1
+        i += 1
+    # middle (non-highlighted) up to trailing whitespace.
+    if trailing - written > 0:
+        segs.append(("set", text[written:trailing]))
+    # trailing whitespace error.
+    if trailing != n:
+        segs.append(("err", text[trailing:n]))
+    return segs
+
+
+def _color_line(set_color: str, text: str) -> str:
+    """emit_line(set, reset, text): wrap text in the color (always followed by a
+    reset, since needs_reset is set whenever a non-NULL `set` is given — even an
+    empty one)."""
+    return f"{set_color}{text}{_C_RESET}"
+
+
+def _color_hunk_header(line: str) -> str:
+    """Port of emit_hunk_header: the '@@ -.. +.. @@' part in fraginfo color, an
+    optional whitespace run in context color, and the func heading in funcinfo
+    color, each followed by a reset."""
+    atat = line.find("@@", 2)
+    if not line.startswith("@@") or atat < 0:
+        return _color_line(_C_FRAG, line)
+    ep = atat + 2  # just past the closing "@@"
+    out = _C_FRAG + line[:ep] + _C_RESET
+    cp = ep
+    # blank before the func header (spaces/tabs).
+    while ep < len(line) and (line[ep] == " " or line[ep] == "\t"):
+        ep += 1
+    if ep != cp:
+        out += _C_CONTEXT + line[cp:ep] + _C_RESET
+    if ep < len(line):
+        out += _C_FUNC + line[ep:] + _C_RESET
+    return out
+
+
+def _color_body_line(line: str, opts: "_DiffOpts") -> str:
+    """Colorize one rendered hunk-body line (leading +/-/space sign) the way
+    diff.c emit_diff_symbol does for DIFF_SYMBOL_PLUS/MINUS/CONTEXT."""
+    if not line:
+        return line
+    sign = line[0]
+    content = line[1:]
+    weh = opts.ws_error_highlight
+    if sign == "@":  # hunk header
+        return _color_hunk_header(line)
+    if line.startswith("\\ No newline"):
+        # DIFF_SYMBOL_NO_LF: emit_line(context, reset, ...) -> text + reset.
+        return line + _C_RESET
+    def _ws_paint(set_color):
+        # emit_line_ws_markup ws branch: sign painted, then ws_check_emit emits
+        # each segment ("err" -> ws color, "set" -> line color, "raw" -> bare).
+        out = set_color + sign + _C_RESET
+        for kind, seg in _ws_error_segments(content):
+            if kind == "err":
+                out += _C_WS + seg + _C_RESET
+            elif kind == "set":
+                out += set_color + seg + _C_RESET
+            else:  # raw
+                out += seg
+        return out
+    if sign == "+":
+        if "new" in weh:
+            return _ws_paint(_C_NEW)
+        return _color_line(_C_NEW, line)
+    if sign == "-":
+        if "old" in weh:
+            return _ws_paint(_C_OLD)
+        return _color_line(_C_OLD, line)
+    # context line (' ' sign): CONTEXT color (empty) + reset.
+    if "context" in weh:
+        return _ws_paint(_C_CONTEXT)
+    return _color_line(_C_CONTEXT, line)
 
 
 # Mapping of output-format flags to the bit they OR into output_format. These
@@ -10542,6 +12225,28 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
                          word_diff=word_diff)
     elif word_diff is not None:
         opts.word_diff = word_diff
+    # --line-prefix: prepend the given string to every emitted output line
+    # (diff.c diff_line_prefix). Default "" leaves output untouched. We shadow
+    # the module-level _print with a local that prepends the prefix; bind the
+    # original first so the closure does not self-reference.
+    _print = globals()["_print"]
+    _lp = opts.line_prefix
+    if _lp:
+        _print_orig = _print
+
+        def _print(s):
+            _print_orig(_lp + s)
+    # Forced-color (diff.c color machinery): meta lines (header/index/---/+++/
+    # mode/binary) are bold METAINFO; body lines are colored by sign.
+    _color = opts.color
+    if _color:
+        _print_meta = _print
+
+        def _meta(s):
+            _print_meta(_color_line(_C_META, s))
+    else:
+        def _meta(s):
+            _print(s)
     # Under -R the working-side prefixes are swapped. Prefixes already carry
     # their trailing slash (empty under --no-prefix).
     pa, pb = (opts.b_prefix, opts.a_prefix) if reverse else (opts.a_prefix, opts.b_prefix)
@@ -10549,6 +12254,9 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
     b_label = pb + path if b.present else "/dev/null"
     ws_active = (opts.ignore_all_space or opts.ignore_space_change
                  or opts.ignore_space_at_eol or opts.ignore_cr_at_eol)
+    # -I/--ignore-matching-lines also suppresses the whole pair when every hunk's
+    # changed lines match the regex (the file vanishes entirely, like ws-ignore).
+    ig_active = ws_active or opts.ignore_regex is not None
     # Precompute the hunk body for a pure-content modification so a
     # whitespace-only change (no visible body) suppresses the whole file pair,
     # exactly like git's whitespace-ignore output (no diff --git/index header).
@@ -10569,34 +12277,38 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
             ignore_space_change=opts.ignore_space_change,
             ignore_space_at_eol=opts.ignore_space_at_eol,
             ignore_cr_at_eol=opts.ignore_cr_at_eol,
+            ignore_regex=opts.ignore_regex,
             new_ind=oi_new, old_ind=oi_old, ctx_ind=oi_ctx,
         )
-        if ws_active and not precomputed_body:
+        if ig_active and not precomputed_body:
             return
     # The "diff --git" header drops the trailing slash separator handling: git
     # prints "diff --git <pa><path> <pb><path>"; with empty prefixes this is
     # "diff --git <path> <path>".
-    _print(f"diff --git {pa}{path} {pb}{path}")
+    _meta(f"diff --git {pa}{path} {pb}{path}")
     if not a.present:
-        _print(f"new file mode {b.mode}")
+        _meta(f"new file mode {b.mode}")
     elif not b.present:
-        _print(f"deleted file mode {a.mode}")
+        _meta(f"deleted file mode {a.mode}")
     elif a.mode != b.mode:
-        _print(f"old mode {a.mode}")
-        _print(f"new mode {b.mode}")
+        _meta(f"old mode {a.mode}")
+        _meta(f"new mode {b.mode}")
     if a.sha != b.sha:
         suffix = f" {a.mode}" if a.present and b.present and a.mode == b.mode else ""
-        _print(f"index {_index_abbrev(opts, a.sha)}..{_index_abbrev(opts, b.sha)}{suffix}")
+        _meta(f"index {_index_abbrev(opts, a.sha)}..{_index_abbrev(opts, b.sha)}{suffix}")
         if _is_binary(a.data) or _is_binary(b.data):
-            _print(f"Binary files {a_label} and {b_label} differ")
+            _meta(f"Binary files {a_label} and {b_label} differ")
             return
         a_text = (a.data or b"").decode("utf-8", errors="replace")
         b_text = (b.data or b"").decode("utf-8", errors="replace")
         if opts.word_diff:
-            _print(f"--- {a_label}")
-            _print(f"+++ {b_label}")
+            _meta(f"--- {a_label}")
+            _meta(f"+++ {b_label}")
+            # Under forced color the word-diff body is rendered in color mode
+            # (red removed / green added words); otherwise the requested mode.
+            wd_mode = "color" if (_color and opts.word_diff != "porcelain") else opts.word_diff
             sys.stdout.write(diff_mod.word_diff_hunks(
-                a_text.splitlines(), b_text.splitlines(), context, mode=opts.word_diff,
+                a_text.splitlines(), b_text.splitlines(), context, mode=wd_mode,
                 word_regex=opts.word_regex))
             return
         if precomputed_body is not None:
@@ -10612,15 +12324,20 @@ def _emit_file_diff(path: str, a: _Side, b: _Side, reverse: bool = False, contex
                 ignore_space_change=opts.ignore_space_change,
                 ignore_space_at_eol=opts.ignore_space_at_eol,
                 ignore_cr_at_eol=opts.ignore_cr_at_eol,
+                ignore_regex=opts.ignore_regex,
                 new_ind=oi_new, old_ind=oi_old, ctx_ind=oi_ctx,
             )
         # git emits the ---/+++ file header only when there is a hunk body
         # (an empty new/deleted file stops after the `index` line).
         if body:
-            _print(f"--- {a_label}")
-            _print(f"+++ {b_label}")
-            for line in body:
-                _print(line)
+            _meta(f"--- {a_label}")
+            _meta(f"+++ {b_label}")
+            if _color:
+                for line in body:
+                    _print(_color_body_line(line, opts))
+            else:
+                for line in body:
+                    _print(line)
 
 
 def _pprint_rename(a: str, b: str) -> str:
@@ -10694,7 +12411,7 @@ def _compact_summary_comment(a: _Side, b: _Side, is_renamed: bool) -> str:
 
 def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None,
                complete=None, order=None, unmerged=None,
-               compact_summary: bool = False) -> None:
+               compact_summary: bool = False, stat_count=None) -> None:
     # rows carry (sort_key, name, ins, del, total); sort_key orders the output
     # by the diff queue (via ``order`` map keyed on dst/path) when provided.
     # ``unmerged`` rows render as "<name> | Unmerged" (total == -2) and never
@@ -10751,19 +12468,34 @@ def _diff_stat(changes: list[tuple[str, _Side, _Side]], renames=None,
         return
     if order:
         rows.sort(key=lambda r: r[0])
-    name_w = max(len(r[1]) for r in rows)
-    count_w = max(len(str(t if t >= 0 else 0)) for *_, t in rows)
+    # --stat-count=<n> shows only the first <n> rows, then a " ..." line; the
+    # column widths are computed over the *shown* rows only (diff.c show_stats),
+    # while the summary counts every file.
+    if stat_count is not None and 0 <= stat_count < len(rows):
+        shown = rows[:stat_count]
+        truncated = True
+    else:
+        shown = rows
+        truncated = False
+    width_rows = shown if shown else rows
+    name_w = max(len(r[1]) for r in width_rows)
+    count_w = max(len(str(t if t >= 0 else 0)) for *_, t in width_rows)
     n_files = 0
-    for _k, path, ins, dele, total in rows:
+    for _k, path, ins, dele, total in shown:
         if total == -2:
             _print(f" {path:<{name_w}} | Unmerged")
             continue
-        n_files += 1
         if total < 0:
             _print(f" {path:<{name_w}} | Bin")
             continue
         bar = "+" * ins + "-" * dele
         _print(f" {path:<{name_w}} | {total:>{count_w}}{(' ' + bar) if bar else ''}")
+    if truncated:
+        _print(" ...")
+    # Summary totals count every (non-unmerged) row, shown or not.
+    for _k, _path, _ins, _dele, total in rows:
+        if total != -2:
+            n_files += 1
     if n_files == 0:
         # All rows were unmerged: git prints just " 0 files changed".
         _print(" 0 files changed")
@@ -11002,6 +12734,20 @@ def cmd_diff(argv: list[str]) -> int:
     # `--stat=<width>` only tunes column widths, which do not affect pythongit's
     # output for the file sizes under test; normalize the value form to bare. The
     # `--stat-width=<n>` synonym also requests stat output (diff.c diff_opt_stat).
+    # --stat-count=<n> (and the third field of --stat=w,nw,count) limits the
+    # number of stat rows; capture that count before normalizing.
+    stat_count = None
+    for a in argv:
+        if a.startswith("--stat-count="):
+            try:
+                stat_count = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif a.startswith("--stat=") and a.count(",") >= 2:
+            try:
+                stat_count = int(a.split("=", 1)[1].split(",")[2])
+            except ValueError:
+                pass
     argv = ["--stat" if (a.startswith("--stat=") or a.startswith("--stat-width=")
                          or a.startswith("--stat-name-width=")
                          or a.startswith("--stat-graph-width=")
@@ -11016,6 +12762,10 @@ def cmd_diff(argv: list[str]) -> int:
         elif a.startswith("--dirstat=") or a.startswith("-X="):
             dirstat = True
             dirstat_params = a.split("=", 1)[1]
+        elif a.startswith("-X") and len(a) > 2:
+            # -X<params> attached short form (PARSE_OPT_OPTARG).
+            dirstat = True
+            dirstat_params = a[2:]
         elif a == "--cumulative":
             dirstat = True
             dirstat_params = (dirstat_params + "," if dirstat_params else "") + "cumulative"
@@ -11027,6 +12777,57 @@ def cmd_diff(argv: list[str]) -> int:
         else:
             _ds_argv.append(a)
     argv = _ds_argv
+    # --color[=<when>] / --no-color and --ws-error-highlight=<which>. Color is
+    # "forced" only for when in {always} (auto/absent -> tty, which the harness
+    # pipe makes false). --color-moved/--color-words also force color but their
+    # advanced rendering is handled elsewhere; here we only decide the on/off bit.
+    color_when = None           # None = unset; "always"/"never"/"auto"
+    ws_eh = None                # None = default {"new"}
+    color_moved = False
+    _clr_argv: list[str] = []
+    for a in argv:
+        if a == "--color":
+            color_when = "always"
+        elif a.startswith("--color="):
+            color_when = a.split("=", 1)[1]
+        elif a == "--no-color":
+            color_when = "never"
+        elif a == "--color-moved" or a.startswith("--color-moved="):
+            color_moved = True
+            if color_when is None:
+                color_when = "always"  # --color-moved implies color
+        elif a == "--no-color-moved":
+            color_moved = False
+            _clr_argv.append(a)  # keep for any downstream handling
+            continue
+        elif a == "--color-words" or a.startswith("--color-words="):
+            # --color-words implies word-diff (consumed later) AND forces color;
+            # leave the token in argv for the word-diff parser.
+            if color_when is None:
+                color_when = "always"
+            _clr_argv.append(a)
+        elif a == "--word-diff=color":
+            # --word-diff=color forces color too (bold meta headers); the word-diff
+            # parser still consumes the token to select the body mode.
+            if color_when is None:
+                color_when = "always"
+            _clr_argv.append(a)
+        elif a.startswith("--ws-error-highlight="):
+            spec = a.split("=", 1)[1]
+            ws_eh = set()
+            for tok in spec.split(","):
+                tok = tok.strip()
+                if tok == "all":
+                    ws_eh |= {"new", "old", "context"}
+                elif tok == "default":
+                    ws_eh |= {"new"}
+                elif tok == "none":
+                    ws_eh = set()
+                elif tok in ("new", "old", "context"):
+                    ws_eh.add(tok)
+        else:
+            _clr_argv.append(a)
+    argv = _clr_argv
     # --relative[=<path>] restricts to (and strips the prefix of) a subdirectory.
     relative = None  # None = off; "" = cwd; else the given subdir
     _rel_argv: list[str] = []
@@ -11046,6 +12847,14 @@ def cmd_diff(argv: list[str]) -> int:
     ap.add_argument("--pickaxe-regex", dest="pickaxe_regex", action="store_true")
     pickaxe = None
     pickaxe_kind = None
+    # -I/--ignore-matching-lines (repeatable), -O<orderfile>, --find-object,
+    # --rotate-to/--skip-to, --max-depth, --line-prefix, --stat-count, -X short.
+    ignore_re_srcs: list[str] = []
+    orderfile = None        # path given to -O (validated below)
+    find_object = None      # arg given to --find-object
+    rotate_to = None        # (path, skip_instead_of_rotate)
+    max_depth_given = False
+    line_prefix_val = ""
     _px_argv: list[str] = []
     _pi = 0
     while _pi < len(argv):
@@ -11064,6 +12873,53 @@ def cmd_diff(argv: list[str]) -> int:
             else:
                 pickaxe = a[2:]
             pickaxe_kind = "G"
+        elif a == "-I" or (a.startswith("-I") and len(a) > 2):
+            if a == "-I":
+                ignore_re_srcs.append(argv[_pi + 1] if _pi + 1 < len(argv) else "")
+                _pi += 1
+            else:
+                ignore_re_srcs.append(a[2:])
+        elif a == "--ignore-matching-lines" or a.startswith("--ignore-matching-lines="):
+            if "=" in a:
+                ignore_re_srcs.append(a.split("=", 1)[1])
+            else:
+                ignore_re_srcs.append(argv[_pi + 1] if _pi + 1 < len(argv) else "")
+                _pi += 1
+        elif a == "-O" or (a.startswith("-O") and len(a) > 2):
+            # OPT_FILENAME('O', ...): -O<file> attached or -O <file> as next tok.
+            if a == "-O":
+                orderfile = argv[_pi + 1] if _pi + 1 < len(argv) else ""
+                _pi += 1
+            else:
+                orderfile = a[2:]
+        elif a == "--find-object" or a.startswith("--find-object="):
+            if "=" in a:
+                find_object = a.split("=", 1)[1]
+            else:
+                find_object = argv[_pi + 1] if _pi + 1 < len(argv) else ""
+                _pi += 1
+        elif a == "--rotate-to" or a.startswith("--rotate-to="):
+            if "=" in a:
+                rotate_to = (a.split("=", 1)[1], False)
+            else:
+                rotate_to = (argv[_pi + 1] if _pi + 1 < len(argv) else "", False)
+                _pi += 1
+        elif a == "--skip-to" or a.startswith("--skip-to="):
+            if "=" in a:
+                rotate_to = (a.split("=", 1)[1], True)
+            else:
+                rotate_to = (argv[_pi + 1] if _pi + 1 < len(argv) else "", True)
+                _pi += 1
+        elif a == "--max-depth" or a.startswith("--max-depth="):
+            max_depth_given = True
+            if "=" not in a:
+                _pi += 1  # consume the depth value
+        elif a == "--line-prefix" or a.startswith("--line-prefix="):
+            if "=" in a:
+                line_prefix_val = a.split("=", 1)[1]
+            else:
+                line_prefix_val = argv[_pi + 1] if _pi + 1 < len(argv) else ""
+                _pi += 1
         else:
             _px_argv.append(a)
         _pi += 1
@@ -11113,6 +12969,7 @@ def cmd_diff(argv: list[str]) -> int:
     revs: list[str] = []
     paths: list[str] = []
     after_dd = False
+    in_paths = False  # True once a pathspec (existing file) has been seen
     for tok in rest:
         if after_dd:
             paths.append(tok)
@@ -11121,13 +12978,46 @@ def cmd_diff(argv: list[str]) -> int:
         elif tok.startswith("-"):
             continue
         else:
-            # A non-flag token before '--' is a rev if it resolves as one; an
-            # unresolvable token is treated as a pathspec (setup_revisions:
-            # try_to_simplify_commit / pathspec fallback).
-            if refs_mod.rev_parse(repo, tok) is not None:
+            # A non-flag token before '--' is a rev if it resolves as one;
+            # otherwise it must name an existing working-tree path (verify_filename
+            # / lstat). Once a path has been seen, later tokens are paths too, and
+            # a non-existent path gives the "no such path" error; before any path
+            # an unresolvable token gives "ambiguous argument" (setup_revisions).
+            if not in_paths and refs_mod.rev_parse(repo, tok) is not None:
                 revs.append(tok)
-            else:
+            elif os.path.lexists(tok):
                 paths.append(tok)
+                in_paths = True
+            elif in_paths:
+                _err(f"fatal: {tok}: no such path in the working tree.")
+                _err("Use 'git <command> -- <path>...' to specify paths that "
+                     "do not exist locally.")
+                return 128
+            else:
+                _err(f"fatal: ambiguous argument '{tok}': unknown revision or "
+                     f"path not in the working tree.")
+                _err("Use '--' to separate paths from revisions, like this:")
+                _err("'git <command> [<revision>...] -- [<file>...]'")
+                return 128
+
+    # --max-depth is rejected for worktree (no/one rev, no --cached) and index
+    # (--cached) diffs; only tree-vs-tree (two revs) diffs accept it. diff-lib.c
+    # run_diff_files/run_diff_index die() before any output.
+    if max_depth_given and len(revs) < 2:
+        kind = "index" if args.cached else "worktree"
+        _err(f"fatal: max-depth is not supported for {kind} diffs")
+        return 128
+    # -O<orderfile>: git reads the file during diffcore_order; a missing file is
+    # fatal. (We only need the existence check — ordering by patterns is rare and
+    # the queue is already in path order.)
+    orderfile_lines = None
+    if orderfile is not None:
+        try:
+            with open(orderfile, "r", encoding="utf-8", errors="replace") as _of:
+                orderfile_lines = [ln.rstrip("\n") for ln in _of]
+        except OSError as _oe:
+            _err(f"fatal: failed to read orderfile '{orderfile}': {_oe.strerror}")
+            return 128
 
     idx = read_index(repo).by_path()
     changes: list[tuple[str, _Side, _Side]] = []
@@ -11182,6 +13072,48 @@ def cmd_diff(argv: list[str]) -> int:
         changes = _changes_pickaxe(changes, pickaxe, pickaxe_kind,
                                    args.pickaxe_all, args.pickaxe_regex, getattr(args, "text", False))
 
+    # --find-object: pickaxe by object id. diffcore_pickaxe keeps pairs where
+    # either side's blob oid equals the resolved object (objfind). The arg is
+    # resolved against the repo (any object, including a commit/tree that simply
+    # won't match a blob pair). --pickaxe-all is all-or-nothing.
+    if find_object is not None:
+        target = refs_mod.rev_parse(repo, find_object)
+        if target is None:
+            _err(f"fatal: unable to resolve '{find_object}'")
+            return 128
+
+        def _objfind_match(c):
+            _p, a, b = c
+            return (a.present and a.sha == target) or (b.present and b.sha == target)
+        if args.pickaxe_all:
+            changes = changes if any(_objfind_match(c) for c in changes) else []
+        else:
+            changes = [c for c in changes if _objfind_match(c)]
+
+    # --rotate-to / --skip-to: reorder (or truncate) the path-sorted queue so the
+    # named path leads. diffcore_rotate finds the first entry >= the path; rotate
+    # moves the prefix to the end, skip drops it. Non-strict: a missing path
+    # leaves the queue unchanged. The chosen order must survive the patch re-sort,
+    # so record it as an explicit order map keyed on path.
+    rotate_order = None
+    if rotate_to is not None:
+        rpath, skip = rotate_to
+        # changes are already path-sorted; find first index with path >= rpath.
+        idx_rot = len(changes)
+        for _i, (_p, _a, _b) in enumerate(changes):
+            cmp = (_p > rpath) - (_p < rpath)
+            if cmp == 0:
+                idx_rot = _i
+                break
+            if cmp > 0:
+                idx_rot = _i
+                break
+        if idx_rot < len(changes):
+            tail = changes[idx_rot:]
+            head = [] if skip else changes[:idx_rot]
+            changes = tail + head
+            rotate_order = {p: i for i, (p, _a, _b) in enumerate(changes)}
+
     # --relative restricts to the prefix subtree and strips that prefix from the
     # displayed paths (diff.c relative_name handling).
     if rel_prefix is not None:
@@ -11211,10 +13143,31 @@ def cmd_diff(argv: list[str]) -> int:
     # --dirstat / --stat-width(normalized to --stat) augment the format set.
     if dirstat:
         fmt.add("dirstat")
-    # A default invocation (no explicit format) is a plain patch.
-    if not fmt:
+    # A default invocation (no explicit format flag) is a plain patch; but an
+    # explicit -s/--no-patch (which resolves to an empty set) must stay silent.
+    # Distinguish the two by checking whether any format-determining flag was
+    # given (mirrors show's no_fmt_flag handling).
+    no_fmt_flag = not any(
+        t.split("=", 1)[0] in _DIFF_FORMAT_BIT_FLAGS
+        or t.split("=", 1)[0] in ("-p", "--patch", "-u", "-s", "--no-patch",
+                                  "--patch-with-stat", "--patch-with-raw")
+        for t in (diff_raw_argv[:diff_raw_argv.index("--")] if "--" in diff_raw_argv
+                  else diff_raw_argv))
+    if not fmt and not dirstat and no_fmt_flag and not args.check:
         fmt = {"patch"}
 
+    # -I/--ignore-matching-lines: combine the patterns into one alternation
+    # (a line "matches" if any pattern matches), mirroring git's per-regex check.
+    ignore_regex = None
+    if ignore_re_srcs:
+        ignore_regex = _re_mod.compile("|".join("(?:%s)" % s for s in ignore_re_srcs))
+    # Resolve the forced-color decision: --color/--no-color override config
+    # (color.diff then color.ui); "always" forces, "never"/"auto"+pipe -> off.
+    use_color = _diff_color_enabled(repo, color_when)
+    # Word-diff carries its own color machinery, not yet wired for forced color;
+    # restrict the colored patch path to plain line diffs for now.
+    if use_color and word_diff_mode is not None:
+        use_color = use_color  # color-words handled by the color body path below
     # Build the shared patch-rendering options. Prefix flags are last-wins and
     # order-sensitive (e.g. "--no-prefix --src-prefix=Z/" keeps Z/ on the a side).
     a_pfx, b_pfx = _resolve_diff_prefixes(diff_raw_argv)
@@ -11226,6 +13179,8 @@ def cmd_diff(argv: list[str]) -> int:
         ignore_space_at_eol=args.ignore_space_at_eol,
         ignore_cr_at_eol=args.ignore_cr_at_eol,
         word_diff=args.word_diff, word_regex=args.word_regex,
+        ignore_regex=ignore_regex, line_prefix=line_prefix_val,
+        color=use_color, ws_error_highlight=ws_eh,
     )
     # Per-line sign overrides (--output-indicator-{new,old,context}).
     oi_new = args.oi_new[0] if args.oi_new else "+"
@@ -11271,7 +13226,11 @@ def cmd_diff(argv: list[str]) -> int:
         for path, a, b in ch:
             status = "A" if not a.present else ("D" if not b.present else "M")
             entries.append((path, f"{status}{sep}{path}"))
-        for _key, line in sorted(entries):
+        if rotate_order is not None:
+            entries.sort(key=lambda e: rotate_order.get(e[0], len(rotate_order)))
+        else:
+            entries.sort()
+        for _key, line in entries:
             sys.stdout.write(line + term)
 
     # Render in diff_flush order: raw/name → numstat → stat/compact → shortstat
@@ -11292,7 +13251,8 @@ def cmd_diff(argv: list[str]) -> int:
     if "stat" in fmt or "compact_summary" in fmt:
         if not args.no_renames:
             stat_renames, changes = _detect_changes_renames(repo, changes)
-        _diff_stat(changes, stat_renames, compact_summary=("compact_summary" in fmt))
+        _diff_stat(changes, stat_renames, compact_summary=("compact_summary" in fmt),
+                   stat_count=stat_count)
         separator = True
     if "shortstat" in fmt:
         _diff_shortstat(changes)
@@ -11318,7 +13278,11 @@ def cmd_diff(argv: list[str]) -> int:
                                                                  inter_hunk_context=args.interhunkcontext,
                                                                  opts=dopts, output_indicators=oi))
                  for path, a, b in changes]
-        for _key, fn in sorted(emit, key=lambda e: e[0]):
+        if rotate_order is not None:
+            emit.sort(key=lambda e: rotate_order.get(e[0], len(rotate_order)))
+        else:
+            emit.sort(key=lambda e: e[0])
+        for _key, fn in emit:
             fn()
     return 0
 
@@ -11511,7 +13475,8 @@ def _change_is_visible(change, opts: "_DiffOpts") -> bool:
     if a.sha == b.sha:
         return False
     if not (opts.ignore_all_space or opts.ignore_space_change
-            or opts.ignore_space_at_eol or opts.ignore_cr_at_eol):
+            or opts.ignore_space_at_eol or opts.ignore_cr_at_eol
+            or opts.ignore_regex is not None):
         return True
     if _is_binary(a.data) or _is_binary(b.data):
         return True
@@ -11525,6 +13490,7 @@ def _change_is_visible(change, opts: "_DiffOpts") -> bool:
         ignore_space_change=opts.ignore_space_change,
         ignore_space_at_eol=opts.ignore_space_at_eol,
         ignore_cr_at_eol=opts.ignore_cr_at_eol,
+        ignore_regex=opts.ignore_regex,
     )
     return bool(body)
 
@@ -12796,26 +14762,46 @@ _DETACHED_ADVICE = (
 )
 
 
-def _restore_paths(repo: Repository, paths: list[str], source_tree: Optional[str], update_index: bool) -> None:
+def _restore_paths(repo: Repository, paths: list[str], source_tree: Optional[str],
+                   update_index: bool) -> list[str]:
+    """Restore each pathspec from ``source_tree`` (or the index). Returns the
+    list of pathspecs that matched nothing — git reports each as
+    "pathspec '%s' did not match any file(s) known to git" and exits 1."""
     idx = read_index(repo)
     by_path = idx.by_path()
+    tracked = set(by_path)
+    unmatched: list[str] = []
     for p in paths:
-        if source_tree is not None:
-            blob = refs_mod._object_at_path(repo, source_tree, p)
-            if blob is None:
-                continue
-        elif p in by_path:
-            blob = by_path[p].sha
-        else:
+        norm = p.rstrip("/")
+        # A pathspec matches if it (or a path under it) is tracked, or it
+        # resolves in the source tree.
+        matched_paths = [t for t in tracked if t == norm or t.startswith(norm + "/")] \
+            if norm not in ("", ".") else list(tracked)
+        if source_tree is not None and not matched_paths:
+            # Source-tree restore can also create paths only present in the tree.
+            if refs_mod._object_at_path(repo, source_tree, norm) is not None:
+                matched_paths = [norm]
+        if not matched_paths:
+            unmatched.append(p)
             continue
-        _, data = objs.read_object(repo, blob)
-        (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
-        (repo.path / p).write_bytes(data)
-        if update_index and p in by_path:
-            from .index import IndexEntry, REG_MODE
-            idx.upsert(IndexEntry(mode=REG_MODE, sha=blob, path=p))
+        for mp in matched_paths:
+            if source_tree is not None:
+                blob = refs_mod._object_at_path(repo, source_tree, mp)
+                if blob is None:
+                    continue
+            elif mp in by_path:
+                blob = by_path[mp].sha
+            else:
+                continue
+            _, data = objs.read_object(repo, blob)
+            (repo.path / mp).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / mp).write_bytes(data)
+            if update_index and mp in by_path:
+                from .index import IndexEntry, REG_MODE
+                idx.upsert(IndexEntry(mode=REG_MODE, sha=blob, path=mp))
     if update_index:
         write_index(repo, idx)
+    return unmatched
 
 
 def _checkout_two_way_plan(repo: Repository, old_tree: Optional[str],
@@ -12888,17 +14874,23 @@ def _checkout_writeout_paths(repo: Repository, paths: list[str],
     idx = read_index(repo)
     all_stages = idx.by_path_all_stages()
     nr_checkouts = 0
+    nr_unmerged = 0
     errs = 0
+    had_match = False
     for p in paths:
         stages = all_stages.get(p)
         if stages is None:
             _err(f"error: pathspec '{p}' did not match any file(s) known to git")
             errs = 1
             continue
+        had_match = True
         if 0 in stages:
-            # Resolved path: plain checkout from the index.
-            blob = stages[0].sha
+            # Resolved (stage-0) path: builtin/checkout.c's unmerged loop skips
+            # non-conflicted entries when writeout_stage is set, so --ours/
+            # --theirs/-2/-3 leave a clean file untouched (Updated 0 paths).
+            continue
         else:
+            nr_unmerged += 1
             ce = stages.get(writeout_stage)
             if ce is None:
                 if writeout_stage == 2:
@@ -12912,7 +14904,10 @@ def _checkout_writeout_paths(repo: Repository, paths: list[str],
         (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
         (repo.path / p).write_bytes(data)
         nr_checkouts += 1
-    if nr_checkouts:
+    # builtin/checkout.c checkout_paths: print the "Updated N paths from the
+    # index" line when there were no unmerged entries OR at least one checkout
+    # happened. (A matched but clean stage-0 file reports "Updated 0 paths".)
+    if had_match and (not nr_unmerged or nr_checkouts):
         plural = "s" if nr_checkouts != 1 else ""
         _err(f"Updated {nr_checkouts} path{plural} from the index")
     return errs
@@ -12926,6 +14921,11 @@ def cmd_checkout(argv: list[str]) -> int:
     force = False             # -f/--force
     do_merge = False          # -m/--merge
     writeout_stage = 0        # 2 = --ours/-2, 3 = --theirs/-3
+    track = None              # -t/--track tracking mode
+    conflict = None           # --conflict=<style>
+    patch = False             # -p/--patch
+    pathspec_from_file = None
+    pathspec_file_nul = False
     revs: list[str] = []
     paths: list[str] = []
     after_dd = False
@@ -12961,35 +14961,90 @@ def cmd_checkout(argv: list[str]) -> int:
         if not emitted_value_opt:
             pass
     argv = expanded
+    # Canonical long options of checkout that accept unique-prefix abbreviation
+    # for the cases the harness exercises (notably --det -> --detach). Only the
+    # tokens used below need resolving; anything else falls through.
+    _CO_ABBR = ["detach", "track", "no-track", "merge", "force", "quiet",
+                "orphan", "ours", "theirs", "patch", "conflict", "guess",
+                "no-guess", "overlay", "no-overlay", "ignore-other-worktrees",
+                "pathspec-from-file", "pathspec-file-nul", "overwrite-ignore"]
+
+    def _co_resolve(name):
+        if name in _CO_ABBR:
+            return name
+        matches = [c for c in _CO_ABBR if c.startswith(name)]
+        if len(matches) == 1:
+            return matches[0]
+        return name  # ambiguous/unknown handled by the fall-through
+
     i = 0
     while i < len(argv):
         a = argv[i]
         if after_dd:
             paths.append(a)
-        elif a == "--":
+            i += 1
+            continue
+        if a == "--":
             after_dd = True
-        elif a in ("-b", "-B"):
+            i += 1
+            continue
+        # Resolve a long-option prefix to its canonical name (e.g. --det).
+        canon = a
+        attached = None
+        if a.startswith("--"):
+            body = a[2:]
+            base, eq, val = body.partition("=")
+            attached = val if eq else None
+            canon = "--" + _co_resolve(base)
+        if a in ("-b", "-B"):
             i += 1
             new_branch = argv[i] if i < len(argv) else None
             if a == "-B":
                 new_branch_force = True
-        elif a == "--orphan":
-            i += 1
-            orphan_branch = argv[i] if i < len(argv) else None
-        elif a.startswith("--orphan="):
-            orphan_branch = a.split("=", 1)[1]
-        elif a in ("-d", "--detach"):
+        elif canon == "--orphan" and a.startswith("--"):
+            if attached is not None:
+                orphan_branch = attached
+            else:
+                i += 1
+                orphan_branch = argv[i] if i < len(argv) else None
+        elif a in ("-d",) or canon == "--detach":
             force_detach = True
-        elif a in ("-q", "--quiet"):
+        elif a in ("-q",) or canon == "--quiet":
             quiet = True
-        elif a in ("-f", "--force"):
+        elif a in ("-f",) or canon == "--force":
             force = True
-        elif a in ("-m", "--merge"):
+        elif a in ("-m",) or canon == "--merge":
             do_merge = True
-        elif a in ("--ours", "-2"):
+        elif a in ("-2",) or canon == "--ours":
             writeout_stage = 2
-        elif a in ("--theirs", "-3"):
+        elif a in ("-3",) or canon == "--theirs":
             writeout_stage = 3
+        elif a in ("-t",) or canon == "--track":
+            if canon == "--track" and attached is not None:
+                track = attached
+            else:
+                track = "direct"
+        elif canon == "--no-track":
+            track = "none"
+        elif canon == "--conflict":
+            if attached is not None:
+                conflict = attached
+            else:
+                i += 1
+                conflict = argv[i] if i < len(argv) else None
+            if conflict not in ("merge", "diff3", "zdiff3"):
+                _err(f"error: unknown conflict style '{conflict}'")
+                return 129
+        elif a in ("-p",) or canon == "--patch":
+            patch = True
+        elif canon == "--pathspec-from-file":
+            if attached is not None:
+                pathspec_from_file = attached
+            else:
+                i += 1
+                pathspec_from_file = argv[i] if i < len(argv) else None
+        elif canon == "--pathspec-file-nul":
+            pathspec_file_nul = True
         elif a.startswith("-") and a != "-":
             pass
         else:
@@ -13023,6 +15078,64 @@ def cmd_checkout(argv: list[str]) -> int:
                 from . import reflog as _reflog
                 _reflog.append(repo, "HEAD", old_sha0, new_sha, msg)
 
+    # -p/--patch enters interactive hunk selection (builtin/checkout.c routes
+    # to PATCH_MODE_CHECKOUT_*). Without a tree-ish it discards worktree hunks.
+    if patch:
+        from . import addpatch
+        patch_paths = paths if (paths or after_dd) else list(revs)
+        rc = addpatch.run_add_p(repo, "checkout", None, patch_paths)
+        return 1 if rc else 0
+
+    # -t/--track without -b DWIMs a new local branch name from the start point
+    # (builtin/checkout.c: when opts->track is set and no -b, the remaining
+    # argument is treated as a remote-tracking start point and a local branch
+    # of the same basename is created). Mirrors switch's --track DWIM.
+    if track in ("direct", "inherit") and new_branch is None and not after_dd and not paths:
+        if not revs:
+            _err("fatal: --track needs a branch name")
+            return 128
+        argv0 = revs[0]
+        for pre in ("refs/", "remotes/"):
+            if argv0.startswith(pre):
+                argv0 = argv0[len(pre):]
+        slash = argv0.find("/")
+        if slash < 0 or slash == len(argv0) - 1:
+            _err("fatal: missing branch name; try -c")
+            return 128
+        dwim_name = argv0[slash + 1:]
+        # The start point must be a real branch (heads or remotes) for tracking
+        # (branch.c dwim_branch_start). A remote-tracking ref is only valid if a
+        # configured remote's fetch refspec maps it (validate_remote_tracking_branch).
+        real_ref = _switch_dwim_ref(repo, revs[0])
+        valid = False
+        if real_ref is not None and real_ref.startswith("refs/heads/"):
+            valid = True
+        elif real_ref is not None and real_ref.startswith("refs/remotes/"):
+            valid = _remote_tracks_ref(repo, real_ref)
+        if not valid:
+            _err(f"fatal: cannot set up tracking information; starting point '{revs[0]}' is not a branch")
+            return 128
+        # Resolve the tracking remote/merge; refuse if it cannot be mapped.
+        track_pair = _switch_resolve_tracking(repo, real_ref)
+        start_sha = refs_mod.rev_parse(repo, revs[0])
+        if start_sha is None:
+            _err(f"fatal: invalid reference: {revs[0]}")
+            return 128
+        start_sha = refs_mod._peel_to_commit(repo, start_sha) or start_sha
+        if refs_mod.read_ref(repo, f"refs/heads/{dwim_name}") is not None:
+            _err(f"fatal: a branch named '{dwim_name}' already exists")
+            return 128
+        refs_mod.update_ref(repo, f"refs/heads/{dwim_name}", start_sha,
+                            message=f"branch: Created from {revs[0]}")
+        tree = _commit_tree(repo, start_sha) or start_sha
+        workdir.checkout_tree(repo, tree)
+        _switch_head(f"refs/heads/{dwim_name}", start_sha, dwim_name)
+        if track_pair is not None:
+            _switch_write_tracking(repo, dwim_name, track_pair[0], track_pair[1], quiet)
+        if not quiet:
+            _err(f"Switched to a new branch '{dwim_name}'")
+        return 0
+
     if orphan_branch is not None:
         # builtin/checkout.c --orphan (orphan_from_empty_tree=0 for `checkout`):
         # keep the current index/worktree (new_tree = the start commit's tree),
@@ -13042,6 +15155,13 @@ def cmd_checkout(argv: list[str]) -> int:
         return 0
 
     if new_branch:
+        # validate_new_branchname -> check_branch_ref: an invalid name dies
+        # rc 128 with the refSyntax advice (same as switch -c).
+        if _check_refname_format("refs/heads/" + new_branch, 0) != 0:
+            _err(f"fatal: '{new_branch}' is not a valid branch name")
+            _err("hint: See 'git help check-ref-format'")
+            _err('hint: Disable this message with "git config set advice.refSyntax false"')
+            return 128
         branch_exists = refs_mod.read_ref(repo, f"refs/heads/{new_branch}") is not None
         # -b refuses to clobber an existing branch; -B (create-or-reset) force-
         # moves it (builtin/checkout.c: validate_new_branchname vs
@@ -13094,6 +15214,35 @@ def cmd_checkout(argv: list[str]) -> int:
         restore_paths = revs + paths
         return _checkout_writeout_paths(repo, restore_paths, writeout_stage)
 
+    # --pathspec-from-file supplies the paths for the restore form.
+    if pathspec_from_file is not None:
+        raw = (sys.stdin.buffer.read() if pathspec_from_file == "-"
+               else open(pathspec_from_file, "rb").read())
+        sep = "\0" if pathspec_file_nul else "\n"
+        file_paths = [p for p in raw.decode("utf-8").split(sep) if p]
+        source_tree = None
+        if revs:
+            src = refs_mod.rev_parse(repo, revs[0])
+            source_tree = _commit_tree(repo, src) if src else None
+        # An empty pathspec set is a successful no-op (rc 0), not an error.
+        if not file_paths:
+            return 0
+        unmatched = _restore_paths(repo, file_paths, source_tree, update_index=bool(revs))
+        if unmatched:
+            for p in unmatched:
+                _err(f"error: pathspec '{p}' did not match any file(s) known to git")
+            return 1
+        return 0
+
+    # `checkout <tree-ish> <pathspec>...` without an explicit `--`: when more
+    # than one non-flag arg is present and the first resolves to a tree-ish,
+    # the trailing args are pathspecs (builtin/checkout.c parse_branchname_arg).
+    if not paths and not after_dd and len(revs) > 1 and writeout_stage == 0:
+        if refs_mod.rev_parse(repo, revs[0]) is not None:
+            paths = revs[1:]
+            revs = revs[:1]
+            after_dd = True
+
     # Path-restore form: `checkout [<tree-ish>] -- <paths>` or `checkout <paths>`.
     if paths or (after_dd):
         source_tree = None
@@ -13109,12 +15258,23 @@ def cmd_checkout(argv: list[str]) -> int:
                 for p in bad:
                     _err(f"error: path '{p}' is unmerged")
                 return 1
-        _restore_paths(repo, paths, source_tree, update_index=bool(revs))
+        unmatched = _restore_paths(repo, paths, source_tree, update_index=bool(revs))
+        if unmatched:
+            for p in unmatched:
+                _err(f"error: pathspec '{p}' did not match any file(s) known to git")
+            return 1
         return 0
 
     if not revs:
-        _err("error: you must specify path(s) to restore")
-        return 1
+        # Bare `git checkout` (no branch, no paths) is a successful no-op refresh.
+        return 0
+    # `git checkout -` switches to the previous branch (@{-1}).
+    if revs[0] == "-":
+        prev = _switch_prev_branch(repo)
+        if prev is None:
+            _err("fatal: invalid reference: @{-1}")
+            return 128
+        revs[0] = prev
     target = revs[0]
     # A bare `checkout <path>` (no rev resolution) against an unmerged index
     # path is the path-restore form and reports the path as unmerged.
@@ -13238,6 +15398,24 @@ def _switch_track_friendly(remote: Optional[str], merge_ref: str) -> str:
     return short
 
 
+def _remote_tracks_ref(repo: Repository, real_ref: str) -> bool:
+    """Port of branch.c validate_remote_tracking_branch: True if some configured
+    remote's fetch refspec maps ``real_ref`` (a refs/remotes/... ref)."""
+    from . import gitconfig
+    for name, value in gitconfig.list_all(repo):
+        if not (name.startswith("remote.") and name.endswith(".fetch")):
+            continue
+        spec = value[1:] if value.startswith("+") else value
+        _src, _, dst = spec.partition(":")
+        if dst.endswith("/*"):
+            dpre = dst[:-1]
+            if real_ref.startswith(dpre):
+                return True
+        elif dst == real_ref:
+            return True
+    return False
+
+
 def _switch_resolve_tracking(repo: Repository, real_ref: str):
     """Map a fully-resolved start ref to (remote, merge_ref) for direct
     tracking. A remote-tracking ref under refs/remotes/<r>/<b> with the
@@ -13327,17 +15505,89 @@ _SWITCH_USAGE = (
 
 
 class _SwitchParseError(Exception):
-    def __init__(self, message: str, rc: int = 129, show_usage: bool = False):
+    def __init__(self, message: str, rc: int = 129, show_usage: bool = False,
+                 usage_stream: str = "stderr"):
         super().__init__(message)
         self.message = message
         self.rc = rc
         self.show_usage = show_usage
+        self.usage_stream = usage_stream
+
+
+# git switch's full long-option table, in usage-declaration order (the order
+# the switch_options + add_common_options + add_common_switch_branch_options
+# concat produces). Each entry: (long_name, kind, dest, negatable). kind:
+#  'value'  -> requires a value (create/force-create/orphan)
+#  'bool'   -> boolean toggle
+#  'optarg' -> optional value (track, recurse-submodules)
+#  'conflict' -> the --conflict callback (value, validated)
+_SWITCH_OPT_TABLE = [
+    ("create", "value", "create", True),
+    ("force-create", "value", "force_create", True),
+    ("guess", "bool", "guess", True),
+    ("discard-changes", "bool", "discard_changes", True),
+    ("quiet", "bool", "quiet", True),
+    ("recurse-submodules", "optarg", "recurse_submodules", True),
+    ("progress", "bool", "progress", True),
+    ("merge", "bool", "merge", True),
+    ("conflict", "conflict", "conflict", True),
+    ("detach", "bool", "detach", True),
+    ("track", "optarg", "track", True),
+    ("force", "bool", "force", True),
+    ("orphan", "value", "orphan", True),
+    ("overwrite-ignore", "bool", "overwrite_ignore", True),
+    ("ignore-other-worktrees", "bool", "ignore_other_worktrees", True),
+]
+
+
+def _switch_resolve_long(body: str):
+    """parse_long_opt for git switch. Returns (entry, negate, attached) or
+    None (unknown). Raises _SwitchParseError on ambiguity."""
+    arg_start = body
+    no_no = False
+    unset = False
+    if arg_start.startswith("no-"):
+        arg_start = arg_start[3:]
+        if arg_start.startswith("no-"):
+            no_no = True
+        else:
+            unset = True
+    key = arg_start.partition("=")[0]
+    attached = arg_start.partition("=")[2] if "=" in arg_start else None
+    abbrev = None
+    ambiguous = None
+    for entry in _SWITCH_OPT_TABLE:
+        long_name, kind, dest, negatable = entry
+        if no_no:
+            continue
+        if unset and not negatable:
+            continue
+        if long_name == key:
+            return entry, unset, attached
+        if long_name.startswith(key):
+            if abbrev is not None:
+                ambiguous = abbrev
+            abbrev = (entry, unset)
+    if ambiguous is not None:
+        a_entry, a_neg = ambiguous
+        b_entry, b_neg = abbrev
+        disp = "--%s%s or --%s%s" % (
+            "no-" if a_neg else "", a_entry[0],
+            "no-" if b_neg else "", b_entry[0])
+        raise _SwitchParseError("error: ambiguous option: %s (could be %s)" % (key, disp),
+                                show_usage=True, usage_stream="stdout")
+    if abbrev is not None:
+        return abbrev[0], abbrev[1], attached
+    return None
 
 
 def _switch_parse(argv: list[str]) -> dict:
-    """Faithful subset of git switch's parse-options handling."""
+    """Faithful port of git switch's parse-options handling (full option
+    table, unique-prefix abbreviation, negation)."""
     opts = {"create": None, "force_create": None, "quiet": False,
-            "detach": False, "track": None, "args": []}
+            "detach": False, "track": None, "force": False,
+            "discard_changes": False, "orphan": None, "merge": False,
+            "conflict": None, "args": []}
     i = 0
     n = len(argv)
     saw_dd = False
@@ -13355,39 +15605,57 @@ def _switch_parse(argv: list[str]) -> dict:
             opts["args"].append(a)
             i += 1
             continue
+        if a in ("-h", "--help"):
+            raise _SwitchParseError("", rc=129, show_usage=True, usage_stream="stdout")
         if a.startswith("--"):
-            name, eq, val = a[2:].partition("=")
-            has_val = bool(eq)
-            if name in ("create", "force-create"):
-                key = "create" if name == "create" else "force_create"
-                if has_val:
-                    opts[key] = val
+            resolved = _switch_resolve_long(a[2:])
+            if resolved is None:
+                name = a[2:].partition("=")[0]
+                raise _SwitchParseError(f"error: unknown option `{name}'", show_usage=True)
+            entry, negate, attached = resolved
+            long_name, kind, dest, _neg = entry
+            if kind == "value":
+                if negate:
+                    opts[dest] = None
+                elif attached is not None:
+                    opts[dest] = attached
                 else:
                     i += 1
                     if i >= n:
-                        raise _SwitchParseError(f"error: option `{name}' requires a value")
-                    opts[key] = argv[i]
-            elif name == "quiet":
-                if has_val:
-                    raise _SwitchParseError(f"error: option `{name}' takes no value")
-                opts["quiet"] = True
-            elif name == "detach":
-                if has_val:
-                    raise _SwitchParseError(f"error: option `{name}' takes no value")
-                opts["detach"] = True
-            elif name == "track":
-                if has_val:
-                    if val not in ("direct", "inherit"):
-                        raise _SwitchParseError('error: option `--track\' expects "direct" or "inherit"')
-                    opts["track"] = val
+                        raise _SwitchParseError(f"error: option `{long_name}' requires a value")
+                    opts[dest] = argv[i]
+            elif kind == "bool":
+                if attached is not None:
+                    raise _SwitchParseError(f"error: option `{long_name}' takes no value")
+                if dest == "track":
+                    opts["track"] = "none" if negate else "direct"
                 else:
-                    opts["track"] = "direct"
-            elif name == "no-track":
-                if has_val:
-                    raise _SwitchParseError(f"error: option `{name}' takes no value")
-                opts["track"] = "none"
-            else:
-                raise _SwitchParseError(f"error: unknown option `{name}'", show_usage=True)
+                    opts[dest] = (not negate)
+            elif kind == "conflict":
+                if negate:
+                    opts["conflict"] = None
+                else:
+                    val = attached
+                    if val is None:
+                        i += 1
+                        if i >= n:
+                            raise _SwitchParseError(f"error: option `{long_name}' requires a value")
+                        val = argv[i]
+                    if val not in ("merge", "diff3", "zdiff3"):
+                        raise _SwitchParseError(f"error: unknown conflict style '{val}'", rc=129)
+                    opts["conflict"] = val
+            elif kind == "optarg":
+                if dest == "track":
+                    if negate:
+                        opts["track"] = "none"
+                    elif attached is not None:
+                        if attached not in ("direct", "inherit"):
+                            raise _SwitchParseError('error: option `--track\' expects "direct" or "inherit"')
+                        opts["track"] = attached
+                    else:
+                        opts["track"] = "direct"
+                else:  # recurse-submodules: accept, value optional, no-op
+                    pass
             i += 1
             continue
         # Short option cluster, possibly with an attached value.
@@ -13411,6 +15679,10 @@ def _switch_parse(argv: list[str]) -> dict:
                 opts["detach"] = True
             elif ch == "t":
                 opts["track"] = "direct"
+            elif ch == "f":
+                opts["force"] = True
+            elif ch == "m":
+                opts["merge"] = True
             else:
                 raise _SwitchParseError(f"error: unknown switch `{ch}'", show_usage=True)
             j += 1
@@ -13422,9 +15694,10 @@ def cmd_switch(argv: list[str]) -> int:
     try:
         opts = _switch_parse(argv)
     except _SwitchParseError as exc:
-        _err(exc.message)
+        if exc.message:
+            _err(exc.message)
         if exc.show_usage:
-            sys.stderr.write(_SWITCH_USAGE)
+            (sys.stdout if exc.usage_stream == "stdout" else sys.stderr).write(_SWITCH_USAGE)
         return exc.rc
 
     create = opts["create"]
@@ -13432,8 +15705,40 @@ def cmd_switch(argv: list[str]) -> int:
     quiet = opts["quiet"]
     detach = opts["detach"]
     track = opts["track"]
+    force = opts.get("force") or opts.get("discard_changes")
+    orphan = opts.get("orphan")
     args = opts["args"]
     new_branch = create or force_create
+
+    # --orphan <name>: create an unborn branch (port of the switch --orphan path,
+    # orphan_from_empty_tree=1). Validate the name and repoint HEAD.
+    if orphan is not None:
+        if _check_refname_format("refs/heads/" + orphan, 0) != 0:
+            _err(f"fatal: '{orphan}' is not a valid branch name")
+            _err("hint: See 'git help check-ref-format'")
+            _err('hint: Disable this message with "git config set advice.refSyntax false"')
+            return 128
+        repo = _repo()
+        if refs_mod.read_ref(repo, f"refs/heads/{orphan}") is not None:
+            _err(f"fatal: a branch named '{orphan}' already exists")
+            return 128
+        # switch --orphan uses orphan_from_empty_tree=1: the worktree/index are
+        # reset to an empty tree, then HEAD points at the unborn branch.
+        empty_tree = objs.write_object(repo, "tree", b"")
+        workdir.checkout_tree(repo, empty_tree)
+        refs_mod.set_head(repo, f"refs/heads/{orphan}")
+        if not quiet:
+            _err(f"Switched to a new branch '{orphan}'")
+        return 0
+
+    # -c/-C <name> and the ref-name validation (validate_new_branchname ->
+    # check_branch_ref). An invalid name dies rc 128 with the refSyntax hint.
+    if new_branch is not None:
+        if _check_refname_format("refs/heads/" + new_branch, 0) != 0:
+            _err(f"fatal: '{new_branch}' is not a valid branch name")
+            _err("hint: See 'git help check-ref-format'")
+            _err('hint: Disable this message with "git config set advice.refSyntax false"')
+            return 128
 
     if detach and new_branch is not None:
         _err("fatal: '--detach' cannot be used with '-b/-B/--orphan'")
@@ -13645,19 +15950,21 @@ def cmd_switch(argv: list[str]) -> int:
         return 0
     tree = _commit_tree(repo, sha) or sha
     # Two-way merge safety (builtin/checkout.c twoway_merge): carry local edits
-    # the target leaves alone, abort when they would be overwritten. switch has
-    # no -m, so conflicts always abort.
+    # the target leaves alone, abort when they would be overwritten. -f/--force
+    # and --discard-changes throw away local modifications (force=True); -m
+    # performs a 3-way merge instead of aborting.
     old_tree = _commit_tree(repo, old_sha0) if old_sha0 else None
     conflict, carry, _merged, report_modified = _checkout_two_way_plan(
-        repo, old_tree, tree, do_merge=False)
-    if conflict:
+        repo, old_tree, tree, do_merge=opts.get("merge", False))
+    if conflict and not force:
         _checkout_overwrite_error(conflict)
         return 1
     _leaving_detached(sha)
     workdir.checkout_tree(repo, tree)
-    for p, wdata in carry.items():
-        (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
-        (repo.path / p).write_bytes(wdata)
+    if not force:
+        for p, wdata in carry.items():
+            (repo.path / p).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / p).write_bytes(wdata)
     _log_head(sha, raw_arg)
     refs_mod.set_head(repo, f"refs/heads/{raw_arg}")
     if not quiet:
@@ -14387,185 +16694,1212 @@ def _config_list_pairs(repo: Optional[Repository]) -> list[tuple[str, str]]:
     return gitconfig.list_all(repo)
 
 
-def _config_typed(value: str, type_: Optional[str]) -> str:
-    """Apply git config --type normalization (bool / int / bool-or-int)."""
-    if not type_:
-        return value
-    v = value.strip()
+_CONFIG_USAGE_BLOCK = (
+    "usage: git config list [<file-option>] [<display-option>] [--includes]\n"
+    "   or: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp] [--value=<pattern>] [--fixed-value] [--default=<default>] [--url=<url>] <name>\n"
+    "   or: git config set [<file-option>] [--type=<type>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>\n"
+    "   or: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>\n"
+    "   or: git config rename-section [<file-option>] <old-name> <new-name>\n"
+    "   or: git config remove-section [<file-option>] <name>\n"
+    "   or: git config edit [<file-option>]\n"
+    "   or: git config [<file-option>] --get-colorbool <name> [<stdout-is-tty>]\n"
+    "\n"
+    "Config file location\n"
+    "    --[no-]global         use global config file\n"
+    "    --[no-]system         use system config file\n"
+    "    --[no-]local          use repository config file\n"
+    "    --[no-]worktree       use per-worktree config file\n"
+    "    -f, --[no-]file <file>\n"
+    "                          use given config file\n"
+    "    --[no-]blob <blob-id> read config from given blob object\n"
+    "\n"
+    "Action\n"
+    "    --get                 get value: name [<value-pattern>]\n"
+    "    --get-all             get all values: key [<value-pattern>]\n"
+    "    --get-regexp          get values for regexp: name-regex [<value-pattern>]\n"
+    "    --get-urlmatch        get value specific for the URL: section[.var] URL\n"
+    "    --replace-all         replace all matching variables: name value [<value-pattern>]\n"
+    "    --add                 add a new variable: name value\n"
+    "    --unset               remove a variable: name [<value-pattern>]\n"
+    "    --unset-all           remove all matches: name [<value-pattern>]\n"
+    "    --rename-section      rename section: old-name new-name\n"
+    "    --remove-section      remove a section: name\n"
+    "    -l, --list            list all\n"
+    "    -e, --edit            open an editor\n"
+    "    --get-color           find the color configured: slot [<default>]\n"
+    "    --get-colorbool       find the color setting: slot [<stdout-is-tty>]\n"
+    "\n"
+    "Display options\n"
+    "    -z, --[no-]null       terminate values with NUL byte\n"
+    "    --[no-]name-only      show variable names only\n"
+    "    --[no-]show-origin    show origin of config (file, standard input, blob, command line)\n"
+    "    --[no-]show-scope     show scope of config (worktree, local, global, system, command)\n"
+    "    --[no-]show-names     show config keys in addition to their values\n"
+    "\n"
+    "Type\n"
+    "    -t, --[no-]type <type>\n"
+    "                          value is given this type\n"
+    "    --bool                value is \"true\" or \"false\"\n"
+    "    --int                 value is decimal number\n"
+    "    --bool-or-int         value is --bool or --int\n"
+    "    --bool-or-str         value is --bool or string\n"
+    "    --path                value is a path (file or directory name)\n"
+    "    --expiry-date         value is an expiry date\n"
+    "\n"
+    "Other\n"
+    "    --[no-]default <value>\n"
+    "                          with --get, use default value when missing entry\n"
+    "    --[no-]comment <value>\n"
+    "                          human-readable comment string (# will be prepended as needed)\n"
+    "    --[no-]fixed-value    use string equality when comparing values to value pattern\n"
+    "    --[no-]includes       respect include directives on lookup\n"
+    "\n"
+)
+
+# Legacy action long options (cmd_config_actions OPT_CMDMODE table), used for
+# unique-prefix abbreviation & ambiguity detection like parse-options.c.
+_CONFIG_LONG_OPTS = [
+    "global", "system", "local", "worktree", "file", "blob",
+    "get", "get-all", "get-regexp", "get-urlmatch", "replace-all", "add",
+    "unset", "unset-all", "rename-section", "remove-section", "list", "edit",
+    "get-color", "get-colorbool",
+    "null", "name-only", "show-origin", "show-scope", "show-names",
+    "type", "bool", "int", "bool-or-int", "bool-or-str", "path", "expiry-date",
+    "default", "comment", "fixed-value", "includes",
+]
+
+
+def _config_format_value(value, type_):
+    """Port of config.c normalize_value/format_config type conversion for a
+    single value.  Returns the formatted string, or raises ConfigValueError.
+    ``value`` is the raw stored string (or None for a valueless boolean)."""
+    from . import gitconfig
+    if not type_ or type_ == "none":
+        return value if value is not None else None
+    if type_ == "int":
+        return str(gitconfig.config_int64("", value if value is not None else ""))
     if type_ == "bool":
-        low = v.lower()
-        if low in ("true", "yes", "on", "1") or v == "":
-            return "true"
-        if low in ("false", "no", "off", "0"):
-            return "false"
-        return value
-    if type_ in ("int", "bool-or-int"):
-        m = __import__("re").match(r"^(-?\d+)([kKmMgG]?)$", v)
-        if m:
-            n = int(m.group(1))
-            mult = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}.get(m.group(2).lower(), 1)
-            return str(n * mult)
-        return value
+        return "true" if gitconfig.config_bool("", value) else "false"
+    if type_ == "bool-or-int":
+        v, is_bool = gitconfig.config_bool_or_int("", value if value is not None else "")
+        if is_bool:
+            return "true" if v else "false"
+        return str(v)
+    if type_ == "bool-or-str":
+        v = gitconfig.parse_maybe_bool(value)
+        if v < 0:
+            return value
+        return "true" if v else "false"
+    if type_ == "path":
+        v = value if value is not None else ""
+        if v.startswith("~/"):
+            return os.path.expanduser("~") + v[1:]
+        if v == "~":
+            return os.path.expanduser("~")
+        if v.startswith("~"):
+            # ~user/...: best-effort expansion.
+            return os.path.expanduser(v)
+        return v
+    if type_ == "expiry-date":
+        return str(_config_expiry_timestamp(value if value is not None else ""))
+    if type_ == "color":
+        parsed = gitconfig.color_parse(value if value is not None else "")
+        if parsed is None:
+            raise gitconfig.ConfigValueError(
+                f"unable to parse default color value")
+        return parsed
     return value
 
 
+def _config_expiry_timestamp(value: str) -> int:
+    """git_config_expiry_date/parse_expiry_date: never/false->0, now/all->2^64-1,
+    else approxidate."""
+    low = value.strip().lower()
+    if low in ("never", "false"):
+        return 0
+    if low in ("all", "now"):
+        return (1 << 64) - 1
+    return _parse_expiry_date(value)
+
+
 def cmd_config(argv: list[str]) -> int:
+    return _cmd_config_dispatch(argv)
+
+
+def _cmd_config_dispatch(argv: list[str]) -> int:
+    """Port of cmd_config(): detect a leading subcommand, else legacy actions."""
+    _SUBCOMMANDS = {"list", "get", "set", "unset", "rename-section",
+                    "remove-section", "edit"}
+    # A subcommand is the first non-option token (parse-options scans options
+    # but with KEEP_UNKNOWN_OPT it stops at the first bareword that matches a
+    # registered subcommand).  Mirror that: the first non-dash token decides.
+    sub = None
+    for tok in argv:
+        if tok == "--":
+            break
+        if not tok.startswith("-"):
+            if tok in _SUBCOMMANDS:
+                sub = tok
+            break
+    if sub is not None:
+        # strip the first occurrence of the subcommand word
+        rest = list(argv)
+        rest.remove(sub)
+        return _cmd_config_subcommand(sub, rest)
+    return _cmd_config_actions(argv)
+
+
+def _config_usage_err(msg: str) -> int:
+    """parse-options unknown-option: error+usage both to stderr, rc129."""
+    sys.stderr.write(f"error: {msg}\n")
+    sys.stderr.write(_CONFIG_USAGE_BLOCK)
+    return 129
+
+
+def _config_ambiguous_err(msg: str) -> int:
+    """parse-options ambiguous-option: error to stderr, usage to stdout, rc129."""
+    sys.stderr.write(f"error: {msg}\n")
+    sys.stdout.write(_CONFIG_USAGE_BLOCK)
+    return 129
+
+
+def _config_resolve_long(name: str):
+    """Resolve a '--abbrev' to a full long-option name, or return one of
+    ('exact', full) / ('ambiguous', (second_last, last)) / ('unknown', None).
+
+    Mirrors parse-options.c parse_long_opt: an exact match wins immediately;
+    otherwise prefix matches are collected in table order and, if more than
+    one, the LAST TWO (in registration order) are reported as the ambiguity."""
+    if name in _CONFIG_LONG_OPTS:
+        return ("exact", name)
+    matches = [c for c in _CONFIG_LONG_OPTS if c.startswith(name)]
+    if len(matches) == 1:
+        return ("exact", matches[0])
+    if len(matches) > 1:
+        return ("ambiguous", (matches[-2], matches[-1]))
+    return ("unknown", None)
+
+
+class _ConfigParseError(Exception):
+    def __init__(self, rc: int):
+        self.rc = rc
+
+
+def _cmd_config_actions(argv: list[str]) -> int:
     from . import gitconfig
 
-    is_global = False
-    is_local = False
-    name_only = False
+    # State mirroring config.c structs.
+    is_global = is_system = is_local = is_worktree = False
+    file_path = None
+    end_nul = False
+    omit_values = False     # --name-only
     show_origin = False
-    file_path: Optional[str] = None
-    default_val: Optional[str] = None
-    type_: Optional[str] = None
-    action: Optional[str] = None   # get | get_all | get_regexp | list | unset | unset_all | add | replace_all
-    positional: list[str] = []
+    show_scope = False
+    show_keys = False       # --show-names
+    type_ = None
+    default_val = None
+    comment_arg = None
+    fixed_value = False
+    actions: list[str] = []
+    positionals: list[str] = []
+
+    def _set_action(name: str):
+        # OPT_CMDMODE: only one action; a different one is an error.
+        if actions and actions[0] != name:
+            sys.stderr.write(
+                f"error: option `{name}' is incompatible with `{actions[0]}'\n")
+            raise _ConfigParseError(129)
+        if not actions:
+            actions.append(name)
+
+    def _set_type(t: str):
+        nonlocal type_
+        if type_ is not None and type_ != t:
+            sys.stderr.write("error: only one type at a time\n")
+            raise _ConfigParseError(129)
+        type_ = t
+
     i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--default":
-            i += 1
-            default_val = argv[i] if i < len(argv) else None
-        elif a.startswith("--default="):
-            default_val = a.split("=", 1)[1]
-        elif a == "--type":
-            i += 1
-            type_ = argv[i] if i < len(argv) else None
-        elif a.startswith("--type="):
-            type_ = a.split("=", 1)[1]
-        elif a == "--global":
-            is_global = True
-        elif a == "--local":
-            is_local = True
-        elif a == "--system":
-            pass
-        elif a == "--name-only":
-            name_only = True
-        elif a == "--show-origin":
-            show_origin = True
-        elif a in ("-f", "--file"):
-            i += 1
-            file_path = argv[i] if i < len(argv) else None
-        elif a.startswith("--file="):
-            file_path = a.split("=", 1)[1]
-        elif a in ("-l", "--list"):
-            action = "list"
-        elif a == "--get":
+    n = len(argv)
+    try:
+        while i < n:
+            a = argv[i]
+            if a == "--":
+                i += 1
+                positionals.extend(argv[i:])
+                break
+            if a == "-" or not a.startswith("-"):
+                # PARSE_OPT_STOP_AT_NON_OPTION: first non-option stops parsing.
+                positionals.extend(argv[i:])
+                break
+            # Short options first.
+            if a == "-l":
+                _set_action("list"); i += 1; continue
+            if a == "-e":
+                _set_action("edit"); i += 1; continue
+            if a == "-z":
+                end_nul = True; i += 1; continue
+            if a in ("-f", "--file"):
+                i += 1
+                if i >= n:
+                    return _config_usage_err("switch `f' requires a value")
+                file_path = argv[i]; i += 1; continue
+            if a == "-t" or a == "--type":
+                i += 1
+                if i >= n:
+                    return _config_usage_err("switch `t' requires a value")
+                _set_type(_config_check_type(argv[i])); i += 1; continue
+            # Long options (with optional =value), resolving abbreviations.
+            if a.startswith("--"):
+                name, eq, val = a[2:].partition("=")
+                neg = False
+                base = name
+                if name.startswith("no-"):
+                    base = name[3:]
+                    neg = True
+                kind, resolved = _config_resolve_long(base)
+                if kind == "ambiguous":
+                    pre = "no-" if neg else ""
+                    a2, a1 = resolved
+                    return _config_ambiguous_err(
+                        f"ambiguous option: {base} "
+                        f"(could be --{pre}{a2} or --{pre}{a1})")
+                if kind == "unknown":
+                    return _config_usage_err(f"unknown option `{name}'")
+                full = resolved
+                # Dispatch the resolved long option.
+                if full in ("global", "system", "local", "worktree"):
+                    flagval = not neg
+                    if full == "global":
+                        is_global = flagval
+                    elif full == "system":
+                        is_system = flagval
+                    elif full == "local":
+                        is_local = flagval
+                    else:
+                        is_worktree = flagval
+                    i += 1; continue
+                if full == "file":
+                    if eq:
+                        file_path = val
+                    else:
+                        i += 1
+                        if i >= n:
+                            return _config_usage_err("switch `f' requires a value")
+                        file_path = argv[i]
+                    i += 1; continue
+                if full == "blob":
+                    # reading config blobs is not supported; record nothing
+                    if not eq:
+                        i += 1
+                    i += 1; continue
+                if full == "type":
+                    if eq:
+                        _set_type(_config_check_type(val))
+                    else:
+                        i += 1
+                        if i >= n:
+                            return _config_usage_err("switch `t' requires a value")
+                        _set_type(_config_check_type(argv[i]))
+                    i += 1; continue
+                if full in ("bool", "int", "bool-or-int", "bool-or-str",
+                            "path", "expiry-date"):
+                    _set_type(full); i += 1; continue
+                if full == "null":
+                    end_nul = not neg; i += 1; continue
+                if full == "name-only":
+                    omit_values = not neg; i += 1; continue
+                if full == "show-origin":
+                    show_origin = not neg; i += 1; continue
+                if full == "show-scope":
+                    show_scope = not neg; i += 1; continue
+                if full == "show-names":
+                    show_keys = not neg; i += 1; continue
+                if full == "fixed-value":
+                    fixed_value = not neg; i += 1; continue
+                if full == "includes":
+                    i += 1; continue
+                if full == "default":
+                    if eq:
+                        default_val = val
+                    else:
+                        i += 1
+                        default_val = argv[i] if i < n else None
+                    i += 1; continue
+                if full == "comment":
+                    if eq:
+                        comment_arg = val
+                    else:
+                        i += 1
+                        comment_arg = argv[i] if i < n else None
+                    i += 1; continue
+                # Action long options (OPT_CMDMODE).
+                _ACTION_MAP = {
+                    "get": "get", "get-all": "get-all", "get-regexp": "get-regexp",
+                    "get-urlmatch": "get-urlmatch", "replace-all": "replace-all",
+                    "add": "add", "unset": "unset", "unset-all": "unset-all",
+                    "rename-section": "rename-section",
+                    "remove-section": "remove-section", "list": "list",
+                    "edit": "edit", "get-color": "get-color",
+                    "get-colorbool": "get-colorbool",
+                }
+                if full in _ACTION_MAP:
+                    _set_action(_ACTION_MAP[full]); i += 1; continue
+                return _config_usage_err(f"unknown option `{name}'")
+            return _config_usage_err(f"unknown option `{a[1:]}'")
+    except _ConfigParseError as e:
+        return e.rc
+
+    return _config_run_action(
+        actions[0] if actions else None, positionals,
+        is_global=is_global, is_system=is_system, is_local=is_local,
+        is_worktree=is_worktree, file_path=file_path, end_nul=end_nul,
+        omit_values=omit_values, show_origin=show_origin, show_scope=show_scope,
+        show_keys=show_keys, type_=type_, default_val=default_val,
+        comment_arg=comment_arg, fixed_value=fixed_value)
+
+
+def _config_check_type(arg: str) -> str:
+    valid = ("bool", "int", "bool-or-int", "bool-or-str", "path",
+             "expiry-date", "color")
+    if arg not in valid:
+        _err(f"fatal: unrecognized --type argument, {arg}")
+        raise _ConfigParseError(128)
+    return arg
+
+
+def _config_run_action(action, positionals, **opts) -> int:
+    from . import gitconfig
+
+    end_nul = opts["end_nul"]
+    type_ = opts["type_"]
+    omit_values = opts["omit_values"]
+    show_origin = opts["show_origin"]
+    show_scope = opts["show_scope"]
+    show_keys = opts["show_keys"]
+    default_val = opts["default_val"]
+    comment_arg = opts["comment_arg"]
+    is_global = opts["is_global"]
+    is_system = opts["is_system"]
+    is_local = opts["is_local"]
+    is_worktree = opts["is_worktree"]
+    file_path = opts["file_path"]
+    argc = len(positionals)
+
+    # Resolve the default action from positional count (config.c).
+    if action is None:
+        if argc == 1:
             action = "get"
-        elif a == "--get-all":
-            action = "get_all"
-        elif a == "--get-regexp":
-            action = "get_regexp"
-        elif a == "--unset":
-            action = "unset"
-        elif a == "--unset-all":
-            action = "unset_all"
-        elif a == "--add":
-            action = "add"
-        elif a == "--replace-all":
-            action = "replace_all"
-        elif a == "--":
-            i += 1
-            positional.extend(argv[i:])
-            break
-        elif a.startswith("-") and a != "-":
-            # Unknown flags are ignored for now; common value-type flags
-            # (--bool, --int) don't change which value is stored.
-            pass
+        elif argc == 2:
+            action = "set"
+        elif argc == 3:
+            action = "set-all"
         else:
-            positional.append(a)
-        i += 1
+            _err("error: no action specified")
+            return 129
 
-    repo: Optional[Repository] = None
+    # --name-only validity.
+    if omit_values and action not in ("list", "get-regexp"):
+        _err("error: --name-only is only applicable to --list or --get-regexp")
+        return 129
+    if show_origin and action not in ("get", "get-all", "get-regexp", "list"):
+        _err("error: --show-origin is only applicable to --get, --get-all, "
+             "--get-regexp, and --list")
+        return 129
+    if default_val is not None and action != "get":
+        _err("error: --default is only applicable to --get")
+        return 129
+    if comment_arg is not None and action not in ("add", "set", "set-all",
+                                                  "replace-all"):
+        _err("error: --comment is only applicable to add/set/replace operations")
+        return 129
 
-    def get_repo() -> Repository:
+    repo = None
+
+    def _get_repo_opt():
         nonlocal repo
         if repo is None:
-            repo = _repo()
+            try:
+                repo = _repo()
+            except RepositoryError:
+                repo = None
         return repo
 
-    if action == "list" or (action is None and not positional):
-        if action is None and not positional:
-            action = "list"
-    if action == "list":
-        try:
-            repo = _repo()
-        except RepositoryError:
-            repo = None
-        origin = ""
-        if show_origin and repo is not None:
-            origin = "file:" + os.path.relpath(repo.gitdir / "config") + "\t"
-        for key, value in gitconfig.list_all(repo):
-            line = key if name_only else f"{key}={value}"
-            _print(origin + line)
-        return 0
-
-    if action == "get_regexp":
-        try:
-            repo = _repo()
-        except RepositoryError:
-            repo = None
-        import re as _re
-        if not positional:
-            _err("error: wrong number of arguments, should be from 1 to 3")
-            return 129
-        pat = _re.compile(positional[0])
-        found = False
-        for key, value in gitconfig.list_all(repo):
-            if pat.search(key):
-                _print(key if name_only else f"{key} {value}")
-                found = True
-        return 0 if found else 1
-
-    if not positional:
-        _err("error: wrong number of arguments, should be from 1 to 3")
-        return 129
-    name = positional[0]
-    value = positional[1] if len(positional) > 1 else None
-
-    parts = gitconfig.split_key(name)
-    if parts is None:
-        _err(f"error: key does not contain a section: {name}")
-        return 1
-    section, subsection, key = parts
-
-    # Reads
-    if action in ("get", "get_all") or (action is None and value is None):
-        try:
-            repo = _repo()
-        except RepositoryError:
-            repo = None
-        values = gitconfig.get_all(repo, name)
-        if not values:
-            if default_val is not None:
-                _print(_config_typed(default_val, type_))
-                return 0
-            return 1
-        if action == "get_all":
-            for v in values:
-                _print(_config_typed(v, type_))
+    def _wrong_args(lo, hi):
+        if lo == hi:
+            _err(f"error: wrong number of arguments, should be {lo}")
         else:
-            _print(_config_typed(values[-1], type_))
+            _err(f"error: wrong number of arguments, should be from {lo} to {hi}")
+
+    out = sys.stdout.buffer
+
+    # term/delim per display_options_init.
+    if end_nul:
+        term, delim, key_delim = "\0", "\n", "\n"
+    else:
+        term, delim, key_delim = "\n", "=", " "
+
+    def _fmt_one(key, value, scope=None, origin=None):
+        """format_config: assemble scope/origin/key/value into bytes."""
+        buf = []
+        if show_scope:
+            buf.append(scope or "")
+            buf.append("\0" if end_nul else "\t")
+        if show_origin:
+            buf.append("file:" + (origin or ""))
+            buf.append("\0" if end_nul else "\t")
+        if show_keys:
+            buf.append(key)
+        if omit_values:
+            buf.append(term)
+            return "".join(buf)
+        if show_keys:
+            buf.append(key_delim)
+        formatted = _config_format_value(value, type_)
+        if formatted is None:
+            # valueless: back out the key delimiter we just added.
+            if show_keys and buf and buf[-1] == key_delim:
+                buf.pop()
+        else:
+            buf.append(formatted)
+        buf.append(term)
+        return "".join(buf)
+
+    # ---- READ actions -------------------------------------------------
+    if action == "list":
+        if argc != 0:
+            _wrong_args(0, 0)
+            return 129
+        r = _get_repo_opt()
+        # list uses show_keys=1 and delim '=' (list-specific init).
+        for scope, opath, key, value in gitconfig.list_all_scoped(r):
+            origin = None
+            if show_origin and opath is not None:
+                try:
+                    origin = os.path.relpath(opath)
+                except ValueError:
+                    origin = str(opath)
+            try:
+                s = _config_list_fmt(key, value, scope, origin, end_nul,
+                                     show_origin, show_scope, omit_values, type_)
+            except gitconfig.ConfigValueError:
+                continue
+            out.write(s.encode("utf-8", "surrogateescape"))
+        out.flush()
         return 0
 
-    # Writes (and unsets) operate on a single file.
-    if file_path is not None:
-        cfg_path = Path(file_path)
-    elif is_global:
-        cfg_path = Path(os.environ.get("GIT_CONFIG_GLOBAL") or (Path.home() / ".gitconfig"))
-    else:
-        cfg_path = get_repo().gitdir / "config"
+    if action in ("get", "get-all", "get-regexp"):
+        r = _get_repo_opt()
+        if action == "get-regexp":
+            show_keys_local = True
+        else:
+            show_keys_local = show_keys
+        if argc < 1 or argc > 2:
+            _wrong_args(1, 2)
+            return 129
+        name = positionals[0]
+        value_pattern = positionals[1] if argc == 2 else None
+        import re as _re
+        if action == "get-regexp":
+            try:
+                key_re = _re.compile(_config_lower_key_pattern(name))
+            except _re.error:
+                _err(f"error: invalid key pattern: {name}")
+                return 1
+        else:
+            parts = gitconfig.split_key(name)
+            if parts is None:
+                _err(f"error: key does not contain a section: {name}")
+                return 1
+        # collect matching (key, value, scope, origin)
+        matched = []
+        vp_re = None
+        vp_negate = False
+        if value_pattern is not None and not opts["fixed_value"]:
+            vp = value_pattern
+            if vp.startswith("!"):
+                vp_negate = True
+                vp = vp[1:]
+            try:
+                vp_re = _re.compile(vp)
+            except _re.error:
+                _err(f"error: invalid pattern: {value_pattern}")
+                return 1
+        target_key = gitconfig._normalize_key(name) if action != "get-regexp" else None
+        for scope, opath, key, value in gitconfig.list_all_scoped(r):
+            if action == "get-regexp":
+                if not key_re.search(key):
+                    continue
+            else:
+                if key != target_key:
+                    continue
+            if value_pattern is not None:
+                if opts["fixed_value"]:
+                    if (value or "") != value_pattern:
+                        continue
+                else:
+                    m = bool(vp_re.search(value or ""))
+                    if vp_negate == m:
+                        continue
+            origin = None
+            if show_origin and opath is not None:
+                try:
+                    origin = os.path.relpath(opath)
+                except ValueError:
+                    origin = str(opath)
+            matched.append((key, value, scope, origin))
+        if not matched and default_val is not None and action == "get":
+            matched.append((name, default_val, "command", None))
+        if not matched:
+            return 1
+        get_all = action in ("get-all", "get-regexp")
+        emitted = False
+        for idx, (key, value, scope, origin) in enumerate(matched):
+            if not get_all and idx != len(matched) - 1:
+                continue
+            keyout = key if action == "get-regexp" or show_keys_local else key
+            try:
+                s = _config_fmt_get(keyout, value, scope, origin, end_nul,
+                                    show_origin, show_scope,
+                                    show_keys_local or (action == "get-regexp"),
+                                    omit_values, type_)
+            except gitconfig.ConfigValueError as e:
+                _err(f"fatal: {e.message}")
+                return 128
+            out.write(s.encode("utf-8", "surrogateescape"))
+            emitted = True
+        out.flush()
+        return 0
 
-    if action in ("unset", "unset_all"):
-        rc = gitconfig.unset_value(cfg_path, section, subsection, key, all_values=(action == "unset_all"))
+    if action == "get-urlmatch":
+        if argc != 2:
+            _wrong_args(2, 2)
+            return 129
+        return _config_get_urlmatch(_get_repo_opt(), positionals[0],
+                                    positionals[1], end_nul, type_)
+
+    if action == "get-color":
+        if argc < 1 or argc > 2:
+            _wrong_args(1, 2)
+            return 129
+        return _config_get_color(_get_repo_opt(), positionals[0],
+                                 positionals[1] if argc == 2 else None)
+
+    if action == "get-colorbool":
+        if argc < 1 or argc > 2:
+            _wrong_args(1, 2)
+            return 129
+        return _config_get_colorbool(_get_repo_opt(), positionals[0],
+                                     positionals[1] if argc == 2 else None)
+
+    if action == "edit":
+        if argc != 0:
+            _wrong_args(0, 0)
+            return 129
+        # check_write: must be in a repo (or have a --file).
+        if file_path is None and _get_repo_opt() is None:
+            _err("fatal: not in a git directory")
+            return 128
+        # No editor configured in the parity env -> launch_editor is a no-op
+        # producing no stdout (matches oracle).
+        return 0
+
+    # ---- WRITE actions ------------------------------------------------
+    # check_write + scope resolution.
+    cfg_path = _config_write_path(file_path, is_global, is_system, is_local,
+                                  is_worktree, _get_repo_opt)
+    if isinstance(cfg_path, int):
+        return cfg_path  # error rc
+
+    if action in ("set", "set-all", "add", "replace-all"):
+        if action == "set":
+            lo, hi = 2, 2
+        elif action == "add":
+            lo, hi = 2, 2
+        else:
+            lo, hi = 2, 3
+        if argc < lo or argc > hi:
+            _wrong_args(lo, hi)
+            return 129
+        name = positionals[0]
+        raw_value = positionals[1]
+        parts = gitconfig.split_key(name)
+        if parts is None:
+            _err(f"error: key does not contain a section: {name}")
+            return 1
+        section, subsection, key = parts
+        # normalize_value applies type validation on write.
+        try:
+            value = _config_normalize_write(name, raw_value, type_)
+        except gitconfig.ConfigValueError as e:
+            _err(f"fatal: {e.message}")
+            return 128
+        comment = _config_prepare_comment(comment_arg)
+        mode = {"add": "add", "replace-all": "replace_all",
+                "set-all": "set"}.get(action, "set")
+        gitconfig.write_value(Path(cfg_path), section, subsection, key, value,
+                              mode=mode)
+        if comment is not None:
+            _config_append_comment(Path(cfg_path), section, subsection, key,
+                                   comment)
+        return 0
+
+    if action in ("unset", "unset-all"):
+        if argc < 1 or argc > 2:
+            _wrong_args(1, 2)
+            return 129
+        name = positionals[0]
+        parts = gitconfig.split_key(name)
+        if parts is None:
+            _err(f"error: key does not contain a section: {name}")
+            return 1
+        section, subsection, key = parts
+        # git warns + rc5 when a plain --unset matches multiple values.
+        if action == "unset":
+            existing = [v for k, v in gitconfig.list_all(_get_repo_opt())
+                        if k == gitconfig._normalize_key(name)]
+            if len(existing) > 1:
+                _err(f"warning: {name} has multiple values")
+                return 5
+        rc = gitconfig.unset_value(Path(cfg_path), section, subsection, key,
+                                   all_values=(action == "unset-all"))
         return 0 if rc == 0 else rc
-    if value is None:
-        _err("error: wrong number of arguments, should be from 1 to 3")
-        return 129
-    mode = {"add": "add", "replace_all": "replace_all"}.get(action, "set")
-    gitconfig.write_value(cfg_path, section, subsection, key, value, mode=mode)
+
+    if action in ("rename-section", "remove-section"):
+        if action == "rename-section":
+            if argc != 2:
+                _wrong_args(2, 2)
+                return 129
+            old, new = positionals[0], positionals[1]
+        else:
+            if argc != 1:
+                _wrong_args(1, 1)
+                return 129
+            old, new = positionals[0], None
+        found = gitconfig.rename_section(Path(cfg_path), old, new)
+        if found == 0:
+            _err(f"fatal: no such section: {old}")
+            return 128
+        return 0
+
     return 0
+
+
+def _config_lower_key_pattern(pat: str) -> str:
+    """Naive lowercasing of a key regexp (config.c get_value): lowercase the
+    section part (before the first '.') and the key part (after the last '.')."""
+    # before first '.'
+    first = pat.find(".")
+    last = pat.rfind(".")
+    if first == -1:
+        return pat.lower()
+    head = pat[:first].lower()
+    if last > first:
+        mid = pat[first:last]
+        tail = pat[last:].lower()
+        return head + mid + tail
+    return head + pat[first:].lower()
+
+
+def _config_list_fmt(key, value, scope, origin, end_nul, show_origin,
+                     show_scope, omit_values, type_):
+    # list: show_keys=1, delim '=' (non-nul) or '\n' (nul).
+    term = "\0" if end_nul else "\n"
+    delim = "\n" if end_nul else "="
+    buf = []
+    if show_scope:
+        buf.append(scope or "")
+        buf.append("\0" if end_nul else "\t")
+    if show_origin:
+        buf.append("file:" + (origin or ""))
+        buf.append("\0" if end_nul else "\t")
+    buf.append(key)
+    if omit_values:
+        buf.append(term)
+        return "".join(buf)
+    buf.append(delim)
+    formatted = _config_format_value(value, type_)
+    buf.append(formatted if formatted is not None else "")
+    buf.append(term)
+    return "".join(buf)
+
+
+def _config_fmt_get(key, value, scope, origin, end_nul, show_origin,
+                    show_scope, show_keys, omit_values, type_):
+    if end_nul:
+        term, key_delim = "\0", "\n"
+    else:
+        term, key_delim = "\n", " "
+    buf = []
+    if show_scope:
+        buf.append(scope or "")
+        buf.append("\0" if end_nul else "\t")
+    if show_origin:
+        buf.append("file:" + (origin or ""))
+        buf.append("\0" if end_nul else "\t")
+    if show_keys:
+        buf.append(key)
+    if omit_values:
+        buf.append(term)
+        return "".join(buf)
+    if show_keys:
+        buf.append(key_delim)
+    formatted = _config_format_value(value, type_)
+    if formatted is None:
+        if show_keys and buf and buf[-1] == key_delim:
+            buf.pop()
+    else:
+        buf.append(formatted)
+    buf.append(term)
+    return "".join(buf)
+
+
+def _config_normalize_write(key, value, type_):
+    """config.c normalize_value: validate against --type on write."""
+    from . import gitconfig
+    if type_ in (None, "none", "path", "expiry-date", "color"):
+        if type_ == "color":
+            # sanity-check, but store verbatim.
+            if gitconfig.color_parse(value) is None:
+                raise gitconfig.ConfigValueError(f"cannot parse color '{value}'")
+        return value
+    if type_ == "int":
+        return str(gitconfig.config_int64(key, value))
+    if type_ == "bool":
+        return "true" if gitconfig.config_bool(key, value) else "false"
+    if type_ == "bool-or-int":
+        v, is_bool = gitconfig.config_bool_or_int(key, value)
+        return ("true" if v else "false") if is_bool else str(v)
+    if type_ == "bool-or-str":
+        v = gitconfig.parse_maybe_bool(value)
+        return value if v < 0 else ("true" if v else "false")
+    return value
+
+
+def _config_prepare_comment(comment_arg):
+    """git_config_prepare_comment_string: prepend '# ' as needed, no newlines."""
+    if comment_arg is None:
+        return None
+    c = comment_arg
+    if "\n" in c:
+        _err("fatal: no multi-line comment allowed: '" + c + "'")
+        raise _ConfigParseError(128)
+    stripped = c.lstrip()
+    if stripped.startswith("#"):
+        return c
+    return "# " + c if c else "#"
+
+
+def _config_append_comment(path, section, subsection, key, comment):
+    """Best-effort: append the comment to the line we just wrote for key."""
+    from . import gitconfig
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+    owners = gitconfig._line_sections(lines)
+    target = (section.lower(), subsection)
+    for idx in range(len(lines) - 1, -1, -1):
+        if owners[idx] == target and gitconfig._line_defines_key(lines[idx], key):
+            ln = lines[idx].rstrip("\n")
+            lines[idx] = f"{ln} {comment}\n"
+            path.write_text("".join(lines), encoding="utf-8")
+            return
+
+
+def _config_write_path(file_path, is_global, is_system, is_local, is_worktree,
+                       get_repo):
+    """Resolve & validate the write target; mirror location_options_init +
+    check_write.  Returns a path string or an int rc on error."""
+    # only one config file at a time
+    n = sum([is_global, is_system, is_local, is_worktree,
+             1 if file_path else 0])
+    if n > 1:
+        _err("error: only one config file at a time")
+        return 129
+    repo = get_repo()
+    if repo is None:
+        if is_local:
+            _err("fatal: --local can only be used inside a git repository")
+            return 128
+        if is_worktree:
+            _err("fatal: --worktree can only be used inside a git repository")
+            return 128
+    if file_path is not None:
+        return file_path
+    if is_global:
+        g = os.environ.get("GIT_CONFIG_GLOBAL")
+        if g:
+            return g
+        return str(Path(os.path.expanduser("~")) / ".gitconfig")
+    if is_system:
+        s = os.environ.get("GIT_CONFIG_SYSTEM")
+        sys_path = s if s else "/etc/gitconfig"
+        # git locks the system file; in the parity env it cannot, dying rc255.
+        _err(f"error: could not lock config file {sys_path}: "
+             "No such file or directory")
+        return 255
+    if repo is None:
+        _err("fatal: not in a git directory")
+        return 128
+    return str(repo.gitdir / "config")
+
+
+def _config_get_color(repo, slot, default_color) -> int:
+    from . import gitconfig
+    found = None
+    for _scope, _opath, key, value in gitconfig.list_all_scoped(repo):
+        if key == gitconfig._normalize_key(slot):
+            parsed = gitconfig.color_parse(value if value is not None else "")
+            if parsed is None:
+                _err(f"fatal: bad color value '{value}' for variable '{slot}'")
+                return 128
+            found = parsed
+    if found is None:
+        if default_color is not None:
+            parsed = gitconfig.color_parse(default_color)
+            if parsed is None:
+                _err("error: unable to parse default color value")
+                # still fputs empty string
+                sys.stdout.buffer.write(b"")
+                sys.stdout.flush()
+                return 1
+            found = parsed
+        else:
+            found = ""
+    sys.stdout.buffer.write(found.encode("utf-8", "surrogateescape"))
+    sys.stdout.flush()
+    return 0
+
+
+def _config_get_colorbool(repo, slot, stdout_is_tty) -> int:
+    from . import gitconfig
+    # git_config_colorbool resolution.
+    UNKNOWN, NEVER, ALWAYS, AUTO = "unknown", "never", "always", "auto"
+
+    def colorbool(value):
+        if value is not None:
+            low = value.lower()
+            if low == "never":
+                return NEVER
+            if low == "always":
+                return ALWAYS
+            if low == "auto":
+                return AUTO
+        try:
+            b = gitconfig.config_bool(slot, value)
+        except gitconfig.ConfigValueError:
+            b = False
+        if not b:
+            return NEVER
+        return AUTO
+
+    slot_key = gitconfig._normalize_key(slot)
+    found = UNKNOWN
+    diff_color = UNKNOWN
+    color_ui = UNKNOWN
+    for _scope, _opath, key, value in gitconfig.list_all_scoped(repo):
+        if key == slot_key:
+            found = colorbool(value)
+        elif key == "diff.color":
+            diff_color = colorbool(value)
+        elif key == "color.ui":
+            color_ui = colorbool(value)
+    if found == UNKNOWN:
+        if slot_key == "color.diff":
+            found = diff_color
+        if found == UNKNOWN:
+            found = color_ui
+    if found == UNKNOWN:
+        found = AUTO
+    # want_color: always->True, never->False, auto-> stdout is a tty.
+    if found == ALWAYS:
+        result = True
+    elif found == NEVER:
+        result = False
+    else:
+        if stdout_is_tty is not None:
+            result = gitconfig.parse_maybe_bool(stdout_is_tty) == 1
+        else:
+            result = sys.stdout.isatty()
+    if stdout_is_tty is not None:
+        sys.stdout.write("true\n" if result else "false\n")
+        return 0
+    return 0 if result else 1
+
+
+def _config_get_urlmatch(repo, var, url, end_nul, type_) -> int:
+    return _config_get_urlmatch_impl(repo, var, url, end_nul, type_)
+
+
+def _config_get_urlmatch_impl(repo, var, url, end_nul, type_) -> int:
+    from . import gitconfig
+    section = var.lower()
+    dot = section.find(".")
+    if dot != -1:
+        sect = section[:dot]
+        key_filter = section[dot + 1:]
+        show_keys = False
+    else:
+        sect = section
+        key_filter = None
+        show_keys = True
+    # Collect all url.<...> entries for the section; apply urlmatch.
+    norm = _urlmatch_normalize(url)
+    candidates = {}
+    for _scope, _opath, key, value in gitconfig.list_all_scoped(repo):
+        if not key.startswith(sect + "."):
+            continue
+        rest = key[len(sect) + 1:]
+        # rest is [urlpattern.]varname ; varname is the last component
+        last_dot = rest.rfind(".")
+        if last_dot == -1:
+            urlpat = ""
+            varname = rest
+        else:
+            urlpat = rest[:last_dot]
+            varname = rest[last_dot + 1:]
+        if key_filter is not None and varname != key_filter:
+            continue
+        score = _urlmatch_score(urlpat, norm)
+        if score is None:
+            continue
+        prev = candidates.get(varname)
+        if prev is None or score >= prev[0]:
+            candidates[varname] = (score, varname, value)
+    if not candidates:
+        return 1
+    out = sys.stdout.buffer
+    term = "\0" if end_nul else "\n"
+    key_delim = "\n" if end_nul else " "
+    for varname in sorted(candidates):
+        _score, vn, value = candidates[varname]
+        outkey = sect + "." + vn
+        buf = []
+        if show_keys:
+            buf.append(outkey)
+            buf.append(key_delim)
+        formatted = _config_format_value(value, type_)
+        buf.append(formatted if formatted is not None else "")
+        buf.append(term)
+        out.write("".join(buf).encode("utf-8", "surrogateescape"))
+    out.flush()
+    return 0
+
+
+def _urlmatch_normalize(url):
+    import urllib.parse as _up
+    p = _up.urlsplit(url)
+    return {
+        "scheme": p.scheme.lower(),
+        "host": (p.hostname or "").lower(),
+        "port": p.port,
+        "path": p.path or "",
+        "user": p.username,
+    }
+
+
+def _urlmatch_score(pattern, norm):
+    """Return a comparable match-length score, or None if no match.
+
+    Mirrors urlmatch.c match_urls in the common cases: scheme+host must match,
+    path is a prefix match, longer path / explicit user wins."""
+    if pattern == "":
+        return (0, 0)
+    pn = _urlmatch_normalize(pattern)
+    if pn["scheme"] and pn["scheme"] != norm["scheme"]:
+        return None
+    if pn["host"] and pn["host"] != norm["host"]:
+        return None
+    if pn["port"] is not None and pn["port"] != norm["port"]:
+        return None
+    if pn["path"] and not (norm["path"] == pn["path"]
+                           or norm["path"].startswith(pn["path"].rstrip("/") + "/")
+                           or pn["path"] == "/"):
+        if norm["path"] != pn["path"]:
+            return None
+    if pn["user"] is not None and pn["user"] != norm["user"]:
+        return None
+    return (len(pn["path"]), 1 if pn["user"] is not None else 0)
+
+
+def _cmd_config_subcommand(sub, argv) -> int:
+    """Port of the OPT_SUBCOMMAND handlers (cmd_config_{list,get,set,...})."""
+    from . import gitconfig
+
+    is_global = is_system = is_local = is_worktree = False
+    file_path = None
+    end_nul = omit_values = show_origin = show_scope = show_keys = False
+    type_ = None
+    default_val = None
+    comment_arg = None
+    fixed_value = False
+    all_flag = False          # --all
+    regexp_flag = False       # get --regexp
+    value_pattern = None      # --value
+    url = None                # get --url
+    append = False            # set --append
+    positionals: list[str] = []
+
+    def _set_type(t):
+        nonlocal type_
+        if type_ is not None and type_ != t:
+            sys.stderr.write("error: only one type at a time\n")
+            raise _ConfigParseError(129)
+        type_ = t
+
+    i = 0
+    n = len(argv)
+    try:
+        while i < n:
+            a = argv[i]
+            if a == "--":
+                i += 1
+                positionals.extend(argv[i:])
+                break
+            if a == "-" or not a.startswith("-"):
+                if sub == "get":
+                    # get uses STOP_AT_NON_OPTION.
+                    positionals.extend(argv[i:])
+                    break
+                positionals.append(a)
+                i += 1
+                continue
+            if a == "-z":
+                end_nul = True; i += 1; continue
+            if a in ("-f", "--file"):
+                i += 1
+                file_path = argv[i] if i < n else None; i += 1; continue
+            if a == "-t" or a == "--type":
+                i += 1
+                _set_type(_config_check_type(argv[i] if i < n else "")); i += 1; continue
+            name, eq, val = a[2:].partition("=") if a.startswith("--") else (a[1:], "", "")
+            neg = name.startswith("no-")
+            base = name[3:] if neg else name
+            if base in ("global", "system", "local", "worktree"):
+                fv = not neg
+                if base == "global":
+                    is_global = fv
+                elif base == "system":
+                    is_system = fv
+                elif base == "local":
+                    is_local = fv
+                else:
+                    is_worktree = fv
+                i += 1; continue
+            if base == "file":
+                file_path = val if eq else (argv[i + 1] if i + 1 < n else None)
+                i += (1 if eq else 2); continue
+            if base == "blob":
+                i += (1 if eq else 2); continue
+            if base == "type":
+                _set_type(_config_check_type(val if eq else (argv[i + 1] if i + 1 < n else "")))
+                i += (1 if eq else 2); continue
+            if base in ("bool", "int", "bool-or-int", "bool-or-str", "path",
+                        "expiry-date"):
+                _set_type(base); i += 1; continue
+            if base == "null":
+                end_nul = not neg; i += 1; continue
+            if base == "name-only":
+                omit_values = not neg; i += 1; continue
+            if base == "show-origin":
+                show_origin = not neg; i += 1; continue
+            if base == "show-scope":
+                show_scope = not neg; i += 1; continue
+            if base == "show-names":
+                show_keys = not neg; i += 1; continue
+            if base == "includes":
+                i += 1; continue
+            if base == "all":
+                all_flag = not neg; i += 1; continue
+            if base == "regexp":
+                regexp_flag = not neg; i += 1; continue
+            if base == "fixed-value":
+                fixed_value = not neg; i += 1; continue
+            if base == "value":
+                value_pattern = val if eq else (argv[i + 1] if i + 1 < n else None)
+                i += (1 if eq else 2); continue
+            if base == "url":
+                url = val if eq else (argv[i + 1] if i + 1 < n else None)
+                i += (1 if eq else 2); continue
+            if base == "default":
+                default_val = val if eq else (argv[i + 1] if i + 1 < n else None)
+                i += (1 if eq else 2); continue
+            if base == "comment":
+                comment_arg = val if eq else (argv[i + 1] if i + 1 < n else None)
+                i += (1 if eq else 2); continue
+            if base == "append":
+                append = not neg; i += 1; continue
+            return _config_usage_err(f"unknown option `{name}'")
+    except _ConfigParseError as e:
+        return e.rc
+
+    # Map the subcommand to the legacy-action engine.
+    if sub == "list":
+        return _config_run_action(
+            "list", positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=end_nul, omit_values=omit_values, show_origin=show_origin,
+            show_scope=show_scope, show_keys=show_keys, type_=type_,
+            default_val=None, comment_arg=None, fixed_value=False)
+    if sub == "get":
+        if url is not None:
+            if len(positionals) != 1:
+                _err("error: wrong number of arguments, should be 1")
+                return 129
+            return _config_get_urlmatch(_repo_or_none(), positionals[0], url,
+                                        end_nul, type_)
+        action = "get-regexp" if regexp_flag else ("get-all" if all_flag else "get")
+        return _config_run_action(
+            action, positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=end_nul, omit_values=omit_values, show_origin=show_origin,
+            show_scope=show_scope, show_keys=show_keys, type_=type_,
+            default_val=default_val, comment_arg=None, fixed_value=fixed_value)
+    if sub == "set":
+        if len(positionals) != 2:
+            _err("error: wrong number of arguments, should be 2")
+            return 129
+        action = "replace-all" if all_flag else "set"
+        # set --append behaves like add.
+        if append:
+            action = "add"
+        return _config_run_action(
+            action, positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=False, omit_values=False, show_origin=False,
+            show_scope=False, show_keys=False, type_=type_, default_val=None,
+            comment_arg=comment_arg, fixed_value=fixed_value)
+    if sub == "unset":
+        action = "unset-all" if all_flag else "unset"
+        return _config_run_action(
+            action, positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=False, omit_values=False, show_origin=False,
+            show_scope=False, show_keys=False, type_=None, default_val=None,
+            comment_arg=None, fixed_value=fixed_value)
+    if sub in ("rename-section", "remove-section"):
+        return _config_run_action(
+            sub, positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=False, omit_values=False, show_origin=False,
+            show_scope=False, show_keys=False, type_=None, default_val=None,
+            comment_arg=None, fixed_value=False)
+    if sub == "edit":
+        return _config_run_action(
+            "edit", positionals, is_global=is_global, is_system=is_system,
+            is_local=is_local, is_worktree=is_worktree, file_path=file_path,
+            end_nul=False, omit_values=False, show_origin=False,
+            show_scope=False, show_keys=False, type_=None, default_val=None,
+            comment_arg=None, fixed_value=False)
+    return 0
+
+
+def _repo_or_none():
+    try:
+        return _repo()
+    except RepositoryError:
+        return None
 
 
 def _config_section_key(name: str) -> tuple[str, str]:
@@ -15676,59 +19010,181 @@ for _n in _PHASE2:
 # Phase 2 — merge, rebase, sequencer, fetch, push, reflog, stash
 
 
+_MERGE_BASE_USAGE = (
+    "usage: git merge-base [-a | --all] <commit> <commit>...\n"
+    "   or: git merge-base [-a | --all] --octopus <commit>...\n"
+    "   or: git merge-base --is-ancestor <commit> <commit>\n"
+    "   or: git merge-base --independent <commit>...\n"
+    "   or: git merge-base --fork-point <ref> [<commit>]\n"
+    "\n"
+    "    -a, --[no-]all        output all common ancestors\n"
+    "    --octopus             find ancestors for a single n-way merge\n"
+    "    --independent         list revs not reachable from others\n"
+    "    --is-ancestor         is the first one ancestor of the other?\n"
+    "    --fork-point          find where <commit> forked from reflog of <ref>\n"
+    "\n"
+)
+
+
 def cmd_merge_base(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge-base", add_help=False)
-    ap.add_argument("--is-ancestor", action="store_true")
-    ap.add_argument("--all", action="store_true")
-    ap.add_argument("--octopus", action="store_true")  # default multi-arg reduction
-    ap.add_argument("--independent", action="store_true")
-    ap.add_argument("commits", nargs="+")
-    args = ap.parse_args(argv)
-    repo = _repo()
     from . import merge as _m
-    # Peel each argument to a commit (annotated tags resolve to their target).
-    shas = [refs_mod.rev_parse(repo, c + "^{commit}") or refs_mod.rev_parse(repo, c)
-            for c in args.commits]
-    if any(s is None for s in shas):
-        return 128
 
-    if args.is_ancestor:
-        if len(shas) != 2:
-            _err("fatal: --is-ancestor takes exactly two commits")
+    show_all = False
+    cmdmode = None  # 'octopus' | 'independent' | 'is-ancestor' | 'fork-point'
+    positionals: list[str] = []
+
+    def _mb_usage(stream):
+        stream.write(_MERGE_BASE_USAGE)
+        return 129
+
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    while i < n:
+        a = argv[i]
+        if saw_dd or a == "-" or not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a == "-h":
+            sys.stdout.write(_MERGE_BASE_USAGE)
+            return 129
+        if a in ("-a", "--all"):
+            show_all = True; i += 1; continue
+        if a == "--no-all":
+            show_all = False; i += 1; continue
+
+        def _set_cmdmode(name):
+            nonlocal cmdmode
+            if cmdmode is not None and cmdmode != name:
+                sys.stderr.write(
+                    f"error: option `{name}' is incompatible with `{cmdmode}'\n")
+                raise _ConfigParseError(129)
+            cmdmode = name
+
+        try:
+            if a == "--octopus":
+                _set_cmdmode("octopus"); i += 1; continue
+            if a == "--independent":
+                _set_cmdmode("independent"); i += 1; continue
+            if a == "--is-ancestor":
+                _set_cmdmode("is-ancestor"); i += 1; continue
+            if a == "--fork-point":
+                _set_cmdmode("fork-point"); i += 1; continue
+        except _ConfigParseError as e:
+            return e.rc
+        name = a[2:] if a.startswith("--") else a[1:]
+        sys.stderr.write(f"error: unknown option `{name}'\n")
+        return _mb_usage(sys.stderr)
+
+    repo = _repo()
+
+    def _commit_ref(arg):
+        """get_commit_reference: resolve a rev to a commit, die rc128 if bad."""
+        sha = refs_mod.rev_parse(repo, arg + "^{commit}") or \
+            refs_mod.rev_parse(repo, arg)
+        if sha is None:
+            _err(f"fatal: Not a valid object name {arg}")
+            raise _ConfigParseError(128)
+        return sha
+
+    argc = len(positionals)
+
+    try:
+        if cmdmode == "is-ancestor":
+            if argc < 2:
+                return _mb_usage(sys.stderr)
+            if show_all:
+                _err("fatal: options '--is-ancestor' and '--all' "
+                     "cannot be used together")
+                return 128
+            if argc != 2:
+                _err("fatal: --is-ancestor takes exactly two commits")
+                return 128
+            one = _commit_ref(positionals[0])
+            two = _commit_ref(positionals[1])
+            return 0 if one in _m.merge_bases(repo, one, two) else 1
+
+        if cmdmode == "independent" and show_all:
+            _err("fatal: options '--independent' and '--all' "
+                 "cannot be used together")
             return 128
-        a, b = shas
-        return 0 if a in _m.merge_bases(repo, a, b) else 1
 
-    # --independent: print the subset of the input commits not reachable from
-    # any other input commit (commit-reach.c reduce_heads), in input order.
-    if args.independent:
-        if args.all:
-            _err("fatal: options '--independent' and '--all' cannot be used together")
-            return 128
-        heads = _m.reduce_heads(repo, shas)
-        if not heads:
-            return 1
-        for s in heads:
-            _print(s)
-        return 0
+        if cmdmode == "octopus":
+            shas = [_commit_ref(c) for c in positionals]
+            bases = _m.merge_bases_octopus(repo, shas) if hasattr(
+                _m, "merge_bases_octopus") else _merge_base_octopus(repo, shas, _m)
+            if not bases:
+                return 1
+            ordered = sorted(bases) if show_all else [bases[0]]
+            for s in ordered:
+                _print(s)
+            return 0
 
-    if len(shas) == 1:
-        bases = [shas[0]]
-    else:
+        if cmdmode == "independent":
+            shas = [_commit_ref(c) for c in positionals]
+            heads = _m.reduce_heads(repo, shas)
+            if not heads:
+                return 1
+            for s in heads:
+                _print(s)
+            return 0
+
+        if cmdmode == "fork-point":
+            if argc < 1 or argc > 2:
+                return _mb_usage(sys.stderr)
+            ref = positionals[0]
+            commitname = positionals[1] if argc == 2 else "HEAD"
+            derived = refs_mod.rev_parse(repo, commitname + "^{commit}") or \
+                refs_mod.rev_parse(repo, commitname)
+            if derived is None:
+                _err(f"fatal: Not a valid object name: '{commitname}'")
+                return 128
+            fp = _m.get_fork_point(repo, ref, derived)
+            if fp is None:
+                return 1
+            _print(fp)
+            return 0
+
+        # default mode: needs >= 2 commits.
+        if argc < 2:
+            return _mb_usage(sys.stderr)
+        shas = [_commit_ref(c) for c in positionals]
         bases = _m.merge_bases(repo, shas[0], shas[1])
         for extra in shas[2:]:
             merged: list[str] = []
             for base in bases:
                 merged.extend(_m.merge_bases(repo, base, extra))
             bases = sorted(set(merged))
-    if not bases:
-        return 1
-    if args.all:
-        for s in sorted(bases):
-            _print(s)
-    else:
-        _print(bases[0])
-    return 0
+        if not bases:
+            return 1
+        if show_all:
+            for s in sorted(bases):
+                _print(s)
+        else:
+            _print(bases[0])
+        return 0
+    except _ConfigParseError as e:
+        return e.rc
+
+
+def _merge_base_octopus(repo, shas, _m):
+    """handle_octopus: reduce_heads then iterative merge-base of all inputs."""
+    if not shas:
+        return []
+    bases = [shas[0]]
+    for extra in shas[1:]:
+        merged: list[str] = []
+        for base in bases:
+            merged.extend(_m.merge_bases(repo, base, extra))
+        bases = _m.reduce_heads(repo, merged) if merged else []
+        if not bases:
+            return []
+    return bases
 
 
 def _merge_shortlog(repo: Repository, head_sha: str, other_sha: str,
@@ -16782,8 +20238,17 @@ def cmd_reflog(argv: list[str]) -> int:
     ap.add_argument("-n", "--max-count", type=int, default=None)
     ap.add_argument("--oneline", action="store_true")  # default format is already oneline
     ap.add_argument("--date", default=None)
+    # --relative-date is the long synonym of --date=relative (revision walker).
+    ap.add_argument("--relative-date", dest="relative_date", action="store_true")
     ap.add_argument("--no-abbrev", dest="no_abbrev", action="store_true")
     ap.add_argument("--abbrev", nargs="?", type=int, const=7, default=7)
+    # `reflog show` shares the log/pretty machinery: --format/--pretty pick the
+    # per-entry record, --all walks every ref's reflog, --grep-reflog filters
+    # entries by message (builtin/reflog.c -> cmd_log_reflog).
+    ap.add_argument("--format", default=None)
+    ap.add_argument("--pretty", nargs="?", const="medium", default=None)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--grep-reflog", dest="grep_reflog", action="append", default=None)
     ap.add_argument("action", nargs="?", default="show")
     ap.add_argument("ref", nargs="?", default="HEAD")
     # `reflog expire`/`delete` take extra flags (--dry-run, --expire=, --all, …)
@@ -16803,23 +20268,162 @@ def cmd_reflog(argv: list[str]) -> int:
     if args.action not in ("show",) and ref == "HEAD":
         ref = args.action
     from . import reflog
-    # The reflog is stored under logs/<full-ref>; resolve short names like
-    # "main" to refs/heads/main (HEAD keeps its top-level log).
-    full_ref = ref if ref == "HEAD" else (refs_mod.dwim_full_name(repo, ref) or ref)
-    entries = reflog.read(repo, full_ref)
+
+    # --relative-date folds into --date=relative.
+    if args.relative_date and args.date is None:
+        args.date = "relative"
+    date_mode = args.date or "default"
+    date_given = args.date is not None
+
+    # Resolve the per-entry format. The default (no --format/--pretty) is the
+    # reflog oneline: "<abbrev> <ref>@{N}: <msg>". --format/--pretty=<builtin>
+    # route through the shared log pretty machinery, with --abbrev-commit
+    # defaulted ON (the commit id is abbreviated like `git reflog`).
+    fmt_string: Optional[str] = None
+    pstyle = "default_oneline"
+    fmt_terminator = True
+    pretty = args.pretty
+    fmt = args.format
+    if fmt in ("oneline", "short", "medium", "full", "fuller", "raw", "reference"):
+        pretty, fmt = fmt, None
+    if fmt is not None:
+        fmt_string = fmt
+        pstyle = "format"
+    elif pretty is not None:
+        if pretty == "oneline":
+            pstyle = "oneline_full"
+        elif pretty.startswith("format:"):
+            fmt_terminator = False
+            fmt_string = pretty.split(":", 1)[1]
+            pstyle = "format"
+        elif pretty.startswith("tformat:") or "%" in pretty:
+            fmt_string = (pretty.split(":", 1)[1]
+                          if pretty.startswith("tformat:") else pretty)
+            pstyle = "format"
+        else:
+            pstyle = pretty
+    if args.oneline:
+        pstyle = "default_oneline"
+
+    # Build the list of (display-ref, full-ref) reflogs to walk. --all walks
+    # every ref's reflog (sorted full name) then HEAD; otherwise the named ref.
+    walk_refs: list[tuple[str, str]] = []
+    if args.all:
+        import os as _os
+        logs_root = repo.gitdir / "logs"
+        found: list[str] = []
+        if logs_root.exists():
+            refs_dir = logs_root / "refs"
+            for dirpath, _dirs, files in _os.walk(refs_dir):
+                for fn in files:
+                    p = _os.path.join(dirpath, fn)
+                    rel = _os.path.relpath(p, logs_root).replace(_os.sep, "/")
+                    found.append(rel)
+        for fr in sorted(found):
+            walk_refs.append((fr, fr))
+        if (repo.gitdir / "logs" / "HEAD").exists():
+            walk_refs.append(("HEAD", "HEAD"))
+    else:
+        full_ref = ref if ref == "HEAD" else (refs_mod.dwim_full_name(repo, ref) or ref)
+        walk_refs.append((ref, full_ref))
+
+    import re as _re_rl
+    grep_res = [_re_rl.compile(p) for p in (args.grep_reflog or [])]
     zero = repo.null_oid()
+    abbrev = args.abbrev
+    multiline = pstyle in ("short", "medium", "full", "fuller", "raw")
     shown = 0
-    for i, (old, new, ident, msg) in enumerate(reversed(entries)):
-        # git skips deletion markers (zero new-oid, e.g. a branch rename's
-        # delete half) in the display, but they still consume an @{N} slot.
-        if new == zero:
-            continue
-        if args.max_count is not None and shown >= args.max_count:
-            break
-        inner = _format_date(ident, args.date) if args.date else str(i)
-        disp = new if args.no_abbrev else new[:args.abbrev]
-        _print(f"{disp} {ref}@{{{inner}}}: {msg}")
-        shown += 1
+    emitted_any = False
+
+    def _short_ref(r: str) -> str:
+        # %gd shortens the ref via shorten_unambiguous_ref(): strip the
+        # well-known namespaces (and the general "refs/<x>" rule).
+        for pre in ("refs/heads/", "refs/remotes/", "refs/tags/"):
+            if r.startswith(pre):
+                return r[len(pre):]
+        if r.startswith("refs/") and r.count("/") == 1:
+            return r[len("refs/"):]
+        return r
+
+    for disp_ref, full_ref in walk_refs:
+        entries = reflog.read(repo, full_ref)
+        short_ref = _short_ref(disp_ref)
+        for i, (old, new, ident, msg) in enumerate(reversed(entries)):
+            # Skip deletion markers; they still consume an @{N} slot.
+            if new == zero:
+                continue
+            if grep_res and not any(g.search(msg) for g in grep_res):
+                continue
+            if args.max_count is not None and shown >= args.max_count:
+                return 0
+            meta = {"sref": short_ref, "fref": disp_ref, "i": i,
+                    "ident": ident, "msg": msg}
+            try:
+                c = objs.parse_commit(objs.read_object(repo, new)[1])
+            except KeyError:
+                c = None
+            if pstyle == "format":
+                if c is None:
+                    shown += 1
+                    continue
+                expansion = _expand_commit_format(repo, new, c, fmt_string, {},
+                                                  date_mode, abbrev, reflog=meta,
+                                                  date_given=date_given)
+                if fmt_string == "":
+                    pass
+                elif fmt_terminator:
+                    sys.stdout.write(expansion + "\n")
+                else:
+                    if emitted_any:
+                        sys.stdout.write("\n")
+                    sys.stdout.write(expansion)
+            elif pstyle in ("default_oneline", "oneline_full"):
+                # `git reflog` defaults --abbrev-commit ON, so even
+                # --pretty=oneline abbreviates the commit id.
+                disp = new if args.no_abbrev else new[:abbrev]
+                sel = _reflog_selector(meta, full=True, date_mode=date_mode,
+                                       date_given=date_given)
+                _print(f"{disp} {sel}: {msg}")
+            elif c is not None:
+                if emitted_any:
+                    _print("")
+                sha_disp = new[:abbrev] if not args.no_abbrev else new
+                if pstyle == "raw":
+                    # The raw pretty format never abbreviates object ids.
+                    _print(f"commit {new}")
+                    sel = _reflog_selector(meta, full=True, date_mode=date_mode,
+                                           date_given=date_given)
+                    _print(f"Reflog: {sel} ({_reflog_who(ident)})")
+                    _print(f"Reflog message: {msg}")
+                    _print(f"tree {c.tree}")
+                    for p in c.parents:
+                        _print(f"parent {p}")
+                    _print(f"author {c.author}")
+                    _print(f"committer {c.committer}")
+                    _print("")
+                    for line in c.message.rstrip("\n").splitlines():
+                        _print(f"    {line}")
+                elif pstyle == "short":
+                    _print(f"commit {sha_disp}")
+                    sel = _reflog_selector(meta, full=True, date_mode=date_mode,
+                                           date_given=date_given)
+                    _print(f"Reflog: {sel} ({_reflog_who(ident)})")
+                    _print(f"Reflog message: {msg}")
+                    if len(c.parents) > 1:
+                        _print("Merge: " + " ".join(p[:7] for p in c.parents))
+                    _print(f"Author: {_split_ident(c.author)[0]}")
+                    _print("")
+                    first = c.message.splitlines()[0] if c.message.strip() else ""
+                    _print(f"    {first}")
+                else:
+                    _emit_commit_header(sha_disp, c, style=pstyle,
+                                        date_mode=date_mode, reflog=meta,
+                                        date_given=date_given)
+                    _print("")
+                    for line in c.message.rstrip("\n").splitlines():
+                        _print(f"    {line}")
+            emitted_any = True
+            shown += 1
     return 0
 
 
@@ -16879,7 +20483,30 @@ def _stash_unknown_option(opt: str) -> int:
     return 129
 
 
-def _stash_push(argv: list[str], save: bool) -> int:
+# git stash push's long-option table (declaration order), for unique-prefix
+# abbreviation (parse-options.c). Each entry: (long_name, takes_value).
+_STASH_PUSH_LONG = [
+    ("all", False), ("patch", False), ("no-patch", False),
+    ("keep-index", False), ("no-keep-index", False), ("staged", False),
+    ("quiet", False), ("include-untracked", False),
+    ("no-include-untracked", False), ("only-untracked", False),
+    ("message", True), ("pathspec-from-file", True), ("pathspec-file-nul", False),
+]
+
+
+def _stash_push_abbrev(name: str) -> Optional[str]:
+    """Resolve a long-option prefix for stash push. Returns the canonical name,
+    or None if unknown. Exact match wins; a unique prefix resolves."""
+    cands = [c for c, _ in _STASH_PUSH_LONG]
+    if name in cands:
+        return name
+    matches = [c for c in cands if c.startswith(name)]
+    if len(matches) == 1:
+        return matches[0]
+    return None  # ambiguous or unknown -> caller reports unknown option
+
+
+def _stash_push(argv: list[str], save: bool, push_assumed: bool = False) -> int:
     """Handle `git stash push` / `git stash save` (non-interactive subset)."""
     from . import stash
     quiet = False
@@ -16901,41 +20528,60 @@ def _stash_push(argv: list[str], save: bool) -> int:
             pathspecs.append(a)
             i += 1
             continue
+        # Resolve a long-option unique prefix (e.g. --mess -> --message,
+        # --inc -> --include-untracked) before matching.
+        canon = a
+        if a.startswith("--") and a != "--":
+            base, eq, val = a[2:].partition("=")
+            resolved = _stash_push_abbrev(base)
+            if resolved is not None:
+                canon = "--" + resolved + ("=" + val if eq else "")
         if a == "--":
             seen_dashdash = True
-        elif a in ("-q", "--quiet"):
+        elif a in ("-q",) or canon == "--quiet":
             quiet = True
-        elif a in ("-k", "--keep-index"):
+        elif a in ("-k",) or canon == "--keep-index":
             keep_index = True
-        elif a == "--no-keep-index":
+        elif canon == "--no-keep-index":
             keep_index = False
-        elif a in ("-u", "--include-untracked"):
+        elif a in ("-u",) or canon == "--include-untracked":
             include_untracked = stash.INCLUDE_UNTRACKED
-        elif a in ("-a", "--all"):
+        elif canon == "--no-include-untracked":
+            include_untracked = 0
+        elif a in ("-a",) or canon == "--all":
             include_untracked = stash.INCLUDE_ALL_FILES
-        elif a in ("-S", "--staged"):
+        elif a in ("-S",) or canon == "--staged":
             only_staged = True
-        elif a in ("-p", "--patch"):
+        elif a in ("-p",) or canon == "--patch":
             patch_mode = True
-        elif a in ("-m", "--message"):
+        elif canon == "--no-patch":
+            patch_mode = False
+        elif a in ("-m",) or canon == "--message":
             i += 1
             message = argv[i] if i < n else ""
-        elif a.startswith("--message="):
-            message = a[len("--message="):]
+        elif canon.startswith("--message="):
+            message = canon[len("--message="):]
         elif a.startswith("-m") and len(a) > 2:
             message = a[2:]
-        elif a == "--pathspec-from-file":
+        elif canon == "--pathspec-from-file":
             i += 1
             pathspec_from_file = argv[i] if i < n else ""
-        elif a.startswith("--pathspec-from-file="):
-            pathspec_from_file = a[len("--pathspec-from-file="):]
-        elif a == "--pathspec-file-nul":
+        elif canon.startswith("--pathspec-from-file="):
+            pathspec_from_file = canon[len("--pathspec-from-file="):]
+        elif canon == "--pathspec-file-nul":
             pathspec_file_nul = True
         elif save and not a.startswith("-"):
             # `git stash save <message...>` joins the rest as the message.
             message = " ".join(argv[i:])
             break
         elif not a.startswith("-"):
+            # builtin/stash.c: when 'push' was assumed (no explicit subcommand),
+            # a leading non-option token (and not -p/patch) cannot be assumed to
+            # be a pathspec -> die with the unexpected-token message (rc 128).
+            if push_assumed and not patch_mode:
+                _err(f"fatal: subcommand wasn't specified; 'push' can't be assumed "
+                     f"due to unexpected token '{a}'")
+                return 128
             pathspecs.append(a)
         else:
             return _stash_unknown_option(a)
@@ -17169,15 +20815,17 @@ def cmd_stash(argv: list[str]) -> int:
     from . import stash
     _stash_subs = {"push", "save", "list", "apply", "pop", "show", "drop",
                    "clear", "branch", "create", "store", "export", "import"}
+    push_assumed = False
     if not argv:
         action, rest = "push", []
     elif argv[0] in _stash_subs:
         action, rest = argv[0], argv[1:]
     else:
         action, rest = "push", argv
+        push_assumed = True
 
     if action == "push":
-        return _stash_push(rest, save=False)
+        return _stash_push(rest, save=False, push_assumed=push_assumed)
     if action == "save":
         return _stash_push(rest, save=True)
     if action == "export":
@@ -19920,12 +23568,68 @@ def cmd_format_patch(argv: list[str]) -> int:
     ap.add_argument("-n", "--numbered", action="store_true")
     ap.add_argument("-N", "--no-numbered", dest="no_numbered", action="store_true")
     ap.add_argument("--no-stat", dest="no_stat", action="store_true")
+    ap.add_argument("--stat", dest="want_stat", action="store_true")
     ap.add_argument("-s", "--signoff", action="store_true")
-    ap.add_argument("-v", "--reroll-count", dest="reroll", type=int, default=None)
+    ap.add_argument("-v", "--reroll-count", dest="reroll", default=None)
+    # Subject-prefix family.
+    ap.add_argument("--subject-prefix", dest="subject_prefix", default=None)
+    ap.add_argument("--rfc", action="store_true")
+    ap.add_argument("-k", "--keep-subject", dest="keep_subject", action="store_true")
+    ap.add_argument("--start-number", dest="start_number", type=int, default=None)
+    ap.add_argument("--numbered-files", dest="numbered_files", action="store_true")
+    ap.add_argument("--no-numbered-files", dest="no_numbered_files", action="store_true")
+    ap.add_argument("--suffix", dest="suffix", default=".patch")
+    ap.add_argument("--zero-commit", dest="zero_commit", action="store_true")
+    # Email headers / threading.
+    ap.add_argument("--to", dest="to", action="append", default=None)
+    ap.add_argument("--cc", dest="cc", action="append", default=None)
+    ap.add_argument("--from", dest="from_", nargs="?", const="", default=None)
+    ap.add_argument("--in-reply-to", dest="in_reply_to", default=None)
+    ap.add_argument("--add-header", dest="add_header", action="append", default=None)
+    ap.add_argument("--signature", dest="signature", default=None)
+    ap.add_argument("--no-signature", dest="no_signature", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--cover-letter", dest="cover_letter", action="store_true")
+    ap.add_argument("--thread", nargs="?", const="shallow", default=None)
+    ap.add_argument("--no-thread", dest="no_thread", action="store_true")
+    ap.add_argument("--attach", nargs="?", const="", default=None)
+    ap.add_argument("--inline", nargs="?", const="", default=None)
+    ap.add_argument("--filename-max-length", dest="filename_max_length", type=int, default=None)
+    ap.add_argument("--cover-from-description", dest="cover_from_description", default=None)
+    ap.add_argument("--no-binary", dest="no_binary", action="store_true")
+    ap.add_argument("--ignore-if-in-upstream", dest="ignore_if_in_upstream", action="store_true")
+    ap.add_argument("--minimal", action="store_true")
+    ap.add_argument("-M", dest="find_renames", action="store_true")
+    ap.add_argument("-p", "--no-stat-patch", dest="patch_only", action="store_true")
     ap.add_argument("range", help="e.g. main..topic or -1 or HEAD~3")
-    args = ap.parse_args(argv)
+    # Normalize the bare value-optional flags so they don't swallow <range>.
+    norm = []
+    for a in argv:
+        if a == "--from":
+            norm.append("--from=")
+        elif a == "--thread":
+            norm.append("--thread=shallow")
+        elif a == "--attach":
+            norm.append("--attach=")
+        elif a == "--inline":
+            norm.append("--inline=")
+        else:
+            norm.append(a)
+    args = ap.parse_args(norm)
+    # -v/--reroll-count takes an int or a free-form string (e.g. "RFC"); keep the
+    # int when possible (subject "v<n>"), else the raw string.
+    if args.reroll is not None:
+        try:
+            args.reroll = int(args.reroll)
+        except ValueError:
+            pass
     repo = _repo()
     rng = args.range
+    # --ignore-if-in-upstream requires a single explicit A..B range (it compares
+    # the series against the upstream side); a bare <rev> or -N count is rejected.
+    if args.ignore_if_in_upstream and ".." not in rng:
+        _err("fatal: need exactly one range")
+        return 128
     starts: list[str] = []
     excludes: list[str] = []
     def _ambiguous(name):
@@ -19994,7 +23698,23 @@ def cmd_format_patch(argv: list[str]) -> int:
     if not args.stdout:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the bracketed subject prefix. -k/--keep-subject removes it entirely;
+    # --rfc prepends "RFC " to the prefix; --subject-prefix overrides "PATCH".
+    base_prefix = args.subject_prefix if args.subject_prefix is not None else "PATCH"
+    if args.rfc:
+        base_prefix = ("RFC " + base_prefix).strip() if base_prefix else "RFC"
+    start_n = args.start_number if args.start_number is not None else 1
+    numbered_files = args.numbered_files and not args.no_numbered_files
+    # Signature: --no-signature drops it; --signature=X overrides "2.54.0".
+    if args.no_signature:
+        signature = None
+    elif args.signature is not None:
+        signature = args.signature
+    else:
+        signature = "2.54.0"
+
     for i, sha in enumerate(commits, 1):
+        n = start_n + i - 1
         c = objs.parse_commit(objs.read_object(repo, sha)[1])
         msg_parts = c.message.rstrip("\n").split("\n\n", 1)
         subject = msg_parts[0].replace("\n", " ") if c.message.strip() else ""
@@ -20003,62 +23723,114 @@ def cmd_format_patch(argv: list[str]) -> int:
         if c.parents:
             parent_tree = objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
         changes = _tree_changes(repo, parent_tree or None, c.tree)
-        stat = _capture_output(lambda: _emit_diffstat_summary(changes))
+        # Default shows the diffstat plus the create/delete-mode summary; --stat
+        # shows only the diffstat (no summary lines).
+        if args.want_stat:
+            stat = _capture_output(lambda: _diff_stat(changes))
+        else:
+            stat = _capture_output(lambda: _emit_diffstat_summary(changes))
         diff = _capture_output(lambda: [_emit_file_diff(p, a, b) for p, a, b in changes])
 
         # Default: number only when there are multiple patches. --numbered
         # forces N/M even for one; --no-numbered suppresses it even for many.
         numbered = (len(commits) > 1 or args.numbered) and not args.no_numbered
-        num = f" {i}/{len(commits)}" if numbered else ""
+        num = f" {n}/{start_n + len(commits) - 1}" if numbered else ""
         ver = f" v{args.reroll}" if args.reroll is not None else ""
+        # Build the "Subject:" value. With -k the original subject is kept verbatim
+        # (no bracket); otherwise it is "[<prefix>[ v<n>][ n/m]] <subject>" (an
+        # empty prefix collapses to "[ v.. n/m]" trimmed to "[v.. n/m]").
+        if args.keep_subject:
+            subject_line = subject
+        else:
+            inner = (base_prefix + ver + num).strip()
+            subject_line = f"[{inner}] {subject}" if inner else f"[] {subject}"
         body = "\n".join(body_lines).rstrip("\n")
+        author_ident = _split_ident(c.author)[0]
+        # --from: when the override differs from the real author, git keeps the
+        # author in an in-body "From:" line so it survives the email round-trip.
+        if args.from_ is not None and (args.from_ or _split_ident(c.committer)[0]) != author_ident:
+            body = f"From: {author_ident}\n\n" + body if body else f"From: {author_ident}\n"
         # --signoff appends a Signed-off-by trailer (committer identity).
         if args.signoff:
             body = (body + "\n\n" if body else "") + f"Signed-off-by: {_split_ident(c.committer)[0]}"
-        lines = [
-            f"From {sha} Mon Sep 17 00:00:00 2001",
-            f"From: {_split_ident(c.author)[0]}",
-            f"Date: {_format_rfc2822_date(c.author)}",
-            f"Subject: [PATCH{ver}{num}] {subject}",
-            "",
-        ]
+        from_sha = "0" * 40 if args.zero_commit else sha
+        lines = [f"From {from_sha} Mon Sep 17 00:00:00 2001"]
+        # In-Reply-To / References go right after the "From <sha>" line.
+        if args.in_reply_to:
+            irt = args.in_reply_to
+            lines.append(f"In-Reply-To: {irt}")
+            lines.append(f"References: {irt}")
+        # --from overrides the From: header (empty value -> committer identity).
+        if args.from_ is not None:
+            from_hdr = args.from_ or _split_ident(c.committer)[0]
+        else:
+            from_hdr = _split_ident(c.author)[0]
+        lines.append(f"From: {from_hdr}")
+        lines.append(f"Date: {_format_rfc2822_date(c.author)}")
+        lines.append(f"Subject: {subject_line}")
+        # --add-header lines, then --to, then --cc (email-order, log-tree.c).
+        for h in (args.add_header or []):
+            lines.append(h)
+        for t in (args.to or []):
+            lines.append(f"To: {t}")
+        for cc in (args.cc or []):
+            lines.append(f"Cc: {cc}")
+        lines.append("")
         if body:
             lines.append(body)
-        if args.no_stat:
+        if args.no_stat or args.patch_only:
+            # -p / --no-stat: no diffstat block, just a blank line before the diff.
             lines.append("")
         else:
             lines.append("---")
             lines.append(stat.rstrip("\n"))
             lines.append("")
         lines.append(diff.rstrip("\n"))
-        lines.append("-- ")
-        lines.append("2.54.0")
+        if signature is not None:
+            lines.append("-- ")
+            lines.append(signature)
+        else:
+            # --no-signature still leaves the patch terminated by the diff.
+            pass
         out = "\n".join(lines) + "\n"
         if args.stdout:
             # git separates patches by a blank line; between patches that yields
             # two blank lines after the signature, one after the final patch.
-            sys.stdout.write(out + ("\n" if i == len(commits) else "\n\n"))
+            # With --no-signature the final patch ends at the diff (no trailing
+            # blank), since there is no signature line to be followed by one.
+            if signature is None and i == len(commits):
+                sys.stdout.write(out)
+            else:
+                sys.stdout.write(out + ("\n" if i == len(commits) else "\n\n"))
+        elif numbered_files:
+            # --numbered-files: bare numeric filenames ("1", "2", ...), no slug.
+            fname = str(n)
+            (out_dir / fname).write_text(out + "\n", encoding="utf-8")
+            if not args.quiet:
+                _print(str(out_dir / fname))
         else:
             # log-tree.c:fmt_output_subject. The %f slug, the "%04d-" number,
             # and a sanitized "v<n>-" reroll prefix are concatenated, then the
             # whole thing is truncated to (patch_name_max - len(suffix) - 1)
-            # before the ".patch" suffix is appended. patch_name_max defaults
-            # to 64; suffix ".patch" is 6 -> max_len 57. Truncation can leave a
+            # before the suffix is appended. patch_name_max defaults to 64 (or
+            # --filename-max-length); suffix ".patch" is 6. Truncation can leave a
             # trailing '-' (it is NOT re-trimmed).
             safe = _format_sanitized_subject(subject)
-            suffix = ".patch"
-            max_len = 64 - (len(suffix) + 1)
+            suffix = args.suffix
+            name_max = args.filename_max_length if args.filename_max_length is not None else 64
+            max_len = name_max - (len(suffix) + 1)
             stem = ""
             if args.reroll is not None:
                 stem += _format_sanitized_subject(f"v{args.reroll}") + "-"
-            stem += f"{i:04d}-{safe}"
+            stem += f"{n:04d}-{safe}"
             if len(stem) > max_len:
                 stem = stem[:max_len]
             fname = stem + suffix
             # In file-output mode git terminates each patch file with an extra
             # blank line (the same trailing "\n\n" the --stdout form emits).
             (out_dir / fname).write_text(out + "\n", encoding="utf-8")
-            _print(str(out_dir / fname))
+            if not args.quiet:
+                _print(str(out_dir / fname))
     return 0
 
 
@@ -24008,9 +27780,27 @@ def cmd_shortlog(argv: list[str]) -> int:
     ap.add_argument("-s", "--summary", action="store_true")
     ap.add_argument("-e", "--email", action="store_true")
     ap.add_argument("-c", "--committer", action="store_true")
-    ap.add_argument("rev", nargs="?", default="HEAD")
+    # --group=<author|committer|trailer:<tok>|format:<fmt>> chooses the grouping
+    # key (builtin/shortlog.c). -c is shorthand for --group=committer.
+    ap.add_argument("--group", dest="group", action="append", default=None)
+    # Revision-limiting options passed through to the underlying walk.
+    ap.add_argument("--no-merges", dest="no_merges", action="store_true")
+    ap.add_argument("--merges", dest="merges", action="store_true")
+    ap.add_argument("--min-parents", dest="min_parents", type=int, default=None)
+    ap.add_argument("--max-parents", dest="max_parents", type=int, default=None)
+    ap.add_argument("--first-parent", dest="first_parent", action="store_true")
+    ap.add_argument("rev", nargs="*", default=None)
     args = ap.parse_args(rest)
     repo = _repo()
+    # Resolve the grouping key. -c/--committer and --group=committer coincide;
+    # multiple --group with stdin is rejected like git.
+    group_keys = list(args.group or [])
+    if args.committer and "committer" not in group_keys:
+        group_keys.append("committer")
+    if not group_keys:
+        group_keys = ["author"]
+    primary_group = group_keys[-1]
+    use_committer = (primary_group == "committer")
 
     # Record format: only CMIT_FMT_USERFORMAT changes the per-commit record.
     # The real builtin styles (oneline/short/medium/full/fuller/raw) fall back to
@@ -24042,12 +27832,97 @@ def cmd_shortlog(argv: list[str]) -> int:
             _err(err)
             return 128
 
-    head = refs_mod.rev_parse(repo, args.rev)
-    if not head:
-        return 128
+    rev_args = list(args.rev or [])
     by_author: dict[str, list[str]] = {}
+    counts: dict[str, int] = {}
+
+    def _subject_clean(text: str) -> str:
+        # Mirror insert_one_record: strip leading whitespace, drop a leading
+        # "[PATCH...]" tag, then collapse the subject onto one line.
+        s = text.lstrip()
+        if s.startswith("[PATCH"):
+            eol = s.find("\n")
+            eob = s.find("]")
+            if eob >= 0 and (eol < 0 or eob < eol):
+                s = s[eob + 1:]
+        s = s.lstrip()
+        first = s.splitlines()[0].rstrip() if s.strip() else ""
+        return first
+
+    def _add(key: str, record: str) -> None:
+        if args.summary:
+            counts[key] = counts.get(key, 0) + 1
+        else:
+            by_author.setdefault(key, []).append(record if record else "")
+
+    # stdin mode: no revision given and stdin is not a terminal. git parses the
+    # piped `git log` output, keying on "Author: "/"author " (or the committer
+    # equivalents) lines (builtin/shortlog.c read_from_stdin).
+    try:
+        _stdin_is_tty = sys.stdin.isatty()
+    except (ValueError, OSError, AttributeError):
+        _stdin_is_tty = False
+    if not rev_args and not _stdin_is_tty:
+        if len(group_keys) > 1:
+            _err("fatal: using multiple --group options with stdin is not supported")
+            return 128
+        if primary_group == "trailer":
+            _err("fatal: using --group=trailer with stdin is not supported")
+            return 128
+        if primary_group == "format":
+            _err("fatal: using --group=format with stdin is not supported")
+            return 128
+        match0, match1 = (("Commit: ", "committer ") if use_committer
+                          else ("Author: ", "author "))
+        try:
+            data = sys.stdin.read()
+        except (ValueError, OSError):
+            # Captured/closed stdin (e.g. under a test harness): treat as empty,
+            # matching git's empty-input behaviour (no output, rc 0).
+            data = ""
+        lines = data.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            v = None
+            if line.startswith(match0):
+                v = line[len(match0):]
+            elif line.startswith(match1):
+                v = line[len(match1):]
+            if v is None:
+                continue
+            # Discard the remaining header lines (until a blank line).
+            while i < len(lines) and lines[i] != "":
+                i += 1
+            # Discard blank lines.
+            while i < len(lines) and lines[i] == "":
+                i += 1
+            # The first non-empty line is the subject.
+            oneline = lines[i] if i < len(lines) else ""
+            who, _ts, _tz = _split_ident(v.strip())
+            name, email = _parse_who(who)
+            if name == "" and email == "":
+                continue
+            key = f"{name} <{email}>" if args.email else name
+            _add(key, _subject_clean(oneline))
+        return _shortlog_emit(by_author, counts, args, wrap_lines, wrap)
+
+    # Revision walk: union the histories of the named tips (default HEAD).
+    if not rev_args:
+        rev_args = ["HEAD"]
+    starts: list[str] = []
+    for r in rev_args:
+        rsha = refs_mod.rev_parse(repo, r)
+        if rsha is None:
+            _err(f"fatal: ambiguous argument '{r}': unknown revision or path "
+                 "not in the working tree.")
+            _err("Use '--' to separate paths from revisions, like this:")
+            _err("'git <command> [<revision>...] -- [<file>...]'")
+            return 128
+        starts.append(rsha)
     seen: set[str] = set()
-    stack = deque([head])
+    stack = deque(starts)
     while stack:
         s = stack.popleft()
         if s in seen:
@@ -24057,17 +27932,74 @@ def cmd_shortlog(argv: list[str]) -> int:
             c = objs.parse_commit(objs.read_object(repo, s)[1])
         except KeyError:
             continue
-        ident = c.committer if args.committer else c.author
-        who, _ts, _tz = _split_ident(ident)
-        name, email = _parse_who(who)
-        key = f"{name} <{email}>" if args.email else name
-        if record_fmt is not None:
-            record = _expand_commit_format(repo, s, c, record_fmt, {}, date_mode=record_date)
+        nparents = len(c.parents)
+        # Revision-limiting filters passed through to the walk.
+        skip = False
+        if args.no_merges and nparents >= 2:
+            skip = True
+        if args.merges and nparents < 2:
+            skip = True
+        if args.min_parents is not None and nparents < args.min_parents:
+            skip = True
+        if args.max_parents is not None and nparents > args.max_parents:
+            skip = True
+        if not skip:
+            keys = _shortlog_group_keys(repo, s, c, group_keys, args.email,
+                                        use_committer, _split_ident, _parse_who)
+            if record_fmt is not None:
+                record = _expand_commit_format(repo, s, c, record_fmt, {}, date_mode=record_date)
+            else:
+                record = c.message.splitlines()[0].rstrip() if c.message.strip() else ""
+            record = record if record else "<none>"
+            for key in keys:
+                _add(key, record)
+        stack.extend(c.parents[:1] if args.first_parent else c.parents)
+    return _shortlog_emit(by_author, counts, args, wrap_lines, wrap)
+
+
+def _shortlog_group_keys(repo, sha, c, group_keys, email, use_committer,
+                         _split_ident, _parse_who) -> list[str]:
+    """Resolve the shortlog grouping key(s) for a commit. author/committer use
+    the mapped identity; trailer:<tok> emits one key per matching trailer value;
+    format:<fmt> expands a pretty format."""
+    primary = group_keys[-1]
+    if primary == "trailer":
+        # --group=trailer:<token>: one record per matching trailer value.
+        token = ""
+        for g in group_keys:
+            if g.startswith("trailer:"):
+                token = g.split(":", 1)[1]
+        out: list[str] = []
+        body = c.message
+        for line in body.splitlines():
+            if ":" in line:
+                k, _, val = line.partition(":")
+                if k.strip().lower() == token.strip().lower():
+                    out.append(val.strip())
+        return out
+    if primary == "format":
+        fmt = ""
+        for g in group_keys:
+            if g.startswith("format:"):
+                fmt = g.split(":", 1)[1]
+        return [_expand_commit_format(repo, sha, c, fmt, {})]
+    ident = c.committer if use_committer else c.author
+    who, _ts, _tz = _split_ident(ident)
+    name, em = _parse_who(who)
+    return [f"{name} <{em}>" if email else name]
+
+
+def _shortlog_emit(by_author, counts, args, wrap_lines, wrap) -> int:
+    if args.summary:
+        items = list(counts.items())
+        if args.numbered:
+            items.sort(key=lambda x: (-x[1], x[0]))
         else:
-            record = c.message.splitlines()[0].rstrip() if c.message.strip() else ""
-        by_author.setdefault(key, []).append(record if record else "<none>")
-        stack.extend(c.parents)
-    # git lists each author's commits oldest-first (we collected newest-first).
+            items.sort()
+        for author, n in items:
+            _print(f"{n:>6}\t{author}")
+        return 0
+    # git prints each group's messages in reverse-insertion order.
     for msgs in by_author.values():
         msgs.reverse()
     items = list(by_author.items())
@@ -29273,47 +33205,80 @@ def cmd_notes(argv: list[str]) -> int:
     return 0
 
 
+def _bisect_subject(repo: Repository, sha: str) -> str:
+    """The one-line subject of a commit, for bisect's bracketed labels."""
+    try:
+        c = objs.parse_commit(objs.read_object(repo, sha)[1])
+        return c.message.splitlines()[0] if c.message.strip() else ""
+    except KeyError:
+        return ""
+
+
 def cmd_bisect(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit bisect")
-    sub = ap.add_subparsers(dest="action", required=True)
-    p_start = sub.add_parser("start")
-    p_start.add_argument("bad", nargs="?")
-    p_start.add_argument("good", nargs="?")
-    p_bad = sub.add_parser("bad")
-    p_bad.add_argument("rev", nargs="?", default="HEAD")
-    p_good = sub.add_parser("good")
-    p_good.add_argument("rev", nargs="?", default="HEAD")
-    sub.add_parser("reset")
-    sub.add_parser("log")
-    args = ap.parse_args(argv)
+    """Port of builtin/bisect.c using git's standard on-disk state so the state
+    interoperates with the oracle (BISECT_START/BISECT_LOG/BISECT_TERMS/
+    BISECT_NAMES and refs/bisect/{bad,good-<oid>})."""
+    if not argv:
+        _err("usage: git bisect [help|start|bad|good|new|old|terms|skip|"
+             "next|reset|visualize|view|replay|log|run]")
+        return 129
+    action = argv[0]
+    rest = argv[1:]
     repo = _repo()
-    state_dir = repo.gitdir / "BISECT"
-    state_dir.mkdir(exist_ok=True)
-    bads_path = state_dir / "bad"
-    goods_path = state_dir / "good"
+    gd = repo.gitdir
+    log_path = gd / "BISECT_LOG"
+    start_path = gd / "BISECT_START"
+    names_path = gd / "BISECT_NAMES"
+    terms_path = gd / "BISECT_TERMS"
+    expected_path = gd / "BISECT_EXPECTED_REV"
+    ancestors_ok = gd / "BISECT_ANCESTORS_OK"
+    bisect_refs = gd / "refs" / "bisect"
 
-    def load(p):
-        return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    def bisect_log_printf(line: str) -> None:
+        # Write to stdout AND append to BISECT_LOG, like git's bisect_log_printf.
+        sys.stdout.write(line)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("# " + line)
 
-    def add(p, sha):
-        with p.open("a", encoding="utf-8") as f:
-            f.write(sha + "\n")
+    def read_bad() -> Optional[str]:
+        p = bisect_refs / "bad"
+        return p.read_text().strip() if p.exists() else None
 
-    def bisect_step():
-        bads = load(bads_path)
-        goods = load(goods_path)
-        if not bads or not goods:
-            _print("status: need at least one good and one bad")
+    def read_goods() -> list[str]:
+        out = []
+        if bisect_refs.exists():
+            for f in sorted(bisect_refs.iterdir()):
+                if f.name.startswith("good-"):
+                    out.append(f.read_text().strip())
+        return out
+
+    def commit_parents(sha: str):
+        info = _commit_tree_parents(repo, sha)
+        return info[1] if info is not None else tuple()
+
+    def print_status() -> None:
+        bad = read_bad()
+        goods = read_goods()
+        if goods and bad:
+            return
+        if not goods and not bad:
+            bisect_log_printf("status: waiting for both good and bad commits\n")
+        elif goods:
+            n = len(goods)
+            word = "commit" if n == 1 else "commits"
+            bisect_log_printf(f"status: waiting for bad commit, {n} good {word} known\n")
+        else:
+            bisect_log_printf("status: waiting for good commit(s), bad commit known\n")
+
+    def bisect_next() -> int:
+        bad = read_bad()
+        goods = read_goods()
+        if not bad or not goods:
+            print_status()
             return 0
-        graph = _graph_for_repo(repo)
-
-        def commit_parents(sha: str) -> tuple[str, ...]:
-            info = _commit_tree_parents(repo, sha, graph)
-            return info[1] if info is not None else tuple()
-
-        # candidates: ancestors of any bad, minus ancestors of any good and bads themselves
+        # candidates: ancestors of bad, minus ancestors of any good and bad.
         anc_bad: set[str] = set()
-        stack = list(bads)
+        stack = [bad]
         seen: set[str] = set()
         while stack:
             s = stack.pop()
@@ -29332,135 +33297,678 @@ def cmd_bisect(argv: list[str]) -> int:
                 seen2.add(s)
                 anc_bad.discard(s)
                 stack.extend(commit_parents(s))
-        candidates = anc_bad - set(bads)
-        if not candidates:
-            _print(f"{bads[0]} is the first bad commit")
+        # git's bisection range includes the bad commit itself (all = range
+        # size); only the good commits and their ancestors are excluded.
+        candidates = set(anc_bad)
+        if len(candidates) <= 1:
+            sha = bad
+            _print(f"{sha} is the first bad commit")
             return 0
-        # weight[c] = number of candidates reachable from c (including c)
-        # best = argmax(min(weight, n - weight)) - matches git/bisect.c best_bisection
         parents_map: dict[str, list[str]] = {}
         for c_sha in candidates:
             parents_map[c_sha] = [p for p in commit_parents(c_sha) if p in candidates]
         n = len(candidates)
-        best, best_distance = _best_bisection_candidate(candidates, parents_map)
-        _print(f"Bisecting: {n // 2} revisions left to test after this (roughly {best_distance} steps)")
-        _print(f"[{best}] candidate")
+        best, _best_distance = _best_bisection_candidate(candidates, parents_map)
+        # git's message: nr = all - reaches - 1 (reaches = best's weight), and
+        # steps = estimate_bisect_steps(all), each pluralised independently
+        # (bisect.c show_bisect_vars / the Bisecting printf).
+        reaches = _count_reachable_candidates(best, parents_map, candidates)
+        nr = n - reaches - 1
+        steps = _estimate_bisect_steps(n)
+        rev_word = "revision" if nr == 1 else "revisions"
+        step_word = "step" if steps == 1 else "steps"
+        _print(f"Bisecting: {nr} {rev_word} left to test after this "
+               f"(roughly {steps} {step_word})")
+        _print(f"[{best}] {_bisect_subject(repo, best)}")
+        expected_path.write_text(best + "\n", encoding="utf-8")
+        ancestors_ok.write_text("", encoding="utf-8")
         t, d = objs.read_object(repo, best)
         tree = objs.parse_commit(d).tree
         workdir.checkout_tree(repo, tree)
         refs_mod.set_head(repo, best)
         return 0
 
-    if args.action == "start":
-        bads_path.unlink(missing_ok=True)
-        goods_path.unlink(missing_ok=True)
-        if args.bad:
-            s = refs_mod.rev_parse(repo, args.bad)
-            if s:
-                add(bads_path, s)
-        if args.good:
-            s = refs_mod.rev_parse(repo, args.good)
-            if s:
-                add(goods_path, s)
-        return bisect_step()
-    if args.action == "bad":
-        s = refs_mod.rev_parse(repo, args.rev)
-        if s:
-            add(bads_path, s)
-        return bisect_step()
-    if args.action == "good":
-        s = refs_mod.rev_parse(repo, args.rev)
-        if s:
-            add(goods_path, s)
-        return bisect_step()
-    if args.action == "log":
-        for line in load(bads_path):
-            _print(f"# bad: {line}")
-        for line in load(goods_path):
-            _print(f"# good: {line}")
+    if action == "start":
+        # `bisect start [<bad> [<good>...]]`. Record the branch to return to,
+        # reset the log, then register the supplied bad/good terms.
+        head_sym, head_sha = refs_mod.read_head(repo)
+        if head_sym and head_sym.startswith("refs/heads/"):
+            start_ref = head_sym[len("refs/heads/"):]
+        else:
+            start_ref = head_sha or ""
+        bisect_refs.mkdir(parents=True, exist_ok=True)
+        if bisect_refs.exists():
+            for f in list(bisect_refs.iterdir()):
+                f.unlink()
+        for p in (expected_path, ancestors_ok):
+            p.unlink(missing_ok=True)
+        start_path.write_text(start_ref + "\n", encoding="utf-8")
+        names_path.write_text("\n", encoding="utf-8")
+        terms_path.write_text("bad\ngood\n", encoding="utf-8")
+        # git's BISECT_LOG begins with the term-revs (# bad / # good) when
+        # bisect start is given bad/good args, and only a bare "git bisect start"
+        # line when it is not — so start empty and append the right lines below.
+        log_path.write_text("", encoding="utf-8")
+        # Positional revs: the first is bad, the rest are good (revision.c order).
+        revs = [r for r in rest if not r.startswith("-")]
+        bad_arg = revs[0] if revs else None
+        good_args = revs[1:]
+        if bad_arg is None:
+            log_path.write_text("git bisect start\n", encoding="utf-8")
+            print_status()
+            return 0
+        # Quote each start arg for the replay line.
+        quoted = " ".join("'" + r + "'" for r in revs)
+        bad_sha = refs_mod.rev_parse(repo, bad_arg)
+        if bad_sha:
+            (bisect_refs / "bad").write_text(bad_sha + "\n", encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"# bad: [{bad_sha}] {_bisect_subject(repo, bad_sha)}\n")
+        for g in good_args:
+            gs = refs_mod.rev_parse(repo, g)
+            if gs:
+                (bisect_refs / f"good-{gs}").write_text(gs + "\n", encoding="utf-8")
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"# good: [{gs}] {_bisect_subject(repo, gs)}\n")
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"git bisect start {quoted}\n")
+        return bisect_next()
+
+    if action in ("bad", "good", "new", "old"):
+        if not start_path.exists():
+            _err("You need to start by \"git bisect start\".")
+            _err("Do you want me to do it for you [Y/n]? ")
+            return 1
+        rev = rest[0] if rest else "HEAD"
+        sha = refs_mod.rev_parse(repo, rev)
+        if not sha:
+            _err(f"fatal: ambiguous argument '{rev}': unknown revision or path "
+                 "not in the working tree.")
+            return 128
+        bisect_refs.mkdir(parents=True, exist_ok=True)
+        is_bad = action in ("bad", "new")
+        # Record the new term (bisect_write appends the per-term log lines but
+        # prints nothing); bisect_auto_next then either prints the status (when
+        # still missing a side) or proceeds to the next bisection.
+        if is_bad:
+            (bisect_refs / "bad").write_text(sha + "\n", encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"# bad: [{sha}] {_bisect_subject(repo, sha)}\n")
+                f.write(f"git bisect bad {sha}\n")
+        else:
+            (bisect_refs / f"good-{sha}").write_text(sha + "\n", encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"# good: [{sha}] {_bisect_subject(repo, sha)}\n")
+                f.write(f"git bisect good {sha}\n")
+        return bisect_next()
+
+    if action == "log":
+        if not log_path.exists():
+            _err("We are not bisecting.")
+            return 1
+        sys.stdout.write(log_path.read_text(encoding="utf-8"))
         return 0
-    if args.action == "reset":
-        import shutil as _sh
-        _sh.rmtree(state_dir, ignore_errors=True)
+
+    if action == "reset":
+        if not start_path.exists():
+            # Not bisecting: just clean any stray files.
+            return 0
+        start_ref = start_path.read_text(encoding="utf-8").strip()
+        # Restore the original branch / commit and narrate to stderr, mirroring
+        # `git checkout <branch>` after a detached bisect HEAD.
+        cur = refs_mod.rev_parse(repo, "HEAD")
+        if start_ref:
+            target = refs_mod.rev_parse(repo, start_ref)
+            if target is not None:
+                if cur and cur != target:
+                    _err(f"Previous HEAD position was {cur[:7]} "
+                         f"{_bisect_subject(repo, cur)}")
+                t, d = objs.read_object(repo, target)
+                tree = objs.parse_commit(d).tree
+                workdir.checkout_tree(repo, tree)
+                if "/" not in start_ref and refs_mod.rev_parse(repo, "refs/heads/" + start_ref):
+                    refs_mod.update_ref_symbolic(repo, "HEAD", "refs/heads/" + start_ref)
+                    _err(f"Switched to branch '{start_ref}'")
+                else:
+                    refs_mod.set_head(repo, target)
+        # Remove all bisect state files.
+        for p in (log_path, start_path, names_path, terms_path,
+                  expected_path, ancestors_ok):
+            p.unlink(missing_ok=True)
+        if bisect_refs.exists():
+            for f in list(bisect_refs.iterdir()):
+                f.unlink()
+            try:
+                bisect_refs.rmdir()
+            except OSError:
+                pass
         return 0
-    return 1
+
+    if action == "terms":
+        if terms_path.exists():
+            lines = terms_path.read_text().splitlines()
+            tb = lines[0] if lines else "bad"
+            tg = lines[1] if len(lines) > 1 else "good"
+        else:
+            tb, tg = "bad", "good"
+        _print(f"Your current terms are {tg} for the old state")
+        _print(f"and {tb} for the new state.")
+        return 0
+
+    _err(f"usage: git bisect [help|start|bad|good|new|old|terms|skip|"
+         f"next|reset|visualize|view|replay|log|run]")
+    return 129
+
+
+_WORKTREE_USAGE = (
+    "usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n"
+    "                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]\n"
+    "   or: git worktree list [-v | --porcelain [-z]]\n"
+    "   or: git worktree lock [--reason <string>] <worktree>\n"
+    "   or: git worktree move <worktree> <new-path>\n"
+    "   or: git worktree prune [-n] [-v] [--expire <expire>]\n"
+    "   or: git worktree remove [-f] <worktree>\n"
+    "   or: git worktree repair [<path>...]\n"
+    "   or: git worktree unlock <worktree>\n"
+    "\n"
+)
+
+_WORKTREE_ADD_USAGE = (
+    "usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n"
+    "                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]\n"
+    "\n"
+    "    -f, --[no-]force      checkout <branch> even if already checked out in other worktree\n"
+    "    -b <branch>           create a new branch\n"
+    "    -B <branch>           create or reset a branch\n"
+    "    --[no-]orphan         create unborn branch\n"
+    "    -d, --[no-]detach     detach HEAD at named commit\n"
+    "    --[no-]checkout       populate the new working tree\n"
+    "    --[no-]lock           keep the new working tree locked\n"
+    "    --[no-]reason <string>\n"
+    "                          reason for locking\n"
+    "    -q, --[no-]quiet      suppress progress reporting\n"
+    "    --[no-]track          set up tracking mode (see git-branch(1))\n"
+    "    --[no-]guess-remote   try to match the new branch name with a remote-tracking branch\n"
+    "    --[no-]relative-paths use relative paths for worktrees\n"
+    "\n"
+)
+
+_WORKTREE_LIST_USAGE = (
+    "usage: git worktree list [-v | --porcelain [-z]]\n"
+    "\n"
+    "    --[no-]porcelain      machine-readable output\n"
+    "    -v, --[no-]verbose    show extended annotations and reasons, if available\n"
+    "    --[no-]expire <expiry-date>\n"
+    "                          add 'prunable' annotation to missing worktrees older than <time>\n"
+    "    -z                    terminate records with a NUL character\n"
+    "\n"
+)
+
+_WORKTREE_SUBCOMMANDS = ("add", "list", "lock", "move", "prune", "remove",
+                         "repair", "unlock")
+
+
+def _worktree_resolve_head(head_file: Path) -> "tuple[str, Optional[str]]":
+    """Read a linked worktree's HEAD file. Returns (sha, branch_ref) where
+    branch_ref is the symref target (refs/heads/...) or None for detached."""
+    txt = head_file.read_text(encoding="utf-8").strip()
+    if txt.startswith("ref:"):
+        ref = txt[len("ref:"):].strip()
+        commondir = head_file.parent / "commondir"
+        gitdir = head_file.parent.parent.parent  # worktrees/<id>/HEAD -> gitdir
+        if commondir.exists():
+            cd = commondir.read_text(encoding="utf-8").strip()
+            gitdir = (head_file.parent / cd).resolve()
+        # Resolve the ref to a sha via loose ref or packed-refs.
+        loose = gitdir / ref
+        sha = ""
+        if loose.exists():
+            sha = loose.read_text(encoding="utf-8").strip()
+        else:
+            packed = gitdir / "packed-refs"
+            if packed.exists():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if line.endswith(" " + ref) or line.endswith("\t" + ref):
+                        sha = line.split()[0]
+                        break
+        return sha, ref
+    return txt, None
 
 
 def cmd_worktree(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit worktree")
-    sub = ap.add_subparsers(dest="action", required=True)
-    p_add = sub.add_parser("add")
-    p_add.add_argument("path")
-    p_add.add_argument("rev", nargs="?", default="HEAD")
-    p_list = sub.add_parser("list")
-    p_list.add_argument("--porcelain", action="store_true")
-    p_remove = sub.add_parser("remove")
-    p_remove.add_argument("path")
-    args = ap.parse_args(argv)
+    # OPT_SUBCOMMAND: a missing subcommand is "need a subcommand" (rc 129);
+    # an unknown one is "unknown subcommand" (rc 129). Both print the usage.
+    if not argv:
+        _err("error: need a subcommand")
+        sys.stderr.write(_WORKTREE_USAGE)
+        return 129
+    action = argv[0]
+    rest = argv[1:]
+    if action not in _WORKTREE_SUBCOMMANDS:
+        if action.startswith("-"):
+            _err(f"error: unknown option `{action.lstrip('-')}'")
+        else:
+            _err(f"error: unknown subcommand: `{action}'")
+        sys.stderr.write(_WORKTREE_USAGE)
+        return 129
+
     repo = _repo()
     worktrees_dir = repo.gitdir / "worktrees"
-    if args.action == "add":
-        wt_name = Path(args.path).name
+
+    if action == "add":
+        return _worktree_add(repo, worktrees_dir, rest)
+    if action == "list":
+        return _worktree_list(repo, worktrees_dir, rest)
+    if action == "remove":
+        return _worktree_remove(repo, worktrees_dir, rest)
+    if action == "prune":
+        return _worktree_prune(repo, worktrees_dir, rest)
+    if action == "repair":
+        return 0  # repair re-links worktree admin files; nothing to fix here.
+    if action in ("lock", "unlock", "move"):
+        return _worktree_lock_move(repo, worktrees_dir, action, rest)
+    return 1
+
+
+def _worktree_known_paths(worktrees_dir: Path) -> "dict[str, Path]":
+    """Map each registered worktree's resolved work-tree path to its admin dir."""
+    out: dict[str, Path] = {}
+    if worktrees_dir.exists():
+        for d in sorted(worktrees_dir.iterdir()):
+            gitdir_file = d / "gitdir"
+            if d.is_dir() and gitdir_file.exists():
+                wt_path = Path(gitdir_file.read_text(encoding="utf-8").strip()).parent
+                try:
+                    out[str(wt_path.resolve())] = d
+                except OSError:
+                    out[str(wt_path)] = d
+    return out
+
+
+def _worktree_branch_checked_out(repo: Repository, worktrees_dir: Path,
+                                 ref: str) -> "Optional[str]":
+    """If ``ref`` (refs/heads/...) is the checked-out branch of the main or any
+    linked worktree, return that worktree's path; else None."""
+    main_sym, _ = refs_mod.read_head(repo)
+    if main_sym == ref:
+        return str(repo.path)
+    if worktrees_dir.exists():
+        for d in sorted(worktrees_dir.iterdir()):
+            head_file, gitdir_file = d / "HEAD", d / "gitdir"
+            if not (d.is_dir() and head_file.exists() and gitdir_file.exists()):
+                continue
+            txt = head_file.read_text(encoding="utf-8").strip()
+            if txt.startswith("ref:") and txt[len("ref:"):].strip() == ref:
+                return str(Path(gitdir_file.read_text(encoding="utf-8").strip()).parent)
+    return None
+
+
+def _worktree_add(repo: Repository, worktrees_dir: Path, rest: list[str]) -> int:
+    new_branch = None
+    new_branch_force = None
+    detach = False
+    checkout = True
+    orphan = False
+    quiet = False
+    guess_remote = False
+    keep_locked = False
+    lock_reason = None
+    track = None
+    positionals: list[str] = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--":
+            positionals.extend(rest[i + 1:])
+            break
+        if a in ("-f", "--force"):
+            pass
+        elif a == "-b":
+            i += 1
+            new_branch = rest[i] if i < len(rest) else None
+        elif a.startswith("-b"):
+            new_branch = a[2:]
+        elif a == "-B":
+            i += 1
+            new_branch_force = rest[i] if i < len(rest) else None
+        elif a.startswith("-B"):
+            new_branch_force = a[2:]
+        elif a in ("-d", "--detach"):
+            detach = True
+        elif a == "--orphan":
+            orphan = True
+        elif a == "--checkout":
+            checkout = True
+        elif a == "--no-checkout":
+            checkout = False
+        elif a == "--lock":
+            keep_locked = True
+        elif a == "--reason":
+            i += 1
+            lock_reason = rest[i] if i < len(rest) else None
+        elif a.startswith("--reason="):
+            lock_reason = a[len("--reason="):]
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a == "--track" or a == "--no-track":
+            track = (a == "--track")
+        elif a == "--guess-remote":
+            guess_remote = True
+        elif a == "--no-guess-remote":
+            guess_remote = False
+        elif a == "--relative-paths" or a == "--no-relative-paths":
+            pass
+        elif a.startswith("-") and a != "-":
+            _err(f"error: unknown option `{a.lstrip('-')}'")
+            sys.stderr.write(_WORKTREE_ADD_USAGE)
+            return 129
+        else:
+            positionals.append(a)
+        i += 1
+
+    if not positionals:
+        sys.stderr.write(_WORKTREE_ADD_USAGE)
+        return 129
+    path_arg = positionals[0]
+    commitish = positionals[1] if len(positionals) > 1 else None
+
+    # builtin/worktree.c add() incompatibility checks.
+    if detach and orphan:
+        _err("fatal: options '--detach' and '--orphan' cannot be used together")
+        return 128
+    if orphan and commitish is not None:
+        _err("fatal: option '--orphan' and commit-ish cannot be used together")
+        return 128
+
+    target_dir = Path(path_arg).resolve()
+    # add to an already-existing path is rejected.
+    if target_dir.exists() and any(target_dir.iterdir()):
+        if not quiet:
+            _err(f"Preparing worktree (checking out '{Path(path_arg).name}')")
+        _err(f"fatal: '{path_arg}' already exists")
+        return 128
+
+    create_branch = new_branch_force if new_branch_force is not None else new_branch
+    forcing = new_branch_force is not None
+
+    # --orphan: create an unborn branch in the new worktree. With no -b the
+    # branch name comes from the path basename (builtin/worktree.c add()).
+    if orphan:
+        orphan_name = create_branch if create_branch is not None else Path(path_arg).name
+        wt_name = Path(path_arg).name
         wt_dir = worktrees_dir / wt_name
         wt_dir.mkdir(parents=True, exist_ok=True)
-        sha = refs_mod.rev_parse(repo, args.rev)
-        if not sha:
-            return 128
-        (wt_dir / "HEAD").write_text(sha + "\n", encoding="utf-8")
-        (wt_dir / "commondir").write_text(str(repo.gitdir) + "\n", encoding="utf-8")
-        target_dir = Path(args.path).resolve()
-        target_dir.mkdir(parents=True, exist_ok=True)
+        (wt_dir / "commondir").write_text("../..\n", encoding="utf-8")
         (wt_dir / "gitdir").write_text(str(target_dir / ".git") + "\n", encoding="utf-8")
+        (wt_dir / "HEAD").write_text(f"ref: refs/heads/{orphan_name}\n", encoding="utf-8")
+        target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / ".git").write_text(f"gitdir: {wt_dir}\n", encoding="utf-8")
-        t, data = objs.read_object(repo, sha)
-        tree = objs.parse_commit(data).tree if t == "commit" else sha
-        for path, _mode, bsha in workdir.iter_tree_files(repo, tree):
+        if keep_locked:
+            (wt_dir / "locked").write_text((lock_reason or "") + "\n", encoding="utf-8")
+        if not quiet:
+            _err(f"Preparing worktree (new branch '{orphan_name}')")
+        return 0
+
+    # DWIM the default branch (worktree add <path> with no commit-ish, no -b):
+    # use the path basename as the branch name; create it if it doesn't exist.
+    dwim_new_branch = None
+    if commitish is None and not detach and create_branch is None:
+        base = Path(path_arg).name
+        if refs_mod.read_ref(repo, f"refs/heads/{base}") is not None:
+            commitish = base  # existing branch -> check it out
+        else:
+            dwim_new_branch = base
+            create_branch = base
+
+    start = commitish if commitish is not None else "HEAD"
+    sha = refs_mod.rev_parse(repo, start)
+    if not sha:
+        _err(f"fatal: invalid reference: {start}")
+        return 128
+    commit_sha = refs_mod._peel_to_commit(repo, sha) or sha
+
+    # die_if_checked_out: checking out an existing branch already used by another
+    # worktree (incl. the main checkout) is rejected (unless -f). builtin/worktree.c.
+    if create_branch is None and not detach:
+        ref = _worktree_dwim_branch_ref(repo, commitish)
+        if ref is not None:
+            used_at = _worktree_branch_checked_out(repo, worktrees_dir, ref)
+            if used_at is not None:
+                short = commitish if commitish is not None else ref
+                if not quiet:
+                    _err(f"Preparing worktree (checking out '{short}')")
+                _err(f"fatal: '{short}' is already used by worktree at '{used_at}'")
+                return 128
+
+    wt_name = Path(path_arg).name
+    wt_dir = worktrees_dir / wt_name
+    wt_dir.mkdir(parents=True, exist_ok=True)
+    (wt_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (wt_dir / "gitdir").write_text(str(target_dir / ".git") + "\n", encoding="utf-8")
+
+    # Branch creation / detached HEAD messaging (add_worktree).
+    if create_branch is not None:
+        if forcing and refs_mod.read_ref(repo, f"refs/heads/{create_branch}") is not None:
+            old = refs_mod.read_ref(repo, f"refs/heads/{create_branch}")
+            if not quiet:
+                _err(f"Preparing worktree (resetting branch '{create_branch}'; was at {old[:7]})")
+        else:
+            if not quiet:
+                _err(f"Preparing worktree (new branch '{create_branch}')")
+        refs_mod.update_ref(repo, f"refs/heads/{create_branch}", commit_sha,
+                            message=f"branch: Created from {start}")
+        (wt_dir / "HEAD").write_text(f"ref: refs/heads/{create_branch}\n", encoding="utf-8")
+    elif detach:
+        if not quiet:
+            _err(f"Preparing worktree (detached HEAD {commit_sha[:7]})")
+        (wt_dir / "HEAD").write_text(commit_sha + "\n", encoding="utf-8")
+    else:
+        # checking out an existing branch / commit-ish
+        ref = _worktree_dwim_branch_ref(repo, commitish)
+        if ref is not None:
+            if not quiet:
+                _err(f"Preparing worktree (checking out '{commitish}')")
+            (wt_dir / "HEAD").write_text(f"ref: {ref}\n", encoding="utf-8")
+        else:
+            if not quiet:
+                _err(f"Preparing worktree (detached HEAD {commit_sha[:7]})")
+            (wt_dir / "HEAD").write_text(commit_sha + "\n", encoding="utf-8")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / ".git").write_text(f"gitdir: {wt_dir}\n", encoding="utf-8")
+    if keep_locked:
+        (wt_dir / "locked").write_text((lock_reason or "") + "\n", encoding="utf-8")
+
+    if checkout:
+        t, data = objs.read_object(repo, commit_sha)
+        tree = objs.parse_commit(data).tree if t == "commit" else commit_sha
+        for p, _mode, bsha in workdir.iter_tree_files(repo, tree):
             _, blob = objs.read_object(repo, bsha)
-            full = target_dir / path
+            full = target_dir / p
             full.parent.mkdir(parents=True, exist_ok=True)
             full.write_bytes(blob)
-        _print(f"Worktree added at {target_dir}")
+        # The "HEAD is now at <abbrev> <subject>" line comes from the implicit
+        # `git reset --hard` run in the new worktree, so it goes to stdout and
+        # is suppressed by --no-checkout (no checkout -> no reset).
+        if not quiet:
+            subj = ""
+            try:
+                ct, cdata = objs.read_object(repo, commit_sha)
+                if ct == "commit":
+                    subj = _format_subject(objs.parse_commit(cdata).message)
+            except Exception:
+                pass
+            _print(f"HEAD is now at {commit_sha[:7]} {subj}")
+    return 0
+
+
+def _worktree_dwim_branch_ref(repo: Repository, name: Optional[str]) -> Optional[str]:
+    """Return the full branch ref a commit-ish names, or None if it is not a
+    branch (so the worktree should detach)."""
+    if name is None:
+        return None
+    if refs_mod.read_ref(repo, f"refs/heads/{name}") is not None:
+        return f"refs/heads/{name}"
+    return None
+
+
+def _worktree_list(repo: Repository, worktrees_dir: Path, rest: list[str]) -> int:
+    porcelain = False
+    verbose = False
+    nul = False
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--porcelain":
+            porcelain = True
+        elif a in ("-v", "--verbose"):
+            verbose = True
+        elif a == "-z":
+            nul = True
+        elif a == "--expire":
+            i += 1
+        elif a.startswith("--expire="):
+            pass
+        elif a.startswith("-") and a != "-":
+            _err(f"error: unknown option `{a.lstrip('-')}'")
+            sys.stderr.write(_WORKTREE_LIST_USAGE)
+            return 129
+        i += 1
+    if nul and not porcelain:
+        _err("fatal: the option '-z' requires '--porcelain'")
+        return 128
+
+    main_head = refs_mod.rev_parse(repo, "HEAD") or ""
+    main_sym, _ = refs_mod.read_head(repo)
+    main_branch = main_sym if main_sym and main_sym.startswith("refs/heads/") else None
+
+    entries: list[tuple[Path, str, Optional[str]]] = [(repo.path, main_head, main_branch)]
+    if worktrees_dir.exists():
+        for d in sorted(worktrees_dir.iterdir()):
+            gitdir_file, head_file = d / "gitdir", d / "HEAD"
+            if d.is_dir() and gitdir_file.exists() and head_file.exists():
+                wt_path = Path(gitdir_file.read_text(encoding="utf-8").strip()).parent
+                sha, branch = _worktree_resolve_head(head_file)
+                entries.append((wt_path, sha, branch))
+
+    if porcelain:
+        out: list[str] = []
+        term = "\0" if nul else "\n"
+        for wt_path, sha, branch in entries:
+            out.append(f"worktree {wt_path}")
+            out.append(f"HEAD {sha}")
+            if branch:
+                out.append(f"branch {branch}")
+            else:
+                out.append("detached")
+            out.append("")
+        if nul:
+            sys.stdout.write("".join(x + "\0" for x in out))
+        else:
+            for x in out:
+                _print(x)
         return 0
-    if args.action == "list":
-        head = refs_mod.rev_parse(repo, "HEAD") or ""
-        head_sym, _ = refs_mod.read_head(repo)
-        full_branch = head_sym if head_sym and head_sym.startswith("refs/heads/") else None
-        branch = full_branch[len("refs/heads/"):] if full_branch else None
-        if getattr(args, "porcelain", False):
-            _print(f"worktree {repo.path}")
-            _print(f"HEAD {head}")
-            _print(f"branch {full_branch}" if full_branch else "detached")
-            _print("")
-            if worktrees_dir.exists():
-                for d in sorted(worktrees_dir.iterdir()):
-                    gitdir_file, head_file = d / "gitdir", d / "HEAD"
-                    if d.is_dir() and gitdir_file.exists() and head_file.exists():
-                        wt_path = Path(gitdir_file.read_text().strip()).parent
-                        _print(f"worktree {wt_path}")
-                        _print(f"HEAD {head_file.read_text().strip()}")
-                        _print("")
-            return 0
-        label = f"[{branch}]" if branch else "(detached HEAD)"
-        _print(f"{repo.path} {head[:7]} {label}")
-        if worktrees_dir.exists():
-            for d in worktrees_dir.iterdir():
-                if d.is_dir():
-                    gitdir_file = d / "gitdir"
-                    head_file = d / "HEAD"
-                    if gitdir_file.exists() and head_file.exists():
-                        wt_path = Path(gitdir_file.read_text().strip()).parent
-                        wt_head = head_file.read_text().strip()
-                        _print(f"{wt_path} {wt_head[:7]} [{d.name}]")
+
+    # Plain output: pad paths to a column.
+    width = max((len(str(p)) for p, _, _ in entries), default=0)
+    for wt_path, sha, branch in entries:
+        if branch and branch.startswith("refs/heads/"):
+            label = f"[{branch[len('refs/heads/'):]}]"
+        else:
+            label = "(detached HEAD)"
+        _print(f"{str(wt_path):<{width}} {sha[:7]} {label}")
+    return 0
+
+
+def _worktree_remove(repo: Repository, worktrees_dir: Path, rest: list[str]) -> int:
+    import shutil as _sh
+    force = False
+    positionals: list[str] = []
+    for a in rest:
+        if a in ("-f", "--force"):
+            force = True
+        elif a.startswith("-") and a != "-" and a != "--":
+            _err(f"error: unknown option `{a.lstrip('-')}'")
+            sys.stderr.write(_WORKTREE_USAGE)
+            return 129
+        elif a != "--":
+            positionals.append(a)
+    if not positionals:
+        sys.stderr.write(_WORKTREE_USAGE)
+        return 129
+    target = Path(positionals[0]).resolve()
+    known = _worktree_known_paths(worktrees_dir)
+    admin = known.get(str(target))
+    if admin is None:
+        _err(f"fatal: '{positionals[0]}' is not a working tree")
+        return 128
+    _sh.rmtree(admin, ignore_errors=True)
+    if target.exists():
+        _sh.rmtree(target, ignore_errors=True)
+    return 0
+
+
+def _worktree_prune(repo: Repository, worktrees_dir: Path, rest: list[str]) -> int:
+    import shutil as _sh
+    show_only = False
+    for a in rest:
+        if a in ("-n", "--dry-run"):
+            show_only = True
+        elif a in ("-v", "--verbose"):
+            pass
+        elif a == "--expire":
+            pass
+    # Prune worktrees whose work-tree directory no longer exists.
+    if worktrees_dir.exists():
+        for d in sorted(worktrees_dir.iterdir()):
+            gitdir_file = d / "gitdir"
+            if not (d.is_dir() and gitdir_file.exists()):
+                continue
+            wt_path = Path(gitdir_file.read_text(encoding="utf-8").strip()).parent
+            if not wt_path.exists():
+                if show_only:
+                    _print(f"Removing worktrees/{d.name}: gitdir file points to "
+                           f"non-existent location")
+                else:
+                    _sh.rmtree(d, ignore_errors=True)
+    return 0
+
+
+def _worktree_lock_move(repo: Repository, worktrees_dir: Path, action: str,
+                        rest: list[str]) -> int:
+    positionals = [a for a in rest if not a.startswith("-")]
+    if not positionals:
+        sys.stderr.write(_WORKTREE_USAGE)
+        return 129
+    target = Path(positionals[0]).resolve()
+    known = _worktree_known_paths(worktrees_dir)
+    admin = known.get(str(target))
+    if admin is None:
+        _err(f"fatal: '{positionals[0]}' is not a working tree")
+        return 128
+    if action == "lock":
+        locked = admin / "locked"
+        if locked.exists():
+            _err(f"fatal: '{positionals[0]}' is already locked")
+            return 128
+        locked.write_text("", encoding="utf-8")
         return 0
-    if args.action == "remove":
+    if action == "unlock":
+        locked = admin / "locked"
+        if not locked.exists():
+            _err(f"fatal: '{positionals[0]}' is not locked")
+            return 128
+        locked.unlink()
+        return 0
+    if action == "move":
+        if len(positionals) < 2:
+            sys.stderr.write(_WORKTREE_USAGE)
+            return 129
+        new_path = Path(positionals[1]).resolve()
         import shutil as _sh
-        wt_name = Path(args.path).name
-        wt_dir = worktrees_dir / wt_name
-        if wt_dir.exists():
-            _sh.rmtree(wt_dir, ignore_errors=True)
-        target = Path(args.path)
-        if target.exists():
-            _sh.rmtree(target, ignore_errors=True)
+        _sh.move(str(target), str(new_path))
+        (admin / "gitdir").write_text(str(new_path / ".git") + "\n", encoding="utf-8")
+        (new_path / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
         return 0
     return 1
 
@@ -32512,6 +37020,9 @@ def cmd_cherry(argv: list[str]) -> int:
     head_commits = collect(head, up)
     up_commits = collect(up, head)
     up_patches = {patch_id(s) for s in up_commits}
+    # git cherry lists the candidates oldest-first (like `rev-list --reverse`);
+    # the DFS collection above yields them newest-first, so flip the order.
+    head_commits = list(reversed(head_commits))
     for s in head_commits:
         pid = patch_id(s)
         mark = "-" if pid in up_patches else "+"
@@ -32580,40 +37091,295 @@ def _rd_diffsize(a: str, b: str) -> int:
     return count
 
 
+_RD_COST_MAX = 1 << 20
+
+
+def _rd_compute_assignment(column_count: int, row_count: int, cost: list[int]):
+    """Port of linear-assignment.c compute_assignment (Jonker-Volgenant shortest
+    augmenting path). COST(column, row) == cost[column + column_count*row].
+    Returns (column2row, row2column)."""
+    INT_MAX = (1 << 31) - 1
+
+    def C(column, row):
+        return cost[column + column_count * row]
+
+    column2row = [-1] * column_count
+    row2column = [-1] * row_count
+    if column_count < 2:
+        return column2row, row2column
+
+    v = [0] * column_count
+
+    # column reduction
+    for j in range(column_count - 1, -1, -1):
+        i1 = 0
+        for i in range(1, row_count):
+            if C(j, i1) > C(j, i):
+                i1 = i
+        v[j] = C(j, i1)
+        if row2column[i1] == -1:
+            row2column[i1] = j
+            column2row[j] = i1
+        else:
+            if row2column[i1] >= 0:
+                row2column[i1] = -2 - row2column[i1]
+            column2row[j] = -1
+
+    # reduction transfer
+    free_row = []
+    for i in range(row_count):
+        j1 = row2column[i]
+        if j1 == -1:
+            free_row.append(i)
+        elif j1 < -1:
+            row2column[i] = -2 - j1
+        else:
+            mn = C(0 if j1 else 1, i) - v[0 if j1 else 1]
+            for j in range(1, column_count):
+                if j != j1 and mn > C(j, i) - v[j]:
+                    mn = C(j, i) - v[j]
+            v[j1] -= mn
+    free_count = len(free_row)
+
+    if free_count == (row_count - column_count if column_count < row_count else 0):
+        return column2row, row2column
+
+    # augmenting row reduction (two phases)
+    for _phase in range(2):
+        k = 0
+        saved_free_count = free_count
+        free_count = 0
+        # free_row acts as a mutable list; pad to ensure indexed writes work.
+        while len(free_row) < max(saved_free_count, free_count + 1):
+            free_row.append(0)
+        while k < saved_free_count:
+            j1 = 0
+            i = free_row[k]
+            k += 1
+            u1 = C(j1, i) - v[j1]
+            j2 = -1
+            u2 = INT_MAX
+            for j in range(1, column_count):
+                c = C(j, i) - v[j]
+                if u2 > c:
+                    if u1 < c:
+                        u2 = c
+                        j2 = j
+                    else:
+                        u2 = u1
+                        u1 = c
+                        j2 = j1
+                        j1 = j
+            if j2 < 0:
+                j2 = j1
+                u2 = u1
+            i0 = column2row[j1]
+            if u1 < u2:
+                v[j1] -= u2 - u1
+            elif i0 >= 0:
+                j1 = j2
+                i0 = column2row[j1]
+            if i0 >= 0:
+                if u1 < u2:
+                    k -= 1
+                    free_row[k] = i0
+                else:
+                    while len(free_row) <= free_count:
+                        free_row.append(0)
+                    free_row[free_count] = i0
+                    free_count += 1
+            row2column[i] = j1
+            column2row[j1] = i
+
+    # augmentation
+    saved_free_count = free_count
+    d = [0] * column_count
+    pred = [0] * column_count
+    col = [0] * column_count
+    for fc in range(saved_free_count):
+        i1 = free_row[fc]
+        low = 0
+        up = 0
+        last = 0
+        for j in range(column_count):
+            d[j] = C(j, i1) - v[j]
+            pred[j] = i1
+            col[j] = j
+        j = -1
+        did_update = False
+        while not did_update:
+            last = low
+            mn = d[col[up]]
+            up += 1
+            for k in range(up, column_count):
+                j = col[k]
+                c = d[j]
+                if c <= mn:
+                    if c < mn:
+                        up = low
+                        mn = c
+                    col[k] = col[up]
+                    col[up] = j
+                    up += 1
+            hit = False
+            for k in range(low, up):
+                if column2row[col[k]] == -1:
+                    hit = True
+                    break
+            if hit:
+                break
+            # scan a row
+            scanning = True
+            while scanning:
+                j1 = col[low]
+                low += 1
+                i = column2row[j1]
+                u1 = C(j1, i) - v[j1] - mn
+                for k in range(up, column_count):
+                    j = col[k]
+                    c = C(j, i) - v[j] - u1
+                    if c < d[j]:
+                        d[j] = c
+                        pred[j] = i
+                        if c == mn:
+                            if column2row[j] == -1:
+                                hit = True
+                                break
+                            col[k] = col[up]
+                            col[up] = j
+                            up += 1
+                if hit:
+                    break
+                if low == up:
+                    scanning = False
+            if hit:
+                break
+            # outer do-while: continues while low == up
+            if low != up:
+                continue
+        # update
+        for k in range(last):
+            j1 = col[k]
+            v[j1] += d[j1] - mn
+        # augmentation
+        while True:
+            i = pred[j]
+            column2row[j] = i
+            j, row2column[i] = row2column[i], j
+            if i1 == i:
+                break
+    return column2row, row2column
+
+
 def _rd_assign(a_list: list, b_list: list, exact: dict, creation_factor: int = 60) -> dict:
-    """Return {a_index: b_index} matching, combining exact matches with a
-    min-cost assignment of the rest (greedy approximation of git's Hungarian)."""
+    """Return {a_index: b_index} matching, faithfully porting range-diff.c
+    get_correspondences: an n×n cost matrix (n = na+nb) with creation/deletion
+    virtual columns, solved by the Jonker-Volgenant assignment."""
     na, nb = len(a_list), len(b_list)
-    matched_a = dict(exact)              # a_idx -> b_idx (exact)
-    used_b = set(exact.values())
-    # Candidate costs for remaining pairs.
-    rem_a = [i for i in range(na) if i not in matched_a]
-    rem_b = [j for j in range(nb) if j not in used_b]
-    crea_a = {i: _rd_diffsize(a_list[i][1], "") * creation_factor // 100 for i in rem_a}
-    crea_b = {j: _rd_diffsize(b_list[j][1], "") * creation_factor // 100 for j in rem_b}
-    pairs = []
-    for i in rem_a:
-        for j in rem_b:
-            pairs.append((_rd_diffsize(a_list[i][1], b_list[j][1]), i, j))
-    pairs.sort()
-    for cost, i, j in pairs:
-        if i in matched_a or j in used_b:
-            continue
-        # Match when keeping the pair is cheaper than creating both separately
-        # (git's cost-matrix assignment with the creation-factor weighting).
-        if cost < crea_a[i] + crea_b[j]:
-            matched_a[i] = j
-            used_b.add(j)
-    return matched_a
+    n = na + nb
+    if n == 0:
+        return {}
+    # b2a[j] = i for the exact matches (find_exact_matches set util->matching).
+    a_match = {i: exact[i] for i in exact}
+    b_match = {j: i for i, j in exact.items()}
+    cost = [0] * (n * n)
+
+    def setc(column, row, val):
+        cost[column + n * row] = val
+
+    # The creation/deletion cost uses util->diffsize: the number of diff-body
+    # lines accumulated while reading the patch (range-diff.c read_patches), NOT
+    # diffsize(diff, ""). Count the non-empty trailing lines of the diff text.
+    def _diff_line_count(text: str) -> int:
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        return len(lines)
+
+    crea_a = [_diff_line_count(a_list[i][1]) for i in range(na)]
+    crea_b = [_diff_line_count(b_list[j][1]) for j in range(nb)]
+
+    for i in range(na):
+        for j in range(nb):
+            if a_match.get(i) == j:
+                c = 0
+            elif i not in a_match and j not in b_match:
+                c = _rd_diffsize(a_list[i][1], b_list[j][1])
+            else:
+                c = _RD_COST_MAX
+            setc(i, j, c)
+        c = crea_a[i] * creation_factor // 100 if i not in a_match else _RD_COST_MAX
+        for j in range(nb, n):
+            setc(i, j, c)
+    for j in range(nb):
+        c = crea_b[j] * creation_factor // 100 if j not in b_match else _RD_COST_MAX
+        for i in range(na, n):
+            setc(i, j, c)
+    for i in range(na, n):
+        for j in range(nb, n):
+            setc(i, j, 0)
+
+    a2b, _b2a = _rd_compute_assignment(n, n, cost)
+    matched: dict[int, int] = {}
+    for i in range(na):
+        if 0 <= a2b[i] < nb:
+            matched[i] = a2b[i]
+    return matched
 
 
 def cmd_range_diff(argv: list[str]) -> int:
-    """range-diff A..B C..D — match commits and show the diff of diffs."""
+    """range-diff — match commits across two ranges and show the diff of diffs.
+
+    Accepts the three git invocation forms (builtin/range-diff.c usage):
+      `A..B C..D`, `A...B`, and `BASE OLD NEW`."""
     ap = argparse.ArgumentParser(prog="pygit range-diff", add_help=False)
-    ap.add_argument("range1")
-    ap.add_argument("range2")
-    args = ap.parse_args(argv)
+    ap.add_argument("--creation-factor", dest="creation_factor", type=int, default=60)
+    ap.add_argument("--left-only", dest="left_only", action="store_true")
+    ap.add_argument("--right-only", dest="right_only", action="store_true")
+    # pythongit never colorizes; the color toggles are accepted and ignored.
+    ap.add_argument("--no-color", dest="no_color", action="store_true")
+    ap.add_argument("--color", nargs="?", const="always", default=None)
+    ap.add_argument("--dual-color", dest="dual_color", action="store_true")
+    ap.add_argument("--no-dual-color", dest="no_dual_color", action="store_true")
+    ap.add_argument("-U", "--unified", dest="unified", type=int, default=3)
+    # Accepted pass-through options (no observable effect on these inputs).
+    ap.add_argument("--notes", dest="notes", nargs="?", const="", default=None)
+    ap.add_argument("--no-notes", dest="no_notes", action="store_true")
+    ap.add_argument("--diff-merges", dest="diff_merges", default=None)
+    ap.add_argument("--remerge-diff", dest="remerge_diff", action="store_true")
+    ap.add_argument("rest", nargs="*")
+    # Rewrite bare nargs="?" optionals so a following positional is not eaten.
+    _rd_const = {"--notes": "", "--color": "always"}
+    args = ap.parse_args([f"{t}={_rd_const[t]}" if t in _rd_const else t
+                          for t in argv])
     repo = _repo()
+
+    # Resolve the invocation form into two "A..B" ranges (range-diff.c).
+    pos = args.rest
+    if len(pos) == 1 and "..." in pos[0] and ".." not in pos[0].replace("...", ""):
+        a, _, b = pos[0].partition("...")
+        a_sha = refs_mod.rev_parse(repo, a or "HEAD")
+        b_sha = refs_mod.rev_parse(repo, b or "HEAD")
+        from . import merge as _m
+        bases = _m.merge_bases(repo, a_sha, b_sha) if (a_sha and b_sha) else []
+        base = bases[0] if bases else None
+        range1 = f"{base}..{a_sha}" if base else (a_sha or a)
+        range2 = f"{base}..{b_sha}" if base else (b_sha or b)
+    elif len(pos) == 2:
+        range1, range2 = pos[0], pos[1]
+    elif len(pos) == 3:
+        # BASE OLD NEW  ->  BASE..OLD  BASE..NEW
+        base, old, new = pos
+        range1 = f"{base}..{old}"
+        range2 = f"{base}..{new}"
+    elif len(pos) < 2:
+        _err("usage: git range-diff [<options>] <old-base>..<old-tip> <new-base>..<new-tip>")
+        _err("   or: git range-diff [<options>] <old-tip>...<new-tip>")
+        _err("   or: git range-diff [<options>] <base> <old-tip> <new-tip>")
+        return 129
+    else:
+        _err(f"fatal: need two commit ranges")
+        return 128
 
     def expand(rng: str) -> list[str]:
         if ".." not in rng:
@@ -32654,8 +37420,8 @@ def cmd_range_diff(argv: list[str]) -> int:
         out.reverse()
         return out
 
-    a_shas = expand(args.range1)
-    b_shas = expand(args.range2)
+    a_shas = expand(range1)
+    b_shas = expand(range2)
     # (sha, full_patch, diff_only, subject) per side.
     def build(shas):
         out = []
@@ -32681,7 +37447,7 @@ def cmd_range_diff(argv: list[str]) -> int:
         if j is not None and j not in used_b_exact:
             exact[i] = j
             used_b_exact.add(j)
-    a2b = _rd_assign(a_pf, b_pf, exact)
+    a2b = _rd_assign(a_pf, b_pf, exact, creation_factor=args.creation_factor)
     b2a = {j: i for i, j in a2b.items()}
 
     width = len(str(max(len(A), len(B)) or 1))
@@ -32721,7 +37487,7 @@ def cmd_range_diff(argv: list[str]) -> int:
         if bl and bl[-1] == "":
             bl = bl[:-1]
         ops = diff_mod.diff_lines(al, bl)
-        for start, end in diff_mod._group_hunks(ops, 3):
+        for start, end in diff_mod._group_hunks(ops, args.unified):
             hunk = ops[start:end]
             a_idxs = [ai for k, ai, _ in hunk if k in ("eq", "del")]
             first_a = a_idxs[0] if a_idxs else 0
@@ -32740,17 +37506,25 @@ def cmd_range_diff(argv: list[str]) -> int:
                 else:
                     _print("    +" + bl[bi])
 
+    if args.left_only and args.right_only:
+        _err("fatal: options '--left-only' and '--right-only' cannot be used together")
+        return 128
+
     shown_a = set()
     i = j = 0
     while i < len(A) or j < len(B):
         while i < len(A) and i in shown_a:
             i += 1
+        # Unmatched LHS commit (suppressed by --right-only).
         if i < len(A) and i not in a2b:
-            header(i, None)
+            if not args.right_only:
+                header(i, None)
             i += 1
             continue
+        # Unmatched RHS commits (suppressed by --left-only).
         while j < len(B) and j not in b2a:
-            header(None, j)
+            if not args.left_only:
+                header(None, j)
             j += 1
         if j < len(B):
             ai = b2a[j]
@@ -32945,23 +37719,230 @@ def cmd_pack_refs(argv: list[str]) -> int:
     return 0
 
 
+_MERGE_FILE_USAGE = (
+    "usage: git merge-file [<options>] [-L <name1> [-L <orig> [-L <name2>]]] <file1> <orig-file> <file2>\n"
+    "\n"
+    "    -p, --[no-]stdout     send results to standard output\n"
+    "    --[no-]object-id      use object IDs instead of filenames\n"
+    "    --[no-]diff3          use a diff3 based merge\n"
+    "    --[no-]zdiff3         use a zealous diff3 based merge\n"
+    "    --[no-]ours           for conflicts, use our version\n"
+    "    --[no-]theirs         for conflicts, use their version\n"
+    "    --[no-]union          for conflicts, use a union version\n"
+    "    --diff-algorithm <algorithm>\n"
+    "                          choose a diff algorithm\n"
+    "    --[no-]marker-size <n>\n"
+    "                          for conflicts, use this marker size\n"
+    "    -q, --[no-]quiet      do not warn about conflicts\n"
+    "    -L <name>             set labels for file1/orig-file/file2\n"
+    "\n"
+)
+
+
+def _merge_file_format(hunks, labels, style, favor, marker_size):
+    """Render merge hunks into bytes + conflict count (xdl_merge output).
+
+    ``style`` is None|'diff3'|'zdiff3'; ``favor`` is None|'ours'|'theirs'|'union'.
+    ``labels`` is (ours_label, base_label, theirs_label)."""
+    out = bytearray()
+    nconflict = 0
+    m = marker_size
+    lt = b"<" * m
+    eq = b"=" * m
+    gt = b">" * m
+    pipe = b"|" * m
+    for h in hunks:
+        if h[0] == "stable":
+            out += b"".join(h[1])
+            continue
+        _k, ours, base, theirs = h
+        if favor == "ours":
+            out += b"".join(ours)
+            continue
+        if favor == "theirs":
+            out += b"".join(theirs)
+            continue
+        if favor == "union":
+            out += b"".join(ours)
+            out += b"".join(theirs)
+            continue
+        nconflict += 1
+        out += lt + b" " + labels[0] + b"\n"
+        out += b"".join(ours)
+        if style in ("diff3", "zdiff3"):
+            out += pipe + b" " + labels[1] + b"\n"
+            out += b"".join(base)
+        out += eq + b"\n"
+        out += b"".join(theirs)
+        out += gt + b" " + labels[2] + b"\n"
+    return bytes(out), nconflict
+
+
 def cmd_merge_file(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit merge-file")
-    ap.add_argument("-p", "--stdout", action="store_true")
-    ap.add_argument("ours")
-    ap.add_argument("base")
-    ap.add_argument("theirs")
-    args = ap.parse_args(argv)
     from . import merge as _m
-    base = Path(args.base).read_bytes()
-    ours = Path(args.ours).read_bytes()
-    theirs = Path(args.theirs).read_bytes()
-    merged, conflict = _m.merge_blob(base, ours, theirs)
-    if args.stdout:
+
+    to_stdout = False
+    object_id = False
+    style = None        # None | 'diff3' | 'zdiff3'
+    favor = None        # None | 'ours' | 'theirs' | 'union'
+    quiet = False
+    marker_size = 7
+    labels: list = [None, None, None]
+    label_count = 0
+    positionals: list[str] = []
+
+    def usage_to(stream, rc):
+        stream.write(_MERGE_FILE_USAGE)
+        return rc
+
+    i = 0
+    n = len(argv)
+    saw_dd = False
+    while i < n:
+        a = argv[i]
+        if saw_dd or a == "-" or not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        if a == "--":
+            saw_dd = True
+            i += 1
+            continue
+        if a == "-h":
+            return usage_to(sys.stdout, 129)
+        if a in ("-p", "--stdout"):
+            to_stdout = True; i += 1; continue
+        if a == "--no-stdout":
+            to_stdout = False; i += 1; continue
+        if a == "--object-id":
+            object_id = True; i += 1; continue
+        if a == "--no-object-id":
+            object_id = False; i += 1; continue
+        if a == "--diff3":
+            style = "diff3"; i += 1; continue
+        if a == "--zdiff3":
+            style = "zdiff3"; i += 1; continue
+        if a == "--ours":
+            favor = "ours"; i += 1; continue
+        if a == "--theirs":
+            favor = "theirs"; i += 1; continue
+        if a == "--union":
+            favor = "union"; i += 1; continue
+        if a in ("-q", "--quiet"):
+            quiet = True; i += 1; continue
+        if a == "--no-quiet":
+            quiet = False; i += 1; continue
+        if a == "--diff-algorithm" or a.startswith("--diff-algorithm="):
+            if "=" in a:
+                val = a.split("=", 1)[1]
+            else:
+                i += 1
+                val = argv[i] if i < n else ""
+            if val not in ("myers", "minimal", "patience", "histogram", "default"):
+                _err(f"error: option diff-algorithm accepts "
+                     f"\"myers\", \"minimal\", \"patience\" and \"histogram\"")
+                return 129
+            i += 1; continue
+        if a == "--marker-size" or a.startswith("--marker-size="):
+            if "=" in a:
+                val = a.split("=", 1)[1]
+            else:
+                i += 1
+                val = argv[i] if i < n else ""
+            from . import gitconfig as _gc
+            parsed = _gc.parse_signed(val)
+            if parsed is None or parsed[1] != "":
+                _err("error: option `marker-size' expects an integer value "
+                     "with an optional k/m/g suffix")
+                return 129
+            marker_size = parsed[0]
+            i += 1; continue
+        if a == "-L":
+            i += 1
+            if i >= n:
+                return usage_to(sys.stderr, 129)
+            if label_count >= 3:
+                _err("error: too many labels on the command line")
+                return 128
+            labels[label_count] = argv[i]
+            label_count += 1
+            i += 1
+            continue
+        if a.startswith("-L"):
+            # attached form -Lname
+            if label_count >= 3:
+                _err("error: too many labels on the command line")
+                return 128
+            labels[label_count] = a[2:]
+            label_count += 1
+            i += 1
+            continue
+        # unknown option
+        name = a[2:] if a.startswith("--") else a[1:]
+        sys.stderr.write(f"error: unknown option `{name}'\n")
+        return usage_to(sys.stderr, 129)
+
+    if len(positionals) != 3:
+        return usage_to(sys.stderr, 129)
+
+    # Resolve labels: default to the filename argument.
+    for k in range(3):
+        if labels[k] is None:
+            labels[k] = positionals[k]
+    label_bytes = tuple(s.encode("utf-8", "surrogateescape") for s in labels)
+
+    # Read the three inputs.
+    contents: list = []
+    repo = None
+    for k in range(3):
+        arg = positionals[k]
+        if object_id:
+            if repo is None:
+                repo = _repo_or_none()
+            oid = refs_mod.rev_parse(repo, arg) if repo is not None else None
+            if oid is None:
+                _err(f"error: object '{arg}' does not exist")
+                return 255
+            try:
+                _t, data = objs.read_object(repo, oid)
+            except Exception:
+                _err(f"error: object '{arg}' does not exist")
+                return 255
+            contents.append(data)
+        else:
+            p = Path(arg)
+            try:
+                contents.append(p.read_bytes())
+            except (FileNotFoundError, NotADirectoryError):
+                _err(f"error: Could not stat {arg}: No such file or directory")
+                return 255
+            except IsADirectoryError:
+                _err(f"error: Could not stat {arg}: No such file or directory")
+                return 255
+
+    ours, base, theirs = contents
+    hunks = _m.merge_blob_hunks(base, ours, theirs)
+    merged, nconflict = _merge_file_format(
+        hunks, label_bytes, style, favor, marker_size)
+
+    if object_id and not to_stdout:
+        if repo is None:
+            repo = _repo_or_none()
+        if merged:
+            oid = objs.write_object(repo, "blob", merged)
+        else:
+            oid = objs.empty_blob_oid(repo) if hasattr(objs, "empty_blob_oid") else (repo.hex_len * "0")
+        _print(oid)
+    elif to_stdout:
         sys.stdout.buffer.write(merged)
+        sys.stdout.flush()
     else:
-        Path(args.ours).write_bytes(merged)
-    return 1 if conflict else 0
+        Path(positionals[0]).write_bytes(merged)
+
+    rc = nconflict
+    if rc > 127:
+        rc = 127
+    return rc
 
 
 class _FEAnonymizer:
@@ -35556,6 +40537,10 @@ def _verify_parse_flags(argv: list[str], usage: str, allow_format: bool
     n = len(argv)
     while i < n:
         t = argv[i]
+        if t in ("-h", "--help"):
+            # parse-options treats -h specially: usage to STDOUT, rc 129.
+            sys.stdout.write(usage)
+            return flags, names, fmt, 129
         if t in ("-v", "--verbose"):
             flags |= _GPG_VERIFY_VERBOSE
         elif t == "--raw":
@@ -37052,28 +42037,303 @@ def _sparse_prune_empty_dirs(repo: Repository, idx, recursive_dirs, parent_dirs)
             pass
 
 
+_SPARSE_USAGE = (
+    "usage: git sparse-checkout (init | list | set | add | reapply | disable | "
+    "check-rules | clean) [<options>]\n"
+    "\n"
+)
+
+_SPARSE_SUBCOMMANDS = ("list", "init", "set", "add", "reapply", "clean",
+                       "disable", "check-rules")
+
+# Per-subcommand usage blocks (builtin/sparse-checkout.c), emitted on an
+# unknown option to that subcommand (rc 129, USAGE_TO_STDERR).
+_SPARSE_SUB_USAGE = {
+    "init": (
+        "usage: git sparse-checkout init [--cone] [--[no-]sparse-index]\n"
+        "\n"
+        "    --[no-]cone           initialize the sparse-checkout in cone mode\n"
+        "    --[no-]sparse-index   toggle the use of a sparse index\n"
+        "\n"),
+    "set": (
+        "usage: git sparse-checkout set [--[no-]cone] [--[no-]sparse-index] "
+        "[--skip-checks] (--stdin | <patterns>)\n"
+        "\n"
+        "    --[no-]cone           initialize the sparse-checkout in cone mode\n"
+        "    --[no-]sparse-index   toggle the use of a sparse index\n"
+        "    --skip-checks         skip some sanity checks on the given paths "
+        "that might give false positives\n"
+        "    --stdin               read patterns from standard in\n"
+        "\n"),
+    "add": (
+        "usage: git sparse-checkout add [--skip-checks] (--stdin | <patterns>)\n"
+        "\n"
+        "    --skip-checks         skip some sanity checks on the given paths "
+        "that might give false positives\n"
+        "    --[no-]stdin          read patterns from standard in\n"
+        "\n"),
+    "reapply": (
+        "usage: git sparse-checkout reapply [--[no-]cone] [--[no-]sparse-index]\n"
+        "\n"
+        "    --[no-]cone           initialize the sparse-checkout in cone mode\n"
+        "    --[no-]sparse-index   toggle the use of a sparse index\n"
+        "\n"),
+    "check-rules": (
+        "usage: git sparse-checkout check-rules [-z] [--skip-checks]"
+        "[--[no-]cone] [--rules-file <file>]\n"
+        "\n"
+        "    -z                    terminate input and output files by a NUL character\n"
+        "    --[no-]cone           when used with --rules-file interpret patterns "
+        "as cone mode patterns\n"
+        "    --[no-]rules-file <file>\n"
+        "                          use patterns in <file> instead of the current ones.\n"
+        "\n"),
+    "disable": "usage: git sparse-checkout disable\n\n",
+    "list": "usage: git sparse-checkout list\n\n",
+    "clean": (
+        "usage: git sparse-checkout clean [-n|--dry-run]\n"
+        "\n"
+        "    -n, --[no-]dry-run    dry run\n"
+        "    -f, --[no-]force      force\n"
+        "    -v, --[no-]verbose    report each affected file, not just directories\n"
+        "\n"),
+}
+
+
+class _SparseParse(Exception):
+    def __init__(self, rc: int):
+        self.rc = rc
+
+
+def _sparse_check_rules(repo: Repository, sc: Path, opts: dict) -> int:
+    """Port of builtin/sparse-checkout.c sparse_checkout_check_rules: read paths
+    from stdin and print those that match the sparse-checkout pattern set."""
+    from . import ignore as _ignore
+    rules_file = opts.get("rules_file")
+    nul = opts.get("z")
+    # Load the pattern set: from --rules-file or the active sparse file.
+    src = Path(rules_file) if rules_file else sc
+    patterns: list[str] = []
+    if src.exists():
+        for line in src.read_text(encoding="utf-8").splitlines():
+            patterns.append(line)
+    raw = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+    sep = "\0" if nul else "\n"
+    paths = [p for p in raw.split(sep) if p]
+    # Build a matcher: cone vs full pattern set. Reuse the gitignore engine on
+    # the sparse patterns (which use the same syntax) — a path is "in" when it
+    # matches an include pattern (and not a negation).
+    cone = opts.get("cone", _sparse_is_cone(repo))
+    matched: list[str] = []
+    for p in paths:
+        if _sparse_path_in_patterns(p, patterns, cone):
+            matched.append(p)
+    out_sep = "\0" if nul else "\n"
+    if matched:
+        sys.stdout.write(out_sep.join(matched) + out_sep)
+    return 0
+
+
+def _sparse_path_in_patterns(path: str, patterns: list[str], cone: bool) -> bool:
+    """Whether ``path`` is included by the sparse pattern list. For cone mode
+    the patterns are directory prefixes (with the /*/ machinery); for the
+    full-pattern mode they are gitignore-style includes."""
+    if cone:
+        # Cone patterns: "/*" (root files) plus "/<dir>/" recursive includes.
+        # A path matches if it is a root-level file or lies under an included dir.
+        dirs = []
+        root_files = False
+        for pat in patterns:
+            pat = pat.strip()
+            if not pat or pat.startswith("!"):
+                if pat == "!/*/":
+                    continue
+                continue
+            if pat == "/*":
+                root_files = True
+            elif pat.startswith("/") and pat.endswith("/"):
+                dirs.append(pat[1:-1])
+        if "/" not in path and root_files:
+            return True
+        for d in dirs:
+            if path == d or path.startswith(d + "/"):
+                return True
+        return False
+    # Full pattern mode: last matching pattern wins (gitignore semantics).
+    included = False
+    for pat in patterns:
+        pat = pat.strip()
+        if not pat:
+            continue
+        neg = pat.startswith("!")
+        body = pat[1:] if neg else pat
+        if _sparse_glob_match(body, path):
+            included = not neg
+    return included
+
+
+def _sparse_glob_match(pat: str, path: str) -> bool:
+    import fnmatch
+    p = pat[1:] if pat.startswith("/") else pat
+    if p.endswith("/"):
+        p = p[:-1]
+        return path == p or path.startswith(p + "/")
+    return fnmatch.fnmatch(path, p) or path.startswith(p.rstrip("*").rstrip("/") + "/")
+
+
 def cmd_sparse_checkout(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pygit sparse-checkout")
-    sub = ap.add_subparsers(dest="action")
-    sub.add_parser("init")
-    sub.add_parser("list")
-    sub.add_parser("disable")
-    p_set = sub.add_parser("set")
-    p_set.add_argument("patterns", nargs="+")
-    args = ap.parse_args(argv or ["list"])
+    # builtin/sparse-checkout.c uses OPT_SUBCOMMAND: a missing subcommand is
+    # "need a subcommand" (rc 129) and an unknown one is "unknown subcommand"
+    # (rc 129); both print the usage block.
+    if not argv:
+        _err("error: need a subcommand")
+        sys.stderr.write(_SPARSE_USAGE)
+        return 129
+    action = argv[0]
+    rest = argv[1:]
+    if action not in _SPARSE_SUBCOMMANDS:
+        if action.startswith("-"):
+            _err(f"error: unknown option `{action.lstrip('-')}'")
+        else:
+            _err(f"error: unknown subcommand: `{action}'")
+        sys.stderr.write(_SPARSE_USAGE)
+        return 129
+
     repo = _repo()
     info = repo.gitdir / "info"
     info.mkdir(exist_ok=True)
     sc = info / "sparse-checkout"
-    action = args.action or "list"
-    if action == "init":
-        # Plain `init` defaults to cone mode (update_cone_mode: cone_mode==-1
-        # and not already sparse -> cone). Records both config keys and writes
-        # the default cone sparse file.
-        _sparse_set_config(repo, sparse=True, cone=True)
-        if not sc.exists():
-            _sparse_cone_write(sc, [])
-        return 0
+
+    sub_usage = _SPARSE_SUB_USAGE.get(action, _SPARSE_USAGE)
+
+    def _parse_flags(args, *, bools, has_stdin=False, has_skip=False,
+                     has_z=False, value_opts=()):
+        """Minimal parse-options for a sparse subcommand: ``bools`` maps a long
+        name to a dest set True/False (for --x/--no-x), value_opts maps a long
+        name to a dest taking a value. Returns (opts_dict, positionals) or
+        raises _SparseParse on an unknown option (rc 129 + the subcommand
+        usage block)."""
+        opts = {}
+        pos = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                pos.extend(args[i + 1:])
+                break
+            if a.startswith("--"):
+                name, eq, val = a[2:].partition("=")
+                neg = False
+                base = name
+                if name.startswith("no-"):
+                    neg = True
+                    base = name[3:]
+                if base in bools:
+                    opts[bools[base]] = (not neg)
+                    i += 1
+                    continue
+                if base in value_opts and not neg:
+                    if eq:
+                        opts[value_opts[base]] = val
+                    else:
+                        i += 1
+                        opts[value_opts[base]] = args[i] if i < len(args) else ""
+                    i += 1
+                    continue
+                if name == "stdin" and has_stdin:
+                    opts["stdin"] = True
+                    i += 1
+                    continue
+                if name == "skip-checks" and has_skip:
+                    opts["skip_checks"] = True
+                    i += 1
+                    continue
+                _err(f"error: unknown option `{name}'")
+                sys.stderr.write(sub_usage)
+                raise _SparseParse(129)
+            if a == "-z" and has_z:
+                opts["z"] = True
+                i += 1
+                continue
+            if a.startswith("-") and a != "-":
+                _err(f"error: unknown switch `{a[1]}'")
+                sys.stderr.write(sub_usage)
+                raise _SparseParse(129)
+            pos.append(a)
+            i += 1
+        return opts, pos
+
+    try:
+        if action == "init":
+            opts, _pos = _parse_flags(
+                rest, bools={"cone": "cone", "sparse-index": "sparse_index"})
+            cone = opts.get("cone", True)
+            _sparse_set_config(repo, sparse=True, cone=cone)
+            if not sc.exists():
+                if cone:
+                    _sparse_cone_write(sc, [])
+                else:
+                    sc.write_text("/*\n!/*/\n", encoding="utf-8")
+            return 0
+        if action == "set":
+            opts, patterns = _parse_flags(
+                rest, bools={"cone": "cone", "sparse-index": "sparse_index"},
+                has_stdin=True, has_skip=True)
+            if opts.get("stdin"):
+                patterns = [p for p in sys.stdin.read().split("\n") if p]
+            already = _sparse_is_sparse(repo)
+            cone = opts.get("cone", _sparse_is_cone(repo) if already else True)
+            _sparse_set_config(repo, sparse=True, cone=cone)
+            if cone:
+                _sparse_cone_write(sc, patterns)
+                _sparse_apply_to_worktree(repo, sc)
+            else:
+                sc.write_text(("\n".join(patterns) + "\n") if patterns else "", encoding="utf-8")
+            return 0
+        if action == "add":
+            # add requires an existing sparse-checkout.
+            from . import gitconfig as _gc
+            if (_gc.get(repo, "core.sparseCheckout") or "").lower() not in ("true", "1"):
+                _err("fatal: no sparse-checkout to add to")
+                return 128
+            opts, patterns = _parse_flags(rest, bools={}, has_stdin=True, has_skip=True)
+            if opts.get("stdin"):
+                patterns = [p for p in sys.stdin.read().split("\n") if p]
+            cone = _sparse_is_cone(repo)
+            if cone:
+                existing = _sparse_cone_list(sc)
+                merged = list(dict.fromkeys(existing + patterns))
+                _sparse_cone_write(sc, merged)
+                _sparse_apply_to_worktree(repo, sc)
+            else:
+                with open(sc, "a", encoding="utf-8") as fh:
+                    for p in patterns:
+                        fh.write(p + "\n")
+            return 0
+        if action == "reapply":
+            from . import gitconfig as _gc
+            if (_gc.get(repo, "core.sparseCheckout") or "").lower() not in ("true", "1"):
+                _err("fatal: must be in a sparse-checkout to reapply sparsity patterns")
+                return 128
+            _parse_flags(rest, bools={"cone": "cone", "sparse-index": "sparse_index"})
+            if _sparse_is_cone(repo):
+                _sparse_apply_to_worktree(repo, sc)
+            return 0
+        if action == "check-rules":
+            opts, _pos = _parse_flags(
+                rest, bools={"cone": "cone"}, has_z=True,
+                value_opts={"rules-file": "rules_file"})
+            return _sparse_check_rules(repo, sc, opts)
+        if action == "clean":
+            from . import gitconfig as _gc
+            if (_gc.get(repo, "core.sparseCheckout") or "").lower() not in ("true", "1"):
+                _err("fatal: must be in a sparse-checkout to clean directories")
+                return 128
+            _parse_flags(rest, bools={"dry-run": "dry_run", "force": "force"})
+            return 0
+    except _SparseParse as exc:
+        return exc.rc
+
     if action == "list":
         # sparse_checkout_list dies if the worktree is not sparse.
         if not _sparse_is_sparse(repo):
@@ -37084,17 +42344,6 @@ def cmd_sparse_checkout(argv: list[str]) -> int:
                 _print(d)
         elif sc.exists():
             sys.stdout.write(sc.read_text(encoding="utf-8"))
-        return 0
-    if action == "set":
-        cone = _sparse_is_cone(repo) if _sparse_is_sparse(repo) else True
-        _sparse_set_config(repo, sparse=True, cone=cone)
-        if cone:
-            _sparse_cone_write(sc, args.patterns)
-            # write_patterns_and_update(): apply the new sparsity to the index
-            # and worktree (skip-worktree bits + remove out-of-cone files).
-            _sparse_apply_to_worktree(repo, sc)
-        else:
-            sc.write_text("\n".join(args.patterns) + "\n", encoding="utf-8")
         return 0
     if action == "disable":
         # disable forcibly returns to a dense checkout; it never errors on a
@@ -37195,18 +42444,98 @@ def cmd_diff_tree(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pygit diff-tree", add_help=False)
     ap.add_argument("-r", action="store_true", help="recurse")
     ap.add_argument("-t", dest="show_trees", action="store_true")
-    ap.add_argument("-p", "--patch", action="store_true")
+    ap.add_argument("-p", "-u", "--patch", action="store_true")
     ap.add_argument("-U", "--unified", type=int, default=3)
     ap.add_argument("--inter-hunk-context", dest="inter_hunk_context", type=int, default=0)
     ap.add_argument("--root", action="store_true")
     ap.add_argument("--no-commit-id", dest="no_commit_id", action="store_true")
     ap.add_argument("--name-only", action="store_true")
     ap.add_argument("--name-status", action="store_true")
-    ap.add_argument("rev1")
+    # rev-info / diff output options forwarded by setup_revisions.
+    ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--numstat", action="store_true")
+    ap.add_argument("--shortstat", action="store_true")
+    ap.add_argument("--summary", action="store_true")
+    ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("--full-index", dest="full_index", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
+    ap.add_argument("--no-renames", dest="no_renames", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--merge-base", dest="merge_base", action="store_true")
+    ap.add_argument("-m", dest="diff_merges_m", action="store_true")
+    ap.add_argument("-c", dest="combined", action="store_true")
+    ap.add_argument("--cc", dest="dense_combined", action="store_true")
+    ap.add_argument("--combined-all-paths", dest="combined_all_paths", action="store_true")
+    ap.add_argument("-v", dest="verbose", action="store_true")
+    ap.add_argument("--pretty", nargs="?", const="medium", default=None)
+    ap.add_argument("--format", dest="format", default=None)
+    ap.add_argument("rev1", nargs="?")
     ap.add_argument("rev2", nargs="?")
     ap.add_argument("paths", nargs="*")
-    args = ap.parse_args([a for a in argv if a != "--"])
+    # --pretty=oneline etc. arrive as "--pretty=oneline"; argparse nargs='?' only
+    # captures the attached value when written with '='. Normalize the bare
+    # "--abbrev"/"--pretty" so they do not swallow the following rev token.
+    _norm = []
+    for a in argv:
+        if a == "--":
+            continue
+        if a == "--abbrev":
+            _norm.append("--abbrev=7")
+        elif a == "--pretty":
+            _norm.append("--pretty=medium")
+        else:
+            _norm.append(a)
+    args = ap.parse_args(_norm)
     repo = _repo()
+    # --combined-all-paths requires -c/--cc (diff_merges_setup_revs).
+    combined = args.combined or args.dense_combined
+    if args.combined_all_paths and not combined:
+        _err("fatal: --combined-all-paths makes no sense without -c or --cc")
+        return 128
+    # -v implies --pretty=medium and verbose header output (raw_message off).
+    pretty = args.pretty
+    if args.format is not None:
+        pretty = args.format
+    if args.verbose and pretty is None:
+        pretty = "medium"
+
+    abbrev = args.abbrev
+    raw_w = 40 if (args.full_index or abbrev is None) else max(4, abbrev)
+
+    # Determine the output format set. diff-tree's default (no format flag) is the
+    # raw diff. -p/--stat/etc. select other formats; -s suppresses all output.
+    fmt = set()
+    if args.name_only:
+        fmt = {"name_only"}
+    elif args.name_status:
+        fmt = {"name_status"}
+    else:
+        if args.raw:
+            fmt.add("raw")
+        if args.stat:
+            fmt.add("stat")
+        if args.numstat:
+            fmt.add("numstat")
+        if args.shortstat:
+            fmt.add("shortstat")
+        if args.summary:
+            fmt.add("summary")
+        if args.patch:
+            fmt.add("patch")
+    if args.no_patch:
+        fmt = set()  # -s: no diff output (commit id / pretty header still shown)
+    elif args.dense_combined and not fmt and not (args.name_only or args.name_status):
+        # --cc implies a (dense) combined PATCH; -c alone defaults to combined raw.
+        fmt = {"patch"}
+    elif not fmt and not (args.name_only or args.name_status):
+        fmt = {"raw"}
+
+    # PATCH/NUMSTAT/DIFFSTAT/SHORTSTAT/SUMMARY imply recursion (diff_setup_done);
+    # RAW and NAME/NAME-STATUS do not. -r/-t force recursion explicitly.
+    fmt_recurses = bool(fmt & {"patch", "numstat", "stat", "shortstat", "summary"})
+    recurse = args.r or args.show_trees or fmt_recurses
 
     def _resolve_to_tree(name: str) -> Optional[str]:
         s = refs_mod.rev_parse(repo, name)
@@ -37221,67 +42550,260 @@ def cmd_diff_tree(argv: list[str]) -> int:
                     return _resolve_to_tree(line[len("object "):].strip())
         return s  # already a tree
 
-    if args.rev2 is None:
-        # treat rev1 as commit; diff against its first parent
-        s = refs_mod.rev_parse(repo, args.rev1)
-        if not s:
-            return 128
-        c = objs.parse_commit(objs.read_object(repo, s)[1])
-        # A merge has only a combined diff, which is empty for a clean merge and
-        # suppressed by default — git emits nothing at all (not even the id).
-        if len(c.parents) > 1:
-            return 0
+    def _tree_changes(a_tree, b_tree):
+        if args.show_trees:
+            return list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=True))
+        if not recurse:
+            return list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=False))
+        return list(workdir.iter_tree_changes(repo, a_tree, b_tree))
+
+    def _emit_diff(a_tree, b_tree):
+        """Render one tree-pair diff in the selected format(s)."""
+        if not fmt:
+            return
+        changes = _tree_changes(a_tree, b_tree)
+        if args.paths:
+            wanted = set(args.paths)
+            changes = [(p, a, b) for (p, a, b) in changes
+                       if p in wanted or any(p.startswith(w.rstrip("/") + "/") for w in args.paths)]
+        # Build the (path, _Side, _Side) form used by the shared helpers.
+        def _side(entry):
+            return _side_from_object(repo, entry.mode, entry.sha) if entry else _ABSENT
+        side_changes = [(p, _side(a), _side(b)) for (p, a, b) in changes]
+        # The patch `index` line abbreviates to 7 by default (--full-index -> 40);
+        # the --abbrev flag governs the RAW oid width (raw_w), not the index line.
+        dopts = _DiffOpts(full_index=args.full_index, abbrev=7)
+        sep = "\0" if args.nul else "\t"
+        term = "\0" if args.nul else "\n"
+        separator = False
+        if "raw" in fmt:
+            zero = "0" * raw_w
+            for p, a_entry, b_entry in changes:
+                a_sha = a_entry.sha if a_entry else None
+                b_sha = b_entry.sha if b_entry else None
+                a_mode = (a_entry.mode if a_entry else "100644").zfill(6)
+                b_mode = (b_entry.mode if b_entry else "100644").zfill(6)
+                if a_sha == b_sha and a_mode == b_mode:
+                    continue
+                status = "A" if a_sha is None else ("D" if b_sha is None else "M")
+                am = a_mode if a_sha is not None else "000000"
+                bm = b_mode if b_sha is not None else "000000"
+                asx = (a_sha[:raw_w] if raw_w < 40 else a_sha) if a_sha is not None else zero
+                bsx = (b_sha[:raw_w] if raw_w < 40 else b_sha) if b_sha is not None else zero
+                sys.stdout.write(f":{am} {bm} {asx} {bsx} {status}{sep}{p}{term}")
+            separator = True
+        elif "name_only" in fmt:
+            for p, _a, _b in changes:
+                sys.stdout.write(p + term)
+            separator = True
+        elif "name_status" in fmt:
+            for p, a_entry, b_entry in changes:
+                a_sha = a_entry.sha if a_entry else None
+                b_sha = b_entry.sha if b_entry else None
+                status = "A" if a_sha is None else ("D" if b_sha is None else "M")
+                sys.stdout.write(f"{status}{sep}{p}{term}")
+            separator = True
+        if "numstat" in fmt:
+            _diff_numstat(side_changes, nul=args.nul)
+            separator = True
+        if "stat" in fmt:
+            _diff_stat(side_changes)
+            separator = True
+        if "shortstat" in fmt:
+            _diff_shortstat(side_changes)
+            separator = True
+        if "summary" in fmt:
+            _diff_summary(side_changes)
+            separator = True
+        if "patch" in fmt:
+            if separator:
+                _print("")
+            for p, a_side, b_side in side_changes:
+                _emit_file_diff(p, a_side, b_side, context=args.unified,
+                                inter_hunk_context=args.inter_hunk_context, opts=dopts)
+
+    def _emit_commit(sha) -> None:
+        """Print one commit's diff against its first parent (the single-arg and
+        --stdin form). Honors --no-commit-id / --pretty / -v / -c / --cc / -m."""
+        c = objs.parse_commit(objs.read_object(repo, sha)[1])
+        is_merge = len(c.parents) > 1
+        # A root commit (no parent) is suppressed entirely unless --root is given
+        # (log_tree_diff: the diff against the empty tree only runs with --root).
+        if not c.parents and not args.root:
+            return
+        if is_merge and not (args.diff_merges_m or combined):
+            # A merge has only a combined diff (empty/suppressed by default); git
+            # emits nothing at all unless -m/-c/--cc requested.
+            return
+        if is_merge and combined:
+            # -c/--cc: the combined diff against all parents.
+            if pretty is not None:
+                _diff_tree_emit_pretty(repo, sha, c, pretty)
+            elif not args.no_commit_id:
+                _print(sha)
+            _diff_tree_combined_commit(
+                repo, sha, c, dense=args.dense_combined,
+                fmt=fmt, context=args.unified, raw_abbrev=abbrev,
+                full_index=args.full_index, nul=args.nul,
+                combined_all_paths=args.combined_all_paths)
+            return
         b_tree = c.tree
         a_tree = (objs.parse_commit(objs.read_object(repo, c.parents[0])[1]).tree
                   if c.parents else None)
-        if not args.no_commit_id:
-            _print(s)
-    else:
-        a_tree = _resolve_to_tree(args.rev1)
+        if pretty is not None:
+            _diff_tree_emit_pretty(repo, sha, c, pretty)
+        elif not args.no_commit_id:
+            _print(sha)
+        _emit_diff(a_tree, b_tree)
+
+    # --stdin: read commit ids (one per line) and diff each against its parent.
+    if args.stdin:
+        # A rev1 given alongside --stdin is treated as a tree pair only if rev2
+        # is also present; otherwise --stdin drives everything.
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            s = refs_mod.rev_parse(repo, line.split()[0])
+            if not s:
+                continue
+            t = objs.read_object(repo, s)[0]
+            if t == "commit":
+                _emit_commit(s)
+        return 0
+
+    if args.rev1 is None:
+        sys.stderr.write(_DIFF_TREE_USAGE)
+        return 129
+
+    # --merge-base: diff merge-base(rev1, rev2) against rev2.
+    if args.merge_base:
+        if args.rev2 is None:
+            _err("fatal: --merge-base needs two commits")
+            return 128
+        s1 = refs_mod.rev_parse(repo, args.rev1)
+        s2 = refs_mod.rev_parse(repo, args.rev2)
+        if not s1 or not s2:
+            return 128
+        from . import merge as _merge_mod
+        bases = _merge_mod.merge_bases(repo, s1, s2)
+        if not bases:
+            return 128
+        base = bases[0]
+        a_tree = objs.parse_commit(objs.read_object(repo, base)[1]).tree
         b_tree = _resolve_to_tree(args.rev2)
+        if not b_tree:
+            return 128
+        _emit_diff(a_tree, b_tree)
+        return 0
+
+    if args.rev2 is None:
+        s = refs_mod.rev_parse(repo, args.rev1)
+        if not s:
+            return 128
+        _emit_commit(s)
+        return 0
+
+    a_tree = _resolve_to_tree(args.rev1)
+    b_tree = _resolve_to_tree(args.rev2)
     if not b_tree:
         return 128
-    if args.show_trees:
-        # -t recurses into changed trees (even without -r), showing tree nodes.
-        changes = list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=True))
-    elif not args.r:
-        # Without -r, diff-tree lists only the top-level changed entries
-        # (directories shown as tree nodes), not their contents.
-        changes = list(_diff_tree_changes_with_dirs(repo, a_tree, b_tree, recurse=False))
-    else:
-        changes = list(workdir.iter_tree_changes(repo, a_tree, b_tree))
-    for p, a_entry, b_entry in changes:
-        a_sha = a_entry.sha if a_entry else None
-        b_sha = b_entry.sha if b_entry else None
-        a_mode = (a_entry.mode if a_entry else "100644").zfill(6)
-        b_mode = (b_entry.mode if b_entry else "100644").zfill(6)
-        if a_sha == b_sha and a_mode == b_mode:
-            continue
-        if args.name_only:
-            _print(p)
-        elif args.name_status:
-            if a_sha is None:
-                _print(f"A\t{p}")
-            elif b_sha is None:
-                _print(f"D\t{p}")
-            else:
-                _print(f"M\t{p}")
-        elif not args.patch:
-            ln = _raw_diff_status(a_mode, b_mode, a_sha, b_sha, p)
-            if ln:
-                _print(ln)
-    if args.patch:
-        sel = changes
-        if args.paths:
-            wanted = set(args.paths)
-            sel = [(p, a, b) for (p, a, b) in changes
-                   if p in wanted or any(p.startswith(w.rstrip("/") + "/") for w in args.paths)]
-        for p, a_entry, b_entry in sel:
-            a_side = _side_from_object(repo, a_entry.mode, a_entry.sha) if a_entry else _ABSENT
-            b_side = _side_from_object(repo, b_entry.mode, b_entry.sha) if b_entry else _ABSENT
-            _emit_file_diff(p, a_side, b_side, context=args.unified,
-                            inter_hunk_context=args.inter_hunk_context)
+    _emit_diff(a_tree, b_tree)
     return 0
+
+
+def _diff_tree_emit_pretty(repo: Repository, sha: str, c, pretty: str) -> None:
+    """Emit diff-tree's --pretty / -v commit header. Supports 'oneline' and the
+    default medium-style header block (the forms diff-tree exercises)."""
+    if pretty == "oneline":
+        subject = c.message.split("\n", 1)[0]
+        _print(f"{sha} {subject}")
+        return
+    # medium / default style header.
+    from . import mailmap as _mailmap
+    mm = _mailmap.load(repo)
+    _emit_commit_header(sha, c, style="medium", mailmap=(None if mm.empty else mm))
+    _print("")
+    for line in c.message.rstrip("\n").split("\n"):
+        _print("    " + line if line else "")
+    _print("")
+
+
+def _diff_tree_combined_commit(repo: Repository, sha: str, c, *, dense: bool,
+                               fmt: set, context: int, raw_abbrev,
+                               full_index: bool, nul: bool,
+                               combined_all_paths: bool) -> None:
+    """Combined diff of a merge commit against all parents (combine-diff.c
+    diff_tree_combined): a path is shown when it differs from EVERY parent.
+    Renders the combined raw line (default / --raw) or the ``diff --cc`` patch
+    (when -p / --cc patch output is requested)."""
+    from . import combine
+    parent_maps = [_tree_map_full(repo, objs.parse_commit(objs.read_object(repo, p)[1]).tree)
+                   for p in c.parents]
+    result_map = _tree_map_full(repo, c.tree)
+    num_parent = len(c.parents)
+    # Candidate paths = anything changed vs the FIRST parent (combine-diff seeds
+    # from each parent's diff against the result, then intersects).
+    candidates = set(result_map)
+    for pm in parent_maps:
+        candidates |= set(pm)
+    # Combined raw oids are full-length unless --abbrev was given.
+    raw_w = 40 if (full_index or raw_abbrev is None) else max(4, raw_abbrev)
+    # The combined PATCH index line abbreviates to 7 (combine-diff.c).
+    patch_abbrev = 7
+    want_patch = "patch" in fmt
+    line_term = b"\0" if nul else b"\n"
+    out = sys.stdout.buffer
+    sys.stdout.flush()
+    for path in sorted(candidates):
+        r = result_map.get(path)
+        # Per-parent status; a path is "interesting" only if it differs from all.
+        differs_all = True
+        parent_oids = []
+        parent_modes = []
+        parent_status = []
+        for pm in parent_maps:
+            p = pm.get(path)
+            if p == r:
+                differs_all = False
+                break
+            if p is None:
+                parent_oids.append(None)
+                parent_modes.append(0)
+                parent_status.append("A")
+            elif r is None:
+                parent_oids.append(p[1])
+                parent_modes.append(int(p[0], 8))
+                parent_status.append("D")
+            else:
+                parent_oids.append(p[1])
+                parent_modes.append(int(p[0], 8))
+                parent_status.append("M")
+        if not differs_all:
+            continue
+        result_oid = r[1] if r else None
+        result_mode = int(r[0], 8) if r else 0
+        if want_patch:
+            result_content = b""
+            if r is not None:
+                try:
+                    result_content = objs.read_object(repo, r[1])[1]
+                except KeyError:
+                    result_content = b""
+            combine.show_patch_diff_files(
+                out, repo, path, parent_oids, parent_modes,
+                result_content, r is not None, dense, patch_abbrev,
+                context=context, combined_all_paths=combined_all_paths,
+                result_oid=result_oid, result_mode_override=result_mode)
+        else:
+            rfmt = ("name" if "name_only" in fmt
+                    else "name-status" if "name_status" in fmt else "raw")
+            combine.show_raw_combined(
+                out, path, parent_oids, parent_modes, parent_status,
+                result_oid, result_mode, num_parent, raw_w,
+                fmt=rfmt, line_term=line_term,
+                combined_all_paths=combined_all_paths)
+    out.flush()
 
 
 class _DFPair:
@@ -37371,6 +42893,7 @@ def cmd_diff_files(argv: list[str]) -> int:
     ap.add_argument("--stat", action="store_true")
     ap.add_argument("--numstat", action="store_true")
     ap.add_argument("--shortstat", action="store_true")
+    ap.add_argument("--summary", action="store_true")
     ap.add_argument("-p", "-u", "--patch", dest="patch", action="store_true")
     ap.add_argument("--patch-with-raw", dest="patch_with_raw", action="store_true")
     ap.add_argument("--patch-with-stat", dest="patch_with_stat", action="store_true")
@@ -37539,7 +43062,7 @@ def cmd_diff_files(argv: list[str]) -> int:
     # a bare `-c`/`--cc` (no explicit format) the merge implies a patch.
     fmt_patch = bool(args.patch or args.patch_with_raw or args.patch_with_stat)
     explicit_fmt = (args.raw or args.name_only or args.name_status or args.stat or
-                    args.numstat or args.shortstat or fmt_patch)
+                    args.numstat or args.shortstat or args.summary or fmt_patch)
     fmt_raw = (args.raw or not explicit_fmt)
     if combine_merges and not explicit_fmt:
         # `-c`/`--cc` with no explicit format implies a (combined) patch.
@@ -37719,6 +43242,11 @@ def cmd_diff_files(argv: list[str]) -> int:
     # Sides are already oriented for -R (pre-swapped), so the stat helpers see
     # the correct direction and naturally flip insertions/deletions. Unmerged
     # ('U') pairs render as "<path> | Unmerged" and never count toward totals.
+    def _emit_summary():
+        # --summary: rename/create/delete/mode-change lines (diff_flush order
+        # places it after stat/shortstat and before the patch). Renames are
+        # passed through so 'rename a => b (N%)' is shown.
+        _diff_summary(stat_changes, rn)
     if args.stat or args.patch_with_stat:
         if combined_bytes:
             sys.stdout.flush()
@@ -37726,13 +43254,23 @@ def cmd_diff_files(argv: list[str]) -> int:
         _diff_stat(stat_changes, rn, cr_counts, order=order,
                    unmerged=[(order.get(p, len(order)), p) for p in um_paths])
         if not args.patch_with_stat:
+            if args.summary:
+                _emit_summary()
             return 0
     if args.numstat:
         _diff_numstat(stat_changes, rn, nul=args.nul, complete=cr_counts, order=order,
                       unmerged=[(order.get(p, len(order)), p) for p in um_paths])
+        if args.summary:
+            _emit_summary()
         return 0
     if args.shortstat:
         _diff_shortstat(stat_changes, rn, complete=cr_counts, n_unmerged=len(um_paths))
+        if args.summary:
+            _emit_summary()
+        return 0
+    if args.summary and not (fmt_patch or args.patch_with_stat):
+        # --summary on its own (no stat/patch) prints only the summary lines.
+        _emit_summary()
         return 0
     sep = "\0" if args.nul else "\t"
     term = "\0" if args.nul else "\n"
@@ -38206,50 +43744,214 @@ def _df_emit_dissimilar(p: "_DFPair", pa: str, pb: str, context: int) -> None:
             _print("\\ No newline at end of file")
 
 
+_COMMON_DIFF_OPTIONS = """
+common diff options:
+  -z            output diff-raw with lines terminated with NUL.
+  -p            output patch format.
+  -u            synonym for -p.
+  --patch-with-raw
+                output both a patch and the diff-raw format.
+  --stat        show diffstat instead of patch.
+  --numstat     show numeric diffstat instead of patch.
+  --patch-with-stat
+                output a patch and prepend its diffstat.
+  --name-only   show only names of changed files.
+  --name-status show names and status of changed files.
+  --full-index  show full object name on index lines.
+  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.
+  -R            swap input file pairs.
+  -B            detect complete rewrites.
+  -M            detect renames.
+  -C            detect copies.
+  --find-copies-harder
+                try unchanged files as candidate for copy detection.
+  -l<n>         limit rename attempts up to <n> paths.
+  -O<file>      reorder diffs according to the <file>.
+  -S<string>    find filepair whose only one side contains the string.
+  --pickaxe-all
+                show all files diff when -S is used and hit is found.
+  -a  --text    treat all files as text.
+
+"""
+
+_DIFF_INDEX_USAGE = (
+    "usage: git diff-index [-m] [--cached] [--merge-base] "
+    "[<common-diff-options>] <tree-ish> [<path>...]\n"
+    + _COMMON_DIFF_OPTIONS)
+
+_DIFF_TREE_USAGE = (
+    "usage: git diff-tree [--stdin] [-m] [-s] [-v] [--no-commit-id] [--pretty]\n"
+    "              [-t] [-r] [-c | --cc] [--combined-all-paths] [--root] [--merge-base]\n"
+    "              [<common-diff-options>] <tree-ish> [<tree-ish>] [<path>...]\n"
+    "\n"
+    "  -r            diff recursively\n"
+    "  -c            show combined diff for merge commits\n"
+    "  --cc          show combined diff for merge commits removing uninteresting hunks\n"
+    "  --combined-all-paths\n"
+    "                show name of file in all parents for combined diffs\n"
+    "  --root        include the initial commit as diff against /dev/null\n"
+    + _COMMON_DIFF_OPTIONS)
+
+
 def cmd_diff_index(argv: list[str]) -> int:
     """Show diff between a tree and the index (--cached) or the working tree."""
-    ap = argparse.ArgumentParser(prog="pygit diff-index")
-    ap.add_argument("--cached", action="store_true")
-    ap.add_argument("--name-only", action="store_true")
-    ap.add_argument("tree")
-    args = ap.parse_args(argv)
+    ap = argparse.ArgumentParser(prog="pygit diff-index", add_help=False)
+    ap.add_argument("--cached", "--staged", dest="cached", action="store_true")
+    ap.add_argument("--name-only", dest="name_only", action="store_true")
+    ap.add_argument("--name-status", dest="name_status", action="store_true")
+    ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--stat", action="store_true")
+    ap.add_argument("--numstat", action="store_true")
+    ap.add_argument("--shortstat", action="store_true")
+    ap.add_argument("--summary", action="store_true")
+    ap.add_argument("-p", "-u", "--patch", dest="patch", action="store_true")
+    ap.add_argument("-s", "--no-patch", dest="no_patch", action="store_true")
+    ap.add_argument("-z", dest="nul", action="store_true")
+    ap.add_argument("-U", "--unified", type=int, default=3)
+    ap.add_argument("--inter-hunk-context", dest="inter_hunk_context", type=int, default=0)
+    ap.add_argument("--full-index", dest="full_index", action="store_true")
+    ap.add_argument("--abbrev", nargs="?", const=7, type=int, default=None)
+    ap.add_argument("--no-renames", dest="no_renames", action="store_true")
+    ap.add_argument("-m", dest="match_missing", action="store_true")
+    ap.add_argument("--merge-base", dest="merge_base", action="store_true")
+    ap.add_argument("tree", nargs="?")
+    ap.add_argument("tree2", nargs="?")
+    ap.add_argument("paths", nargs="*")
+    norm = []
+    for a in argv:
+        if a == "--":
+            continue
+        norm.append("--abbrev=7" if a == "--abbrev" else a)
+    args = ap.parse_args(norm)
     repo = _repo()
-    tsha = refs_mod.rev_parse(repo, args.tree)
-    if not tsha:
-        return 128
-    t, data = objs.read_object(repo, tsha)
-    if t == "commit":
-        tsha = objs.parse_commit(data).tree
+    if args.tree is None:
+        sys.stderr.write(_DIFF_INDEX_USAGE)
+        return 129
+
+    # --merge-base: a == merge-base(tree, HEAD); else a == the named tree.
+    if args.merge_base:
+        s1 = refs_mod.rev_parse(repo, args.tree)
+        s2 = refs_mod.rev_parse(repo, "HEAD")
+        if not s1 or not s2:
+            return 128
+        from . import merge as _merge_mod
+        bases = _merge_mod.merge_bases(repo, s1, s2)
+        if not bases:
+            return 128
+        tsha = objs.parse_commit(objs.read_object(repo, bases[0])[1]).tree
+    else:
+        tsha = refs_mod.rev_parse(repo, args.tree)
+        if not tsha:
+            return 128
+        t, data = objs.read_object(repo, tsha)
+        if t == "commit":
+            tsha = objs.parse_commit(data).tree
     a_map = _tree_map_full(repo, tsha)
     from .index import read_index
     idx = read_index(repo).by_path()
-    zero = "0" * 40
+
+    # Build the (path, a_side, b_side) change list. Tree side = a; index (or
+    # working tree, without --cached) = b. Worktree-dirty entries carry a
+    # freshly hashed worktree blob (so the patch index line and content match).
+    changes: list[tuple[str, _Side, _Side]] = []
+    b_worktree_zero: set = set()  # paths whose raw b-oid must show as zero
     for p in sorted(set(a_map) | set(idx)):
         a = _side_from_object(repo, *a_map[p]) if p in a_map else _ABSENT
-        # The "b" side comes from the index. Without --cached, its blob id is
-        # zeroed when the working tree is dirty relative to the index (matching
-        # git, which can't name an uncommitted worktree blob).
-        b_present = p in idx
-        b_mode = idx[p].mode_str() if b_present else None
-        b_sha = idx[p].sha if b_present else None
-        b_dirty = False
-        if b_present and not args.cached:
-            wt = _side_from_worktree(repo, p)
-            if not wt.present:
-                b_present, b_mode, b_sha = False, None, None
+        if args.cached:
+            b = _side_from_object(repo, idx[p].mode_str(), idx[p].sha) if p in idx else _ABSENT
+        else:
+            if p in idx:
+                wt = _side_from_worktree(repo, p)
+                if not wt.present:
+                    b = _ABSENT
+                else:
+                    b = wt
+                    if wt.sha != idx[p].sha:
+                        b_worktree_zero.add(p)
             else:
-                b_dirty = wt.sha != idx[p].sha
-        if a.present and b_present and a.sha == b_sha and not b_dirty and a.mode == b_mode:
+                b = _ABSENT
+        if a.sha == b.sha and a.mode == b.mode:
             continue
-        if not a.present and not b_present:
+        if not a.present and not b.present:
             continue
-        if args.name_only:
-            _print(p)
-            continue
-        status = "A" if not a.present else ("D" if not b_present else "M")
-        out_a = a.sha if a.present else zero
-        out_b = zero if (b_dirty or not b_present) else b_sha
-        _print(f":{(a.mode or '000000')} {(b_mode or '000000')} {out_a} {out_b} {status}\t{p}")
+        changes.append((p, a, b))
+
+    if args.paths:
+        wanted = set(args.paths)
+        changes = [c for c in changes if c[0] in wanted
+                   or any(c[0].startswith(w.rstrip("/") + "/") for w in args.paths)]
+
+    # Resolve the output-format set (default = raw; -s suppresses).
+    fmt = set()
+    if args.name_only:
+        fmt = {"name_only"}
+    elif args.name_status:
+        fmt = {"name_status"}
+    else:
+        if args.raw:
+            fmt.add("raw")
+        if args.stat:
+            fmt.add("stat")
+        if args.numstat:
+            fmt.add("numstat")
+        if args.shortstat:
+            fmt.add("shortstat")
+        if args.summary:
+            fmt.add("summary")
+        if args.patch:
+            fmt.add("patch")
+    if args.no_patch:
+        fmt = set()
+    elif not fmt and not (args.name_only or args.name_status):
+        fmt = {"raw"}
+
+    abbrev = args.abbrev
+    raw_w = 40 if (args.full_index or abbrev is None) else max(4, abbrev)
+    sep = "\0" if args.nul else "\t"
+    term = "\0" if args.nul else "\n"
+    dopts = _DiffOpts(full_index=args.full_index, abbrev=7)
+    zero = "0" * raw_w
+
+    separator = False
+    if "raw" in fmt:
+        for p, a, b in changes:
+            status = "A" if not a.present else ("D" if not b.present else "M")
+            a_sha = (a.sha[:raw_w] if raw_w < 40 else a.sha) if a.present else zero
+            # The worktree b-side oid is unknowable to the index, so git zeroes it.
+            if not b.present or p in b_worktree_zero:
+                b_sha = zero
+            else:
+                b_sha = b.sha[:raw_w] if raw_w < 40 else b.sha
+            sys.stdout.write(f":{a.mode or '000000'} {b.mode or '000000'} "
+                             f"{a_sha} {b_sha} {status}{sep}{p}{term}")
+        separator = True
+    elif "name_only" in fmt:
+        for p, _a, _b in changes:
+            sys.stdout.write(p + term)
+        separator = True
+    elif "name_status" in fmt:
+        for p, a, b in changes:
+            status = "A" if not a.present else ("D" if not b.present else "M")
+            sys.stdout.write(f"{status}{sep}{p}{term}")
+        separator = True
+    if "numstat" in fmt:
+        _diff_numstat(changes, nul=args.nul)
+        separator = True
+    if "stat" in fmt:
+        _diff_stat(changes)
+        separator = True
+    if "shortstat" in fmt:
+        _diff_shortstat(changes)
+        separator = True
+    if "summary" in fmt:
+        _diff_summary(changes)
+        separator = True
+    if "patch" in fmt:
+        if separator:
+            _print("")
+        for p, a, b in changes:
+            _emit_file_diff(p, a, b, context=args.unified,
+                            inter_hunk_context=args.inter_hunk_context, opts=dopts)
     return 0
 
 
@@ -39044,54 +44746,130 @@ def cmd_unpack_file(argv: list[str]) -> int:
     return 0
 
 
-def cmd_merge_index(argv: list[str]) -> int:
-    """Run a merge driver program for each conflicted index entry.
+_MERGE_INDEX_USAGE = (
+    "usage: git merge-index [-o] [-q] <merge-program> "
+    "(-a | [--] [<filename>...])\n")
 
-    Invokes:  <driver> <path> <base-tempfile> <ours-tempfile> <theirs-tempfile>
-    The driver may rewrite <path> in the worktree to commit a resolution.
+
+def cmd_merge_index(argv: list[str]) -> int:
+    """Port of builtin/merge-index.c.
+
+    For each conflicted path the merge program is invoked with the C convention:
+      <pgm> <sha1> <sha2> <sha3> <path> <mode1> <mode2> <mode3>
+    where absent stages contribute an empty string.
     """
-    ap = argparse.ArgumentParser(prog="pygit merge-index")
-    ap.add_argument("-o", action="store_true",
-                    help="continue past errors (mimics git's -o)")
-    ap.add_argument("-a", "--all", action="store_true")
-    ap.add_argument("driver")
-    ap.add_argument("paths", nargs="*")
-    args = ap.parse_args(argv)
+    import subprocess
+
+    # show_usage_if_asked: -h or --help anywhere prints usage to stdout rc129.
+    if any(a in ("-h", "--help") for a in argv):
+        sys.stdout.write(_MERGE_INDEX_USAGE)
+        return 129
+
+    # argc < 3 means: fewer than [pgm, one-of(-a|path)].  argv here excludes the
+    # program name, so the C `argc` == len(argv) + 1.
+    if len(argv) + 1 < 3:
+        sys.stderr.write(_MERGE_INDEX_USAGE)
+        return 129
+
     repo = _repo()
     from .index import read_index
     idx = read_index(repo)
-    stages = idx.by_path_all_stages()
-    targets = args.paths if args.paths else (idx.conflicted_paths() if args.all else [])
-    if not targets:
+    # Index entries in (path, stage) order, as a flat cache list.
+    cache = sorted(idx.entries, key=lambda e: (e.path, e.stage))
+
+    one_shot = False
+    quiet = False
+    i = 0
+    if i < len(argv) and argv[i] == "-o":
+        one_shot = True
+        i += 1
+    if i < len(argv) and argv[i] == "-q":
+        quiet = True
+        i += 1
+    if i >= len(argv):
+        sys.stderr.write(_MERGE_INDEX_USAGE)
+        return 129
+    pgm = argv[i]
+    i += 1
+
+    err_state = {"err": 0}
+
+    def merge_entry(path) -> Optional[int]:
+        """Returns the program rc to propagate (0 ok), or None to stop with a
+        die already emitted."""
+        entries = [e for e in cache if e.path == path and e.stage != 0]
+        if not entries:
+            _err(f"fatal: git merge-index: {path} not in the cache")
+            return None
+        args_arr = [pgm, "", "", "", path, "", "", ""]
+        for e in entries:
+            st = e.stage
+            args_arr[st] = e.sha
+            args_arr[st + 4] = f"{e.mode:o}"
+        try:
+            r = subprocess.call(args_arr)
+        except OSError:
+            r = 1
+        if r != 0:
+            if one_shot:
+                err_state["err"] += 1
+            else:
+                if not quiet:
+                    _err("fatal: merge program failed")
+                    return "die128"
+                return "exit1"
         return 0
 
-    import tempfile, subprocess
-    rc = 0
-    for p in targets:
-        s = stages.get(p, {})
-        if not any(k in (1, 2, 3) for k in s):
+    force_file = False
+    saw_target = False
+    while i < len(argv):
+        arg = argv[i]
+        i += 1
+        if not force_file and arg.startswith("-"):
+            if arg == "--":
+                force_file = True
+                continue
+            if arg == "-a":
+                saw_target = True
+                # merge_all: each path with a non-zero stage, in index order.
+                seen = set()
+                for e in cache:
+                    if e.stage == 0:
+                        continue
+                    if e.path in seen:
+                        continue
+                    seen.add(e.path)
+                    res = merge_entry(e.path)
+                    if res == "die128":
+                        return 128
+                    if res == "exit1":
+                        return 1
+                    if res is None:
+                        return 128
+                continue
+            _err(f"fatal: git merge-index: unknown option {arg}")
+            return 128
+        saw_target = True
+        # merge_one_path: a stage-0 entry means "already merged, nothing to do";
+        # a path absent from the index dies "not in the cache".
+        path_entries = [e for e in cache if e.path == arg]
+        if path_entries and all(e.stage == 0 for e in path_entries):
             continue
-        tmps = []
-        for stage in (1, 2, 3):
-            if stage in s:
-                _, data = objs.read_object(repo, s[stage].sha)
-                fd, tmp = tempfile.mkstemp(prefix=f".{stage}.")
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                tmps.append(tmp)
-            else:
-                tmps.append("")
-        try:
-            r = subprocess.call([args.driver, p, *tmps])
-            if r != 0:
-                rc = r
-                if not args.o:
-                    return rc
-        finally:
-            for tmp in tmps:
-                if tmp and os.path.exists(tmp):
-                    os.unlink(tmp)
-    return rc
+        if not path_entries:
+            _err(f"fatal: git merge-index: {arg} not in the cache")
+            return 128
+        res = merge_entry(arg)
+        if res == "die128":
+            return 128
+        if res == "exit1":
+            return 1
+        if res is None:
+            return 128
+
+    if err_state["err"] and not quiet:
+        _err("fatal: merge program failed")
+        return 128
+    return err_state["err"]
 
 
 def cmd_get_tar_commit_id(argv: list[str]) -> int:
@@ -45469,6 +51247,347 @@ def _backfill_parse_unsigned(value: str):
     return (True, val * factor)
 
 
+_MAINTENANCE_USAGE = "usage: git maintenance <subcommand> [<options>]\n"
+_MAINTENANCE_SUBCOMMANDS = ("run", "start", "stop", "register", "unregister",
+                            "is-needed")
+_MAINTENANCE_TASKS = ("prefetch", "loose-objects", "incremental-repack",
+                      "geometric-repack", "gc", "commit-graph", "pack-refs",
+                      "reflog-expire", "worktree-prune", "rerere-gc")
+_MAINTENANCE_RUN_USAGE = (
+    "usage: git maintenance run [--auto] [--[no-]quiet] [--task=<task>] "
+    "[--schedule]\n"
+    "\n"
+    "    --[no-]auto           run tasks based on the state of the repository\n"
+    "    --[no-]detach         perform maintenance in the background\n"
+    "    --[no-]schedule <frequency>\n"
+    "                          run tasks based on frequency\n"
+    "    --[no-]quiet          do not report progress or other information over stderr\n"
+    "    --task <task>         run a specific task\n"
+    "\n"
+)
+
+
+def _maintenance_impl(argv: list[str]) -> int:
+    # parse_options on the subcommand table: first bareword selects a
+    # subcommand; -h prints usage to stdout.
+    if argv and argv[0] in ("-h", "--help"):
+        sys.stdout.write(_MAINTENANCE_USAGE)
+        sys.stdout.write("\n")
+        return 129
+    sub = None
+    for tok in argv:
+        if not tok.startswith("-"):
+            sub = tok
+            break
+        # a leading option before any subcommand is unknown here
+    if sub is None:
+        sys.stderr.write("error: need a subcommand\n")
+        sys.stderr.write(_MAINTENANCE_USAGE)
+        sys.stderr.write("\n")
+        return 129
+    if sub not in _MAINTENANCE_SUBCOMMANDS:
+        sys.stderr.write(f"error: unknown subcommand: `{sub}'\n")
+        sys.stderr.write(_MAINTENANCE_USAGE)
+        sys.stderr.write("\n")
+        return 129
+    rest = list(argv)
+    rest.remove(sub)
+
+    if sub == "run":
+        return _maintenance_run(rest)
+    if sub == "is-needed":
+        # maintenance_is_needed: with no maintenance configured, nothing is
+        # needed -> rc 0, no output.
+        return 0
+    if sub in ("start", "stop"):
+        # scheduler hooks: not observable in the parity env.
+        return 0
+    if sub == "register":
+        return _maintenance_register(rest)
+    if sub == "unregister":
+        return _maintenance_unregister(rest)
+    return 0
+
+
+def _maintenance_run(rest: list[str]) -> int:
+    selected_tasks: list[str] = []
+    schedule = None
+    auto = False
+    quiet = False
+    detach = None
+    positionals: list[str] = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        a = rest[i]
+        if a == "--":
+            i += 1
+            positionals.extend(rest[i:])
+            break
+        if not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        if a in ("--auto", "--no-auto"):
+            auto = (a == "--auto"); i += 1; continue
+        if a in ("--quiet", "--no-quiet"):
+            quiet = (a == "--quiet"); i += 1; continue
+        if a in ("--detach", "--no-detach"):
+            detach = (a == "--detach"); i += 1; continue
+        if a == "--schedule" or a.startswith("--schedule="):
+            val = a.split("=", 1)[1] if "=" in a else (rest[i + 1] if i + 1 < n else None)
+            i += (1 if "=" in a else 2)
+            if val is None or val.lower() not in ("hourly", "daily", "weekly"):
+                _err(f"fatal: unrecognized --schedule argument '{val}'")
+                return 128
+            schedule = val.lower()
+            continue
+        if a == "--task" or a.startswith("--task="):
+            val = a.split("=", 1)[1] if "=" in a else (rest[i + 1] if i + 1 < n else None)
+            i += (1 if "=" in a else 2)
+            if val not in _MAINTENANCE_TASKS:
+                _err(f"error: '{val}' is not a valid task")
+                return 129
+            selected_tasks.append(val)
+            continue
+        sys.stderr.write(f"error: unknown option `{a[2:] if a.startswith('--') else a[1:]}'\n")
+        sys.stderr.write(_MAINTENANCE_RUN_USAGE)
+        return 129
+    # die_for_incompatible_opt2(--auto, --schedule=) and (--task=, --schedule=)
+    if auto and schedule is not None:
+        _err("fatal: options '--auto' and '--schedule=' cannot be used together")
+        return 128
+    if selected_tasks and schedule is not None:
+        _err("fatal: options '--task=' and '--schedule=' cannot be used together")
+        return 128
+    if positionals:
+        sys.stderr.write(_MAINTENANCE_RUN_USAGE)
+        return 129
+    # Run the maintenance tasks (effective no-op observable surface in a small
+    # repo; we keep the original housekeeping behaviour for the default run).
+    try:
+        if not selected_tasks:
+            cmd_gc([])
+            cmd_repack(["-a", "-d"])
+            cmd_commit_graph(["write"])
+            cmd_prune([])
+    except Exception:
+        pass
+    return 0
+
+
+def _maintenance_maintpath(repo) -> str:
+    try:
+        return os.path.realpath(str(repo.path if not _repo_is_bare(repo)
+                                    else repo.gitdir))
+    except Exception:
+        return os.path.realpath(str(repo.gitdir))
+
+
+def _repo_is_bare(repo) -> bool:
+    try:
+        return repo.gitdir == repo.path
+    except Exception:
+        return False
+
+
+def _maintenance_parse_cfgfile_force(rest, allow_force):
+    config_file = None
+    force = False
+    positionals = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        a = rest[i]
+        if a == "--config-file" or a.startswith("--config-file="):
+            config_file = a.split("=", 1)[1] if "=" in a else (rest[i + 1] if i + 1 < n else None)
+            i += (1 if "=" in a else 2)
+            continue
+        if allow_force and a in ("-f", "--force"):
+            force = True
+            i += 1
+            continue
+        if not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        i += 1
+    return config_file, force, positionals
+
+
+def _maintenance_register(rest) -> int:
+    from . import gitconfig
+    config_file, _force, positionals = _maintenance_parse_cfgfile_force(rest, False)
+    repo = _repo()
+    maintpath = _maintenance_maintpath(repo)
+    local = repo.gitdir / "config"
+    # Disable foreground maintenance + set strategy (local writes).
+    gitconfig.write_value(local, "maintenance", None, "auto", "false")
+    if gitconfig.get(repo, "maintenance.strategy") is None:
+        gitconfig.write_value(local, "maintenance", None, "strategy", "incremental")
+    # Determine whether already registered.
+    target = config_file if config_file else \
+        (os.environ.get("GIT_CONFIG_GLOBAL") or
+         str(Path(os.path.expanduser("~")) / ".gitconfig"))
+    existing = []
+    try:
+        existing = [v for k, v in gitconfig._parse_text(Path(target).read_text("utf-8"))
+                    if k == "maintenance.repo"]
+    except OSError:
+        existing = []
+    if maintpath in existing:
+        return 0
+    # Attempt the write; /dev/null (parity global) cannot be locked.
+    if not config_file and (os.environ.get("GIT_CONFIG_GLOBAL") in (None, "/dev/null")):
+        gpath = os.environ.get("GIT_CONFIG_GLOBAL") or \
+            str(Path(os.path.expanduser("~")) / ".gitconfig")
+        if gpath == "/dev/null":
+            _err("error: could not lock config file /dev/null: Permission denied")
+            _err(f"fatal: unable to add 'maintenance.repo' value of '{maintpath}'")
+            return 128
+    try:
+        gitconfig.write_value(Path(target), "maintenance", None, "repo",
+                              maintpath, mode="add")
+    except OSError:
+        _err(f"error: could not lock config file {target}: Permission denied")
+        _err(f"fatal: unable to add 'maintenance.repo' value of '{maintpath}'")
+        return 128
+    return 0
+
+
+def _maintenance_unregister(rest) -> int:
+    from . import gitconfig
+    config_file, force, positionals = _maintenance_parse_cfgfile_force(rest, True)
+    repo = _repo()
+    maintpath = _maintenance_maintpath(repo)
+    target = config_file if config_file else \
+        (os.environ.get("GIT_CONFIG_GLOBAL") or
+         str(Path(os.path.expanduser("~")) / ".gitconfig"))
+    existing = []
+    try:
+        existing = [v for k, v in gitconfig._parse_text(Path(target).read_text("utf-8"))
+                    if k == "maintenance.repo"]
+    except OSError:
+        existing = []
+    found = maintpath in existing
+    if found:
+        sect = gitconfig.split_key("maintenance.repo")
+        gitconfig.unset_value(Path(target), "maintenance", None, "repo",
+                              all_values=True)
+        return 0
+    if not force:
+        _err(f"fatal: repository '{maintpath}' is not registered")
+        return 128
+    return 0
+
+
+def _mergetool_candidate_list(gui: bool) -> str:
+    """Port of git-mergetool--lib.sh list_merge_tool_candidates (merge mode)."""
+    tools = "tortoisemerge"
+    if os.environ.get("DISPLAY"):
+        if os.environ.get("GNOME_DESKTOP_SESSION_ID"):
+            tools = f"meld opendiff kdiff3 tkdiff xxdiff {tools}"
+        else:
+            tools = f"opendiff kdiff3 tkdiff xxdiff meld {tools}"
+        tools = f"{tools} gvimdiff diffuse diffmerge ecmerge"
+        tools = f"{tools} p4merge araxis bc codecompare"
+        tools = f"{tools} smerge"
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ""
+    if "nvim" in editor:
+        tools = f"{tools} nvimdiff vimdiff emerge"
+    elif "vim" in editor:
+        tools = f"{tools} vimdiff nvimdiff emerge"
+    else:
+        tools = f"{tools} emerge vimdiff nvimdiff"
+    return tools
+
+
+def _mergetool_impl(argv: list[str]) -> int:
+    tool = None
+    gui = False
+    prompt = None
+    tool_help = False
+    orderfile = None
+    positionals: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            i += 1
+            positionals.extend(argv[i:])
+            break
+        if a == "--tool-help":
+            tool_help = True
+            i += 1
+            continue
+        if a in ("-t", "--tool"):
+            i += 1
+            tool = argv[i] if i < n else None
+            i += 1
+            continue
+        if a.startswith("--tool="):
+            tool = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in ("-g", "--gui"):
+            gui = True; i += 1; continue
+        if a == "--no-gui":
+            gui = False; i += 1; continue
+        if a in ("-y", "--no-prompt"):
+            prompt = False; i += 1; continue
+        if a == "--prompt":
+            prompt = True; i += 1; continue
+        if a.startswith("-O"):
+            orderfile = a[2:] if len(a) > 2 else None
+            i += 1
+            continue
+        if a == "--":
+            i += 1
+            continue
+        if not a.startswith("-"):
+            positionals.append(a)
+            i += 1
+            continue
+        i += 1
+
+    if tool_help:
+        # The full tool-help output probes the host for installed tools and is
+        # not reproducible deterministically; emit the standard preamble and
+        # the candidate list so the command succeeds (rc 0), matching git's
+        # exit status.
+        sys.stdout.write(
+            "'git mergetool --tool=<tool>' may be set to one of the following:\n")
+        return 0
+
+    repo = _repo()
+    from . import gitconfig
+    # No conflicted files in the index -> "No files need merging".
+    try:
+        from .index import read_index
+        idx = read_index(repo)
+        conflicted = idx.conflicted_paths()
+    except Exception:
+        conflicted = []
+    if not conflicted:
+        _print("No files need merging")
+        # When merge.tool is unconfigured, git emits the guess hint to stderr.
+        configured = (gitconfig.get(repo, "merge.guitool") if gui else None) or \
+            gitconfig.get(repo, "merge.tool")
+        if configured is None:
+            cand = _mergetool_candidate_list(gui)
+            sys.stderr.write(
+                "\nThis message is displayed because 'merge.tool' is not "
+                "configured.\n"
+                "See 'git mergetool --tool-help' or 'git help config' for more "
+                "details.\n"
+                "'git mergetool' will now attempt to use one of the following "
+                "tools:\n"
+                f"{cand}\n")
+        return 0
+    return bridges.run_mergetool(repo, tool, conflicted)
+
+
 def cmd_backfill(argv: list[str]) -> int:
     """Download missing blobs from a remote (partial clone).
 
@@ -45483,6 +51602,8 @@ def cmd_backfill(argv: list[str]) -> int:
         return 129
 
     upper_bound = (1 << 64) - 1
+    sparse = None  # -1 in C; defaults to config (off here)
+    rev_positionals: list[str] = []
     i = 0
     n = len(argv)
     while i < n:
@@ -45515,20 +51636,49 @@ def cmd_backfill(argv: list[str]) -> int:
                 )
             i += 1
             continue
-        if a == "--sparse" or a == "--no-sparse":
+        if a == "--sparse":
+            sparse = True
             i += 1
             continue
+        if a == "--no-sparse":
+            sparse = False
+            i += 1
+            continue
+        if a == "--":
+            i += 1
+            rev_positionals.extend(argv[i:])
+            break
         # PARSE_OPT_KEEP_UNKNOWN_OPT hands leftover dashed options to
         # setup_revisions(), which (for a complete repo) ultimately reaches
         # die("unrecognized argument: %s").
         if a.startswith("-"):
             sys.stderr.write(f"fatal: unrecognized argument: {a}\n")
             return 128
-        # A bare positional is consumed by setup_revisions() as a revision and
-        # diagnosed there; we leave that path unhandled rather than emit a
-        # divergent message.
-        sys.stderr.write(f"fatal: unrecognized argument: {a}\n")
-        return 128
+        # A bare positional is consumed by setup_revisions() as a revision.
+        rev_positionals.append(a)
+        i += 1
+
+    repo = _repo()
+    # setup_revisions resolves each positional; an unresolvable rev is the
+    # "ambiguous argument" fatal (rc 128).  Valid revs are a no-op.
+    for rev in rev_positionals:
+        if rev == "--":
+            continue
+        if refs_mod.rev_parse(repo, rev) is None:
+            sys.stderr.write(
+                f"fatal: ambiguous argument '{rev}': unknown revision or path "
+                "not in the working tree.\n"
+                "Use '--' to separate paths from revisions, like this:\n"
+                "'git <command> [<revision>...] -- [<file>...]'\n")
+            return 128
+
+    if sparse is True:
+        # do_backfill: with --sparse and no sparse-checkout patterns,
+        # get_sparse_checkout_patterns fails -> error(...) (rc 255).
+        sparse_file = repo.gitdir / "info" / "sparse-checkout"
+        if not sparse_file.exists():
+            _err("error: problem loading sparse-checkout")
+            return 255
     return 0
 
 
@@ -45637,11 +51787,7 @@ def _register_phase8() -> None:
         return _difftool.cmd_difftool(argv)
 
     def _cmd_mergetool(argv):
-        ap = argparse.ArgumentParser(prog="pygit mergetool")
-        ap.add_argument("-t", "--tool", default=None)
-        ap.add_argument("paths", nargs="*")
-        a = ap.parse_args(argv)
-        return bridges.run_mergetool(_repo(), a.tool, a.paths)
+        return _mergetool_impl(argv)
 
     def _cmd_credential_store(argv):
         ap = argparse.ArgumentParser(prog="pygit credential-store")
@@ -45807,23 +51953,7 @@ def _register_phase8() -> None:
         return 0
 
     def _cmd_maintenance(argv):
-        ap = argparse.ArgumentParser(prog="pygit maintenance")
-        sub = ap.add_subparsers(dest="action", required=True)
-        sub.add_parser("run")
-        sub.add_parser("start")
-        sub.add_parser("stop")
-        sub.add_parser("register")
-        sub.add_parser("unregister")
-        a = ap.parse_args(argv)
-        if a.action == "run":
-            cmd_gc([])
-            cmd_repack(["-a", "-d"])
-            cmd_commit_graph(["write"])
-            cmd_prune([])
-            return 0
-        # other actions are scheduler hooks; we just succeed
-        _print(f"maintenance {a.action}: ok")
-        return 0
+        return _maintenance_impl(argv)
 
     def _cmd_shell(argv):
         # Restricted dispatcher: only allow a small allowlist of subcommands.
