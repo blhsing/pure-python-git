@@ -114,11 +114,12 @@ def main() -> int:
         finally:
             sys.stdin = old_stdin
 
-        # get-tar-commit-id: feed something without comment=
+        # get-tar-commit-id: a short (<1024-byte) input is an EOF before the
+        # tar header, exactly like Git 2.54 -> fatal + rc 128.
         sys.stdin = FakeStdin("", binary=b"hello\n")
         try:
             rc = run("get-tar-commit-id")
-            check(rc == 1, "get-tar-commit-id returns 1 when missing")
+            check(rc == 128, "get-tar-commit-id EOF on short input")
         finally:
             sys.stdin = old_stdin
 

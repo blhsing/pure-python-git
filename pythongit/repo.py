@@ -73,7 +73,10 @@ class Repository:
                 return cls(candidate, gitdir=git)
             if (candidate / "HEAD").exists() and (candidate / "objects").is_dir():
                 return cls(candidate, gitdir=candidate, bare=True)
-        raise RepositoryError(f"not a git repository: {start}")
+        # setup.c: when no GIT_DIR is set and the walk-up finds no repository,
+        # git reports the relative name it was looking for (".git").
+        raise RepositoryError(
+            "not a git repository (or any of the parent directories): .git")
 
     # ---- init ----------------------------------------------------------
 

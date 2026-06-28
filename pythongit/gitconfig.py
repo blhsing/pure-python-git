@@ -206,6 +206,30 @@ def get(repo: Optional[Repository], name: str) -> Optional[str]:
     return values[-1] if values else None
 
 
+def apply_insteadof(repo: Optional[Repository], url: str, *, push: bool = False) -> str:
+    """Rewrite ``url`` per ``url.<base>.insteadOf`` (and pushInsteadOf).
+
+    Mirrors remote.c:alias_url(): among all ``url.<base>.insteadOf = <prefix>``
+    entries whose ``<prefix>`` is a prefix of ``url``, the longest-matching
+    prefix wins; the URL's matching prefix is replaced by ``<base>`` (the
+    subsection). When ``push`` is set, pushInsteadOf is consulted first (and the
+    URL is only rewritten if a push rule matches; remote.c falls back to plain
+    insteadOf for the fetch URL separately, so callers decide the order)."""
+    subkey = "pushinsteadof" if push else "insteadof"
+    longest_base: Optional[str] = None
+    longest_prefix = ""
+    for full, value in list_all(repo):
+        if not full.startswith("url.") or not full.endswith("." + subkey):
+            continue
+        base = full[len("url."):-len("." + subkey)]
+        if url.startswith(value) and (longest_base is None or len(value) > len(longest_prefix)):
+            longest_base = base
+            longest_prefix = value
+    if longest_base is None:
+        return url
+    return longest_base + url[len(longest_prefix):]
+
+
 def _header_for(section: str, subsection: Optional[str]) -> str:
     if subsection is None:
         return f"[{section}]"

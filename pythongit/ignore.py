@@ -109,6 +109,28 @@ class IgnoreSet:
                 result = None if r.negate else r
         return result
 
+    def last_matching_rule(self, rel_path: str, is_dir: bool = False):
+        """Return the LAST pattern that matches ``rel_path`` (negative or
+        positive), mirroring git's last_matching_pattern(). Unlike match_rule,
+        a trailing negative pattern is returned rather than collapsed to None.
+        Used by check-ignore --verbose."""
+        rel_path, is_dir = _normalize_path(rel_path, is_dir)
+        if not rel_path:
+            return None
+        parts = rel_path.split("/")
+        for i in range(1, len(parts)):
+            rule = self._last_match_any("/".join(parts[:i]), True)
+            if rule is not None:
+                return rule
+        return self._last_match_any(rel_path, is_dir)
+
+    def _last_match_any(self, rel_path: str, is_dir: bool):
+        result = None
+        for r in self.rules:
+            if r.match(rel_path, is_dir):
+                result = r
+        return result
+
 
 def load(repo_path: Path) -> IgnoreSet:
     s = IgnoreSet()

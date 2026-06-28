@@ -83,11 +83,50 @@ class Mailmap:
         return (proper_name or name), (proper_email or email)
 
 
+def _read_file_into(mm: "Mailmap", filename: str) -> None:
+    """Port of mailmap.c read_mailmap_file: a missing file is a silent no-op."""
+    import os
+    if not filename or not os.path.exists(filename):
+        return
+    with open(filename, "r", encoding="utf-8", errors="replace") as f:
+        for line in f.read().splitlines():
+            mm._add_line(line)
+
+
+def _read_blob_into(mm: "Mailmap", repo: Repository, name: str) -> None:
+    """Port of mailmap.c read_mailmap_blob: a missing object is a silent no-op."""
+    from . import objects as _objs
+    from . import refs as _refs
+    try:
+        sha = _refs.rev_parse(repo, name)
+    except Exception:
+        sha = None
+    if not sha:
+        return
+    try:
+        typ, data = _objs.read_object(repo, sha)
+    except Exception:
+        return
+    if typ != "blob":
+        return
+    for line in data.decode("utf-8", "replace").splitlines():
+        mm._add_line(line)
+
+
 def load(repo: Repository) -> Mailmap:
-    """Read the repository's ``.mailmap`` (top-level working-tree file)."""
+    """Read the repository's mailmap (worktree ``.mailmap`` plus the
+    ``mailmap.file`` / ``mailmap.blob`` config entries), mirroring the order in
+    mailmap.c read_mailmap()."""
     mm = Mailmap()
     path = repo.path / ".mailmap"
     if path.exists():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             mm._add_line(line)
+    from . import gitconfig
+    blob = gitconfig.get(repo, "mailmap.blob")
+    if blob:
+        _read_blob_into(mm, repo, blob)
+    cfg_file = gitconfig.get(repo, "mailmap.file")
+    if cfg_file:
+        _read_file_into(mm, cfg_file)
     return mm

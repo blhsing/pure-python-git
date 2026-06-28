@@ -27,6 +27,66 @@ S_IFGITLINK = 0o160000
 EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 NULL_OID = "0" * 40
 
+# sign modes accepted by fast-import's parse_one_option via parse_sign_mode.
+_SIGN_MODES = frozenset({
+    "abort", "verbatim", "ignore", "warn-verbatim", "warn", "warn-strip",
+    "strip", "abort-if-invalid", "strip-if-invalid", "sign-if-invalid",
+})
+
+
+def _valid_sign_mode(arg: str) -> bool:
+    """True if ``arg`` is accepted by gpg-interface.c:parse_sign_mode.
+
+    fast-import uses parse_sign_mode directly (unlike fast-export, it does not
+    reject the *-if-invalid variants), and also accepts a keyid via the
+    "sign-if-invalid=<keyid>" form."""
+    return arg in _SIGN_MODES or arg.startswith("sign-if-invalid=")
+
+
+def _git_parse_ulong(value: str):
+    """Port of parse.c:git_parse_ulong / git_parse_unsigned.
+
+    Parses an optionally-suffixed (k/m/g, case-insensitive) non-negative
+    integer in base 0 (decimal, 0x hex, 0 octal).  Returns the int value, or
+    None on any parse error (negative, empty, bad suffix, non-numeric)."""
+    if value is None or value == "":
+        return None
+    if "-" in value:  # strtoumax would accept it; git rejects explicitly
+        return None
+    # strtoumax(value, &end, 0): leading numeric run in base 0.
+    s = value
+    try:
+        # Determine the numeric prefix the C strtoumax would consume.
+        end = 0
+        n = len(s)
+        if s[end:end + 2].lower() == "0x":
+            j = end + 2
+            while j < n and s[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j == end + 2:
+                return None
+            val = int(s[end:j], 16)
+        elif s[end] == "0":
+            j = end + 1
+            while j < n and s[j] in "01234567":
+                j += 1
+            val = int(s[end:j], 8) if j > end + 1 else 0
+        else:
+            j = end
+            while j < n and s[j].isdigit():
+                j += 1
+            if j == end:
+                return None
+            val = int(s[end:j], 10)
+    except ValueError:
+        return None
+    suffix = s[j:]
+    factor = {"": 1, "k": 1024, "m": 1024 * 1024,
+              "g": 1024 * 1024 * 1024}.get(suffix.lower())
+    if factor is None:
+        return None
+    return val * factor
+
 
 class FastImportDie(Exception):
     """Raised for a ``fatal:`` stream error (exit 128 + crash report)."""
@@ -238,6 +298,10 @@ class FastImport:
         self.allow_unsafe_features = False
         self.seen_data_command = False
         self.cat_blob_fd = sys.stdout.buffer
+        # Pack-layout knobs (accepted/validated; pygit's pack writer is internal
+        # so the stored values only gate the parse, not the on-disk layout).
+        self.max_packsize = 0
+        self.big_file_threshold = 512 * 1024 * 1024
 
         # stream state
         self._pos = 0
@@ -362,10 +426,28 @@ class FastImport:
             self.cat_blob_fd = sys.stdout.buffer
 
     def _parse_one_option(self, option: str) -> bool:
+        # builtin/fast-import.c:parse_one_option — a value that git_parse_ulong
+        # rejects makes the option fall through (return 0) to the unknown-option
+        # die, so an invalid numeric here means "unknown option --<opt>".
         if option.startswith("max-pack-size="):
-            return True  # accepted; pack layout is internal
+            v = _git_parse_ulong(option[len("max-pack-size="):])
+            if v is None:
+                return False  # falls through -> "unknown option --max-pack-size=..."
+            # max-pack-size is now in bytes; small values get a unit warning.
+            if v < 8192:
+                sys.stderr.write(
+                    "warning: max-pack-size is now in bytes, assuming "
+                    "--max-pack-size=%dm\n" % v)
+                v *= 1024 * 1024
+            elif v < 1024 * 1024:
+                sys.stderr.write("warning: minimum max-pack-size is 1 MiB\n")
+                v = 1024 * 1024
+            self.max_packsize = v
         elif option.startswith("big-file-threshold="):
-            return True
+            v = _git_parse_ulong(option[len("big-file-threshold="):])
+            if v is None:
+                return False
+            self.big_file_threshold = v
         elif option.startswith("depth="):
             self._option_depth(option[len("depth="):])
         elif option.startswith("active-branches="):
@@ -373,9 +455,15 @@ class FastImport:
         elif option.startswith("export-pack-edges="):
             return True
         elif option.startswith("signed-commits="):
-            return True
+            if not _valid_sign_mode(option[len("signed-commits="):]):
+                raise FastImportUsage(
+                    "unknown --signed-commits mode '%s'"
+                    % option[len("signed-commits="):])
         elif option.startswith("signed-tags="):
-            return True
+            if not _valid_sign_mode(option[len("signed-tags="):]):
+                raise FastImportUsage(
+                    "unknown --signed-tags mode '%s'"
+                    % option[len("signed-tags="):])
         elif option == "quiet":
             self.show_stats = False
             self.quiet = True
@@ -389,7 +477,8 @@ class FastImport:
 
     def _option_depth(self, depth: str):
         v = self._ulong_arg("--depth", depth)
-        MAX_DEPTH = 4095
+        # DEPTH_BITS=13 -> MAX_DEPTH = (1<<13)-1 = 8191.
+        MAX_DEPTH = 8191
         if v > MAX_DEPTH:
             raise FastImportDie("--depth cannot exceed %u" % MAX_DEPTH)
 
@@ -1435,10 +1524,23 @@ class FastImport:
         w("Total branches:  %10d (%10d loads     )\n" % (branch_count, self._stat_branch_loads))
         w("      marks:     %10d (%10d unique    )\n" % (marks_total, len(self.marks)))
         w("      atoms:     %10d\n" % len(self._stat_atoms))
-        # Non-reproducible memory accounting (this process, not git's heap).
-        obj_kib = (alloc_count * 80) // 1024
-        w("Memory total:    %10d KiB\n" % (2048 + obj_kib))
-        w("       pools:    %10d KiB\n" % 2048)
+        # Memory accounting, ported from dump_stats():
+        #   objects = alloc_count * sizeof(struct object_entry) / 1024
+        #   pools   = (tree_entry_allocd + fi_mem_pool.pool_alloc) / 1024
+        #   total   = (tree_entry_allocd + pool_alloc + objects_bytes) / 1024
+        # sizeof(struct object_entry) is 72 on a 64-bit build (pack_idx_entry
+        # 48 + hashmap_entry 16 + a packed uint32_t 4, padded to 8).  The pool
+        # holds a single 2 MiB block here (fi_mem_pool.block_alloc) so pool_alloc
+        # is exactly 2 MiB once any pool allocation has happened.
+        OBJECT_ENTRY_SIZE = 72
+        objects_bytes = alloc_count * OBJECT_ENTRY_SIZE
+        pool_alloc = 2 * 1024 * 1024  # one fi_mem_pool block
+        tree_entry_allocd = 0  # no deltified-tree bookkeeping in pygit's writer
+        obj_kib = objects_bytes // 1024
+        pools_kib = (tree_entry_allocd + pool_alloc) // 1024
+        total_kib = (tree_entry_allocd + pool_alloc + objects_bytes) // 1024
+        w("Memory total:    %10d KiB\n" % total_kib)
+        w("       pools:    %10d KiB\n" % pools_kib)
         w("     objects:    %10d KiB\n" % obj_kib)
         w("-" * 69 + "\n")
         try:
